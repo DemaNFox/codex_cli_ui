@@ -8,7 +8,8 @@ runtime secrets, Docker access or deployment credentials.
 ## Assumptions
 
 - Ubuntu with systemd, Nginx, Node.js 22+, Python 3, `curl`, and the pinned Codex
-  executable already installed. Startup fails unless `codex --version` exactly
+  executable already installed. `binutils` is required when installing the
+  scoped AppArmor profile. Startup fails unless `codex --version` exactly
   matches `CODEX_WEB_CODEX_VERSION_PIN` (initially `codex-cli 0.153.4`).
 - The chosen service user already exists and is not root. The current server may
   use `ai-chat-agent` with `CODEX_HOME=/opt/ai-chat-agents/home/.codex`.

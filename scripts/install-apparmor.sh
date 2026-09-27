@@ -42,7 +42,7 @@ done
 validate_root_executable() {
   local label=${1:?label required} input=${2:?path required} path owner mode
   path=$(canonical_existing_file "$input")
-  [[ $path =~ ^/[A-Za-z0-9._/+-]+$ ]] || die "$label path contains unsupported AppArmor characters: $path"
+  [[ $path =~ ^/[A-Za-z0-9._/@+-]+$ ]] || die "$label path contains unsupported AppArmor characters: $path"
   [[ -x $path ]] || die "$label is not executable: $path"
   readelf -h -- "$path" >/dev/null 2>&1 || die "$label must be a native ELF executable: $path"
   owner=$(stat -Lc '%u' -- "$path")

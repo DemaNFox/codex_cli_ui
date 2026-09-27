@@ -28,6 +28,7 @@ class AppArmorStaticTest(unittest.TestCase):
             "must be a native ELF executable",
             "must be owned by root",
             "must not be writable by group or other",
+            "A-Za-z0-9._/@+-",
             'apparmor_parser -Q "$temporary"',
             'apparmor_parser -r "$profile_path"',
             'apparmor_parser -R "$profile_path"',
