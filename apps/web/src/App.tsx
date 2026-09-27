@@ -1071,9 +1071,37 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
           current.map((item) => (item.id === requestedThreadId ? history.data : item)),
         );
         mergeEvents(history.events, requestedThreadId);
-        setThreadAttachmentBytes(
-          attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
+        const referencedIds = new Set(
+          history.events.flatMap((event) =>
+            attachmentsFrom(event).map((attachment) => attachment.id),
+          ),
         );
+        const unused = attachments.filter((attachment) => !referencedIds.has(attachment.id));
+        if (unused.length === 0) {
+          setThreadAttachmentBytes(
+            attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
+          );
+          return;
+        }
+        void Promise.allSettled(
+          unused.map((attachment) =>
+            api.deleteAttachment(session.csrfToken, requestedThreadId, attachment.id),
+          ),
+        ).then((results) => {
+          if (cancelled) return;
+          const deletedIds = new Set(
+            results.flatMap((result, index) =>
+              result.status === 'fulfilled' ? [unused[index]!.id] : [],
+            ),
+          );
+          setThreadAttachmentBytes(
+            attachments.reduce(
+              (total, attachment) =>
+                total + (deletedIds.has(attachment.id) ? 0 : attachment.sizeBytes),
+              0,
+            ),
+          );
+        });
       })
       .catch((cause: unknown) => {
         if (!cancelled) setError(errorMessage(cause));
@@ -1081,7 +1109,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     return () => {
       cancelled = true;
     };
-  }, [mergeEvents, threadId]);
+  }, [mergeEvents, session.csrfToken, threadId]);
 
   useEffect(() => {
     if (!selectedProject) return;

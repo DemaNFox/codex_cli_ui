@@ -473,6 +473,32 @@ describe('App', () => {
     expect(download.hasAttribute('download')).toBe(true);
   });
 
+  it('cleans up an unused staged upload when a thread is reopened', async () => {
+    const orphan = {
+      id: 'attachment-orphan',
+      threadId: 'thread-1',
+      name: 'orphan.txt',
+      mediaType: 'text/plain',
+      kind: 'file',
+      sizeBytes: 12,
+      createdAt: '2026-09-27T10:10:00.000Z',
+      url: '/api/threads/thread-1/attachments/attachment-orphan/content',
+    };
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1/attachments' && !init?.method)
+        return jsonResponse([orphan]);
+      return undefined;
+    });
+    render(<App />);
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/threads/thread-1/attachments/attachment-orphan',
+        expect.objectContaining({ method: 'DELETE' }),
+      ),
+    );
+  });
+
   it('opens a project archive and restores a chat', async () => {
     const archivedThread = { ...thread, id: 'thread-old', name: 'Старый чат', archived: true };
     const archivedEvent = {
