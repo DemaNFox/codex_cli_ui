@@ -243,6 +243,13 @@ button:disabled {
   display: flex;
   flex-direction: column;
   padding: 0.9rem;
+  overflow: hidden;
+}
+.navigation-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-gutter: stable;
 }
 .app-brand {
   display: flex;
@@ -410,7 +417,7 @@ button:disabled {
   background: #2d343a;
 }
 .account-row {
-  margin-top: auto;
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   gap: 0.55rem;

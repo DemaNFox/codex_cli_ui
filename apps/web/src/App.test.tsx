@@ -304,6 +304,10 @@ describe('App', () => {
 
     const navigationToggle = screen.getByRole('button', { name: 'Открыть навигацию' });
     const navigation = screen.getByRole('complementary', { name: 'Навигация' });
+    const navigationScroll = navigation.querySelector('.navigation-scroll');
+    const accountRow = screen.getByRole('button', { name: 'Выйти' }).closest('.account-row');
+    expect(navigationScroll?.parentElement).toBe(navigation);
+    expect(accountRow?.parentElement).toBe(navigation);
     expect(navigationToggle.getAttribute('aria-expanded')).toBe('false');
     expect(navigation.classList.contains('mobile-open')).toBe(false);
     await user.click(navigationToggle);

@@ -408,10 +408,26 @@ def main() -> int:
         ):
             raise AssertionError(f"mobile navigation drawer is outside the viewport: {navigation_box}")
         logout = page.get_by_role("button", name="Выйти")
-        logout.scroll_into_view_if_needed()
+        logout_box_before = logout.bounding_box()
+        page.locator(".navigation-scroll").evaluate(
+            """element => {
+                const spacer = document.createElement('div');
+                spacer.dataset.smokeSpacer = 'true';
+                spacer.style.height = '2000px';
+                element.append(spacer);
+                element.scrollTop = element.scrollHeight;
+            }"""
+        )
         logout_box = logout.bounding_box()
-        if not logout_box or logout_box["y"] < 0 or logout_box["y"] + logout_box["height"] > 600:
+        if (
+            not logout_box_before
+            or not logout_box
+            or abs(logout_box["y"] - logout_box_before["y"]) > 1
+            or logout_box["y"] < 0
+            or logout_box["y"] + logout_box["height"] > 600
+        ):
             raise AssertionError("mobile drawer does not expose the session logout control")
+        page.locator('[data-smoke-spacer="true"]').evaluate("element => element.remove()")
         page.keyboard.press("Shift+Tab")
         if not navigation.evaluate("element => element.contains(document.activeElement)"):
             raise AssertionError("keyboard focus escaped the mobile navigation drawer")

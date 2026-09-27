@@ -640,105 +640,109 @@ function NavigationSidebar({
           ×
         </button>
       </div>
-      <button className="new-chat-button" onClick={onNew} disabled={!projects.length || disabled}>
-        <span aria-hidden="true">＋</span>
-        Новый чат
-      </button>
-      <div className="section-heading">
-        <span>Проекты</span>
-        <button
-          className="icon-button"
-          onClick={() => setCreating(true)}
-          aria-label="Добавить проект"
-          disabled={disabled}
-        >
-          ＋
+      <div className="navigation-scroll">
+        <button className="new-chat-button" onClick={onNew} disabled={!projects.length || disabled}>
+          <span aria-hidden="true">＋</span>
+          Новый чат
         </button>
-      </div>
-      {creating && (
-        <CreateProjectForm
-          onCreate={async (name, path) => {
-            await onCreate(name, path);
-            setCreating(false);
-          }}
-          onCancel={() => setCreating(false)}
-        />
-      )}
-      <nav className="project-list" aria-label="Проекты">
-        {projects.map((project) => (
-          <div className="project-group" key={project.id}>
-            <div className={`project-row ${project.id === selectedProjectId ? 'selected' : ''}`}>
-              <button
-                className="project-button"
-                aria-expanded={expandedProjectId === project.id}
-                onClick={() => {
-                  const next = expandedProjectId === project.id ? null : project.id;
-                  setExpandedProjectId(next);
-                  if (next) onSelectProject(project.id);
-                }}
-                disabled={disabled}
-              >
-                <span className="project-chevron" aria-hidden="true">
-                  {expandedProjectId === project.id ? '⌄' : '›'}
-                </span>
-                <span>
-                  <strong>{project.name}</strong>
-                  <small>{project.path}</small>
-                </span>
-              </button>
-              <button
-                className="icon-button subtle"
-                aria-label={`Новый чат в проекте ${project.name}`}
-                title="Новый чат в проекте"
-                disabled={disabled}
-                onClick={() => onNewInProject(project.id)}
-              >
-                ＋
-              </button>
-              <ContextMenu label={`Меню проекта ${project.name}`} disabled={disabled}>
-                {(close) => (
-                  <button
-                    role="menuitem"
-                    onClick={() => {
-                      close();
-                      setExpandedProjectId(project.id);
-                      onShowArchived(project.id);
-                    }}
-                  >
-                    Архивированные чаты
-                  </button>
-                )}
-              </ContextMenu>
-            </div>
-            {expandedProjectId === project.id && project.id === selectedProjectId && (
-              <div className="project-threads">
-                {archived && (
-                  <div className="archive-heading">
-                    <span>Архив</span>
-                    <button className="ghost" onClick={onBack} disabled={disabled}>
-                      Назад
+        <div className="section-heading">
+          <span>Проекты</span>
+          <button
+            className="icon-button"
+            onClick={() => setCreating(true)}
+            aria-label="Добавить проект"
+            disabled={disabled}
+          >
+            ＋
+          </button>
+        </div>
+        {creating && (
+          <CreateProjectForm
+            onCreate={async (name, path) => {
+              await onCreate(name, path);
+              setCreating(false);
+            }}
+            onCancel={() => setCreating(false)}
+          />
+        )}
+        <nav className="project-list" aria-label="Проекты">
+          {projects.map((project) => (
+            <div className="project-group" key={project.id}>
+              <div className={`project-row ${project.id === selectedProjectId ? 'selected' : ''}`}>
+                <button
+                  className="project-button"
+                  aria-expanded={expandedProjectId === project.id}
+                  onClick={() => {
+                    const next = expandedProjectId === project.id ? null : project.id;
+                    setExpandedProjectId(next);
+                    if (next) onSelectProject(project.id);
+                  }}
+                  disabled={disabled}
+                >
+                  <span className="project-chevron" aria-hidden="true">
+                    {expandedProjectId === project.id ? '⌄' : '›'}
+                  </span>
+                  <span>
+                    <strong>{project.name}</strong>
+                    <small>{project.path}</small>
+                  </span>
+                </button>
+                <button
+                  className="icon-button subtle"
+                  aria-label={`Новый чат в проекте ${project.name}`}
+                  title="Новый чат в проекте"
+                  disabled={disabled}
+                  onClick={() => onNewInProject(project.id)}
+                >
+                  ＋
+                </button>
+                <ContextMenu label={`Меню проекта ${project.name}`} disabled={disabled}>
+                  {(close) => (
+                    <button
+                      role="menuitem"
+                      onClick={() => {
+                        close();
+                        setExpandedProjectId(project.id);
+                        onShowArchived(project.id);
+                      }}
+                    >
+                      Архивированные чаты
                     </button>
-                  </div>
-                )}
-                {threadRows(threads, false, archived)}
-                {!threads.length && (
-                  <p className="empty-hint">{archived ? 'Архив пуст.' : 'Здесь пока нет чатов.'}</p>
-                )}
+                  )}
+                </ContextMenu>
               </div>
-            )}
-          </div>
-        ))}
-      </nav>
-      {!projects.length && !creating && (
-        <p className="empty-hint">Добавьте первый проект на сервере.</p>
-      )}
-      <div className="section-heading recent-heading">
-        <span>Недавние</span>
+              {expandedProjectId === project.id && project.id === selectedProjectId && (
+                <div className="project-threads">
+                  {archived && (
+                    <div className="archive-heading">
+                      <span>Архив</span>
+                      <button className="ghost" onClick={onBack} disabled={disabled}>
+                        Назад
+                      </button>
+                    </div>
+                  )}
+                  {threadRows(threads, false, archived)}
+                  {!threads.length && (
+                    <p className="empty-hint">
+                      {archived ? 'Архив пуст.' : 'Здесь пока нет чатов.'}
+                    </p>
+                  )}
+                </div>
+              )}
+            </div>
+          ))}
+        </nav>
+        {!projects.length && !creating && (
+          <p className="empty-hint">Добавьте первый проект на сервере.</p>
+        )}
+        <div className="section-heading recent-heading">
+          <span>Недавние</span>
+        </div>
+        <nav className="recent-list" aria-label="Недавние чаты">
+          {threadRows(recentThreads, true)}
+          {!recentThreads.length && <p className="empty-hint">Недавних чатов пока нет.</p>}
+        </nav>
       </div>
-      <nav className="recent-list" aria-label="Недавние чаты">
-        {threadRows(recentThreads, true)}
-        {!recentThreads.length && <p className="empty-hint">Недавних чатов пока нет.</p>}
-      </nav>
       <div className="account-row">
         <span className="avatar">{username.slice(0, 1).toUpperCase()}</span>
         <span>{username}</span>
