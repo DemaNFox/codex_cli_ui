@@ -558,14 +558,12 @@ describe('Codex routes', () => {
     const { app, appServer, projectPath } = await fixture();
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
-    const thread = (
-      await app.inject({
-        method: 'POST',
-        url: '/api/threads',
-        headers: session.headers,
-        payload: { projectId: project.id },
-      })
-    ).json<{ data: { id: string } }>().data;
+    const thread = { id: appServer.addExternalThread(projectPath) };
+    await app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
     appServer.setThreadTurns(thread.id, [
       {
         id: 'historical-turn',
@@ -662,14 +660,12 @@ describe('Codex routes', () => {
     const { app, appServer, repository, projectPath } = await fixture();
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
-    const thread = (
-      await app.inject({
-        method: 'POST',
-        url: '/api/threads',
-        headers: session.headers,
-        payload: { projectId: project.id },
-      })
-    ).json<{ data: { id: string } }>().data;
+    const thread = { id: appServer.addExternalThread(projectPath) };
+    await app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
     repository.appendEvent({
       threadId: thread.id,
       turnId: null,
@@ -913,6 +909,13 @@ describe('Codex routes', () => {
     });
     expect(first.statusCode).toBe(202);
     expect(appServer.requests.filter((item) => item.method === 'thread/resume')).toHaveLength(0);
+    const history = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${thread.id}`,
+      headers: { cookie: session.headers.cookie },
+    });
+    expect(history.statusCode).toBe(200);
+    expect(appServer.requests.filter((item) => item.method === 'thread/read')).toHaveLength(0);
 
     appServer.emit({
       method: 'turn/completed',

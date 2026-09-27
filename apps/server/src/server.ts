@@ -732,6 +732,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const thread = repository.upsertThread(
       mapThread(result.thread, project.id, false, result.instructionSources, result.model),
     );
+    repository.markThreadHistoryHydrated(thread.id);
     loadedThreadGenerations.set(thread.id, appServer.generation);
     repository.audit('thread.start', 'succeeded', {
       projectId: project.id,
@@ -748,7 +749,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (!existing) throw new HttpError(404, 'THREAD_NOT_FOUND');
     const thread = !repository.isThreadHistoryHydrated(id)
       ? await hydrateThreadHistory(existing)
-      : (await readThreadFromAppServer(existing, false)).thread;
+      : loadedThreadGenerations.get(id) === appServer.generation
+        ? existing
+        : (await readThreadFromAppServer(existing, false)).thread;
     return { data: thread, events: repository.listEvents(id, 0) };
   });
 
@@ -821,6 +824,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     try {
       const resumeCwd = await canonicalProjectPath(pathPolicy, project);
       if (loadedThreadGenerations.get(id) !== appServer.generation) {
+        if (!repository.isThreadHistoryHydrated(id)) await hydrateThreadHistory(thread);
         const resumed = threadResponseSchema.parse(
           await appServer.request('thread/resume', {
             threadId: id,
