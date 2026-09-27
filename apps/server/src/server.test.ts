@@ -603,6 +603,15 @@ describe('Codex routes', () => {
         params: { threadId, turnId: 'turn-1', delta },
       });
     }
+    for (const delta of [privatePath.slice(0, split), privatePath.slice(split)]) {
+      appServer.emit({
+        method: 'item/commandExecution/outputDelta',
+        params: { threadId, turnId: 'turn-1', delta },
+      });
+    }
+    expect(repository.listEvents(threadId, 0).filter((event) => event.phase === 'delta')).toEqual(
+      [],
+    );
     expect(
       repository.listEvents(threadId, 0).filter((event) => event.kind === 'agent-message'),
     ).toEqual([]);
@@ -926,7 +935,7 @@ describe('Codex routes', () => {
   });
 
   it('hydrates existing thread history once through a strict public item allowlist', async () => {
-    const { app, appServer, projectPath } = await fixture();
+    const { app, appServer, attachmentStore, projectPath } = await fixture();
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const thread = { id: appServer.addExternalThread(projectPath) };
@@ -948,7 +957,11 @@ describe('Codex routes', () => {
               { type: 'localImage', path: '/private/image.png' },
             ],
           },
-          { id: 'agent', type: 'agentMessage', text: 'safe answer' },
+          {
+            id: 'agent',
+            type: 'agentMessage',
+            text: `safe answer from ${attachmentStore.root}/private-file.txt`,
+          },
           { id: 'plan', type: 'plan', text: 'public plan' },
           {
             id: 'reasoning',
@@ -1011,6 +1024,8 @@ describe('Codex routes', () => {
     expect(first.body).not.toContain('output-secret');
     expect(first.body).not.toContain('/private/image.png');
     expect(first.body).not.toContain('supersecret');
+    expect(first.body).not.toContain(attachmentStore.root);
+    expect(first.body).toContain('[attachment-storage]/private-file.txt');
 
     const second = await app.inject({
       method: 'GET',

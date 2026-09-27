@@ -405,7 +405,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       if (repository.isThreadHistoryHydrated(existing.id))
         return repository.getThread(existing.id) ?? existing;
       const result = await readThreadFromAppServer(existing, true);
-      for (const event of normalizeThreadHistory(existing.id, result.turns, config.maxEventBytes)) {
+      const safeTurns = redactAttachmentStorage(result.turns, attachmentStore.root);
+      for (const event of normalizeThreadHistory(existing.id, safeTurns, config.maxEventBytes)) {
         publish(repository.appendEvent(event));
       }
       repository.markThreadHistoryHydrated(existing.id);
@@ -581,8 +582,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     // The safe user event is authored below from browser text plus public attachment metadata.
     if (isUserMessageLifecycle(message)) return;
     // Delta fragments cannot be redacted safely in isolation because a private path may span messages.
-    // Publish only the completed full agent message after exact path redaction.
-    if ('method' in message && message.method === 'item/agentMessage/delta') return;
+    // Publish only completed/state snapshots after exact path redaction.
     const redactedMessage = redactAttachmentStorage(
       message,
       attachmentStore.root,
@@ -591,6 +591,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       completedAgentMessage(redactedMessage, config.maxEventBytes) ??
       normalizeNotification(redactedMessage, config.maxEventBytes);
     if (!normalized || !repository.getThread(normalized.threadId)) return;
+    if (normalized.phase === 'delta') return;
     if (message.method === 'turn/started' && normalized.turnId)
       activeTurns.add(`${normalized.threadId}:${normalized.turnId}`);
     if (message.method === 'turn/completed' && normalized.turnId) {
