@@ -145,18 +145,85 @@ function eventText(event: SafeEvent): string {
 }
 
 function eventTitle(event: SafeEvent): string {
-  const titles: Partial<Record<SafeEvent['kind'], string>> = {
-    plan: 'План',
-    command: 'Команда',
-    'file-change': 'Изменения файлов',
-    tool: 'Инструмент',
+  const titles: Partial<Record<SafeEvent['kind'], Partial<Record<SafeEvent['phase'], string>>>> = {
+    plan: { started: 'Составляет план', completed: 'План обновлён', failed: 'План не выполнен' },
+    command: {
+      started: 'Выполняет команду',
+      completed: 'Выполнил команду',
+      failed: 'Команда завершилась с ошибкой',
+    },
+    'file-change': {
+      started: 'Изменяет файлы',
+      completed: 'Изменил файлы',
+      failed: 'Не удалось изменить файлы',
+    },
+    tool: {
+      started: 'Использует инструмент',
+      completed: 'Выполнил действие',
+      failed: 'Действие завершилось с ошибкой',
+    },
+    turn: { failed: 'Задача завершилась с ошибкой' },
+    warning: { state: 'Предупреждение' },
+    error: { failed: 'Ошибка' },
+  };
+  const fallbacks: Partial<Record<SafeEvent['kind'], string>> = {
+    plan: 'Обновил план',
+    command: 'Работает в терминале',
+    'file-change': 'Редактирует файлы',
+    tool: 'Выполняет действие',
     usage: 'Использование',
     warning: 'Предупреждение',
     error: 'Ошибка',
-    turn: 'Состояние задачи',
-    thread: 'Состояние чата',
+    turn: 'Задача',
   };
-  return titles[event.kind] ?? 'Событие';
+  return titles[event.kind]?.[event.phase] ?? fallbacks[event.kind] ?? 'Событие';
+}
+
+function eventPreview(event: SafeEvent): string | null {
+  const source = event.payload;
+  const item =
+    source.item && typeof source.item === 'object'
+      ? (source.item as Record<string, unknown>)
+      : null;
+  const candidates = [
+    source.command,
+    source.summary,
+    source.message,
+    source.name,
+    source.tool,
+    source.method,
+    item?.title,
+    item?.name,
+    item?.tool,
+    item?.type,
+  ];
+  let value = candidates.find((candidate): candidate is string => typeof candidate === 'string');
+  if (!value) return null;
+  if (value === item?.type) {
+    value =
+      {
+        commandExecution: 'команда',
+        fileChange: 'изменение файлов',
+        mcpToolCall: 'внешний инструмент',
+        reasoning: 'анализ',
+      }[value] ?? '';
+  }
+  const compact = value.replace(/\s+/g, ' ').trim();
+  if (!compact) return null;
+  return compact.length <= 92 ? compact : `${compact.slice(0, 89)}…`;
+}
+
+function eventIdentity(event: SafeEvent): string | null {
+  const source = event.payload;
+  const item =
+    source.item && typeof source.item === 'object'
+      ? (source.item as Record<string, unknown>)
+      : null;
+  for (const candidate of [source.itemId, item?.id]) {
+    if (typeof candidate === 'string' && candidate)
+      return `${event.turnId ?? 'thread'}:${event.kind}:${candidate}`;
+  }
+  return null;
 }
 
 function pendingApprovalFrom(event: SafeEvent): PendingApproval | null {
@@ -829,13 +896,24 @@ function PermissionCard({
 function Transcript({ events }: { events: SafeEvent[] }) {
   const displayEvents = useMemo(() => {
     const output: SafeEvent[] = [];
+    const finishedActivities = new Set(
+      events
+        .filter((event) => event.phase === 'completed' || event.phase === 'failed')
+        .map(eventIdentity)
+        .filter((identity): identity is string => identity !== null),
+    );
     for (const event of events) {
       if (
         event.kind === 'approval' ||
         event.kind === 'user-input' ||
-        event.kind === 'permission-approval'
+        event.kind === 'permission-approval' ||
+        event.kind === 'thread' ||
+        event.kind === 'usage' ||
+        (event.kind === 'turn' && event.phase !== 'failed')
       )
         continue;
+      const identity = eventIdentity(event);
+      if (event.phase === 'started' && identity && finishedActivities.has(identity)) continue;
       if (event.kind === 'agent-message' && event.phase === 'delta') {
         const previous = output.at(-1);
         if (previous?.kind === 'agent-message' && previous.turnId === event.turnId) {
@@ -878,18 +956,29 @@ function Transcript({ events }: { events: SafeEvent[] }) {
             </article>
           );
         }
-        return (
+        const preview = eventPreview(event);
+        const details = eventText(event);
+        const hasDetails = details !== `${event.kind}: ${event.phase}` && details !== preview;
+        const content = (
+          <>
+            <span className="activity-dot" aria-hidden="true" />
+            <span className="activity-title">{eventTitle(event)}</span>
+            {preview && <small>{preview}</small>}
+          </>
+        );
+        return hasDetails ? (
           <details
-            className={`activity-card ${event.kind}`}
+            className={`activity-row ${event.kind}`}
             key={event.id}
             open={event.kind === 'error'}
           >
-            <summary>
-              <span>{eventTitle(event)}</span>
-              <small>{event.phase}</small>
-            </summary>
-            <pre>{eventText(event)}</pre>
+            <summary>{content}</summary>
+            <pre>{details}</pre>
           </details>
+        ) : (
+          <div className={`activity-row ${event.kind}`} key={event.id}>
+            <div className="activity-line">{content}</div>
+          </div>
         );
       })}
     </div>

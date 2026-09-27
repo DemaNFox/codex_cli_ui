@@ -157,6 +157,42 @@ def main() -> int:
                 {
                     "id": 1,
                     "threadId": "t1",
+                    "turnId": None,
+                    "kind": "thread",
+                    "phase": "state",
+                    "payload": {"status": "active"},
+                    "createdAt": "2026-09-27T12:00:00.000Z",
+                },
+                {
+                    "id": 2,
+                    "threadId": "t1",
+                    "turnId": "turn-1",
+                    "kind": "tool",
+                    "phase": "started",
+                    "payload": {"item": {"id": "command-1", "type": "commandExecution"}},
+                    "createdAt": "2026-09-27T12:00:00.100Z",
+                },
+                {
+                    "id": 3,
+                    "threadId": "t1",
+                    "turnId": "turn-1",
+                    "kind": "tool",
+                    "phase": "completed",
+                    "payload": {"item": {"id": "command-1", "type": "commandExecution"}},
+                    "createdAt": "2026-09-27T12:00:00.200Z",
+                },
+                {
+                    "id": 4,
+                    "threadId": "t1",
+                    "turnId": "turn-1",
+                    "kind": "command",
+                    "phase": "completed",
+                    "payload": {"command": "pnpm test", "output": "All tests passed"},
+                    "createdAt": "2026-09-27T12:00:00.300Z",
+                },
+                {
+                    "id": 5,
+                    "threadId": "t1",
                     "turnId": "turn-1",
                     "kind": "user-input",
                     "phase": "state",
@@ -182,7 +218,7 @@ def main() -> int:
                     "createdAt": "2026-09-27T12:00:01.000Z",
                 },
                 {
-                    "id": 2,
+                    "id": 6,
                     "threadId": "t1",
                     "turnId": "turn-1",
                     "kind": "permission-approval",
@@ -231,6 +267,17 @@ def main() -> int:
         page.get_by_label("Пароль").fill("correct-horse-battery-staple")
         page.get_by_role("button", name="Войти").click()
         page.get_by_role("heading", name="Переносимый чат").wait_for()
+
+        page.get_by_text("Выполнил действие").wait_for()
+        if page.locator(".activity-card").count():
+            raise AssertionError("legacy activity cards are still rendered")
+        if page.get_by_text("Состояние чата").count():
+            raise AssertionError("thread lifecycle noise is still rendered")
+        if page.get_by_text("Использует инструмент").count():
+            raise AssertionError("completed tool lifecycle was not collapsed")
+        command_row = page.locator("details.activity-row").filter(has_text="Выполнил команду")
+        command_row.get_by_text("Выполнил команду").click()
+        command_row.get_by_text("All tests passed").wait_for()
 
         page.get_by_label("Вопросы Codex").wait_for()
         secret = page.get_by_label("Секрет: ответ")

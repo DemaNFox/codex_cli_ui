@@ -294,6 +294,74 @@ describe('App', () => {
     expect(screen.queryByRole('menuitem', { name: 'Архивировать чат' })).toBeNull();
   });
 
+  it('keeps execution history compact and removes redundant lifecycle noise', async () => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: null,
+        kind: 'thread',
+        phase: 'state',
+        payload: { status: 'active' },
+        createdAt: '2026-09-27T10:01:00.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        kind: 'turn',
+        phase: 'started',
+        payload: { status: 'inProgress' },
+        createdAt: '2026-09-27T10:01:01.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        kind: 'tool',
+        phase: 'started',
+        payload: { item: { id: 'item-1', type: 'commandExecution' } },
+        createdAt: '2026-09-27T10:01:02.000Z',
+      },
+      {
+        id: 4,
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        kind: 'tool',
+        phase: 'completed',
+        payload: { item: { id: 'item-1', type: 'commandExecution' } },
+        createdAt: '2026-09-27T10:01:03.000Z',
+      },
+      {
+        id: 5,
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        kind: 'command',
+        phase: 'completed',
+        payload: { command: 'pnpm test', output: 'All tests passed' },
+        createdAt: '2026-09-27T10:01:04.000Z',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText('Выполнил действие')).not.toBeNull();
+    expect(screen.queryByText('Состояние чата')).toBeNull();
+    expect(screen.queryByText('Состояние задачи')).toBeNull();
+    expect(screen.queryByText('Использует инструмент')).toBeNull();
+    const command = screen.getByText('Выполнил команду').closest('details');
+    expect(command?.classList.contains('activity-row')).toBe(true);
+    expect(document.querySelector('.activity-card')).toBeNull();
+    expect(command?.open).toBe(false);
+    await user.click(screen.getByText('Выполнил команду'));
+    expect(command?.open).toBe(true);
+    expect(screen.getByText('All tests passed')).not.toBeNull();
+  });
+
   it('steers an active turn and can interrupt it', async () => {
     const fetchMock = installAuthenticatedApi();
     const user = userEvent.setup();
