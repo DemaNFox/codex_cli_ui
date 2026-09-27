@@ -28,6 +28,11 @@ class AppArmorStaticTest(unittest.TestCase):
             "must be a native ELF executable",
             "must be owned by root",
             "must not be writable by group or other",
+            "validate_root_parent_chain",
+            "parent must be a non-symlink directory",
+            "parent must be owned by root",
+            "parent must not be writable by group or other",
+            "[[ $parent == / ]] && break",
             "A-Za-z0-9._/@+-",
             'apparmor_parser -Q "$temporary"',
             'apparmor_parser -r "$profile_path"',
@@ -43,6 +48,9 @@ class AppArmorStaticTest(unittest.TestCase):
             "systemctl disable apparmor",
         ):
             self.assertNotIn(forbidden, installer)
+
+        executable_validation = installer.split("validate_root_executable()", 1)[1]
+        self.assertIn('validate_root_parent_chain "$label" "$path"', executable_validation)
 
 
 if __name__ == "__main__":

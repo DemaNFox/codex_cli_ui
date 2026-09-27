@@ -39,6 +39,22 @@ for command in apparmor_parser install mktemp readelf realpath stat; do
 done
 [[ -r $template && -f $template && ! -L $template ]] || die "AppArmor template is missing: $template"
 
+validate_root_parent_chain() {
+  local label=${1:?label required} path=${2:?path required} parent owner mode
+  parent=${path%/*}
+  [[ -n $parent ]] || parent=/
+  while :; do
+    [[ -d $parent && ! -L $parent ]] || die "$label parent must be a non-symlink directory: $parent"
+    owner=$(stat -Lc '%u' -- "$parent")
+    [[ $owner == 0 ]] || die "$label parent must be owned by root: $parent"
+    mode=$(stat -Lc '%a' -- "$parent")
+    (( (8#$mode & 8#022) == 0 )) || die "$label parent must not be writable by group or other: $parent"
+    [[ $parent == / ]] && break
+    parent=${parent%/*}
+    [[ -n $parent ]] || parent=/
+  done
+}
+
 validate_root_executable() {
   local label=${1:?label required} input=${2:?path required} path owner mode
   path=$(canonical_existing_file "$input")
@@ -49,6 +65,7 @@ validate_root_executable() {
   [[ $owner == 0 ]] || die "$label must be owned by root: $path"
   mode=$(stat -Lc '%a' -- "$path")
   (( (8#$mode & 8#022) == 0 )) || die "$label must not be writable by group or other: $path"
+  validate_root_parent_chain "$label" "$path"
   printf '%s\n' "$path"
 }
 
