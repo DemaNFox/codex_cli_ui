@@ -8,15 +8,15 @@ upstream codex_web_backend {
 }
 
 server {
-    listen 80;
-    listen [::]:80;
+    listen @@HTTP_PORT@@;
+    listen [::]:@@HTTP_PORT@@;
     server_name @@DOMAIN@@;
-    return 301 https://$host$request_uri;
+    return 301 https://$host:@@HTTPS_PORT@@$request_uri;
 }
 
 server {
-    listen 443 ssl;
-    listen [::]:443 ssl;
+    listen @@HTTPS_PORT@@ ssl;
+    listen [::]:@@HTTPS_PORT@@ ssl;
     http2 on;
     server_name @@DOMAIN@@;
 

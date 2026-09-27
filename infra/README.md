@@ -67,6 +67,9 @@ operations procedure before retrying the update.
    local or server `CODEX_HOME` as that source.
 5. Install the Nginx template with existing TLS certificate/key paths using
    `scripts/install-nginx.sh`; review `nginx -t` before `--reload`.
+   On a shared host where ports 80/443 are already owned, pass distinct
+   `--http-port` and `--https-port` values and include the HTTPS port in
+   `CODEX_WEB_PUBLIC_ORIGIN`.
 6. Start `codex-web-ui@USER.service` and run
    `sudo scripts/health-check.sh`. The check needs root only to read the
    protected environment and never prints secret values.

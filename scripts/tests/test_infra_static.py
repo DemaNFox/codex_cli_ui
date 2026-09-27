@@ -38,7 +38,9 @@ class InfraStaticTest(unittest.TestCase):
     def test_nginx_edge_is_tls_only_for_application_traffic_and_sse_unbuffered(self) -> None:
         nginx = (ROOT / "infra/nginx/codex-web-ui.conf.template").read_text(encoding="utf-8")
         for expected in (
-            "return 301 https://$host$request_uri;",
+            "listen @@HTTP_PORT@@;",
+            "listen @@HTTPS_PORT@@ ssl;",
+            "return 301 https://$host:@@HTTPS_PORT@@$request_uri;",
             "ssl_protocols TLSv1.2 TLSv1.3;",
             "limit_req zone=codex_web_login",
             "proxy_buffering off;",
@@ -54,6 +56,11 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("root /opt/codex-web-ui/current/apps/web/dist;", static_route)
         self.assertIn("try_files $uri $uri/ /index.html;", static_route)
         self.assertNotIn("proxy_pass", static_route)
+
+        installer = (ROOT / "scripts/install-nginx.sh").read_text(encoding="utf-8")
+        self.assertIn("--http-port", installer)
+        self.assertIn("--https-port", installer)
+        self.assertIn('HTTP and HTTPS edge ports must differ', installer)
 
     def test_environment_template_contains_no_populated_secret(self) -> None:
         environment = (ROOT / "infra/env/codex-web-ui.env.example").read_text(encoding="utf-8")
