@@ -39,7 +39,7 @@ class InfraStaticTest(unittest.TestCase):
         nginx = (ROOT / "infra/nginx/codex-web-ui.conf.template").read_text(encoding="utf-8")
         for expected in (
             "listen @@HTTP_PORT@@;",
-            "listen @@HTTPS_PORT@@ ssl;",
+            "listen @@HTTPS_PORT@@ ssl http2;",
             "return 301 https://$host:@@HTTPS_PORT@@$request_uri;",
             "ssl_protocols TLSv1.2 TLSv1.3;",
             "limit_req zone=codex_web_login",

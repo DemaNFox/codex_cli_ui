@@ -15,9 +15,8 @@ server {
 }
 
 server {
-    listen @@HTTPS_PORT@@ ssl;
-    listen [::]:@@HTTPS_PORT@@ ssl;
-    http2 on;
+    listen @@HTTPS_PORT@@ ssl http2;
+    listen [::]:@@HTTPS_PORT@@ ssl http2;
     server_name @@DOMAIN@@;
 
     ssl_certificate @@TLS_CERT@@;
