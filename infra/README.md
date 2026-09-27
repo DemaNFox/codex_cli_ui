@@ -9,11 +9,13 @@ runtime secrets, Docker access or deployment credentials.
 
 The normal path is `./install.sh` from a clean Git checkout. It builds an
 architecture-specific checksummed package without root, then invokes the root
-installer only for system integration. The runner defaults to the `sudo` caller,
-so its existing Codex login is reused without copying credentials:
+installer only for system integration. It first installs the repository-pinned
+Node.js, pnpm and Codex CLI toolchain beneath `/opt/codex-web-ui/runtime` and
+exposes stable launchers in `/usr/local/bin`. The runner defaults to the `sudo`
+caller. Its existing Codex login is reused without copying credentials; otherwise
+the installer starts Codex device login for that user on the controlling terminal:
 
 ```sh
-corepack pnpm install --frozen-lockfile
 ./install.sh \
   --public-origin https://codex.example.com \
   --external-proxy \
@@ -23,9 +25,11 @@ corepack pnpm install --frozen-lockfile
 For a dedicated Nginx edge, replace `--external-proxy` with existing
 `--tls-cert` and `--tls-key` paths. The private key must be root-owned `0600`
 and the certificate must cover the origin hostname. Installations fail closed
-on an unsupported OS/architecture, Node/Codex version mismatch, missing Codex
-login, package checksum mismatch, unsafe Codex ownership, or public plaintext
-configuration. Use `--upgrade` explicitly to preserve the existing admin config
+on an unsupported OS/architecture, artifact or package checksum mismatch,
+failed Codex login, unsafe Codex ownership, or public plaintext configuration.
+Downloaded artifacts use exact versions and committed SHA-256/SHA-512 digests;
+there is no `curl | sh`, floating `latest` tag or root-owned Codex credential
+store. Use `--upgrade` explicitly to preserve the existing admin config
 while switching to a new immutable release.
 
 The API runs as `codex-web-ui-api`; Codex runs as the selected existing user.
@@ -34,12 +38,19 @@ and runner settings are separate root-owned `0600` files.
 
 ## Assumptions
 
-- Ubuntu with systemd, Nginx, Node.js 22+, Python 3, `curl`, and the pinned Codex
-  executable already installed. `binutils` is required when installing the
-  scoped AppArmor profile. Startup fails unless `codex --version` exactly
-  matches `CODEX_WEB_CODEX_VERSION_PIN` (initially `codex-cli 0.153.4`).
+- Ubuntu 22.04/24.04 with systemd, internet access and a sudo-capable non-root
+  operator. The bootstrap installs missing `ca-certificates`, `curl`, `git`,
+  `python3`, `xz-utils` and (for the bundled edge) Nginx through APT. It installs
+  exact toolchain versions from `infra/toolchain.env`; startup fails unless
+  `codex --version` exactly matches `CODEX_WEB_CODEX_VERSION_PIN` (initially
+  `codex-cli 0.153.4`). `binutils` remains an additional prerequisite only for
+  the optional scoped AppArmor profile.
 - The chosen service user already exists and is not root. The current server may
   use `ai-chat-agent` with `CODEX_HOME=/opt/ai-chat-agents/home/.codex`.
+- First-time authentication requires an interactive controlling terminal. The
+  device code is displayed by Codex directly and must not be shared. For an
+  unattended host, authenticate beforehand as the runner with
+  `sudo -u USER -H /usr/local/bin/codex login --device-auth`; never log in as root.
 - A prepared release contains `apps/server/dist/index.js` and
   `apps/web/dist/index.html`. Nginx serves the web build directly and proxies
   only `/api/` to the loopback backend. Release directories are immutable and

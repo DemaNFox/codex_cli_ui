@@ -1,6 +1,6 @@
 # Codex Web UI agent guide
 
-This repository is a standalone, portable web client for an already installed Codex CLI. It must not depend on or modify any hosted product repository.
+This repository is a standalone, portable Codex server package. Its supported Ubuntu installer bootstraps the repository-pinned Node.js, pnpm and Codex CLI toolchain, then installs the Web UI. It must not depend on or modify any hosted product repository.
 
 ## Product boundary
 
@@ -9,6 +9,7 @@ This repository is a standalone, portable web client for an already installed Co
 - Codex runs with the permissions of the configured non-root Linux service user. The web UI never grants root, sudo, Docker socket, or implicit deployment credentials.
 - Projects are existing directories beneath configured real-path allowlisted roots. Reject traversal, symlink escape, and unregistered working directories.
 - OpenAI credentials remain in the server-side `CODEX_HOME`; never return, log, persist, or accept them through the browser API.
+- Bootstrap Codex authentication only as the selected non-root runner through its direct terminal. Never authenticate Codex as root, capture a device code, or accept an OpenAI token through installer arguments, logs, or the Web UI.
 - Do not persist chain-of-thought. Persist only user-visible messages, concise reasoning summaries when explicitly emitted, plans, diffs, bounded/redacted command output, approvals, and lifecycle events.
 
 ## Security

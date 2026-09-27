@@ -103,21 +103,54 @@ class InfraStaticTest(unittest.TestCase):
     def test_portable_installer_has_explicit_secure_bootstrap(self) -> None:
         wrapper = (ROOT / "install.sh").read_text(encoding="utf-8")
         installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        bootstrap = (ROOT / "scripts/bootstrap-ubuntu.sh").read_text(encoding="utf-8")
         self.assertIn("prepare-package.sh", wrapper)
+        self.assertIn("bootstrap-ubuntu.sh", wrapper)
+        self.assertIn("pnpm install --frozen-lockfile", wrapper)
+        self.assertIn("preflight_origin", wrapper)
         for expected in (
             'prepare-package.sh" --verify',
-            "Codex is not authenticated for the runner user",
+            "starting device login",
+            "login --device-auth",
             "installation exists; rerun with --upgrade",
             "setup-admin.mjs",
             "--external-proxy",
             "codex-web-ui-app-server.socket",
             "changing the runner user requires an explicit migration workflow",
+            "managed_codex_bin=",
+            "an explicit --codex-home must already exist",
+            "exec {tty_fd}<>/dev/tty",
+            "runner_config_backup=",
+            "load_toolchain_pins",
             "trap rollback_activation ERR INT TERM",
             "systemctl restart codex-web-ui-app-server.socket codex-web-ui@api.service",
             "--check-releases --additional-releases 1",
         ):
             self.assertIn(expected, installer)
         self.assertNotIn("http://", installer)
+        self.assertNotIn('source "$PACKAGE_ROOT/infra/toolchain.env"', installer)
+        self.assertNotIn('source "$REPO_ROOT/infra/toolchain.env"', bootstrap)
+        for expected in (
+            "NODE_LINUX_X64_SHA256",
+            "PNPM_TARBALL_SHA512",
+            "CODEX_LINUX_ARM64_TARBALL_SHA512",
+            "https://nodejs.org/download/release/v${NODE_VERSION}",
+            "https://registry.npmjs.org/@openai/codex/-/codex-${CODEX_CLI_VERSION}.tgz",
+            "sha256sum --check --strict --status",
+            "sha512sum --check --strict --status",
+            "/opt/codex-web-ui/runtime",
+        ):
+            self.assertIn(expected, bootstrap)
+        self.assertNotIn("curl |", bootstrap)
+        self.assertNotIn("@latest", bootstrap)
+        self.assertNotIn("@alpha", bootstrap)
+
+    def test_device_login_never_runs_as_root_or_captures_the_code(self) -> None:
+        installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        login_line = next(line for line in installer.splitlines() if 'login --device-auth <&' in line)
+        self.assertIn('runuser -u "$runner_user"', login_line)
+        self.assertIn('>&${tty_fd} 2>&${tty_fd}', login_line)
+        self.assertIn("Never share the displayed device code", installer)
 
     def test_install_update_and_rollback_keep_release_and_codex_state_boundaries(self) -> None:
         install_script = (ROOT / "scripts/install-ubuntu.sh").read_text(encoding="utf-8")

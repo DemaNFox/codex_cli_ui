@@ -48,8 +48,20 @@ class PreparePackageTest(unittest.TestCase):
         files = {
             "install.sh": "#!/usr/bin/env bash\n",
             "scripts/install-package.sh": "#!/usr/bin/env bash\n",
+            "scripts/bootstrap-ubuntu.sh": "#!/usr/bin/env bash\n",
             "apps/server/dist/index.js": "console.log('server');\n",
             "apps/web/dist/index.html": "<!doctype html>\n",
+            "infra/toolchain.env": (
+                "NODE_VERSION=22.23.3\n"
+                "PNPM_VERSION=10.33.2\n"
+                "CODEX_CLI_VERSION=0.153.4\n"
+                f"NODE_LINUX_X64_SHA256={'1' * 64}\n"
+                f"NODE_LINUX_ARM64_SHA256={'2' * 64}\n"
+                f"PNPM_TARBALL_SHA512={'3' * 128}\n"
+                f"CODEX_TARBALL_SHA512={'4' * 128}\n"
+                f"CODEX_LINUX_X64_TARBALL_SHA512={'5' * 128}\n"
+                f"CODEX_LINUX_ARM64_TARBALL_SHA512={'6' * 128}\n"
+            ),
             "infra/release-manifest.schema.json": "{}\n",
         }
         binary_names = (
@@ -129,6 +141,20 @@ class PreparePackageTest(unittest.TestCase):
         result = self._verify("linux-arm64")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not match requested", result.stderr)
+
+    def test_codex_manifest_and_toolchain_pin_must_match(self) -> None:
+        toolchain = self.root / "infra/toolchain.env"
+        toolchain.write_text(
+            toolchain.read_text(encoding="utf-8").replace(
+                "CODEX_CLI_VERSION=0.153.4", "CODEX_CLI_VERSION=0.153.3"
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        self._write_checksums()
+        result = self._verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("manifest and toolchain pins differ", result.stderr)
 
     def test_forbidden_runtime_file_is_rejected_even_if_inventoried(self) -> None:
         (self.root / ".env").write_text("SECRET=value\n", encoding="utf-8")

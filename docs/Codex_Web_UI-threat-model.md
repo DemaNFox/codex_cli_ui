@@ -30,6 +30,8 @@ This service is an Internet-reachable development control plane with remote-code
 - API -> SQLite: hashed sessions, projects, mappings, normalized events and audit records; no OpenAI token or chain-of-thought.
 - API -> app-server: typed JSON-RPC over a private Unix socket; allowlisted methods, bounded messages and reconnect backoff. API and runner have separate OS identities.
 - Local root terminal -> bootstrap: administrator credentials become a bounded Argon2id hash and random session secret through an atomic root-owned `0600` replacement; plaintext is neither logged nor placed in argv.
+- Git checkout -> root bootstrap: reviewed installer code downloads exact Node.js/npm artifacts over HTTPS, verifies repository-pinned digests and installs immutable root-owned runtime directories.
+- Codex runner terminal -> OpenAI device login: Codex displays and consumes the device flow directly as the non-root runner; the installer never captures the code or accepts an account token.
 - Browser -> attachment store: authenticated multipart uploads with per-file, per-turn and per-thread bounds; only opaque IDs and safe metadata return to the browser.
 - Attachment store -> app-server: signature-checked images use native `localImage`; inert common files are referenced only through a backend-generated path after thread ownership and realpath checks.
 - App-server -> project: commands and file changes under the selected permission preset and Linux-user permissions.
@@ -48,16 +50,17 @@ flowchart LR
 
 ## Assets and security objectives
 
-| Asset                           | Why it matters                              | Objective |
-| ------------------------------- | ------------------------------------------- | --------- |
-| Website password and sessions   | They authorize remote code execution        | C/I       |
-| Codex account credential        | Account access, usage and spend             | C/I       |
-| Source and Git state            | Product integrity and intellectual property | C/I/A     |
-| `AGENTS.md`, skills and config  | They control agent behavior and safety      | I         |
-| Project secrets                 | May authorize external systems              | C/I       |
-| Chats, diffs and command output | Can contain sensitive development data      | C/I/A     |
-| Host resources                  | Shared-host availability                    | A         |
-| Uploaded images and files       | May contain private data or hostile content | C/I/A     |
+| Asset                           | Why it matters                                | Objective |
+| ------------------------------- | --------------------------------------------- | --------- |
+| Website password and sessions   | They authorize remote code execution          | C/I       |
+| Codex account credential        | Account access, usage and spend               | C/I       |
+| Source and Git state            | Product integrity and intellectual property   | C/I/A     |
+| `AGENTS.md`, skills and config  | They control agent behavior and safety        | I         |
+| Project secrets                 | May authorize external systems                | C/I       |
+| Chats, diffs and command output | Can contain sensitive development data        | C/I/A     |
+| Host resources                  | Shared-host availability                      | A         |
+| Uploaded images and files       | May contain private data or hostile content   | C/I/A     |
+| Managed runtime artifacts       | They execute with installer/service authority | I/A       |
 
 ## Attacker model
 
@@ -102,26 +105,30 @@ flowchart LR
 11. App-server echoes an absolute `localImage` path in a `userMessage` item which is accidentally persisted or streamed to the browser.
 12. A compromised Web API reads the Codex credential or directly tampers with projects because API and Codex share an OS identity.
 13. Bootstrap secrets leak through argv/terminal echo, weak hashing, unsafe replacement or an accidental rerun.
+14. A substituted Node.js, pnpm or Codex archive gains root-time or runner-time code execution during bootstrap.
+15. A device code is captured, logged, shared or bound to root instead of the isolated runner account.
 
 ## Threat model table
 
-| ID     | Threat                                                 | Existing controls                                            | Required mitigation                                                                                                                                                              | Likelihood | Impact | Priority |
-| ------ | ------------------------------------------------------ | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------ | -------- |
-| TM-001 | Password/session compromise grants code execution      | Single owner, TLS planned                                    | Argon2id, strong secret, rate limit, lockout, rotation, audit; add TOTP/passkey later                                                                                            | medium     | high   | high     |
-| TM-002 | Stored/reflected XSS through model/tool output         | React escaping planned                                       | No raw HTML, strict CSP, safe Markdown, hostile-output tests                                                                                                                     | medium     | high   | high     |
-| TM-003 | Project path traversal or symlink escape               | Root allowlist planned                                       | `realpath` containment on registration and every execution, no client cwd                                                                                                        | medium     | high   | high     |
-| TM-004 | Codex/OpenAI or project secret leakage                 | Server-only Codex home                                       | Redaction, output bounds, no raw env/logging, isolated service user                                                                                                              | medium     | high   | high     |
-| TM-005 | CSRF or SSE authorization bypass                       | Same-site cookie planned                                     | Session-bound CSRF, Origin checks, per-thread authorization                                                                                                                      | medium     | high   | high     |
-| TM-006 | Resource exhaustion harms shared host                  | Service cgroup plus startup/update/periodic soft disk guards | Enforce host filesystem byte/inode quota or dedicated bounded volumes; retain concurrency queue, timeouts and process-group cancellation                                         | high       | high   | critical |
-| TM-007 | Skill/rule supply-chain tampering                      | Git-owned `AGENTS.md`                                        | Checksummed skill manifest, owner-only install, diagnostics and update audit                                                                                                     | medium     | high   | high     |
-| TM-008 | Approval confusion after reconnect/restart             | App-server request IDs                                       | Durable pending state, fail closed, reconcile active requests, never auto-approve                                                                                                | medium     | high   | high     |
-| TM-009 | Backend compromise reaches root/Docker/product secrets | None in new service yet                                      | Non-root user, inaccessible paths, no Docker socket, separate deploy broker                                                                                                      | low        | high   | high     |
-| TM-010 | Cross-thread attachment access or path traversal       | Authenticated thread routes                                  | Opaque IDs, thread ownership on every read/claim/delete, generated storage names, realpath containment, hostile-ID tests                                                         | medium     | high   | high     |
-| TM-011 | Hostile upload becomes browser or host execution       | React escaping, dedicated storage                            | Signature-check images, allowlisted types/extensions, `nosniff`, download non-images, never parse/execute/unzip in API                                                           | medium     | high   | high     |
-| TM-012 | Uploads exhaust shared-host resources                  | Bounded ext4 application volume and tmpfs                    | 20 MiB/file, 8/turn, 50 MiB/thread, edge/body timeout, bounded in-memory parsing with failed-write cleanup, existing byte/inode/resource limits                                  | medium     | high   | high     |
-| TM-013 | Internal attachment path leaks through Codex events    | Safe normalized event projection                             | Ignore live app-server `userMessage` items and fragmented agent deltas; publish redacted completed messages; persist one backend-authored user event; path-leak regression tests | medium     | high   | high     |
-| TM-014 | Bootstrap leaks or silently replaces admin secrets     | Local root-only bootstrap                                    | Hidden TTY entry, bounded Argon2id, CSPRNG session secret, atomic `0600` replacement, explicit `--rotate`, no secrets in argv/logs                                               | low        | high   | high     |
-| TM-015 | Web API compromise reaches Codex credentials/projects  | Dedicated API and runner identities                          | Private systemd socket, separate environments, API cannot read `CODEX_HOME`, runner cannot read Web secrets/SQLite, explicit project and attachment mounts                       | low        | high   | high     |
+| ID     | Threat                                                 | Existing controls                                            | Required mitigation                                                                                                                                                              | Likelihood | Impact   | Priority |
+| ------ | ------------------------------------------------------ | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | -------- | -------- |
+| TM-001 | Password/session compromise grants code execution      | Single owner, TLS planned                                    | Argon2id, strong secret, rate limit, lockout, rotation, audit; add TOTP/passkey later                                                                                            | medium     | high     | high     |
+| TM-002 | Stored/reflected XSS through model/tool output         | React escaping planned                                       | No raw HTML, strict CSP, safe Markdown, hostile-output tests                                                                                                                     | medium     | high     | high     |
+| TM-003 | Project path traversal or symlink escape               | Root allowlist planned                                       | `realpath` containment on registration and every execution, no client cwd                                                                                                        | medium     | high     | high     |
+| TM-004 | Codex/OpenAI or project secret leakage                 | Server-only Codex home                                       | Redaction, output bounds, no raw env/logging, isolated service user                                                                                                              | medium     | high     | high     |
+| TM-005 | CSRF or SSE authorization bypass                       | Same-site cookie planned                                     | Session-bound CSRF, Origin checks, per-thread authorization                                                                                                                      | medium     | high     | high     |
+| TM-006 | Resource exhaustion harms shared host                  | Service cgroup plus startup/update/periodic soft disk guards | Enforce host filesystem byte/inode quota or dedicated bounded volumes; retain concurrency queue, timeouts and process-group cancellation                                         | high       | high     | critical |
+| TM-007 | Skill/rule supply-chain tampering                      | Git-owned `AGENTS.md`                                        | Checksummed skill manifest, owner-only install, diagnostics and update audit                                                                                                     | medium     | high     | high     |
+| TM-008 | Approval confusion after reconnect/restart             | App-server request IDs                                       | Durable pending state, fail closed, reconcile active requests, never auto-approve                                                                                                | medium     | high     | high     |
+| TM-009 | Backend compromise reaches root/Docker/product secrets | None in new service yet                                      | Non-root user, inaccessible paths, no Docker socket, separate deploy broker                                                                                                      | low        | high     | high     |
+| TM-010 | Cross-thread attachment access or path traversal       | Authenticated thread routes                                  | Opaque IDs, thread ownership on every read/claim/delete, generated storage names, realpath containment, hostile-ID tests                                                         | medium     | high     | high     |
+| TM-011 | Hostile upload becomes browser or host execution       | React escaping, dedicated storage                            | Signature-check images, allowlisted types/extensions, `nosniff`, download non-images, never parse/execute/unzip in API                                                           | medium     | high     | high     |
+| TM-012 | Uploads exhaust shared-host resources                  | Bounded ext4 application volume and tmpfs                    | 20 MiB/file, 8/turn, 50 MiB/thread, edge/body timeout, bounded in-memory parsing with failed-write cleanup, existing byte/inode/resource limits                                  | medium     | high     | high     |
+| TM-013 | Internal attachment path leaks through Codex events    | Safe normalized event projection                             | Ignore live app-server `userMessage` items and fragmented agent deltas; publish redacted completed messages; persist one backend-authored user event; path-leak regression tests | medium     | high     | high     |
+| TM-014 | Bootstrap leaks or silently replaces admin secrets     | Local root-only bootstrap                                    | Hidden TTY entry, bounded Argon2id, CSPRNG session secret, atomic `0600` replacement, explicit `--rotate`, no secrets in argv/logs                                               | low        | high     | high     |
+| TM-015 | Web API compromise reaches Codex credentials/projects  | Dedicated API and runner identities                          | Private systemd socket, separate environments, API cannot read `CODEX_HOME`, runner cannot read Web secrets/SQLite, explicit project and attachment mounts                       | low        | high     | high     |
+| TM-016 | Toolchain supply-chain substitution during bootstrap   | HTTPS downloads                                              | Exact versions, committed SHA-256/SHA-512 digests, immutable root-owned version directories, no shell-pipe installer or floating tags, package inventory verification            | low        | critical | high     |
+| TM-017 | Device authentication leaks or uses the wrong identity | Local interactive operator                                   | Run `codex login --device-auth` only via `runuser` as the runner with direct `/dev/tty`, never capture output/token, warn against code sharing, recheck authenticated state      | low        | high     | high     |
 
 ## Criticality calibration
 
@@ -141,6 +148,7 @@ flowchart LR
 | `apps/server/src/attachment-store.ts` | Upload validation, containment and cleanup  | TM-010, TM-011, TM-012, TM-013 |
 | `apps/web/src/`                       | Rendering of untrusted content              | TM-002, TM-005                 |
 | `infra/`                              | TLS, non-root service and resource limits   | TM-001, TM-006, TM-009         |
+| `scripts/bootstrap-ubuntu.sh`         | Root-time package and toolchain bootstrap   | TM-016, TM-017                 |
 | `skills/manifest.json`                | Agent-policy supply chain                   | TM-007                         |
 
 ## Quality check

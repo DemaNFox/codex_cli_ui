@@ -6,6 +6,29 @@ PACKAGE_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 # shellcheck source=scripts/lib/ubuntu-common.sh
 source "$SCRIPT_DIR/lib/ubuntu-common.sh"
 
+load_toolchain_pins() {
+  local file=${1:?pin file required} line key value required
+  local -A seen=()
+  while IFS= read -r line || [[ -n $line ]]; do
+    [[ -z $line || $line == \#* ]] && continue
+    [[ $line =~ ^([A-Z][A-Z0-9_]*)=([^[:space:]]+)$ ]] || die 'invalid toolchain pin file'
+    key=${BASH_REMATCH[1]}
+    value=${BASH_REMATCH[2]}
+    case "$key" in
+      NODE_VERSION|PNPM_VERSION|CODEX_CLI_VERSION|NODE_LINUX_X64_SHA256|NODE_LINUX_ARM64_SHA256|PNPM_TARBALL_SHA512|CODEX_TARBALL_SHA512|CODEX_LINUX_X64_TARBALL_SHA512|CODEX_LINUX_ARM64_TARBALL_SHA512) ;;
+      *) die "unsupported toolchain pin: $key" ;;
+    esac
+    [[ -z ${seen[$key]+x} ]] || die "duplicate toolchain pin: $key"
+    seen[$key]=1
+    printf -v "$key" '%s' "$value"
+  done <"$file"
+  for required in NODE_VERSION PNPM_VERSION CODEX_CLI_VERSION NODE_LINUX_X64_SHA256 NODE_LINUX_ARM64_SHA256 PNPM_TARBALL_SHA512 CODEX_TARBALL_SHA512 CODEX_LINUX_X64_TARBALL_SHA512 CODEX_LINUX_ARM64_TARBALL_SHA512; do
+    [[ -n ${seen[$required]+x} ]] || die "missing toolchain pin: $required"
+  done
+}
+
+load_toolchain_pins "$PACKAGE_ROOT/infra/toolchain.env"
+
 package=$PACKAGE_ROOT
 runner_user=
 codex_home=
@@ -23,9 +46,9 @@ usage() {
   cat <<'EOF'
 Usage: sudo scripts/install-package.sh [options]
 
-  --runner-user USER       Existing OS user already logged in to Codex (default: sudo caller)
+  --runner-user USER       Existing non-root OS user for Codex (default: sudo caller)
   --codex-home DIR         Its existing CODEX_HOME (default: USER_HOME/.codex)
-  --codex-bin FILE         Codex executable (default: codex from PATH)
+  --codex-bin FILE         Codex executable (default: managed repository-pinned CLI)
   --project-root DIR       Allowed project root; repeatable (default: /srv/codex-projects)
   --public-origin URL      Required HTTPS origin, for example https://codex.example.com
   --external-proxy         TLS terminates in an existing reverse proxy
@@ -34,10 +57,10 @@ Usage: sudo scripts/install-package.sh [options]
   --upgrade                Explicitly replace an existing release, preserving config
   --no-start               Install only; use this while provisioning hard storage quotas
 
-The command verifies the checksummed inventory, Codex version/login, creates an
-isolated API identity, prompts locally for the administrator credentials, and
-starts the service. Plain HTTP and automatically generated public certificates
-are intentionally unsupported.
+The command bootstraps the pinned Node.js/pnpm/Codex toolchain, verifies the
+checksummed inventory and Codex version/login, creates an isolated API identity,
+prompts locally for the administrator credentials, and starts the service.
+Plain HTTP and automatically generated public certificates are unsupported.
 EOF
 }
 
@@ -62,10 +85,21 @@ done
 require_root
 [[ -f /etc/os-release ]] && . /etc/os-release
 [[ ${ID:-} == ubuntu && ${VERSION_ID:-} =~ ^(22\.04|24\.04)$ ]] || die 'supported OS is Ubuntu 22.04 or 24.04'
+[[ -n $public_origin ]] || die '--public-origin is required'
+if $external_proxy; then
+  [[ -z $tls_cert && -z $tls_key ]] || die 'choose either --external-proxy or --tls-cert/--tls-key'
+else
+  [[ -n $tls_cert && -n $tls_key ]] || die 'provide --external-proxy or both --tls-cert and --tls-key'
+fi
+bootstrap_args=()
+$external_proxy || bootstrap_args+=(--install-nginx)
+"$SCRIPT_DIR/bootstrap-ubuntu.sh" "${bootstrap_args[@]}"
+export PATH="/usr/local/bin:$PATH"
 for command in getent install realpath sha256sum systemctl runuser python3 node stat groupadd useradd cut date readlink find chown chmod sed rm; do require_command "$command"; done
-[[ -x /usr/bin/node && $(/usr/bin/node -p 'process.versions.node.split(".")[0]') == 22 ]] || die 'system Node.js 22 is required at /usr/bin/node'
+[[ -x /usr/local/bin/node && $(/usr/local/bin/node -p 'process.versions.node.split(".")[0]') == 22 ]] || die 'managed Node.js 22 is required at /usr/local/bin/node'
 package=$(canonical_existing_dir "$package")
 case "$(uname -m)" in x86_64) target=linux-x64 ;; aarch64) target=linux-arm64 ;; *) die 'unsupported CPU architecture' ;; esac
+managed_codex_bin="/opt/codex-web-ui/runtime/toolchain-pnpm-${PNPM_VERSION}-codex-${CODEX_CLI_VERSION}-${target#linux-}/bin/codex"
 "$package/scripts/prepare-package.sh" --verify "$package" --arch "$target" || die 'package verification failed'
 python3 - "$package/release.json" <<'PY'
 import json, platform, sys
@@ -92,10 +126,16 @@ if [[ $mode == upgrade ]]; then
   persisted_user=$(stat -c '%U' "$persisted_home")
   [[ -z $runner_user || $runner_user == "$persisted_user" ]] || die 'changing the runner user requires an explicit migration workflow'
   [[ -z $codex_home || $codex_home == "$persisted_home" ]] || die 'changing CODEX_HOME requires an explicit migration workflow'
-  [[ -z $codex_bin || $(realpath -e -- "$codex_bin") == "$persisted_bin" ]] || die 'changing CODEX_BIN requires an explicit migration workflow'
+  if [[ -n $codex_bin ]]; then
+    [[ $(realpath -e -- "$codex_bin") == "$persisted_bin" ]] || die 'changing CODEX_BIN requires an explicit migration workflow'
+  else
+    case "$persisted_bin" in
+      /opt/codex-web-ui/runtime/toolchain-pnpm-*-codex-*-${target#linux-}/bin/codex) codex_bin=$managed_codex_bin ;;
+      *) codex_bin=$persisted_bin ;;
+    esac
+  fi
   runner_user=$persisted_user
   codex_home=$persisted_home
-  codex_bin=$persisted_bin
 fi
 [[ -n $runner_user ]] || runner_user=${SUDO_USER:-}
 
@@ -103,8 +143,13 @@ fi
 validate_service_user "$runner_user"
 runner_group=$(id -gn "$runner_user")
 runner_home=$(getent passwd "$runner_user" | cut -d: -f6)
-[[ -n $codex_home ]] || codex_home="$runner_home/.codex"
-[[ -n $codex_bin ]] || codex_bin=$(runuser -u "$runner_user" -- sh -lc 'command -v codex')
+if [[ -z $codex_home ]]; then
+  codex_home="$runner_home/.codex"
+  if [[ ! -e $codex_home ]]; then install -d -m 0700 -o "$runner_user" -g "$runner_group" "$codex_home"; fi
+else
+  [[ -e $codex_home ]] || die 'an explicit --codex-home must already exist'
+fi
+[[ -n $codex_bin ]] || codex_bin=$managed_codex_bin
 codex_home=$(canonical_existing_dir "$codex_home")
 codex_bin=$(canonical_existing_file "$codex_bin")
 [[ $codex_home =~ ^/[A-Za-z0-9_./@+-]+$ && $codex_bin =~ ^/[A-Za-z0-9_./@+-]+$ ]] || die 'Codex paths contain characters unsafe for systemd environment files'
@@ -113,14 +158,22 @@ codex_bin=$(canonical_existing_file "$codex_bin")
 [[ $(stat -c '%u' "$codex_home") == $(id -u "$runner_user") ]] || die 'CODEX_HOME must be owned by the runner user'
 (( (8#$(stat -c '%a' "$codex_home") & 8#077) == 0 )) || die 'CODEX_HOME must have no group/other permissions'
 version_pin=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["codex"]["versionPin"])' "$package/release.json")
-[[ $(runuser -u "$runner_user" -- env CODEX_HOME="$codex_home" "$codex_bin" --version) == "$version_pin" ]] || die "Codex must match package pin: $version_pin"
-runuser -u "$runner_user" -- env CODEX_HOME="$codex_home" "$codex_bin" login status >/dev/null || die 'Codex is not authenticated for the runner user'
+[[ $(runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" --version) == "$version_pin" ]] || die "Codex must match package pin: $version_pin"
+if ! runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login status >/dev/null 2>&1; then
+  exec {tty_fd}<>/dev/tty || die "Codex login is required; rerun interactively or run: sudo -u $runner_user -H /usr/local/bin/codex login --device-auth"
+  printf 'Codex is not authenticated for %s; starting device login. Never share the displayed device code.\n' "$runner_user" >&${tty_fd}
+  runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login --device-auth <&${tty_fd} >&${tty_fd} 2>&${tty_fd} || \
+    die "Codex device login failed; retry with: sudo -u $runner_user -H /usr/local/bin/codex login --device-auth"
+  exec {tty_fd}>&-
+  runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login status >/dev/null 2>&1 || die 'Codex login did not produce an authenticated state'
+fi
 
 if [[ $mode == upgrade || $resuming_bootstrap == true ]]; then
   installed_origin=$(sed -n 's/^CODEX_WEB_PUBLIC_ORIGIN=//p' "$config")
   [[ -z $public_origin || $public_origin == "$installed_origin" ]] || die 'changing the public origin requires an explicit reconfiguration workflow'
   public_origin=$installed_origin
 fi
+
 PUBLIC_ORIGIN=$public_origin python3 - <<'PY'
 import ipaddress, os, re
 from urllib.parse import urlsplit
@@ -185,6 +238,11 @@ if [[ -n $previous ]]; then
   chown root:codex-web-ui /var/lib/codex-web-ui/previous-release
   chmod 0640 /var/lib/codex-web-ui/previous-release
 fi
+runner_config_backup=
+if [[ -f $runner_config ]]; then
+  runner_config_backup=$(mktemp /etc/codex-web-ui/.runner-config.rollback.XXXXXX)
+  install -m 0600 -o root -g root "$runner_config" "$runner_config_backup"
+fi
 atomic_symlink "$release_dir" /opt/codex-web-ui/current
 activation_complete=false
 rollback_activation() {
@@ -196,6 +254,11 @@ rollback_activation() {
       atomic_symlink "$previous" /opt/codex-web-ui/current
     else
       rm -f -- /opt/codex-web-ui/current
+    fi
+    if [[ -n $runner_config_backup ]]; then
+      install -m 0600 -o root -g root "$runner_config_backup" "$runner_config"
+    else
+      rm -f -- "$runner_config"
     fi
     systemctl daemon-reload >/dev/null 2>&1 || true
     systemctl restart codex-web-ui@api.service >/dev/null 2>&1 || true
@@ -233,7 +296,7 @@ if [[ ! -e $config ]]; then
   chmod 0600 "$config"
 fi
 if [[ -z $(sed -n 's/^CODEX_WEB_ADMIN_PASSWORD_HASH=//p' "$config") ]]; then
-  /usr/bin/node "$package/scripts/setup-admin.mjs" --config "$config"
+  /usr/local/bin/node "$package/scripts/setup-admin.mjs" --config "$config"
 fi
 umask 077
 {
@@ -261,4 +324,5 @@ else
   printf 'Codex Web UI %s is installed but not started; establish hard storage bounds, then enable the API, socket and storage timer.\n' "$release_id"
 fi
 activation_complete=true
+if [[ -n $runner_config_backup ]]; then rm -f -- "$runner_config_backup"; fi
 trap - ERR INT TERM

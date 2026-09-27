@@ -61,8 +61,10 @@ expected = os.environ.get("EXPECTED_ARCH", "")
 required = (
     "install.sh",
     "scripts/install-package.sh",
+    "scripts/bootstrap-ubuntu.sh",
     "apps/server/dist/index.js",
     "apps/web/dist/index.html",
+    "infra/toolchain.env",
     "infra/release-manifest.schema.json",
     "release.json",
     "SHA256SUMS",
@@ -121,6 +123,24 @@ if not isinstance(runtime, dict) or set(runtime) != {"node", "codex", "nativeMod
     raise SystemExit("prepare-package: runtime fields do not match schema version 1")
 if runtime.get("node") != {"major": 22, "range": ">=22 <23"}:
     raise SystemExit("prepare-package: unsupported Node runtime contract")
+toolchain = {}
+for number, line in enumerate((root / "infra/toolchain.env").read_text(encoding="utf-8").splitlines(), 1):
+    if not line or line.startswith("#"):
+        continue
+    match = re.fullmatch(r"([A-Z][A-Z0-9_]*)=([^\s]+)", line)
+    if not match or match.group(1) in toolchain:
+        raise SystemExit(f"prepare-package: invalid toolchain pin on line {number}")
+    toolchain[match.group(1)] = match.group(2)
+if set(toolchain) != {"NODE_VERSION", "PNPM_VERSION", "CODEX_CLI_VERSION", "NODE_LINUX_X64_SHA256", "NODE_LINUX_ARM64_SHA256", "PNPM_TARBALL_SHA512", "CODEX_TARBALL_SHA512", "CODEX_LINUX_X64_TARBALL_SHA512", "CODEX_LINUX_ARM64_TARBALL_SHA512"}:
+    raise SystemExit("prepare-package: toolchain pin fields do not match the supported contract")
+if not re.fullmatch(r"22\.\d+\.\d+", toolchain["NODE_VERSION"]):
+    raise SystemExit("prepare-package: invalid Node.js toolchain pin")
+if not re.fullmatch(r"\d+\.\d+\.\d+", toolchain["PNPM_VERSION"]):
+    raise SystemExit("prepare-package: invalid pnpm toolchain pin")
+if any(not re.fullmatch(r"[0-9a-f]{64}", toolchain[name]) for name in ("NODE_LINUX_X64_SHA256", "NODE_LINUX_ARM64_SHA256")):
+    raise SystemExit("prepare-package: invalid Node.js checksum pin")
+if any(not re.fullmatch(r"[0-9a-f]{128}", toolchain[name]) for name in ("PNPM_TARBALL_SHA512", "CODEX_TARBALL_SHA512", "CODEX_LINUX_X64_TARBALL_SHA512", "CODEX_LINUX_ARM64_TARBALL_SHA512")):
+    raise SystemExit("prepare-package: invalid npm tarball checksum pin")
 revision = manifest.get("gitRevision", "")
 if not re.fullmatch(r"[0-9a-f]{40}", revision):
     raise SystemExit("prepare-package: invalid git revision")
@@ -130,6 +150,8 @@ if not isinstance(codex, dict) or set(codex) != {"versionPin"}:
 codex_pin = codex.get("versionPin", "")
 if not re.fullmatch(r"codex-cli \d+\.\d+\.\d+", codex_pin):
     raise SystemExit("prepare-package: invalid Codex version pin")
+if codex_pin != f"codex-cli {toolchain['CODEX_CLI_VERSION']}":
+    raise SystemExit("prepare-package: Codex manifest and toolchain pins differ")
 
 native_modules = runtime.get("nativeModules")
 if not isinstance(native_modules, dict) or set(native_modules) != {"argon2"}:

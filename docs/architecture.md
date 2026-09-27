@@ -53,8 +53,11 @@ The service does not add sudo, root, Docker socket, product secrets, or deployme
 
 All executable source, database migrations, protocol snapshots, service templates, installer scripts and
 required custom skills live in this repository. Host-specific absolute paths and credentials live only in
-separate protected Web and runner environment files. Installation fails closed when the installed Codex CLI does not match a
-checked-in compatible protocol snapshot.
+separate protected Web and runner environment files. The supported installer downloads exact, repository-pinned
+Node.js, pnpm and Codex CLI artifacts, verifies committed digests, and installs them in immutable root-owned
+version directories. Codex authentication is performed only as the selected non-root runner through its direct
+terminal. Installation fails closed when the managed Codex CLI does not match the checked-in compatible protocol
+snapshot.
 
 Deployment secrets are kept in a root-owned `0600` environment file. systemd
 loads it before changing to the unprivileged service identity, so the service
@@ -79,6 +82,11 @@ dedicated bounded volume remains mandatory for a hard disk limit.
 - `GET /api/system/capabilities` for safe version/auth/instruction/skill, rate-limit and aggregate-usage status
 
 All state-changing routes require an authenticated session, exact Origin and a session-bound CSRF token.
+
+An empty chat can exist locally before Codex has written a rollout for it. Archive and restore first use the
+upstream Codex operation; if Codex specifically rejects that request and the local chat has no persisted events,
+the Web UI records the state locally and audits the degraded path. Timeouts, unavailable Codex and failures for
+chats with history remain errors rather than being silently accepted.
 
 The single navigation sidebar expands each project into its chat list, offers global and per-project new-chat
 actions and keeps a cross-project recent list. The project context menu exposes an archived-chat view scoped

@@ -13,7 +13,7 @@ WorkingDirectory=/opt/codex-web-ui/current
 Environment=NODE_ENV=production
 EnvironmentFile=/etc/codex-web-ui/codex-web-ui.env
 ExecStartPre=/usr/local/libexec/codex-web-ui-validate-config
-ExecStart=/usr/bin/node /opt/codex-web-ui/current/apps/server/dist/index.js
+ExecStart=/usr/local/bin/node /opt/codex-web-ui/current/apps/server/dist/index.js
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=45s

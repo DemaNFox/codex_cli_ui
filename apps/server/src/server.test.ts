@@ -967,6 +967,16 @@ describe('Codex routes', () => {
     });
     expect(started.statusCode).toBe(201);
     const threadId = started.json<{ data: { id: string } }>().data.id;
+    const turn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Keep this chat',
+        idempotencyKey: '00000000-0000-4000-8000-000000000060',
+      },
+    });
+    expect(turn.statusCode).toBe(202);
 
     expect(
       (
@@ -996,6 +1006,66 @@ describe('Codex routes', () => {
     ).toBe(200);
     expect(appServer.requests.map((item) => item.method)).toContain('thread/archive');
     expect(appServer.requests.map((item) => item.method)).toContain('thread/unarchive');
+  });
+
+  it('archives an empty local chat when Codex has not persisted its thread yet', async () => {
+    const { app, appServer, projectPath, repository } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    repository.appendEvent({
+      threadId,
+      turnId: null,
+      kind: 'thread',
+      phase: 'state',
+      payload: { status: 'idle' },
+    });
+
+    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_FAILED');
+    const archived = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/archive`,
+      headers: session.headers,
+    });
+    expect(archived.statusCode).toBe(200);
+    expect(archived.json<{ data: { archived: boolean } }>().data.archived).toBe(true);
+
+    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_FAILED');
+    const restored = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/unarchive`,
+      headers: session.headers,
+    });
+    expect(restored.statusCode).toBe(200);
+    expect(restored.json<{ data: { archived: boolean } }>().data.archived).toBe(false);
+  });
+
+  it('does not hide an upstream archive failure for a chat with history', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Persisted content',
+        idempotencyKey: '00000000-0000-4000-8000-000000000061',
+      },
+    });
+    expect(turn.statusCode).toBe(202);
+
+    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_FAILED');
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/archive`,
+      headers: session.headers,
+    });
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toEqual({
+      error: { code: 'INTERNAL_ERROR', message: 'Request failed' },
+    });
   });
 
   it('imports existing app-server threads for a registered cwd and reports live account auth safely', async () => {

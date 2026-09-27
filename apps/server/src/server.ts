@@ -974,7 +974,22 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const thread = repository.getThread(id);
     if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
     if (thread.archived !== archived) {
-      await appServer.request(archived ? 'thread/archive' : 'thread/unarchive', { threadId: id });
+      try {
+        await appServer.request(archived ? 'thread/archive' : 'thread/unarchive', { threadId: id });
+      } catch (error) {
+        const hasUserContent = repository
+          .listEvents(id, 0)
+          .some((event) => event.kind === 'user-message');
+        const isUnpersistedEmptyThread =
+          error instanceof Error &&
+          error.message === 'APP_SERVER_REQUEST_FAILED' &&
+          !hasUserContent;
+        if (!isUnpersistedEmptyThread) throw error;
+        repository.audit(archived ? 'thread.archive' : 'thread.unarchive', 'degraded', {
+          threadId: id,
+          reason: 'empty_thread_not_persisted_upstream',
+        });
+      }
     }
     const updated = repository.setThreadArchived(id, archived)!;
     repository.audit(archived ? 'thread.archive' : 'thread.unarchive', 'succeeded', {

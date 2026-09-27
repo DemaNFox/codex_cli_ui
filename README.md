@@ -1,6 +1,6 @@
 # Codex Web UI
 
-A self-hosted, single-operator browser client for an existing Codex CLI installation.
+A self-hosted, single-operator Codex server package with a browser interface.
 
 The service keeps Codex on the server and provides projects, durable chats, streamed progress, approvals,
 interactive questions, one-turn permission grants, model/reasoning selection, interruption and continuation
@@ -34,30 +34,33 @@ See [architecture](docs/architecture.md) and the [threat model](docs/Codex_Web_U
 ## Portability contract
 
 The repository is the complete distributable source. On Ubuntu 22.04/24.04
-(x64 or arm64), clone it as the already authenticated Codex user and run:
+(x64 or arm64), clone it as the intended non-root Codex user and run:
 
 ```bash
 git clone https://github.com/DemaNFox/codex_cli_ui.git
 cd codex_cli_ui
-corepack pnpm install --frozen-lockfile
 ./install.sh --public-origin https://codex.example.com --external-proxy
 ```
 
 Replace `--external-proxy` with `--tls-cert /path/fullchain.pem --tls-key
-/path/privkey.pem` to install the bundled Nginx edge. The installer verifies the
-checksummed package inventory, Node 22, the pinned Codex CLI and `codex login status`, then
-prompts on the local terminal for the Web UI administrator. An existing
+/path/privkey.pem` to install the bundled Nginx edge. The installer installs any
+missing base Ubuntu commands plus repository-pinned Node.js 22, pnpm and Codex
+CLI artifacts, verifies their cryptographic checksums and the release inventory,
+then checks `codex login status`. When the runner has no Codex session, it starts
+`codex login --device-auth` directly on the local terminal as that non-root user.
+It never accepts or stores an OpenAI token itself. Finally it prompts locally for
+the Web UI administrator. An existing
 installation requires the explicit `--upgrade` flag.
 For a shared host, add `--no-start`, establish filesystem byte/inode quotas,
 then enable the units; the default start path is intended for a dedicated
 personal server.
 
-A new host needs:
+A new host needs only:
 
-1. a supported, already authenticated Codex CLI;
-2. Node.js/pnpm and this Git checkout;
-3. an HTTPS domain/proxy or an existing certificate and private key;
-4. write access for that Codex user to the intended project roots.
+1. Ubuntu 22.04 or 24.04 on x64/arm64, Git, internet access and a normal sudo-capable user;
+2. an HTTPS domain/proxy or an existing certificate and private key;
+3. write access for the selected Codex user to the intended project roots;
+4. an interactive terminal for the first Codex device login and Web UI administrator bootstrap.
 
 Codex authentication, website passwords, `.env` values, databases, transcripts and project worktrees are
 host state and are never committed. The installer must validate the pinned CLI protocol before activation.
@@ -71,7 +74,9 @@ scripts/prepare-release.sh --output /tmp/codex-web-ui-release
 ```
 
 `scripts/prepare-package.sh --output /tmp/package --arch linux-x64 --archive tar.gz`
-creates a checksummed, architecture-specific offline installer. Deployment,
+creates a checksummed, architecture-specific application package. The package
+still downloads its checksum-pinned Node.js/pnpm/Codex toolchain during first
+installation; it is not an air-gapped bundle. Deployment,
 TLS, storage bounds and upgrades are documented in [infra/README.md](infra/README.md). Required
 custom Codex skills are vendored with checksums under `skills/bundle`; project
 `AGENTS.md` files remain with their respective Git repositories and are loaded
