@@ -1,0 +1,4 @@
+interface:
+  display_name: "Project Change Workflow"
+  short_description: "Scale repository delivery checks to the change risk"
+  default_prompt: "Use $project-change-workflow to deliver this repository change through the lightest safe lane: fast for small local work, concise planning for standard work, and full controls for high-risk work."

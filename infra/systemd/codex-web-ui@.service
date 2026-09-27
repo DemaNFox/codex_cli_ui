@@ -1,0 +1,63 @@
+[Unit]
+Description=Codex Web UI (%i)
+After=network-online.target
+Wants=network-online.target
+Wants=codex-web-ui-storage-guard@%i.timer
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/opt/codex-web-ui/current
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/codex-web-ui/codex-web-ui.env
+ExecStartPre=/usr/local/libexec/codex-web-ui-validate-config
+ExecStart=/usr/bin/node /opt/codex-web-ui/current/apps/server/dist/index.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=45s
+TimeoutStopSec=30s
+KillMode=control-group
+UMask=0077
+
+# Shared-host capacity boundary. The project runner adds its own per-turn limits.
+CPUQuota=300%
+MemoryHigh=3G
+MemoryMax=4G
+MemorySwapMax=0
+TasksMax=512
+Nice=5
+
+# The service is intentionally a non-root development control plane.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# Project roots and CODEX_HOME are added as canonical ReadWritePaths by the
+# installer in an instance-specific drop-in. Product runtime and container
+# control paths remain unavailable even for the full-access Codex preset.
+ReadWritePaths=/var/lib/codex-web-ui
+InaccessiblePaths=-/root -/run/docker.sock -/run/containerd -/opt/git -/opt/nikita -/opt/ai-chat-platform -/opt/ai-chat-live-dev -/opt/ai-chat-data -/opt/ai-chat-deploy-state -/opt/ai-chat-agent-release -/opt/ai-chat-agent-tools -/opt/ai-chat-agents/state -/opt/ai-chat-agents/worktrees -/opt/tg -/opt/chateval
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=codex-web-ui
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,27 @@
+{
+  "name": "@codex-web/server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx watch src/index.ts",
+    "lint": "eslint src --max-warnings 0",
+    "test": "pnpm --filter @codex-web/contracts build && vitest run",
+    "typecheck": "pnpm --filter @codex-web/contracts build && tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@codex-web/contracts": "workspace:*",
+    "@fastify/cookie": "11.0.2",
+    "argon2": "0.44.0",
+    "fastify": "5.6.1",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.1",
+    "eslint": "9.36.0",
+    "tsx": "4.20.6",
+    "typescript": "5.9.2",
+    "vitest": "3.2.7"
+  }
+}

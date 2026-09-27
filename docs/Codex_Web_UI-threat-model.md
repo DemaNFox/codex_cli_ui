@@ -1,0 +1,136 @@
+# Codex Web UI threat model
+
+## Executive summary
+
+This service is an Internet-reachable development control plane with remote-code-execution authority under its Linux service user. The dominant risks are account/session compromise, browser injection through untrusted agent output, path escape across projects, credential exfiltration from `CODEX_HOME`, and resource exhaustion on a shared host. Password-only single-user access is accepted by the owner, so strong password hashing, throttling, lockout, secure sessions, TLS and audit are mandatory; optional second-factor support remains recommended.
+
+## Scope and assumptions
+
+- In scope: the standalone reverse-proxied web/API service, SQLite metadata, Codex supervisor, app-server stdio protocol, registered project roots, server Codex home, installer and runtime unit.
+- Out of scope: product CRM/Admin code, product databases and secrets, Provider/Telegram controls, Docker socket, root shell, and automatic deployment.
+- One trusted human operator uses multiple personal devices.
+- The service initially shares the existing Ubuntu host with other workloads.
+- Public access is protected by HTTPS and application login. Password compromise remains a material residual risk.
+
+## System model
+
+### Primary components
+
+- TLS reverse proxy and rate limits.
+- React browser client.
+- Node.js API, session and authorization boundary.
+- SQLite metadata/session/audit/event store.
+- Codex supervisor and local stdio JSON-RPC adapter.
+- Non-root Codex process, `CODEX_HOME`, and allowlisted projects.
+
+### Data flows and trust boundaries
+
+- Browser -> edge: credentials, session cookie and UI requests over HTTPS; protected by TLS, limits and security headers.
+- Edge -> API: authenticated REST/SSE; exact Origin, CSRF on mutations, schema and size validation.
+- API -> SQLite: hashed sessions, projects, mappings, normalized events and audit records; no OpenAI token or chain-of-thought.
+- API -> app-server: typed JSON-RPC over child stdio; allowlisted methods and bounded messages.
+- App-server -> project: commands and file changes under the selected permission preset and Linux-user permissions.
+- App-server -> OpenAI: server-side Codex credential; never crosses the browser boundary.
+
+```mermaid
+flowchart LR
+  B["Personal browser"] --> E["TLS edge"]
+  E --> A["Web API"]
+  A --> D["SQLite"]
+  A --> S["Codex supervisor"]
+  S --> C["Codex app server"]
+  C --> P["Allowed projects"]
+  C --> O["OpenAI"]
+```
+
+## Assets and security objectives
+
+| Asset                           | Why it matters                              | Objective |
+| ------------------------------- | ------------------------------------------- | --------- |
+| Website password and sessions   | They authorize remote code execution        | C/I       |
+| Codex account credential        | Account access, usage and spend             | C/I       |
+| Source and Git state            | Product integrity and intellectual property | C/I/A     |
+| `AGENTS.md`, skills and config  | They control agent behavior and safety      | I         |
+| Project secrets                 | May authorize external systems              | C/I       |
+| Chats, diffs and command output | Can contain sensitive development data      | C/I/A     |
+| Host resources                  | Shared-host availability                    | A         |
+
+## Attacker model
+
+### Capabilities
+
+- An unauthenticated Internet client can reach the login surface.
+- Repository content and tool output can be attacker-controlled.
+- A logged-in attacker can submit prompts and choose exposed permission presets.
+- A malicious dependency can execute when an authorized Codex run invokes project tooling.
+
+### Non-capabilities
+
+- The attacker does not initially control the host, TLS private key, server environment or operator device.
+- The service user has no sudo, root, Docker socket or product-runtime secret access by design.
+
+## Entry points and attack surfaces
+
+| Surface               | How reached           | Boundary                   | Planned controls                                    |
+| --------------------- | --------------------- | -------------------------- | --------------------------------------------------- |
+| Login                 | Public HTTPS          | Internet to session        | Argon2id, throttling, lockout, generic errors       |
+| REST mutations        | Authenticated browser | Session to API             | CSRF, exact Origin, Zod, idempotency                |
+| SSE                   | Authenticated browser | API to browser             | Per-thread authorization, replay cursor, no secrets |
+| Markdown/diffs/output | Codex events          | Untrusted output to DOM    | text-safe rendering, no raw HTML, CSP               |
+| Project registration  | Admin form            | API to filesystem          | configured roots, realpath, symlink/path rejection  |
+| JSON-RPC              | Local child stdio     | API to Codex               | method/schema allowlist, IDs, size bounds           |
+| Skills and rules      | Project/server files  | Filesystem to agent policy | pinned bundle, checksums, visible loaded sources    |
+
+## Top abuse paths
+
+1. Attacker guesses or steals the password, obtains a session, starts a full-access run and exfiltrates reachable source or credentials.
+2. Repository text injects HTML/script into streamed output; unsafe rendering steals the authenticated session or submits a turn.
+3. A crafted project path or symlink escapes the allowlisted root and grants access to host files.
+4. A prompt or dependency prints tokens into command output; unredacted persistence later exposes them through chat history or backup.
+5. A forged cross-site request starts a destructive turn using the operator's cookie.
+6. Parallel builds and runaway child processes exhaust CPU, RAM or disk and disrupt co-hosted applications.
+7. A tampered skill weakens approvals or repository rules and is silently loaded by later threads.
+8. A backend restart loses an approval state and incorrectly treats the request as accepted.
+
+## Threat model table
+
+| ID     | Threat                                                 | Existing controls                                            | Required mitigation                                                                                                                      | Likelihood | Impact | Priority |
+| ------ | ------------------------------------------------------ | ------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------ | -------- |
+| TM-001 | Password/session compromise grants code execution      | Single owner, TLS planned                                    | Argon2id, strong secret, rate limit, lockout, rotation, audit; add TOTP/passkey later                                                    | medium     | high   | high     |
+| TM-002 | Stored/reflected XSS through model/tool output         | React escaping planned                                       | No raw HTML, strict CSP, safe Markdown, hostile-output tests                                                                             | medium     | high   | high     |
+| TM-003 | Project path traversal or symlink escape               | Root allowlist planned                                       | `realpath` containment on registration and every execution, no client cwd                                                                | medium     | high   | high     |
+| TM-004 | Codex/OpenAI or project secret leakage                 | Server-only Codex home                                       | Redaction, output bounds, no raw env/logging, isolated service user                                                                      | medium     | high   | high     |
+| TM-005 | CSRF or SSE authorization bypass                       | Same-site cookie planned                                     | Session-bound CSRF, Origin checks, per-thread authorization                                                                              | medium     | high   | high     |
+| TM-006 | Resource exhaustion harms shared host                  | Service cgroup plus startup/update/periodic soft disk guards | Enforce host filesystem byte/inode quota or dedicated bounded volumes; retain concurrency queue, timeouts and process-group cancellation | high       | high   | critical |
+| TM-007 | Skill/rule supply-chain tampering                      | Git-owned `AGENTS.md`                                        | Checksummed skill manifest, owner-only install, diagnostics and update audit                                                             | medium     | high   | high     |
+| TM-008 | Approval confusion after reconnect/restart             | App-server request IDs                                       | Durable pending state, fail closed, reconcile active requests, never auto-approve                                                        | medium     | high   | high     |
+| TM-009 | Backend compromise reaches root/Docker/product secrets | None in new service yet                                      | Non-root user, inaccessible paths, no Docker socket, separate deploy broker                                                              | low        | high   | high     |
+
+## Criticality calibration
+
+- Critical: reliable host takeover, production-secret compromise, or resource exhaustion that repeatedly takes down co-hosted production.
+- High: website auth bypass, source/Codex credential exfiltration, cross-project write, or approval bypass.
+- Medium: bounded transcript disclosure, recoverable single-thread corruption, or targeted temporary denial of service.
+- Low: non-sensitive metadata leakage or noisy failures with no authority gain.
+
+## Focus paths for security review
+
+| Path                        | Reason                                      | Threats                |
+| --------------------------- | ------------------------------------------- | ---------------------- |
+| `apps/server/src/auth/`     | Public authentication and session authority | TM-001, TM-005         |
+| `apps/server/src/codex/`    | RCE-capable protocol and approval boundary  | TM-004, TM-008, TM-009 |
+| `apps/server/src/projects/` | Filesystem containment                      | TM-003                 |
+| `apps/server/src/events/`   | Redaction, retention and reconnect          | TM-002, TM-004         |
+| `apps/web/src/`             | Rendering of untrusted content              | TM-002, TM-005         |
+| `infra/`                    | TLS, non-root service and resource limits   | TM-001, TM-006, TM-009 |
+| `skills/manifest.json`      | Agent-policy supply chain                   | TM-007                 |
+
+## Quality check
+
+- Public login, authenticated API/SSE, local JSON-RPC, filesystem, OpenAI and skill boundaries are covered.
+- Product runtime and its secrets are explicitly outside the dev control plane.
+- The owner confirmed one operator, same-host placement and desktop-equivalent Codex permissions.
+- Password-only exposure remains an accepted residual risk; second factor is recommended.
+- The disk monitor is detection and fail-closed response, not a hard quota. A
+  shared production host remains unsafe against rapid disk exhaustion until the
+  operator configures an OS/filesystem-enforced byte and inode bound.

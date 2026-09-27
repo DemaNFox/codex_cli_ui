@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "required_skills": [
+    "multi-agent-orchestrator",
+    "project-change-workflow",
+    "react-best-practices",
+    "security-threat-model",
+    "systematic-debugging",
+    "webapp-testing"
+  ],
+  "bundle_manifest": "bundle.manifest.json",
+  "install_subdirectory": "skills"
+}

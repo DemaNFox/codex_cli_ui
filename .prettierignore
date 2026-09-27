@@ -1,0 +1,4 @@
+**/coverage/**
+**/dist/**
+protocol/0.153.4/*.json
+skills/bundle/**

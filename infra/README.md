@@ -1,0 +1,76 @@
+# Ubuntu deployment assets
+
+These files install the standalone Codex Web UI as an unprivileged, loopback-only
+Node.js service behind an HTTPS Nginx edge. They do not deploy automatically and
+they never copy `CODEX_HOME`, Codex authentication, project `.env` files, product
+runtime secrets, Docker access or deployment credentials.
+
+## Assumptions
+
+- Ubuntu with systemd, Nginx, Node.js 22+, Python 3, `curl`, and the pinned Codex
+  executable already installed. Startup fails unless `codex --version` exactly
+  matches `CODEX_WEB_CODEX_VERSION_PIN` (initially `codex-cli 0.153.4`).
+- The chosen service user already exists and is not root. The current server may
+  use `ai-chat-agent` with `CODEX_HOME=/opt/ai-chat-agents/home/.codex`.
+- A prepared release contains `apps/server/dist/index.js` and
+  `apps/web/dist/index.html`. Nginx serves the web build directly and proxies
+  only `/api/` to the loopback backend. Release directories are immutable and
+  retained under `/opt/codex-web-ui/releases`; `current` is an atomic symlink.
+- Each allowed project root and `CODEX_HOME` is an existing canonical directory.
+  They cannot overlap. The generated systemd drop-in grants write access only to
+  those paths and application state.
+- `/api/health` returns a 2xx response on the configured loopback listener.
+- `/etc/codex-web-ui/codex-web-ui.env` is a regular, non-symlink file owned by
+  `root:root` with mode `0600`. The systemd manager reads `EnvironmentFile=`
+  before switching to `User=%i`; the service user must not be able to read the
+  file directly.
+- The safe event journal is capped at 1,000 events per thread and 32 KiB per
+  event. Codex rollout history remains authoritative; the bounded journal is
+  the reconnect/UI projection and prevents one browser replay from exhausting
+  the service cgroup.
+
+## Disk safety boundary
+
+`CODEX_WEB_MIN_FREE_BYTES`, `CODEX_WEB_MAX_DATABASE_BYTES` and
+`CODEX_WEB_MAX_RELEASES` are soft fail-closed guards, not filesystem quotas.
+Startup and health checks reject low free space or an oversized database; the
+root storage timer repeats the check every minute and stops the service after a
+violation. Install/update admission also refuses to create a release beyond the
+configured retained-release count. No script automatically deletes a release.
+
+A shared production host **must** additionally place application state, project
+workspaces and release storage on a filesystem with an administrator-enforced
+byte and inode quota (or on dedicated size-bounded volumes). The quota is the
+hard protection against a fast write burst between timer checks. Size it so the
+configured free-space floor remains available to the OS and co-hosted services.
+If release admission reaches its cap, the operator must identify an inactive,
+non-current release beneath `/opt/codex-web-ui/releases`, preserve any required
+rollback artifact, and remove that exact directory through the host's reviewed
+operations procedure before retrying the update.
+
+## Safe installation sequence
+
+1. Build a verified minimal release outside `CODEX_HOME` with
+   `scripts/prepare-release.sh --output /absolute/new/release-directory`. The
+   command runs the full repository gate and produces only the production
+   backend dependency closure plus the compiled web assets. Ensure the output
+   contains no `.env`, database, Codex state or escaping symlink.
+2. Run `scripts/install-ubuntu.sh` without `--start`. It creates no credentials.
+3. Populate `/etc/codex-web-ui/codex-web-ui.env` through a protected channel;
+   keep it `root:root 0600`.
+4. Verify and install the self-contained required skill bundle with
+   `sudo scripts/install-skills.sh --codex-home /absolute/codex/home`. The exact
+   vendored file set in `skills/bundle/bundle.manifest.json` is enforced and
+   existing skill versions are backed up. Updating the bundle is a reviewed
+   source change: run `skill-bundle.py build` from an explicit skill source root,
+   inspect the diff and regenerate the committed checksums; never use the whole
+   local or server `CODEX_HOME` as that source.
+5. Install the Nginx template with existing TLS certificate/key paths using
+   `scripts/install-nginx.sh`; review `nginx -t` before `--reload`.
+6. Start `codex-web-ui@USER.service` and run
+   `sudo scripts/health-check.sh`. The check needs root only to read the
+   protected environment and never prints secret values.
+
+Updates atomically switch `current`, restart the service, and automatically
+restore the prior release if health fails. Rollback accepts only an existing
+release beneath `/opt/codex-web-ui/releases`; neither path deletes releases.

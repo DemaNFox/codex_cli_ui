@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+data/
+coverage/
+*.log
+__pycache__/
+*.pyc
+*.tsbuildinfo
+/.tmp-deploy-server/
+/.codex/orchestration/

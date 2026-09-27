@@ -1,0 +1,4 @@
+interface:
+  display_name: "Self-Optimizing Orchestrator"
+  short_description: "Route, verify, and learn from complex repo work."
+  default_prompt: "Use $multi-agent-orchestrator to run this non-trivial repository task with bounded context, risk-aware routing, and independent acceptance."
