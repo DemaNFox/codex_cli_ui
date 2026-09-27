@@ -563,13 +563,28 @@ export class SqliteRepository {
     return row.bytes;
   }
 
-  deleteUnusedAttachment(id: string, threadId: string): AttachmentRecord | undefined {
-    const record = this.getAttachment(id);
-    if (!record || record.threadId !== threadId || record.turnId !== null) return undefined;
-    const deleted = this.database
-      .prepare('DELETE FROM attachments WHERE id=? AND thread_id=? AND turn_id IS NULL')
-      .run(id, threadId);
-    return deleted.changes === 1 ? record : undefined;
+  claimAttachmentDeletion(id: string, threadId: string, claimToken: string): boolean {
+    return (
+      this.database
+        .prepare('UPDATE attachments SET turn_id=? WHERE id=? AND thread_id=? AND turn_id IS NULL')
+        .run(claimToken, id, threadId).changes === 1
+    );
+  }
+
+  completeAttachmentDeletion(id: string, threadId: string, claimToken: string): boolean {
+    return (
+      this.database
+        .prepare('DELETE FROM attachments WHERE id=? AND thread_id=? AND turn_id=?')
+        .run(id, threadId, claimToken).changes === 1
+    );
+  }
+
+  releaseAttachmentDeletion(id: string, threadId: string, claimToken: string): boolean {
+    return (
+      this.database
+        .prepare('UPDATE attachments SET turn_id=NULL WHERE id=? AND thread_id=? AND turn_id=?')
+        .run(id, threadId, claimToken).changes === 1
+    );
   }
 
   claimAttachments(threadId: string, ids: readonly string[], claimToken: string): boolean {

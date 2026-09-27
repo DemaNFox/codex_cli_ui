@@ -4,6 +4,22 @@ import path from 'node:path';
 import { sanitizeEventPayload } from './event-normalizer.js';
 
 type JournalEvent = Omit<SafeEvent, 'id' | 'createdAt'>;
+const ATTACHMENT_REFERENCE_MARKER =
+  '\n\n[Codex Web attachment references (server-local; do not repeat paths):\n';
+
+function stripServerAttachmentSuffix(value: string): string {
+  const marker = value.lastIndexOf(ATTACHMENT_REFERENCE_MARKER);
+  if (marker < 0) return value;
+  const suffix = value.slice(marker + ATTACHMENT_REFERENCE_MARKER.length);
+  if (!suffix.endsWith('\n]')) return value;
+  const references = suffix.slice(0, -2).split('\n');
+  if (
+    references.length === 0 ||
+    references.some((reference) => !/^.{1,180}: (?:[A-Za-z]:[\\/]|\/)/u.test(reference))
+  )
+    return value;
+  return value.slice(0, marker);
+}
 
 function record(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -52,9 +68,17 @@ function normalizeItem(
   if (!item || typeof item.type !== 'string') return null;
 
   if (item.type === 'userMessage') {
-    // The app-server history may contain absolute localImage paths and server-only file references.
-    // User messages owned by this service are journaled at turn acceptance with safe attachment metadata.
-    return null;
+    if (!Array.isArray(item.content)) return null;
+    const text = item.content
+      .map(record)
+      .filter(
+        (input): input is Record<string, unknown> =>
+          input !== null && input.type === 'text' && typeof input.text === 'string',
+      )
+      .map((input) => stripServerAttachmentSuffix(input.text as string))
+      .filter((part) => part.length > 0)
+      .join('\n');
+    return textEvent(threadId, turnId, 'user-message', 'text', text, maxBytes);
   }
 
   if (item.type === 'agentMessage' && typeof item.text === 'string') {

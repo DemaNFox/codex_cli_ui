@@ -200,6 +200,15 @@ class FakeAppServer implements AppServerClient {
   }
 }
 
+class FailingRemoveAttachmentStore extends AttachmentStore {
+  failRemove = true;
+
+  override async remove(projectId: string, threadId: string, storageName: string): Promise<void> {
+    if (this.failRemove) throw new Error('simulated attachment remove failure');
+    await super.remove(projectId, threadId, storageName);
+  }
+}
+
 let passwordHash: string;
 const openApps: Awaited<ReturnType<typeof buildServer>>[] = [];
 
@@ -213,6 +222,7 @@ afterEach(async () => {
 async function fixture(
   maxConcurrentTurns = 2,
   seed?: (context: { repository: SqliteRepository; projectPath: string }) => void,
+  attachmentStoreFactory: (root: string) => AttachmentStore = (root) => new AttachmentStore(root),
 ) {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-server-'));
   const root = path.join(temp, 'projects');
@@ -240,16 +250,17 @@ async function fixture(
   const repository = new SqliteRepository(':memory:', config.eventRetentionPerThread);
   seed?.({ repository, projectPath });
   const appServer = new FakeAppServer();
+  const attachmentStore = attachmentStoreFactory(config.attachmentStoragePath);
   const app = await buildServer({
     config,
     repository,
     pathPolicy: await ProjectPathPolicy.create([root]),
     appServer,
-    attachmentStore: new AttachmentStore(config.attachmentStoragePath),
+    attachmentStore,
   });
   openApps.push(app);
   await app.ready();
-  return { app, repository, appServer, projectPath, root };
+  return { app, repository, appServer, attachmentStore, projectPath, root };
 }
 
 async function login(app: Awaited<ReturnType<typeof buildServer>>) {
@@ -299,12 +310,17 @@ async function createThread(
   return response.json<{ data: { id: string } }>().data.id;
 }
 
-function multipartFile(name: string, mimeType: string, bytes: Buffer, boundary = 'codex-web-test') {
+function multipartFile(
+  name: string,
+  mimeType: string | undefined,
+  bytes: Buffer,
+  boundary = 'codex-web-test',
+) {
   return {
     contentType: `multipart/form-data; boundary=${boundary}`,
     body: Buffer.concat([
       Buffer.from(
-        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\nContent-Type: ${mimeType}\r\n\r\n`,
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\n${mimeType === undefined ? '' : `Content-Type: ${mimeType}\r\n`}\r\n`,
       ),
       bytes,
       Buffer.from(`\r\n--${boundary}--\r\n`),
@@ -489,6 +505,40 @@ describe('Codex routes', () => {
     expect(deleted.statusCode).toBe(204);
   });
 
+  it('keeps attachment metadata retryable when filesystem deletion fails', async () => {
+    const { app, repository, attachmentStore, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new FailingRemoveAttachmentStore(root),
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const upload = multipartFile('retry.txt', 'text/plain', Buffer.from('keep me'));
+    const uploaded = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/attachments`,
+      headers: { ...session.headers, 'content-type': upload.contentType },
+      payload: upload.body,
+    });
+    const attachment = uploaded.json<{ data: Attachment }>().data;
+    const failed = await app.inject({
+      method: 'DELETE',
+      url: `/api/threads/${threadId}/attachments/${attachment.id}`,
+      headers: session.headers,
+    });
+    expect(failed.statusCode).toBe(500);
+    expect(repository.getAttachment(attachment.id)?.turnId).toBeNull();
+    (attachmentStore as FailingRemoveAttachmentStore).failRemove = false;
+    const retried = await app.inject({
+      method: 'DELETE',
+      url: `/api/threads/${threadId}/attachments/${attachment.id}`,
+      headers: session.headers,
+    });
+    expect(retried.statusCode).toBe(204);
+    expect(repository.getAttachment(attachment.id)).toBeUndefined();
+  });
+
   it('passes images as localImage and files as private server text while journaling safe metadata only', async () => {
     const { app, appServer, repository, projectPath } = await fixture();
     const session = await login(app);
@@ -545,14 +595,28 @@ describe('Codex routes', () => {
       },
     });
     expect(repository.listEvents(threadId, 0).filter((event) => event.kind === 'tool')).toEqual([]);
+    const privatePath = String(localImage.path);
+    const split = Math.floor(privatePath.length / 2);
+    for (const delta of [`read ${privatePath.slice(0, split)}`, privatePath.slice(split)]) {
+      appServer.emit({
+        method: 'item/agentMessage/delta',
+        params: { threadId, turnId: 'turn-1', delta },
+      });
+    }
+    expect(repository.listEvents(threadId, 0).filter((event) => event.kind === 'agent-message')).toEqual([]);
     appServer.emit({
-      method: 'item/agentMessage/delta',
-      params: { threadId, turnId: 'turn-1', delta: `read ${String(localImage.path)}` },
+      method: 'item/completed',
+      params: {
+        threadId,
+        turnId: 'turn-1',
+        item: { type: 'agentMessage', text: `read ${privatePath}` },
+      },
     });
     const agentEvent = repository
       .listEvents(threadId, 0)
-      .find((event) => event.kind === 'agent-message');
-    expect(JSON.stringify(agentEvent)).not.toContain(String(localImage.path));
+      .find((event) => event.kind === 'agent-message')!;
+    expect(agentEvent.phase).toBe('completed');
+    expect(JSON.stringify(agentEvent)).not.toContain(privatePath);
     expect(JSON.stringify(agentEvent)).toContain('[attachment-storage]');
     const hydrated = normalizeThreadHistory(
       threadId,
@@ -575,7 +639,8 @@ describe('Codex routes', () => {
       ],
       4_096,
     );
-    expect(hydrated.map((event) => event.kind)).toEqual(['turn']);
+    expect(hydrated.map((event) => event.kind)).toEqual(['user-message', 'turn']);
+    expect(hydrated[0]?.payload).toEqual({ text: 'visible' });
     expect(JSON.stringify(hydrated)).not.toContain('C:\\private');
   });
 
@@ -670,6 +735,27 @@ describe('Codex routes', () => {
       expect(response.statusCode).toBe(201);
       expect(response.json()).toMatchObject({ data: { name, mediaType: mimeType, kind: 'file' } });
     }
+    for (const [name, mediaType] of [
+      ['source.ts', 'video/mp2t'],
+      ['script.py', 'application/octet-stream'],
+      ['notes.md', undefined],
+    ] as const) {
+      const upload = multipartFile(name, mediaType, Buffer.from('safe source text'));
+      const response = await app.inject({
+        method: 'POST', url: `/api/threads/${threadId}/attachments`,
+        headers: { ...session.headers, 'content-type': upload.contentType }, payload: upload.body,
+      });
+      expect(response.statusCode).toBe(201);
+      expect(response.json()).toMatchObject({
+        data: { name, mediaType: name.endsWith('.md') ? 'text/markdown' : 'text/plain' },
+      });
+    }
+    const executable = multipartFile('payload.exe', 'application/octet-stream', Buffer.from('MZ'));
+    const rejected = await app.inject({
+      method: 'POST', url: `/api/threads/${threadId}/attachments`,
+      headers: { ...session.headers, 'content-type': executable.contentType }, payload: executable.body,
+    });
+    expect(rejected.statusCode).toBe(415);
   });
 
   it('uses the exact initialized notification and never exposes upstream error details', async () => {
@@ -902,6 +988,7 @@ describe('Codex routes', () => {
     expect(first.statusCode).toBe(200);
     const firstEvents = first.json<{ events: { id: number; kind: string }[] }>().events;
     expect(firstEvents.map((event) => event.kind)).toEqual([
+      'user-message',
       'agent-message',
       'plan',
       'plan',
@@ -917,6 +1004,7 @@ describe('Codex routes', () => {
     expect(first.body).not.toContain('command-secret');
     expect(first.body).not.toContain('output-secret');
     expect(first.body).not.toContain('/private/image.png');
+    expect(first.body).not.toContain('supersecret');
 
     const second = await app.inject({
       method: 'GET',
@@ -973,7 +1061,7 @@ describe('Codex routes', () => {
     expect(response.statusCode).toBe(200);
     expect(
       response.json<{ events: { kind: string }[] }>().events.map((event) => event.kind),
-    ).toEqual(['warning', 'turn']);
+    ).toEqual(['warning', 'user-message', 'turn']);
     expect(repository.isThreadHistoryHydrated(thread.id)).toBe(true);
   });
 

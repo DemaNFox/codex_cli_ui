@@ -69,6 +69,12 @@ const MIME_RULES: Readonly<
   'text/csv': { kind: 'file', extensions: ['.csv'] },
 };
 
+const INFERRED_MIME_BY_EXTENSION: Readonly<Record<string, string>> = Object.fromEntries(
+  Object.entries(MIME_RULES).flatMap(([mimeType, rule]) =>
+    rule.extensions.map((extension) => [extension, mimeType]),
+  ),
+);
+
 export interface ParsedUpload {
   readonly name: string;
   readonly mimeType: string;
@@ -124,7 +130,7 @@ function validImageSignature(mimeType: string, bytes: Buffer): boolean {
   return true;
 }
 
-function validateUpload(name: string, mimeType: string, bytes: Buffer): ParsedUpload {
+function validateUpload(name: string, mimeType: string | undefined, bytes: Buffer): ParsedUpload {
   const normalizedName = name.normalize('NFC').trim();
   if (
     normalizedName.length === 0 ||
@@ -141,7 +147,18 @@ function validateUpload(name: string, mimeType: string, bytes: Buffer): ParsedUp
     throw new HttpError(400, 'ATTACHMENT_NAME_INVALID');
   if (bytes.length === 0) throw new HttpError(400, 'ATTACHMENT_EMPTY');
   if (bytes.length > MAX_ATTACHMENT_BYTES) throw new HttpError(413, 'ATTACHMENT_TOO_LARGE');
-  const normalizedMime = mimeType.split(';', 1)[0]!.trim().toLowerCase();
+  const suppliedMime = mimeType?.split(';', 1)[0]!.trim().toLowerCase() ?? '';
+  const extension = Object.keys(INFERRED_MIME_BY_EXTENSION)
+    .sort((left, right) => right.length - left.length)
+    .find((candidate) => normalizedName.toLowerCase().endsWith(candidate));
+  const inferredMime = extension === undefined ? undefined : INFERRED_MIME_BY_EXTENSION[extension];
+  const normalizedMime =
+    suppliedMime === '' ||
+    suppliedMime === 'application/octet-stream' ||
+    (suppliedMime === 'video/mp2t' && extension === '.ts')
+      ? inferredMime
+      : suppliedMime;
+  if (!normalizedMime) throw new HttpError(415, 'ATTACHMENT_TYPE_REQUIRED');
   const rule = MIME_RULES[normalizedMime];
   if (!rule) throw new HttpError(415, 'ATTACHMENT_TYPE_NOT_ALLOWED');
   const lowerName = normalizedName.toLowerCase();
@@ -211,7 +228,6 @@ export function parseSingleFileMultipart(contentType: string, body: Buffer): Par
   const filename = quotedParameter(disposition, 'filename');
   if (filename === null) throw new HttpError(400, 'MULTIPART_FILENAME_REQUIRED');
   const mimeType = headerMap.get('content-type');
-  if (!mimeType) throw new HttpError(415, 'ATTACHMENT_TYPE_REQUIRED');
   const dataStart = headerEnd + 4;
   const dataEnd = body.indexOf(closing, dataStart);
   if (dataEnd < 0) throw new HttpError(400, 'MULTIPART_BODY_INVALID');

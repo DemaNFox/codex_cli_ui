@@ -199,6 +199,29 @@ function isUserMessageLifecycle(message: AppServerInbound): boolean {
   return inputRecord(params?.item)?.type === 'userMessage';
 }
 
+function completedAgentMessage(
+  message: AppServerInbound,
+  maxBytes: number,
+): Omit<SafeEvent, 'id' | 'createdAt'> | null {
+  if (!('method' in message) || message.method !== 'item/completed') return null;
+  const params = inputRecord(message.params);
+  const item = inputRecord(params?.item);
+  if (
+    typeof params?.threadId !== 'string' ||
+    typeof params.turnId !== 'string' ||
+    item?.type !== 'agentMessage' ||
+    typeof item.text !== 'string'
+  )
+    return null;
+  return {
+    threadId: params.threadId,
+    turnId: params.turnId,
+    kind: 'agent-message',
+    phase: 'completed',
+    payload: sanitizeEventPayload({ text: item.text }, maxBytes),
+  };
+}
+
 function safeContentDisposition(name: string, inline: boolean): string {
   const encoded = encodeURIComponent(name).replaceAll("'", '%27');
   return `${inline ? 'inline' : 'attachment'}; filename="attachment"; filename*=UTF-8''${encoded}`;
@@ -557,10 +580,16 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     // App-server echoes localImage and server-local file paths in userMessage lifecycle items.
     // The safe user event is authored below from browser text plus public attachment metadata.
     if (isUserMessageLifecycle(message)) return;
-    const normalized = normalizeNotification(
-      redactAttachmentStorage(message, attachmentStore.root) as AppServerInbound,
-      config.maxEventBytes,
-    );
+    // Delta fragments cannot be redacted safely in isolation because a private path may span messages.
+    // Publish only the completed full agent message after exact path redaction.
+    if ('method' in message && message.method === 'item/agentMessage/delta') return;
+    const redactedMessage = redactAttachmentStorage(
+      message,
+      attachmentStore.root,
+    ) as AppServerInbound;
+    const normalized =
+      completedAgentMessage(redactedMessage, config.maxEventBytes) ??
+      normalizeNotification(redactedMessage, config.maxEventBytes);
     if (!normalized || !repository.getThread(normalized.threadId)) return;
     if (message.method === 'turn/started' && normalized.turnId)
       activeTurns.add(`${normalized.threadId}:${normalized.turnId}`);
@@ -957,9 +986,17 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       if (!existing || existing.threadId !== params.id)
         throw new HttpError(404, 'ATTACHMENT_NOT_FOUND');
       if (existing.turnId !== null) throw new HttpError(409, 'ATTACHMENT_ALREADY_SENT');
-      const deleted = repository.deleteUnusedAttachment(params.attachmentId, params.id);
-      if (!deleted) throw new HttpError(409, 'ATTACHMENT_ALREADY_SENT');
-      await attachmentStore.remove(project.id, params.id, deleted.storageName);
+      const deletionClaim = `deleting:${params.attachmentId}`;
+      if (!repository.claimAttachmentDeletion(params.attachmentId, params.id, deletionClaim))
+        throw new HttpError(409, 'ATTACHMENT_ALREADY_SENT');
+      try {
+        await attachmentStore.remove(project.id, params.id, existing.storageName);
+      } catch (error) {
+        repository.releaseAttachmentDeletion(params.attachmentId, params.id, deletionClaim);
+        throw error;
+      }
+      if (!repository.completeAttachmentDeletion(params.attachmentId, params.id, deletionClaim))
+        throw new HttpError(409, 'ATTACHMENT_DELETE_OUTCOME_UNKNOWN');
     });
     repository.audit('attachment.delete', 'succeeded', {
       threadId: params.id,
