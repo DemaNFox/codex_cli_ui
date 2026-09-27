@@ -55,12 +55,44 @@ class BoundedStorageInstallerTest(unittest.TestCase):
             "chmod 0600 \"$IMAGE_PATH\"",
             "mount -o loop,nodev,nosuid",
             "/var/lib/codex-web-ui",
-            "/srv/codex-projects",
             "/opt/codex-web-ui/releases",
             "$IMAGE_PATH $VOLUME_ROOT ext4 loop,nodev,nosuid 0 2",
             "none bind,nodev,nosuid,x-systemd.requires-mounts-for=",
             "x-systemd.requires-mounts-for=$VOLUME_ROOT",
             'findmnt --verify --tab-file "$FSTAB"',
+        ):
+            self.assertIn(expected, self.source)
+
+    def test_all_project_roots_are_explicitly_matched_and_dynamically_bounded(self) -> None:
+        for expected in (
+            '--project-root) project_roots+=("${2:?}")',
+            "at least one --project-root is required",
+            "CODEX_WEB_PROJECT_ROOTS=",
+            "explicit project roots do not match configured project roots",
+            "configured project root was not explicitly bounded",
+            "configured project roots overlap",
+            "explicit project root is not configured",
+            "project root overlaps protected storage",
+            "project root contains unsupported persistent-mount characters",
+            'VOLUME_DIRS+=("projects/$index")',
+            '"$VOLUME_ROOT" "$index" "${canonical_roots[$index]}"',
+        ):
+            self.assertIn(expected, self.source)
+        self.assertNotIn("/srv/codex-projects none bind", self.source)
+
+    def test_codex_home_is_copied_into_bounded_state_and_config_is_switched(self) -> None:
+        for expected in (
+            "BOUNDED_CODEX_HOME=/var/lib/codex-web-ui/codex-home",
+            "project root overlaps CODEX_HOME",
+            "configured CODEX_HOME contains a symlink",
+            "configured CODEX_HOME contains unsupported systemd path characters",
+            '"$configured_codex_home/" "$VOLUME_ROOT/state/codex-home/"',
+            "copied CODEX_HOME failed checksum verification",
+            'CODEX_HOME=" codex_home',
+            'write_path_drop_in "$service_user" "$BOUNDED_CODEX_HOME"',
+            "InaccessiblePaths=%s",
+            "codex-web-ui.env.pre-bounded-",
+            "chmod 0600 \"$config_backup\"",
         ):
             self.assertIn(expected, self.source)
 
@@ -91,6 +123,7 @@ class BoundedStorageInstallerTest(unittest.TestCase):
             cwd=ROOT,
         )
         self.assertIn("--size-bytes BYTES", help_result.stdout)
+        self.assertIn("--project-root DIR", help_result.stdout)
         dry_run = subprocess.run(
             [
                 bash,
@@ -99,6 +132,8 @@ class BoundedStorageInstallerTest(unittest.TestCase):
                 "1073741824",
                 "--inode-count",
                 "4096",
+                "--project-root",
+                "/srv/codex-projects",
                 "--dry-run",
             ],
             check=True,
@@ -109,6 +144,7 @@ class BoundedStorageInstallerTest(unittest.TestCase):
         self.assertIn("no changes made", dry_run.stdout)
         self.assertIn("1073741824 bytes", dry_run.stdout)
         self.assertIn("4096 inodes requested", dry_run.stdout)
+        self.assertIn("/srv/codex-projects", dry_run.stdout)
 
     def test_script_has_valid_bash_syntax(self) -> None:
         bash = working_bash()
