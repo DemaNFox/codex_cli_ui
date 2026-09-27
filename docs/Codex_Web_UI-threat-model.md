@@ -6,7 +6,7 @@ This service is an Internet-reachable development control plane with remote-code
 
 ## Scope and assumptions
 
-- In scope: the standalone reverse-proxied web/API service, SQLite metadata, bounded attachment storage, Codex supervisor, app-server stdio protocol, registered project roots, server Codex home, installer and runtime unit.
+- In scope: the standalone reverse-proxied web/API service, SQLite metadata, bounded attachment storage, private app-server socket, registered project roots, server Codex home, package/bootstrap installer and runtime units.
 - Out of scope: product CRM/Admin code, product databases and secrets, Provider/Telegram controls, Docker socket, root shell, and automatic deployment.
 - One trusted human operator uses multiple personal devices.
 - The service initially shares the existing Ubuntu host with other workloads.
@@ -20,15 +20,16 @@ This service is an Internet-reachable development control plane with remote-code
 - React browser client.
 - Node.js API, session and authorization boundary.
 - SQLite metadata/session/audit/event store.
-- Codex supervisor and local stdio JSON-RPC adapter.
-- Non-root Codex process, `CODEX_HOME`, and allowlisted projects.
+- Mode-0600 systemd Unix socket and bounded JSON-RPC adapter.
+- A separate non-root Codex runner, `CODEX_HOME`, and allowlisted projects.
 
 ### Data flows and trust boundaries
 
 - Browser -> edge: credentials, session cookie and UI requests over HTTPS; protected by TLS, limits and security headers.
 - Edge -> API: authenticated REST/SSE; exact Origin, CSRF on mutations, schema and size validation.
 - API -> SQLite: hashed sessions, projects, mappings, normalized events and audit records; no OpenAI token or chain-of-thought.
-- API -> app-server: typed JSON-RPC over child stdio; allowlisted methods and bounded messages.
+- API -> app-server: typed JSON-RPC over a private Unix socket; allowlisted methods, bounded messages and reconnect backoff. API and runner have separate OS identities.
+- Local root terminal -> bootstrap: administrator credentials become a bounded Argon2id hash and random session secret through an atomic root-owned `0600` replacement; plaintext is neither logged nor placed in argv.
 - Browser -> attachment store: authenticated multipart uploads with per-file, per-turn and per-thread bounds; only opaque IDs and safe metadata return to the browser.
 - Attachment store -> app-server: signature-checked images use native `localImage`; inert common files are referenced only through a backend-generated path after thread ownership and realpath checks.
 - App-server -> project: commands and file changes under the selected permission preset and Linux-user permissions.
@@ -39,8 +40,8 @@ flowchart LR
   B["Personal browser"] --> E["TLS edge"]
   E --> A["Web API"]
   A --> D["SQLite"]
-  A --> S["Codex supervisor"]
-  S --> C["Codex app server"]
+  A --> S["Private Unix socket"]
+  S --> C["Isolated Codex runner"]
   C --> P["Allowed projects"]
   C --> O["OpenAI"]
 ```
@@ -99,6 +100,8 @@ flowchart LR
 9. A forged or cross-thread attachment ID exposes another chat's file, or a crafted filename escapes the attachment directory.
 10. A polyglot or mislabeled upload executes in the browser, or oversized uploads exhaust disk, memory, inodes or request workers.
 11. App-server echoes an absolute `localImage` path in a `userMessage` item which is accidentally persisted or streamed to the browser.
+12. A compromised Web API reads the Codex credential or directly tampers with projects because API and Codex share an OS identity.
+13. Bootstrap secrets leak through argv/terminal echo, weak hashing, unsafe replacement or an accidental rerun.
 
 ## Threat model table
 
@@ -117,6 +120,8 @@ flowchart LR
 | TM-011 | Hostile upload becomes browser or host execution       | React escaping, dedicated storage                            | Signature-check images, allowlisted types/extensions, `nosniff`, download non-images, never parse/execute/unzip in API                                                           | medium     | high   | high     |
 | TM-012 | Uploads exhaust shared-host resources                  | Bounded ext4 application volume and tmpfs                    | 20 MiB/file, 8/turn, 50 MiB/thread, edge/body timeout, bounded in-memory parsing with failed-write cleanup, existing byte/inode/resource limits                                  | medium     | high   | high     |
 | TM-013 | Internal attachment path leaks through Codex events    | Safe normalized event projection                             | Ignore live app-server `userMessage` items and fragmented agent deltas; publish redacted completed messages; persist one backend-authored user event; path-leak regression tests | medium     | high   | high     |
+| TM-014 | Bootstrap leaks or silently replaces admin secrets     | Local root-only bootstrap                                    | Hidden TTY entry, bounded Argon2id, CSPRNG session secret, atomic `0600` replacement, explicit `--rotate`, no secrets in argv/logs                                               | low        | high   | high     |
+| TM-015 | Web API compromise reaches Codex credentials/projects  | Dedicated API and runner identities                          | Private systemd socket, separate environments, API cannot read `CODEX_HOME`, runner cannot read Web secrets/SQLite, explicit project and attachment mounts                       | low        | high   | high     |
 
 ## Criticality calibration
 
@@ -144,10 +149,13 @@ flowchart LR
 - Product runtime and its secrets are explicitly outside the dev control plane.
 - The owner confirmed one operator, same-host placement and desktop-equivalent Codex permissions.
 - Password-only exposure remains an accepted residual risk; second factor is recommended.
+- Supported portable targets are Ubuntu 22.04/24.04 on x64/arm64. Public plaintext HTTP and automatically
+  generated bare-IP certificates are excluded; operators supply a domain-backed HTTPS proxy or valid keypair.
 - The reference deployment uses a dedicated 80 GiB ext4 volume with a fixed inode ceiling for state,
-  projects and releases, plus bounded `/tmp` and `/var/tmp` tmpfs mounts. Portable installations must
-  establish equivalent administrator-enforced byte and inode bounds; the disk monitor remains a secondary
-  fail-closed control rather than the hard quota.
+  projects and releases, plus bounded `/tmp` and `/var/tmp` tmpfs mounts. Portable installation defaults
+  target a dedicated personal server and retain soft fail-closed guards. On a shared host, use `--no-start`
+  until equivalent administrator-enforced byte and inode bounds exist; the disk monitor is secondary rather
+  than a hard quota.
 - Attachment upload itself has no idempotency key. A lost upload response can create an unused duplicate;
   this tab cleans up only staged IDs it can prove it owns when navigating, while the 50 MiB thread ceiling
   bounds reload and network-unknown leftovers. An ambiguous `turn/start` claim remains unavailable rather

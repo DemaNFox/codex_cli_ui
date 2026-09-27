@@ -10,7 +10,7 @@ class InfraStaticTest(unittest.TestCase):
     def test_systemd_unit_keeps_non_root_shared_host_boundary(self) -> None:
         unit = (ROOT / "infra/systemd/codex-web-ui@.service").read_text(encoding="utf-8")
         for expected in (
-            "User=%i",
+            "User=codex-web-ui-api",
             "Wants=codex-web-ui-storage-guard@%i.timer",
             "ProtectSystem=strict",
             "NoNewPrivileges=yes",
@@ -22,13 +22,24 @@ class InfraStaticTest(unittest.TestCase):
             "TemporaryFileSystem=/tmp:rw,nosuid,nodev,size=1G,nr_inodes=16384,mode=1777",
             "TemporaryFileSystem=/var/tmp:rw,nosuid,nodev,size=1G,nr_inodes=16384,mode=1777",
             "/run/docker.sock",
-            "/opt/ai-chat-agents/state",
-            "/opt/ai-chat-agent-release",
         ):
             self.assertIn(expected, unit)
         self.assertNotIn("User=root", unit)
         self.assertNotIn("SupplementaryGroups=docker", unit)
         self.assertNotIn("ProcSubset=pid", unit)
+
+        runner = (ROOT / "infra/systemd/codex-web-ui-app-server@.service").read_text(
+            encoding="utf-8"
+        )
+        socket = (ROOT / "infra/systemd/codex-web-ui-app-server.socket").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("User=codex-web-ui-runner", runner)
+        self.assertIn("EnvironmentFile=/etc/codex-web-ui/codex-runner.env", runner)
+        self.assertIn("InaccessiblePaths=-/etc/codex-web-ui/codex-web-ui.env", runner)
+        self.assertIn("ReadOnlyPaths=-/var/lib/codex-web-ui/data/attachments", runner)
+        self.assertIn("Accept=yes", socket)
+        self.assertIn("SocketMode=0600", socket)
 
         guard_unit = (ROOT / "infra/systemd/codex-web-ui-storage-guard@.service").read_text(
             encoding="utf-8"
@@ -69,6 +80,10 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("--http-port", installer)
         self.assertIn("--https-port", installer)
         self.assertIn('HTTP and HTTPS edge ports must differ', installer)
+        self.assertIn('TLS private key must be owned by root', installer)
+        self.assertIn('openssl x509 -in "$tls_cert" -noout -checkhost "$domain"', installer)
+        self.assertIn('previous configuration restored', installer)
+        self.assertIn('trap rollback ERR', installer)
 
     def test_environment_template_contains_no_populated_secret(self) -> None:
         environment = (ROOT / "infra/env/codex-web-ui.env.example").read_text(encoding="utf-8")
@@ -82,6 +97,27 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("CODEX_WEB_MIN_FREE_BYTES=5368709120", environment)
         self.assertIn("CODEX_WEB_MAX_DATABASE_BYTES=2147483648", environment)
         self.assertIn("CODEX_WEB_MAX_RELEASES=5", environment)
+        self.assertIn("CODEX_WEB_APP_SERVER_SOCKET=/run/codex-web-ui/app-server.sock", environment)
+        self.assertNotIn("CODEX_HOME=", environment)
+
+    def test_portable_installer_has_explicit_secure_bootstrap(self) -> None:
+        wrapper = (ROOT / "install.sh").read_text(encoding="utf-8")
+        installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        self.assertIn("prepare-package.sh", wrapper)
+        for expected in (
+            'prepare-package.sh" --verify',
+            "Codex is not authenticated for the runner user",
+            "installation exists; rerun with --upgrade",
+            "setup-admin.mjs",
+            "--external-proxy",
+            "codex-web-ui-app-server.socket",
+            "changing the runner user requires an explicit migration workflow",
+            "trap rollback_activation ERR INT TERM",
+            "systemctl restart codex-web-ui-app-server.socket codex-web-ui@api.service",
+            "--check-releases --additional-releases 1",
+        ):
+            self.assertIn(expected, installer)
+        self.assertNotIn("http://", installer)
 
     def test_install_update_and_rollback_keep_release_and_codex_state_boundaries(self) -> None:
         install_script = (ROOT / "scripts/install-ubuntu.sh").read_text(encoding="utf-8")
@@ -107,6 +143,17 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn('@codex-web/server', release_script)
         self.assertIn('unlink -- "$self_link"', release_script)
         self.assertIn('SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"', health_script)
+
+    def test_runner_helper_requires_owned_pinned_codex_identity(self) -> None:
+        helper = (ROOT / "scripts/run-app-server.sh").read_text(encoding="utf-8")
+        for expected in (
+            "CODEX_BIN must be owned by root",
+            "CODEX_HOME must be owned by the runner user",
+            "CODEX_HOME must not be accessible by group or other users",
+            'actual_version=$($CODEX_BIN --version)',
+            'exec "$CODEX_BIN" app-server --listen stdio://',
+        ):
+            self.assertIn(expected, helper)
 
 
 if __name__ == "__main__":

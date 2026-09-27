@@ -2,6 +2,7 @@ import type { Attachment, SafeEvent } from '@codex-web/contracts';
 import { hash } from 'argon2';
 import { EventEmitter } from 'node:events';
 import { mkdtemp, mkdir, rename, symlink, writeFile } from 'node:fs/promises';
+import { createServer as createNetServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, beforeAll, describe, expect, it } from 'vitest';
@@ -9,6 +10,7 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   INITIALIZED_NOTIFICATION,
   INITIALIZE_PARAMS,
+  CodexAppServerSocketClient,
   CodexAppServerSupervisor,
   buildCodexEnvironment,
   type AppServerClient,
@@ -381,6 +383,100 @@ describe('security and repository boundary', () => {
     );
   });
 
+  it('uses a bounded Unix-stream JSON-RPC connection and reconnects after protocol abuse', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'codex-web-socket-'));
+    const socketPath =
+      process.platform === 'win32'
+        ? `\\\\.\\pipe\\codex-web-${process.pid}-${Date.now()}`
+        : path.join(root, 'app-server.sock');
+    let connections = 0;
+    let sentOversizedLine = false;
+    const receivedMethods: string[] = [];
+    const listener = createNetServer((socket) => {
+      connections += 1;
+      socket.on('error', () => undefined);
+      let buffered = '';
+      socket.on('data', (chunk: Buffer) => {
+        buffered += chunk.toString('utf8');
+        while (true) {
+          const newline = buffered.indexOf('\n');
+          if (newline === -1) break;
+          const line = buffered.slice(0, newline);
+          buffered = buffered.slice(newline + 1);
+          const message = JSON.parse(line) as { id?: RpcId; method?: string };
+          if (message.method) receivedMethods.push(message.method);
+          if (message.method === 'initialize' && message.id !== undefined) {
+            socket.write(`${JSON.stringify({ id: message.id, result: { serverInfo: {} } })}\n`);
+          } else if (message.method === 'initialized' && !sentOversizedLine) {
+            sentOversizedLine = true;
+            socket.write('x'.repeat(1_048_577));
+          } else if (message.id !== undefined) {
+            socket.write(`${JSON.stringify({ id: message.id, result: { ok: true } })}\n`);
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      listener.once('error', reject);
+      listener.listen(socketPath, resolve);
+    });
+    const client = new CodexAppServerSocketClient({ socketPath, requestTimeoutMs: 2_000 });
+    try {
+      await client.start();
+      await expect.poll(() => client.generation, { timeout: 3_000 }).toBe(2);
+      await expect(client.request('account/read', {})).resolves.toEqual({ ok: true });
+      await expect(client.request('account/credentials/read', {})).rejects.toThrow(
+        'APP_SERVER_METHOD_NOT_ALLOWED',
+      );
+      expect(connections).toBe(2);
+      expect(receivedMethods.filter((method) => method === 'initialize')).toHaveLength(2);
+    } finally {
+      await client.stop();
+      await new Promise<void>((resolve, reject) =>
+        listener.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+
+  it('clears a connected socket after initialize timeout so a retry can reconnect', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'codex-web-init-timeout-'));
+    const socketPath =
+      process.platform === 'win32'
+        ? `\\\\.\\pipe\\codex-web-timeout-${process.pid}-${Date.now()}`
+        : path.join(root, 'app-server.sock');
+    let connections = 0;
+    const listener = createNetServer((socket) => {
+      connections += 1;
+      socket.on('error', () => undefined);
+      let buffered = '';
+      socket.on('data', (chunk: Buffer) => {
+        buffered += chunk.toString('utf8');
+        const newline = buffered.indexOf('\n');
+        if (newline === -1) return;
+        const message = JSON.parse(buffered.slice(0, newline)) as { id?: RpcId; method?: string };
+        if (connections > 1 && message.method === 'initialize' && message.id !== undefined) {
+          socket.write(`${JSON.stringify({ id: message.id, result: {} })}\n`);
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      listener.once('error', reject);
+      listener.listen(socketPath, resolve);
+    });
+    const client = new CodexAppServerSocketClient({ socketPath, requestTimeoutMs: 100 });
+    try {
+      await expect(client.start()).rejects.toThrow('APP_SERVER_REQUEST_TIMEOUT');
+      await expect(client.start()).resolves.toBeUndefined();
+      expect(client.generation).toBe(1);
+      expect(connections).toBeGreaterThanOrEqual(2);
+    } finally {
+      await client.stop();
+      await new Promise<void>((resolve, reject) =>
+        listener.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+  });
+
   it('hard-caps retained event count and serialized event bytes', () => {
     const environment = {
       CODEX_WEB_ADMIN_USERNAME: 'owner',
@@ -398,6 +494,19 @@ describe('security and repository boundary', () => {
       loadConfig({ ...environment, CODEX_WEB_EVENT_RETENTION_PER_THREAD: '1001' }),
     ).toThrow();
     expect(() => loadConfig({ ...environment, CODEX_WEB_MAX_EVENT_BYTES: '32769' })).toThrow();
+    expect(
+      loadConfig({
+        ...environment,
+        CODEX_WEB_APP_SERVER_SOCKET: '/run/codex-web-ui/app-server.sock',
+      }),
+    ).toMatchObject({ appServerSocket: '/run/codex-web-ui/app-server.sock' });
+    expect(() =>
+      loadConfig({
+        ...environment,
+        CODEX_WEB_APP_SERVER_SOCKET: '/run/codex-web-ui/app-server.sock',
+        CODEX_HOME: '/srv/codex-home',
+      }),
+    ).toThrow('CODEX_HOME must not be provided to the API');
   });
 
   it('requires exact Origin and persists only hashed session tokens', async () => {

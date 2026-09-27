@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Web UI private app-server socket
+
+[Socket]
+ListenStream=/run/codex-web-ui/app-server.sock
+Accept=yes
+SocketUser=codex-web-ui-api
+SocketGroup=codex-web-ui
+SocketMode=0600
+DirectoryMode=0755
+RemoveOnStop=yes
+MaxConnections=1
+
+[Install]
+WantedBy=sockets.target

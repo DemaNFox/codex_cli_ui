@@ -1,12 +1,14 @@
 [Unit]
 Description=Codex Web UI (%i)
 After=network-online.target
+After=codex-web-ui-app-server.socket
 Wants=network-online.target
 Wants=codex-web-ui-storage-guard@%i.timer
+Requires=codex-web-ui-app-server.socket
 
 [Service]
 Type=simple
-User=%i
+User=codex-web-ui-api
 WorkingDirectory=/opt/codex-web-ui/current
 Environment=NODE_ENV=production
 EnvironmentFile=/etc/codex-web-ui/codex-web-ui.env
@@ -17,7 +19,7 @@ RestartSec=5s
 TimeoutStartSec=45s
 TimeoutStopSec=30s
 KillMode=control-group
-UMask=0077
+UMask=0027
 
 # Shared-host capacity boundary. The project runner adds its own per-turn limits.
 CPUQuota=300%
@@ -54,11 +56,10 @@ LockPersonality=yes
 SystemCallArchitectures=native
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
-# Project roots and CODEX_HOME are added as canonical ReadWritePaths by the
-# installer in an instance-specific drop-in. Product runtime and container
-# control paths remain unavailable even for the full-access Codex preset.
-ReadWritePaths=/var/lib/codex-web-ui
-InaccessiblePaths=-/root -/run/docker.sock -/run/containerd -/opt/git -/opt/nikita -/opt/ai-chat-platform -/opt/ai-chat-live-dev -/opt/ai-chat-data -/opt/ai-chat-deploy-state -/opt/ai-chat-agent-release -/opt/ai-chat-agent-tools -/opt/ai-chat-agents/state -/opt/ai-chat-agents/worktrees -/opt/tg -/opt/chateval
+# The API owns only its database and attachment state. Project roots remain
+# readable for canonical-path validation, while Codex credentials are hidden.
+ReadWritePaths=/var/lib/codex-web-ui/data
+InaccessiblePaths=-/etc/codex-web-ui/codex-runner.env -/var/lib/codex-web-ui/previous-release -/var/lib/codex-web-ui/codex-home -/root -/run/docker.sock -/run/containerd
 
 StandardOutput=journal
 StandardError=journal

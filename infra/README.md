@@ -5,6 +5,33 @@ Node.js service behind an HTTPS Nginx edge. They do not deploy automatically and
 they never copy `CODEX_HOME`, Codex authentication, project `.env` files, product
 runtime secrets, Docker access or deployment credentials.
 
+## Portable installation
+
+The normal path is `./install.sh` from a clean Git checkout. It builds an
+architecture-specific checksummed package without root, then invokes the root
+installer only for system integration. The runner defaults to the `sudo` caller,
+so its existing Codex login is reused without copying credentials:
+
+```sh
+corepack pnpm install --frozen-lockfile
+./install.sh \
+  --public-origin https://codex.example.com \
+  --external-proxy \
+  --project-root /srv/codex-projects
+```
+
+For a dedicated Nginx edge, replace `--external-proxy` with existing
+`--tls-cert` and `--tls-key` paths. The private key must be root-owned `0600`
+and the certificate must cover the origin hostname. Installations fail closed
+on an unsupported OS/architecture, Node/Codex version mismatch, missing Codex
+login, package checksum mismatch, unsafe Codex ownership, or public plaintext
+configuration. Use `--upgrade` explicitly to preserve the existing admin config
+while switching to a new immutable release.
+
+The API runs as `codex-web-ui-api`; Codex runs as the selected existing user.
+They communicate only through `/run/codex-web-ui/app-server.sock`. Web secrets
+and runner settings are separate root-owned `0600` files.
+
 ## Assumptions
 
 - Ubuntu with systemd, Nginx, Node.js 22+, Python 3, `curl`, and the pinned Codex
@@ -91,14 +118,24 @@ Use a dedicated Web UI `CODEX_HOME` inside the bounded state directory; do not
 reuse an unbounded agent home. The systemd unit separately places `/tmp` and
 `/var/tmp` on byte- and inode-bounded tmpfs mounts charged to the service cgroup.
 
-## Safe installation sequence
+## Legacy manual scripts
+
+`install-ubuntu.sh`, `update-ubuntu.sh` and `rollback-ubuntu.sh` are retained as
+historical low-level assets for the original single-identity deployment. They
+do not install the isolated socket/runner topology and must not be used for a
+new portable installation or upgrade. `install.sh` and
+`scripts/install-package.sh` are the supported lifecycle entry points.
+
+The following steps describe the underlying controls for maintainers, not an
+alternative installation path:
 
 1. Build a verified minimal release outside `CODEX_HOME` with
    `scripts/prepare-release.sh --output /absolute/new/release-directory`. The
    command runs the full repository gate and produces only the production
    backend dependency closure plus the compiled web assets. Ensure the output
    contains no `.env`, database, Codex state or escaping symlink.
-2. Run `scripts/install-ubuntu.sh` without `--start`. It creates no credentials.
+2. Let `install.sh` assemble and activate that release; use `--no-start` on a
+   shared host until hard byte/inode storage bounds have been established.
 3. Populate `/etc/codex-web-ui/codex-web-ui.env` through a protected channel;
    keep it `root:root 0600`.
 4. Install the bounded storage boundary described above before exposing the
@@ -120,8 +157,8 @@ reuse an unbounded agent home. The systemd unit separately places `/tmp` and
    On a shared host where ports 80/443 are already owned, pass distinct
    `--http-port` and `--https-port` values and include the HTTPS port in
    `CODEX_WEB_PUBLIC_ORIGIN`.
-8. Start `codex-web-ui@USER.service` and run
-   `sudo scripts/health-check.sh`. The check needs root only to read the
+8. Start `codex-web-ui@api.service` plus the private app-server socket and run
+   `sudo scripts/health-check.sh --service-user api`. The check needs root only to read the
    protected environment and never prints secret values.
 
 Updates atomically switch `current`, restart the service, and automatically

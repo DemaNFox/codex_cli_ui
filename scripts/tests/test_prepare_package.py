@@ -1,0 +1,154 @@
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "scripts/prepare-package.sh"
+
+
+def find_bash() -> str | None:
+    windows_git_bash = Path(r"C:\Program Files\Git\bin\bash.exe")
+    if os.name == "nt" and windows_git_bash.exists():
+        return str(windows_git_bash)
+    found = shutil.which("bash")
+    if found:
+        return found
+    return str(windows_git_bash) if windows_git_bash.exists() else None
+
+
+def shell_path(path: Path) -> str:
+    resolved = str(path.resolve())
+    if os.name == "nt":
+        drive, rest = os.path.splitdrive(resolved)
+        return f"/{drive[0].lower()}{rest.replace(os.sep, '/')}"
+    return resolved
+
+
+class PreparePackageTest(unittest.TestCase):
+    def setUp(self) -> None:
+        bash = find_bash()
+        if bash is None:
+            self.skipTest("bash is not available")
+        self.bash = bash
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name) / "package"
+        self._write_fixture("x64")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _write_fixture(self, arch: str) -> None:
+        files = {
+            "install.sh": "#!/usr/bin/env bash\n",
+            "scripts/install-package.sh": "#!/usr/bin/env bash\n",
+            "apps/server/dist/index.js": "console.log('server');\n",
+            "apps/web/dist/index.html": "<!doctype html>\n",
+            "infra/release-manifest.schema.json": "{}\n",
+        }
+        binary_names = (
+            ("argon2.glibc.node", "argon2.musl.node")
+            if arch == "x64"
+            else ("argon2.armv8.glibc.node", "argon2.armv8.musl.node")
+        )
+        for name in binary_names:
+            files[f"apps/server/node_modules/argon2/prebuilds/linux-{arch}/{name}"] = name
+        for relative, content in files.items():
+            path = self.root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8", newline="\n")
+        manifest = {
+            "schemaVersion": 1,
+            "name": "codex-web-ui",
+            "version": "0.1.0",
+            "gitRevision": "a" * 40,
+            "target": {"platform": "linux", "architecture": arch},
+            "runtime": {
+                "node": {"major": 22, "range": ">=22 <23"},
+                "codex": {"versionPin": "codex-cli 0.153.4"},
+                "nativeModules": {
+                    "argon2": {
+                        "version": "0.44.0",
+                        "prebuildDirectory": f"prebuilds/linux-{arch}",
+                        "libc": ["glibc", "musl"],
+                    }
+                },
+            },
+            "configSchemaVersion": 1,
+            "checksumAlgorithm": "sha256",
+        }
+        (self.root / "release.json").write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8", newline="\n"
+        )
+        self._write_checksums()
+
+    def _write_checksums(self) -> None:
+        files = sorted(path for path in self.root.rglob("*") if path.is_file() and path.name != "SHA256SUMS")
+        content = "".join(
+            f"{hashlib.sha256(path.read_bytes()).hexdigest()}  ./{path.relative_to(self.root).as_posix()}\n"
+            for path in files
+        )
+        (self.root / "SHA256SUMS").write_text(content, encoding="utf-8", newline="\n")
+
+    def _verify(self, arch: str = "linux-x64") -> subprocess.CompletedProcess[str]:
+        environment = os.environ.copy()
+        if os.name == "nt":
+            environment["PYTHON_BIN"] = shell_path(Path(os.sys.executable))
+        return subprocess.run(
+            [self.bash, shell_path(SCRIPT), "--verify", shell_path(self.root), "--arch", arch],
+            text=True,
+            capture_output=True,
+            check=False,
+            env=environment,
+        )
+
+    def test_complete_inventory_verifies_without_root(self) -> None:
+        result = self._verify()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Verified portable package", result.stdout)
+
+    def test_tampered_payload_is_rejected(self) -> None:
+        (self.root / "apps/server/dist/index.js").write_text("tampered\n", encoding="utf-8")
+        result = self._verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("checksum mismatch", result.stderr)
+
+    def test_unlisted_inventory_file_is_rejected(self) -> None:
+        (self.root / "unexpected.txt").write_text("not inventoried\n", encoding="utf-8")
+        result = self._verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("inventory mismatch", result.stderr)
+
+    def test_wrong_architecture_is_rejected(self) -> None:
+        result = self._verify("linux-arm64")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match requested", result.stderr)
+
+    def test_forbidden_runtime_file_is_rejected_even_if_inventoried(self) -> None:
+        (self.root / ".env").write_text("SECRET=value\n", encoding="utf-8")
+        self._write_checksums()
+        result = self._verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("forbidden sensitive/runtime file", result.stderr)
+
+    def test_escaping_symlink_is_rejected(self) -> None:
+        outside = Path(self.temporary.name) / "outside.txt"
+        outside.write_text("outside\n", encoding="utf-8")
+        link = self.root / "escape"
+        try:
+            link.symlink_to(outside)
+        except OSError as error:
+            self.skipTest(f"symlinks are unavailable: {error}")
+        result = self._verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("broken or escaping symlink", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -3,22 +3,65 @@
 set -euo pipefail
 
 config=${CODEX_WEB_CONFIG:-/etc/codex-web-ui/codex-web-ui.env}
-exec python3 - "$config" <<'PY'
+python_args=("$config")
+if [[ ${1:-} == --check-admin-hash ]]; then
+  python_args=("$@")
+fi
+exec python3 - "${python_args[@]}" <<'PY'
 from __future__ import annotations
 
+import base64
+import binascii
 import os
 import pathlib
 import re
 import shlex
 import shutil
 import stat
-import subprocess
 import sys
 
 
 def fail(message: str) -> None:
     print(message, file=sys.stderr)
     raise SystemExit(1)
+
+
+def validate_admin_hash(encoded_hash: str) -> None:
+    hash_match = re.fullmatch(
+        r"\$argon2id\$v=([0-9]+)\$m=([0-9]+),t=([0-9]+),p=([0-9]+)"
+        r"\$([A-Za-z0-9+/]+)\$([A-Za-z0-9+/]+)",
+        encoded_hash,
+    )
+    if not hash_match:
+        fail("admin password hash must be a valid Argon2id PHC string")
+    version, memory, iterations, parallelism = map(int, hash_match.group(1, 2, 3, 4))
+    if version != 19:
+        fail("admin password hash must use Argon2 version 19")
+    if not 65536 <= memory <= 262144:
+        fail("admin password hash memory cost must be between 65536 and 262144 KiB")
+    if not 3 <= iterations <= 6:
+        fail("admin password hash time cost must be between 3 and 6")
+    if not 1 <= parallelism <= 4:
+        fail("admin password hash parallelism must be between 1 and 4")
+
+    def decoded_length(value: str, label: str) -> int:
+        try:
+            decoded = base64.b64decode(value + "=" * (-len(value) % 4), validate=True)
+        except (ValueError, binascii.Error):
+            fail(f"admin password hash has invalid {label} encoding")
+        return len(decoded)
+
+    if not 16 <= decoded_length(hash_match.group(5), "salt") <= 64:
+        fail("admin password hash salt must contain 16-64 bytes")
+    if not 32 <= decoded_length(hash_match.group(6), "digest") <= 64:
+        fail("admin password hash digest must contain 32-64 bytes")
+
+
+if sys.argv[1:2] == ["--check-admin-hash"]:
+    if len(sys.argv) != 3:
+        fail("--check-admin-hash requires exactly one PHC string")
+    validate_admin_hash(sys.argv[2])
+    raise SystemExit(0)
 
 
 values: dict[str, str] = {}
@@ -57,8 +100,8 @@ required = (
     "CODEX_WEB_PUBLIC_ORIGIN",
     "CODEX_WEB_DATABASE_PATH",
     "CODEX_WEB_PROJECT_ROOTS",
-    "CODEX_BIN",
-    "CODEX_HOME",
+    "CODEX_WEB_ATTACHMENT_STORAGE_PATH",
+    "CODEX_WEB_APP_SERVER_SOCKET",
     "CODEX_WEB_CODEX_VERSION_PIN",
     "CODEX_WEB_ADMIN_USERNAME",
     "CODEX_WEB_ADMIN_PASSWORD_HASH",
@@ -81,22 +124,19 @@ if not 1024 <= port <= 65535:
     fail("invalid CODEX_WEB_PORT")
 if not re.fullmatch(r"https://[^/]+", values["CODEX_WEB_PUBLIC_ORIGIN"]):
     fail("CODEX_WEB_PUBLIC_ORIGIN must be one HTTPS origin without a path")
+if values.get("CODEX_WEB_COOKIE_SECURE", "true") != "true":
+    fail("CODEX_WEB_COOKIE_SECURE must remain true")
 if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", values["CODEX_WEB_ADMIN_USERNAME"]):
     fail("invalid admin username")
-if not values["CODEX_WEB_ADMIN_PASSWORD_HASH"].startswith("$argon2id$"):
-    fail("admin password must be stored as an Argon2id encoded hash")
+validate_admin_hash(values["CODEX_WEB_ADMIN_PASSWORD_HASH"])
 if not re.fullmatch(r"[A-Za-z0-9_-]{43,256}", values["CODEX_WEB_SESSION_SECRET"]):
     fail("session secret must be 43-256 base64url characters")
 
-for name in ("CODEX_WEB_DATABASE_PATH", "CODEX_BIN", "CODEX_HOME"):
+for name in ("CODEX_WEB_DATABASE_PATH", "CODEX_WEB_ATTACHMENT_STORAGE_PATH", "CODEX_WEB_APP_SERVER_SOCKET"):
     if not pathlib.Path(values[name]).is_absolute():
         fail(f"{name} must be absolute")
-codex_bin = pathlib.Path(values["CODEX_BIN"])
-codex_home = pathlib.Path(values["CODEX_HOME"])
-if not codex_bin.is_file() or not os.access(codex_bin, os.X_OK):
-    fail("CODEX_BIN is not executable")
-if not codex_home.is_dir() or codex_home.is_symlink():
-    fail("CODEX_HOME must be a real directory")
+if values["CODEX_WEB_APP_SERVER_SOCKET"] != "/run/codex-web-ui/app-server.sock":
+    fail("CODEX_WEB_APP_SERVER_SOCKET must use the protected systemd socket")
 
 
 def positive_integer(name: str) -> int:
@@ -130,20 +170,6 @@ if database.exists() or database.is_symlink():
         fail("database path must be a regular non-symlink file")
     if database_info.st_size > maximum_database:
         fail("database exceeds CODEX_WEB_MAX_DATABASE_BYTES")
-try:
-    result = subprocess.run(
-        [str(codex_bin), "--version"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=10,
-        check=False,
-    )
-except (OSError, subprocess.TimeoutExpired):
-    fail("unable to execute CODEX_BIN --version")
-if result.returncode or result.stdout.strip() != values["CODEX_WEB_CODEX_VERSION_PIN"]:
-    fail("Codex version does not match CODEX_WEB_CODEX_VERSION_PIN")
-
 roots = values["CODEX_WEB_PROJECT_ROOTS"].split(",")
 if not roots or any(not root for root in roots):
     fail("at least one project root is required")

@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://codex-web-ui.invalid/schemas/release-manifest.schema.json",
+  "title": "Codex Web UI portable release manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "name",
+    "version",
+    "gitRevision",
+    "target",
+    "runtime",
+    "configSchemaVersion",
+    "checksumAlgorithm"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "name": { "const": "codex-web-ui" },
+    "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "gitRevision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["platform", "architecture"],
+      "properties": {
+        "platform": { "const": "linux" },
+        "architecture": { "enum": ["x64", "arm64"] }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["node", "codex", "nativeModules"],
+      "properties": {
+        "node": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["major", "range"],
+          "properties": {
+            "major": { "const": 22 },
+            "range": { "const": ">=22 <23" }
+          }
+        },
+        "codex": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["versionPin"],
+          "properties": {
+            "versionPin": { "type": "string", "pattern": "^codex-cli [0-9]+\\.[0-9]+\\.[0-9]+$" }
+          }
+        },
+        "nativeModules": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["argon2"],
+          "properties": {
+            "argon2": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["version", "prebuildDirectory", "libc"],
+              "properties": {
+                "version": { "const": "0.44.0" },
+                "prebuildDirectory": {
+                  "enum": ["prebuilds/linux-x64", "prebuilds/linux-arm64"]
+                },
+                "libc": {
+                  "type": "array",
+                  "prefixItems": [{ "const": "glibc" }, { "const": "musl" }],
+                  "items": false,
+                  "minItems": 2,
+                  "maxItems": 2
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "configSchemaVersion": { "const": 1 },
+    "checksumAlgorithm": { "const": "sha256" }
+  }
+}

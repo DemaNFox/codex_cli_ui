@@ -7,17 +7,20 @@ Build a portable standalone service around the official Codex app-server protoco
 ```text
 Browser
   -> reverse proxy with TLS and request limits
-    -> Node.js API: login, projects, threads, turns, approvals, SSE
+    -> Node.js API (codex-web-ui-api): login, projects, threads, turns, approvals, SSE
       -> SQLite: UI metadata, sessions, audit and bounded event journal
-      -> Codex supervisor
-        -> codex app-server --listen stdio://
+      -> root-created mode-0600 Unix socket
+        -> isolated runner identity -> codex app-server --listen stdio://
           -> configured CODEX_HOME
           -> allowlisted project roots
 ```
 
 ## Runtime ownership
 
-- One backend process owns one long-lived app-server child and restarts it with bounded backoff.
+- The API owns one bounded Unix-socket client. systemd starts the app-server under the configured,
+  already authenticated runner identity and restarts each accepted connection independently.
+- The API cannot read `CODEX_HOME` or the runner environment. The runner cannot read the Web login/session
+  environment or SQLite; it receives read-only attachment access and explicit project/Codex-home paths.
 - JSON-RPC requests are correlated by generated numeric IDs. Server-initiated approval and input requests are recorded as pending UI actions.
 - The backend projects safe, normalized events to per-thread SSE streams. Reconnect uses the last event ID and the durable event journal.
 - Codex rollout files remain the source of truth for Codex conversation history. SQLite stores the local project registry, thread-to-project mapping, UI metadata, sessions, audit records and a bounded reconnect journal.
@@ -50,7 +53,7 @@ The service does not add sudo, root, Docker socket, product secrets, or deployme
 
 All executable source, database migrations, protocol snapshots, service templates, installer scripts and
 required custom skills live in this repository. Host-specific absolute paths and credentials live only in
-the protected environment file. Installation fails closed when the installed Codex CLI does not match a
+separate protected Web and runner environment files. Installation fails closed when the installed Codex CLI does not match a
 checked-in compatible protocol snapshot.
 
 Deployment secrets are kept in a root-owned `0600` environment file. systemd

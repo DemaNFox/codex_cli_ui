@@ -243,7 +243,7 @@ export class AttachmentStore {
 
   constructor(root: string) {
     const resolved = path.resolve(root);
-    mkdirSync(resolved, { recursive: true, mode: 0o700 });
+    mkdirSync(resolved, { recursive: true, mode: 0o750 });
     this.root = realpathSync(resolved);
   }
 
@@ -296,10 +296,10 @@ export class AttachmentStore {
     const id = randomUUID();
     const storageName = this.storageName(id, name);
     const directory = path.dirname(this.localPath(projectId, threadId, storageName));
-    await mkdir(directory, { recursive: true, mode: 0o700 });
+    await mkdir(directory, { recursive: true, mode: 0o750 });
     const canonicalDirectory = await realpath(directory);
     this.assertContained(canonicalDirectory);
-    await writeFile(path.join(canonicalDirectory, storageName), bytes, { flag: 'wx', mode: 0o600 });
+    await writeFile(path.join(canonicalDirectory, storageName), bytes, { flag: 'wx', mode: 0o640 });
     return { id, storageName };
   }
 

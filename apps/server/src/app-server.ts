@@ -1,9 +1,11 @@
 import { EventEmitter } from 'node:events';
 import { execFile, spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { createInterface } from 'node:readline';
+import { createConnection, type Socket } from 'node:net';
+import type { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
+const MAX_RPC_LINE_BYTES = 1_048_576;
 
 const CODEX_ENV_ALLOWLIST = new Set([
   'PATH',
@@ -110,6 +112,42 @@ function parseInbound(value: unknown): AppServerInbound | JsonRpcResponse | null
   return null;
 }
 
+function attachBoundedLineReader(
+  stream: Readable,
+  consume: (line: string) => void,
+  reject: () => void,
+): () => void {
+  let buffered: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+  let rejected = false;
+  const rejectOnce = () => {
+    if (rejected) return;
+    rejected = true;
+    reject();
+  };
+  const onData = (chunk: Buffer | string) => {
+    if (rejected) return;
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    buffered = buffered.length === 0 ? bytes : Buffer.concat([buffered, bytes]);
+    while (true) {
+      const newline = buffered.indexOf(0x0a);
+      if (newline === -1) break;
+      const hasCarriageReturn = newline > 0 && buffered[newline - 1] === 0x0d;
+      if (newline - (hasCarriageReturn ? 1 : 0) > MAX_RPC_LINE_BYTES) {
+        rejectOnce();
+        return;
+      }
+      let line = buffered.subarray(0, newline);
+      buffered = buffered.subarray(newline + 1);
+      if (line.at(-1) === 0x0d) line = line.subarray(0, -1);
+      consume(line.toString('utf8'));
+      if (rejected) return;
+    }
+    if (buffered.length > MAX_RPC_LINE_BYTES) rejectOnce();
+  };
+  stream.on('data', onData);
+  return () => stream.off('data', onData);
+}
+
 export interface SupervisorOptions {
   readonly executable: string;
   readonly codexHome?: string;
@@ -127,6 +165,7 @@ export class CodexAppServerSupervisor implements AppServerClient {
   private restartTimer: NodeJS.Timeout | null = null;
   private initialized = false;
   private currentGeneration = 0;
+  private detachLineReader: (() => void) | null = null;
 
   constructor(private readonly options: SupervisorOptions) {}
 
@@ -159,6 +198,8 @@ export class CodexAppServerSupervisor implements AppServerClient {
     const child = this.child;
     this.child = null;
     this.initialized = false;
+    this.detachLineReader?.();
+    this.detachLineReader = null;
     if (!child || child.exitCode !== null) return;
     await new Promise<void>((resolve) => {
       const timer = setTimeout(() => child.kill('SIGKILL'), 3_000);
@@ -202,12 +243,16 @@ export class CodexAppServerSupervisor implements AppServerClient {
     });
     this.child = child;
     this.initialized = false;
-    const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
-    lines.on('line', (line) => this.consumeLine(line));
+    this.detachLineReader = attachBoundedLineReader(
+      child.stdout,
+      (line) => this.consumeLine(line),
+      () => child.kill('SIGKILL'),
+    );
     // Drain stderr without persisting it: app-server diagnostics may contain private paths.
     child.stderr.on('data', () => undefined);
     child.once('exit', () => {
-      lines.close();
+      this.detachLineReader?.();
+      this.detachLineReader = null;
       if (this.child === child) this.child = null;
       this.initialized = false;
       this.rejectAll(new Error('APP_SERVER_EXITED'));
@@ -225,6 +270,7 @@ export class CodexAppServerSupervisor implements AppServerClient {
   }
 
   private scheduleRestart(): void {
+    if (this.restartTimer || this.stopping) return;
     const delay = Math.min(30_000, 500 * 2 ** Math.min(this.restartAttempt++, 6));
     this.restartTimer = setTimeout(() => {
       this.restartTimer = null;
@@ -257,7 +303,7 @@ export class CodexAppServerSupervisor implements AppServerClient {
   }
 
   private consumeLine(line: string): void {
-    if (Buffer.byteLength(line) > 1_048_576) {
+    if (Buffer.byteLength(line) > MAX_RPC_LINE_BYTES) {
       this.child?.kill('SIGKILL');
       return;
     }
@@ -266,6 +312,204 @@ export class CodexAppServerSupervisor implements AppServerClient {
       decoded = JSON.parse(line) as unknown;
     } catch {
       this.child?.kill('SIGKILL');
+      return;
+    }
+    const message = parseInbound(decoded);
+    if (!message) return;
+    if ('method' in message) {
+      this.events.emit('message', message);
+      return;
+    }
+    const pending = this.pending.get(message.id);
+    if (!pending) return;
+    clearTimeout(pending.timeout);
+    this.pending.delete(message.id);
+    if (message.error) {
+      pending.reject(new Error('APP_SERVER_REQUEST_FAILED'));
+    } else {
+      pending.resolve(message.result);
+    }
+  }
+
+  private rejectAll(error: Error): void {
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+    }
+    this.pending.clear();
+  }
+}
+
+export interface SocketClientOptions {
+  readonly socketPath: string;
+  readonly requestTimeoutMs?: number;
+}
+
+export class CodexAppServerSocketClient implements AppServerClient {
+  private socket: Socket | null = null;
+  private nextId = 1;
+  private readonly pending = new Map<RpcId, PendingRequest>();
+  private readonly events = new EventEmitter();
+  private stopping = false;
+  private restartAttempt = 0;
+  private restartTimer: NodeJS.Timeout | null = null;
+  private initialized = false;
+  private currentGeneration = 0;
+  private detachLineReader: (() => void) | null = null;
+
+  constructor(private readonly options: SocketClientOptions) {}
+
+  get ready(): boolean {
+    return this.socket !== null && !this.socket.destroyed && this.initialized;
+  }
+
+  get generation(): number {
+    return this.currentGeneration;
+  }
+
+  async start(): Promise<void> {
+    this.stopping = false;
+    try {
+      await this.connectAndInitialize();
+    } catch (error) {
+      this.scheduleRestart();
+      throw error;
+    }
+  }
+
+  async stop(): Promise<void> {
+    this.stopping = true;
+    if (this.restartTimer) clearTimeout(this.restartTimer);
+    this.restartTimer = null;
+    this.rejectAll(new Error('APP_SERVER_STOPPED'));
+    const socket = this.socket;
+    this.socket = null;
+    this.initialized = false;
+    this.detachLineReader?.();
+    this.detachLineReader = null;
+    if (!socket || socket.destroyed) return;
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => socket.destroy(), 3_000);
+      socket.once('close', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      socket.end();
+    });
+  }
+
+  subscribe(listener: (message: AppServerInbound) => void): () => void {
+    this.events.on('message', listener);
+    return () => this.events.off('message', listener);
+  }
+
+  async request(method: string, params: unknown): Promise<unknown> {
+    if (!ALLOWED_REQUESTS.has(method)) throw new Error('APP_SERVER_METHOD_NOT_ALLOWED');
+    if (!this.ready) throw new Error('APP_SERVER_UNAVAILABLE');
+    return this.sendRequest(method, params);
+  }
+
+  respond(id: RpcId, result: unknown): void {
+    this.write({ id, result });
+  }
+
+  respondError(id: RpcId, code: number, message: string): void {
+    this.write({ id, error: { code, message } });
+  }
+
+  private async connectAndInitialize(): Promise<void> {
+    if (this.socket) return;
+    const socket = createConnection(this.options.socketPath);
+    await new Promise<void>((resolve, reject) => {
+      const onConnect = () => {
+        socket.off('error', onError);
+        resolve();
+      };
+      const onError = (error: Error) => {
+        socket.off('connect', onConnect);
+        reject(error);
+      };
+      socket.once('connect', onConnect);
+      socket.once('error', onError);
+    });
+    socket.on('error', () => undefined);
+    this.socket = socket;
+    this.initialized = false;
+    this.detachLineReader = attachBoundedLineReader(
+      socket,
+      (line) => this.consumeLine(line),
+      () => socket.destroy(),
+    );
+    socket.once('close', () => {
+      if (this.socket !== socket) return;
+      this.detachLineReader?.();
+      this.detachLineReader = null;
+      this.socket = null;
+      this.initialized = false;
+      this.rejectAll(new Error('APP_SERVER_EXITED'));
+      this.scheduleRestart();
+    });
+
+    try {
+      await this.sendRequest('initialize', INITIALIZE_PARAMS);
+      this.write(INITIALIZED_NOTIFICATION);
+      this.initialized = true;
+      this.currentGeneration += 1;
+      this.restartAttempt = 0;
+    } catch (error) {
+      if (this.socket === socket) this.socket = null;
+      this.detachLineReader?.();
+      this.detachLineReader = null;
+      this.initialized = false;
+      socket.destroy();
+      this.rejectAll(new Error('APP_SERVER_INITIALIZE_FAILED'));
+      throw error;
+    }
+  }
+
+  private scheduleRestart(): void {
+    if (this.restartTimer || this.stopping) return;
+    const delay = Math.min(30_000, 500 * 2 ** Math.min(this.restartAttempt++, 6));
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      void this.connectAndInitialize().catch(() => this.scheduleRestart());
+    }, delay);
+    this.restartTimer.unref();
+  }
+
+  private sendRequest(method: string, params: unknown): Promise<unknown> {
+    const id = this.nextId++;
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error('APP_SERVER_REQUEST_TIMEOUT'));
+      }, this.options.requestTimeoutMs ?? 30_000);
+      this.pending.set(id, { resolve, reject, timeout });
+      try {
+        this.write({ method, id, params });
+      } catch (error) {
+        clearTimeout(timeout);
+        this.pending.delete(id);
+        reject(error instanceof Error ? error : new Error('APP_SERVER_WRITE_FAILED'));
+      }
+    });
+  }
+
+  private write(value: unknown): void {
+    if (!this.socket?.writable) throw new Error('APP_SERVER_UNAVAILABLE');
+    this.socket.write(`${JSON.stringify(value)}\n`);
+  }
+
+  private consumeLine(line: string): void {
+    if (Buffer.byteLength(line) > MAX_RPC_LINE_BYTES) {
+      this.socket?.destroy();
+      return;
+    }
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(line) as unknown;
+    } catch {
+      this.socket?.destroy();
       return;
     }
     const message = parseInbound(decoded);

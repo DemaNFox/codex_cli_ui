@@ -14,6 +14,7 @@ const envSchema = z.object({
   CODEX_WEB_PROJECT_ROOTS: z.string().min(1),
   CODEX_BIN: z.string().min(1).default('codex'),
   CODEX_HOME: z.string().min(1).optional(),
+  CODEX_WEB_APP_SERVER_SOCKET: z.string().startsWith('/').optional(),
   CODEX_WEB_CODEX_VERSION_PIN: z.string().regex(/^codex-cli \d+\.\d+\.\d+$/),
   CODEX_WEB_COOKIE_SECURE: z.enum(['true', 'false']).default('true'),
   CODEX_WEB_EVENT_RETENTION_PER_THREAD: z.coerce.number().int().min(100).max(1_000).default(1_000),
@@ -34,6 +35,7 @@ export interface ServerConfig {
   readonly projectRoots: readonly string[];
   readonly codexBinary: string;
   readonly codexHome?: string;
+  readonly appServerSocket?: string;
   readonly codexVersionPin: string;
   readonly cookieSecure: boolean;
   readonly cookieName: string;
@@ -44,6 +46,9 @@ export interface ServerConfig {
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const parsed = envSchema.parse(env);
+  if (parsed.CODEX_WEB_APP_SERVER_SOCKET !== undefined && parsed.CODEX_HOME !== undefined) {
+    throw new Error('CODEX_HOME must not be provided to the API when socket isolation is enabled');
+  }
   const roots = parsed.CODEX_WEB_PROJECT_ROOTS.split(',')
     .map((root) => root.trim())
     .filter(Boolean);
@@ -64,6 +69,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     projectRoots: roots,
     codexBinary: parsed.CODEX_BIN,
     ...(parsed.CODEX_HOME === undefined ? {} : { codexHome: parsed.CODEX_HOME }),
+    ...(parsed.CODEX_WEB_APP_SERVER_SOCKET === undefined
+      ? {}
+      : { appServerSocket: parsed.CODEX_WEB_APP_SERVER_SOCKET }),
     codexVersionPin: parsed.CODEX_WEB_CODEX_VERSION_PIN,
     cookieSecure: parsed.CODEX_WEB_COOKIE_SECURE === 'true',
     cookieName: '__Host-codex_web_session',

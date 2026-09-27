@@ -32,7 +32,7 @@ while (($#)); do
 done
 
 require_root
-for command in nginx python3 install; do require_command "$command"; done
+for command in nginx openssl python3 install stat; do require_command "$command"; done
 [[ -n ${domain:-} && ${#domain} -le 253 ]] || die 'invalid domain'
 IFS='.' read -r -a domain_labels <<<"$domain"
 for label in "${domain_labels[@]}"; do
@@ -44,11 +44,46 @@ done
 [[ $http_port != "$https_port" ]] || die 'HTTP and HTTPS edge ports must differ'
 [[ ${tls_cert:-} = /* && $tls_cert =~ ^[A-Za-z0-9_./-]+$ ]] || die 'invalid TLS certificate path'
 [[ ${tls_key:-} = /* && $tls_key =~ ^[A-Za-z0-9_./-]+$ ]] || die 'invalid TLS key path'
-canonical_existing_file "$tls_cert" >/dev/null
-canonical_existing_file "$tls_key" >/dev/null
+tls_cert=$(canonical_existing_file "$tls_cert")
+tls_key=$(canonical_existing_file "$tls_key")
+[[ $(stat -c '%u' "$tls_key") == 0 ]] || die 'TLS private key must be owned by root'
+key_mode=$(stat -c '%a' "$tls_key")
+(( (8#$key_mode & 8#077) == 0 )) || die 'TLS private key must not be accessible by group or other users'
+openssl x509 -in "$tls_cert" -noout -checkend 86400 >/dev/null || die 'TLS certificate is invalid or expires within 24 hours'
+openssl x509 -in "$tls_cert" -noout -checkhost "$domain" >/dev/null || die 'TLS certificate does not cover the configured domain'
 
 target=/etc/nginx/sites-available/codex-web-ui.conf
+enabled=/etc/nginx/sites-enabled/codex-web-ui.conf
+[[ ! -e $target || -f $target && ! -L $target ]] || die 'existing Nginx target must be a regular non-symlink file'
+[[ ! -e $enabled || -L $enabled ]] || die 'existing enabled Nginx entry must be a symlink'
 temporary=$(mktemp /etc/nginx/sites-available/codex-web-ui.conf.XXXXXX)
+backup=$(mktemp /etc/nginx/sites-available/codex-web-ui.backup.XXXXXX)
+had_target=false
+previous_enabled=
+if [[ -f $target ]]; then
+  cp -a -- "$target" "$backup"
+  had_target=true
+fi
+if [[ -L $enabled ]]; then previous_enabled=$(readlink -- "$enabled"); fi
+
+rollback() {
+  local status=$?
+  trap - ERR
+  if $had_target; then
+    install -m 0644 "$backup" "$target"
+  else
+    rm -f -- "$target"
+  fi
+  if [[ -n $previous_enabled ]]; then
+    ln -sfn -- "$previous_enabled" "$enabled"
+  else
+    rm -f -- "$enabled"
+  fi
+  rm -f -- "$temporary" "$backup"
+  printf 'Nginx installation failed; previous configuration restored.\n' >&2
+  exit "$status"
+}
+trap rollback ERR
 DOMAIN=$domain TLS_CERT=$tls_cert TLS_KEY=$tls_key PORT=$port HTTP_PORT=$http_port HTTPS_PORT=$https_port \
   python3 - "$REPO_ROOT/infra/nginx/codex-web-ui.conf.template" "$temporary" <<'PY'
 import os
@@ -64,7 +99,9 @@ pathlib.Path(sys.argv[2]).write_text(source, encoding="utf-8")
 PY
 chmod 0644 "$temporary"
 mv -f -- "$temporary" "$target"
-ln -sfn -- "$target" /etc/nginx/sites-enabled/codex-web-ui.conf
+ln -sfn -- "$target" "$enabled"
 nginx -t
 if $reload; then systemctl reload nginx; fi
+trap - ERR
+rm -f -- "$backup"
 printf 'Installed and validated %s%s\n' "$target" "$($reload && printf ' (nginx reloaded)' || true)"

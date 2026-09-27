@@ -1,0 +1,56 @@
+[Unit]
+Description=Codex Web UI isolated app-server connection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex-web-ui-runner
+SupplementaryGroups=codex-web-ui
+WorkingDirectory=/opt/codex-web-ui/current
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/codex-web-ui/codex-runner.env
+ExecStart=/usr/local/libexec/codex-web-ui-run-app-server
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+SyslogIdentifier=codex-web-ui-app-server
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillMode=control-group
+UMask=0077
+
+CPUQuota=300%
+MemoryHigh=3G
+MemoryMax=4G
+MemorySwapMax=0
+TasksMax=512
+Nice=5
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=no
+TemporaryFileSystem=/tmp:rw,nosuid,nodev,size=1G,nr_inodes=16384,mode=1777
+TemporaryFileSystem=/var/tmp:rw,nosuid,nodev,size=1G,nr_inodes=16384,mode=1777
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+# The installer grants only canonical project roots and the runner CODEX_HOME
+# through a template drop-in. Attachments are readable as Codex inputs, while
+# website secrets, mutable database state and release-control state stay hidden.
+ReadOnlyPaths=-/var/lib/codex-web-ui/data/attachments
+InaccessiblePaths=-/etc/codex-web-ui/codex-web-ui.env -/var/lib/codex-web-ui/data/codex-web-ui.sqlite3 -/var/lib/codex-web-ui/data/codex-web-ui.sqlite3-wal -/var/lib/codex-web-ui/data/codex-web-ui.sqlite3-shm -/var/lib/codex-web-ui/previous-release -/root -/run/docker.sock -/run/containerd
