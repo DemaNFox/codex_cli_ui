@@ -603,7 +603,9 @@ describe('Codex routes', () => {
         params: { threadId, turnId: 'turn-1', delta },
       });
     }
-    expect(repository.listEvents(threadId, 0).filter((event) => event.kind === 'agent-message')).toEqual([]);
+    expect(
+      repository.listEvents(threadId, 0).filter((event) => event.kind === 'agent-message'),
+    ).toEqual([]);
     appServer.emit({
       method: 'item/completed',
       params: {
@@ -742,8 +744,10 @@ describe('Codex routes', () => {
     ] as const) {
       const upload = multipartFile(name, mediaType, Buffer.from('safe source text'));
       const response = await app.inject({
-        method: 'POST', url: `/api/threads/${threadId}/attachments`,
-        headers: { ...session.headers, 'content-type': upload.contentType }, payload: upload.body,
+        method: 'POST',
+        url: `/api/threads/${threadId}/attachments`,
+        headers: { ...session.headers, 'content-type': upload.contentType },
+        payload: upload.body,
       });
       expect(response.statusCode).toBe(201);
       expect(response.json()).toMatchObject({
@@ -752,8 +756,10 @@ describe('Codex routes', () => {
     }
     const executable = multipartFile('payload.exe', 'application/octet-stream', Buffer.from('MZ'));
     const rejected = await app.inject({
-      method: 'POST', url: `/api/threads/${threadId}/attachments`,
-      headers: { ...session.headers, 'content-type': executable.contentType }, payload: executable.body,
+      method: 'POST',
+      url: `/api/threads/${threadId}/attachments`,
+      headers: { ...session.headers, 'content-type': executable.contentType },
+      payload: executable.body,
     });
     expect(rejected.statusCode).toBe(415);
   });
