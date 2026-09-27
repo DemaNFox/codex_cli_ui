@@ -74,17 +74,17 @@ flowchart LR
 
 ## Entry points and attack surfaces
 
-| Surface               | How reached           | Boundary                   | Planned controls                                    |
-| --------------------- | --------------------- | -------------------------- | --------------------------------------------------- |
-| Login                 | Public HTTPS          | Internet to session        | Argon2id, throttling, lockout, generic errors       |
-| REST mutations        | Authenticated browser | Session to API             | CSRF, exact Origin, Zod, idempotency                |
-| SSE                   | Authenticated browser | API to browser             | Per-thread authorization, replay cursor, no secrets |
-| Markdown/diffs/output | Codex events          | Untrusted output to DOM    | text-safe rendering, no raw HTML, CSP               |
-| Project registration  | Admin form            | API to filesystem          | configured roots, realpath, symlink/path rejection  |
-| JSON-RPC              | Local child stdio     | API to Codex               | method/schema allowlist, IDs, size bounds           |
-| Attachment upload     | Authenticated browser | Browser to bounded storage | multipart/type/signature/size limits, opaque IDs    |
-| Attachment content    | Authenticated browser | Storage to browser         | thread ownership, `nosniff`, download non-images    |
-| Skills and rules      | Project/server files  | Filesystem to agent policy | pinned bundle, checksums, visible loaded sources    |
+| Surface               | How reached           | Boundary                   | Planned controls                                                         |
+| --------------------- | --------------------- | -------------------------- | ------------------------------------------------------------------------ |
+| Login                 | Public HTTPS          | Internet to session        | Argon2id, throttling, lockout, generic errors                            |
+| REST mutations        | Authenticated browser | Session to API             | CSRF, exact Origin, Zod, turn/action idempotency; bounded upload cleanup |
+| SSE                   | Authenticated browser | API to browser             | Per-thread authorization, replay cursor, no secrets                      |
+| Markdown/diffs/output | Codex events          | Untrusted output to DOM    | text-safe rendering, no raw HTML, CSP                                    |
+| Project registration  | Admin form            | API to filesystem          | configured roots, realpath, symlink/path rejection                       |
+| JSON-RPC              | Local child stdio     | API to Codex               | method/schema allowlist, IDs, size bounds                                |
+| Attachment upload     | Authenticated browser | Browser to bounded storage | multipart/type/signature/size limits, opaque IDs                         |
+| Attachment content    | Authenticated browser | Storage to browser         | thread ownership, `nosniff`, download non-images                         |
+| Skills and rules      | Project/server files  | Filesystem to agent policy | pinned bundle, checksums, visible loaded sources                         |
 
 ## Top abuse paths
 
@@ -102,21 +102,21 @@ flowchart LR
 
 ## Threat model table
 
-| ID     | Threat                                                 | Existing controls                                            | Required mitigation                                                                                                                             | Likelihood | Impact | Priority |
-| ------ | ------------------------------------------------------ | ------------------------------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------ | -------- |
-| TM-001 | Password/session compromise grants code execution      | Single owner, TLS planned                                    | Argon2id, strong secret, rate limit, lockout, rotation, audit; add TOTP/passkey later                                                           | medium     | high   | high     |
-| TM-002 | Stored/reflected XSS through model/tool output         | React escaping planned                                       | No raw HTML, strict CSP, safe Markdown, hostile-output tests                                                                                    | medium     | high   | high     |
-| TM-003 | Project path traversal or symlink escape               | Root allowlist planned                                       | `realpath` containment on registration and every execution, no client cwd                                                                       | medium     | high   | high     |
-| TM-004 | Codex/OpenAI or project secret leakage                 | Server-only Codex home                                       | Redaction, output bounds, no raw env/logging, isolated service user                                                                             | medium     | high   | high     |
-| TM-005 | CSRF or SSE authorization bypass                       | Same-site cookie planned                                     | Session-bound CSRF, Origin checks, per-thread authorization                                                                                     | medium     | high   | high     |
-| TM-006 | Resource exhaustion harms shared host                  | Service cgroup plus startup/update/periodic soft disk guards | Enforce host filesystem byte/inode quota or dedicated bounded volumes; retain concurrency queue, timeouts and process-group cancellation        | high       | high   | critical |
-| TM-007 | Skill/rule supply-chain tampering                      | Git-owned `AGENTS.md`                                        | Checksummed skill manifest, owner-only install, diagnostics and update audit                                                                    | medium     | high   | high     |
-| TM-008 | Approval confusion after reconnect/restart             | App-server request IDs                                       | Durable pending state, fail closed, reconcile active requests, never auto-approve                                                               | medium     | high   | high     |
-| TM-009 | Backend compromise reaches root/Docker/product secrets | None in new service yet                                      | Non-root user, inaccessible paths, no Docker socket, separate deploy broker                                                                     | low        | high   | high     |
-| TM-010 | Cross-thread attachment access or path traversal       | Authenticated thread routes                                  | Opaque IDs, thread ownership on every read/claim/delete, generated storage names, realpath containment, hostile-ID tests                        | medium     | high   | high     |
-| TM-011 | Hostile upload becomes browser or host execution       | React escaping, dedicated storage                            | Signature-check images, allowlisted types/extensions, `nosniff`, download non-images, never parse/execute/unzip in API                          | medium     | high   | high     |
-| TM-012 | Uploads exhaust shared-host resources                  | Bounded ext4 application volume and tmpfs                    | 20 MiB/file, 8/turn, 50 MiB/thread, edge/body timeout, bounded in-memory parsing with failed-write cleanup, existing byte/inode/resource limits | medium     | high   | high     |
-| TM-013 | Internal attachment path leaks through Codex events    | Safe normalized event projection                             | Ignore app-server `userMessage` item notifications; persist one backend-authored event with safe metadata; path-leak regression tests           | medium     | high   | high     |
+| ID     | Threat                                                 | Existing controls                                            | Required mitigation                                                                                                                                                              | Likelihood | Impact | Priority |
+| ------ | ------------------------------------------------------ | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | ------ | -------- |
+| TM-001 | Password/session compromise grants code execution      | Single owner, TLS planned                                    | Argon2id, strong secret, rate limit, lockout, rotation, audit; add TOTP/passkey later                                                                                            | medium     | high   | high     |
+| TM-002 | Stored/reflected XSS through model/tool output         | React escaping planned                                       | No raw HTML, strict CSP, safe Markdown, hostile-output tests                                                                                                                     | medium     | high   | high     |
+| TM-003 | Project path traversal or symlink escape               | Root allowlist planned                                       | `realpath` containment on registration and every execution, no client cwd                                                                                                        | medium     | high   | high     |
+| TM-004 | Codex/OpenAI or project secret leakage                 | Server-only Codex home                                       | Redaction, output bounds, no raw env/logging, isolated service user                                                                                                              | medium     | high   | high     |
+| TM-005 | CSRF or SSE authorization bypass                       | Same-site cookie planned                                     | Session-bound CSRF, Origin checks, per-thread authorization                                                                                                                      | medium     | high   | high     |
+| TM-006 | Resource exhaustion harms shared host                  | Service cgroup plus startup/update/periodic soft disk guards | Enforce host filesystem byte/inode quota or dedicated bounded volumes; retain concurrency queue, timeouts and process-group cancellation                                         | high       | high   | critical |
+| TM-007 | Skill/rule supply-chain tampering                      | Git-owned `AGENTS.md`                                        | Checksummed skill manifest, owner-only install, diagnostics and update audit                                                                                                     | medium     | high   | high     |
+| TM-008 | Approval confusion after reconnect/restart             | App-server request IDs                                       | Durable pending state, fail closed, reconcile active requests, never auto-approve                                                                                                | medium     | high   | high     |
+| TM-009 | Backend compromise reaches root/Docker/product secrets | None in new service yet                                      | Non-root user, inaccessible paths, no Docker socket, separate deploy broker                                                                                                      | low        | high   | high     |
+| TM-010 | Cross-thread attachment access or path traversal       | Authenticated thread routes                                  | Opaque IDs, thread ownership on every read/claim/delete, generated storage names, realpath containment, hostile-ID tests                                                         | medium     | high   | high     |
+| TM-011 | Hostile upload becomes browser or host execution       | React escaping, dedicated storage                            | Signature-check images, allowlisted types/extensions, `nosniff`, download non-images, never parse/execute/unzip in API                                                           | medium     | high   | high     |
+| TM-012 | Uploads exhaust shared-host resources                  | Bounded ext4 application volume and tmpfs                    | 20 MiB/file, 8/turn, 50 MiB/thread, edge/body timeout, bounded in-memory parsing with failed-write cleanup, existing byte/inode/resource limits                                  | medium     | high   | high     |
+| TM-013 | Internal attachment path leaks through Codex events    | Safe normalized event projection                             | Ignore live app-server `userMessage` items and fragmented agent deltas; publish redacted completed messages; persist one backend-authored user event; path-leak regression tests | medium     | high   | high     |
 
 ## Criticality calibration
 
@@ -148,3 +148,6 @@ flowchart LR
   projects and releases, plus bounded `/tmp` and `/var/tmp` tmpfs mounts. Portable installations must
   establish equivalent administrator-enforced byte and inode bounds; the disk monitor remains a secondary
   fail-closed control rather than the hard quota.
+- Attachment upload itself has no idempotency key. A lost upload response can temporarily create an unused
+  duplicate; reopening the chat removes unreferenced staged rows, and the 50 MiB thread ceiling bounds the
+  failure. An ambiguous `turn/start` claim remains unavailable rather than risking duplicate execution.
