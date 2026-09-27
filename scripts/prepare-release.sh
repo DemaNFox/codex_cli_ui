@@ -24,13 +24,18 @@ cd "$REPO_ROOT"
 pnpm install --frozen-lockfile
 pnpm verify
 mkdir -p "$output/apps"
-pnpm --filter @codex-web/server deploy --prod --legacy "$output/apps/server"
-self_link="$output/apps/server/node_modules/.pnpm/node_modules/@codex-web/server"
-[[ -L $self_link ]] || {
-  printf 'prepare-release: expected generated server self-link is missing\n' >&2
-  exit 1
+pnpm --filter @codex-web/server --config.inject-workspace-packages=true deploy --prod "$output/apps/server"
+SERVER_ROOT="$output/apps/server" node --input-type=module <<'JS'
+import { createRequire } from 'node:module';
+import path from 'node:path';
+
+const root = process.env.SERVER_ROOT;
+if (!root) throw new Error('SERVER_ROOT is required');
+const require = createRequire(path.join(root, 'package.json'));
+for (const dependency of ['@codex-web/contracts', '@fastify/cookie', 'argon2', 'fastify', 'zod']) {
+  require(dependency);
 }
-unlink -- "$self_link"
+JS
 mkdir -p "$output/apps/web"
 cp -a apps/web/dist "$output/apps/web/dist"
 

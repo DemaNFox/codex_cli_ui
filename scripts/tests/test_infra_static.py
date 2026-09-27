@@ -174,7 +174,9 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("/opt/codex-web-ui/releases/*", rollback_script)
         self.assertNotIn("rm -rf", install_script + update_script + rollback_script)
         self.assertIn('@codex-web/server', release_script)
-        self.assertIn('unlink -- "$self_link"', release_script)
+        self.assertIn('--config.inject-workspace-packages=true deploy --prod', release_script)
+        self.assertIn("'@codex-web/contracts', '@fastify/cookie', 'argon2', 'fastify', 'zod'", release_script)
+        self.assertNotIn('deploy --prod --legacy', release_script)
         self.assertIn('SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"', health_script)
 
     def test_runner_helper_requires_owned_pinned_codex_identity(self) -> None:

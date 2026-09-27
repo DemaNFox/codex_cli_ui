@@ -36,6 +36,11 @@ The API runs as `codex-web-ui-api`; Codex runs as the selected existing user.
 They communicate only through `/run/codex-web-ui/app-server.sock`. Web secrets
 and runner settings are separate root-owned `0600` files.
 
+Release assembly uses pnpm's isolated deploy graph and loads every direct
+production dependency, including Argon2, before accepting the output. This
+prevents a flattened but incomplete transitive dependency graph from reaching
+activation.
+
 ## Assumptions
 
 - Ubuntu 22.04/24.04 with systemd, internet access and a sudo-capable non-root
