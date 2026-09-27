@@ -245,6 +245,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const sseListeners = new Map<string, Set<SseListener>>();
   const activeTurns = new Set<string>();
   const approvalGenerations = new Map<string, number>();
+  const loadedThreadGenerations = new Map<string, number>();
   const historyHydrations = new Map<string, Promise<Thread>>();
   repository.markPendingIdempotencyUnknown();
   let pendingTurnStarts = 0;
@@ -731,6 +732,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const thread = repository.upsertThread(
       mapThread(result.thread, project.id, false, result.instructionSources, result.model),
     );
+    loadedThreadGenerations.set(thread.id, appServer.generation);
     repository.audit('thread.start', 'succeeded', {
       projectId: project.id,
       threadId: thread.id,
@@ -818,14 +820,17 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     let turnStartIssued = false;
     try {
       const resumeCwd = await canonicalProjectPath(pathPolicy, project);
-      const resumed = threadResponseSchema.parse(
-        await appServer.request('thread/resume', {
-          threadId: id,
-          cwd: resumeCwd,
-          excludeTurns: true,
-        }),
-      );
-      if (resumed.thread.cwd !== resumeCwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
+      if (loadedThreadGenerations.get(id) !== appServer.generation) {
+        const resumed = threadResponseSchema.parse(
+          await appServer.request('thread/resume', {
+            threadId: id,
+            cwd: resumeCwd,
+            excludeTurns: true,
+          }),
+        );
+        if (resumed.thread.cwd !== resumeCwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
+        loadedThreadGenerations.set(id, appServer.generation);
+      }
       const turnCwd = await canonicalProjectPath(pathPolicy, project);
       turnStartIssued = true;
       result = turnResponseSchema.parse(

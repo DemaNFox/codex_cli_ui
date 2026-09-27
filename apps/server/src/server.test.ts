@@ -889,6 +889,49 @@ describe('Codex routes', () => {
     expect((await firstPromise).statusCode).toBe(202);
   });
 
+  it('reuses a newly started thread writer and resumes it only after app-server restart', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const thread = (
+      await app.inject({
+        method: 'POST',
+        url: '/api/threads',
+        headers: session.headers,
+        payload: { projectId: project.id },
+      })
+    ).json<{ data: { id: string } }>().data;
+
+    const first = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${thread.id}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'first',
+        idempotencyKey: '66666666-6666-4666-8666-666666666666',
+      },
+    });
+    expect(first.statusCode).toBe(202);
+    expect(appServer.requests.filter((item) => item.method === 'thread/resume')).toHaveLength(0);
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: thread.id, turn: { id: 'turn-1' } },
+    });
+    appServer.restart();
+    const second = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${thread.id}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'second',
+        idempotencyKey: '77777777-7777-4777-8777-777777777777',
+      },
+    });
+    expect(second.statusCode).toBe(202);
+    expect(appServer.requests.filter((item) => item.method === 'thread/resume')).toHaveLength(1);
+  });
+
   it('marks an ambiguous turn/start failure unknown and never retries it', async () => {
     const { app, appServer, projectPath } = await fixture();
     const session = await login(app);
