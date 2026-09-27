@@ -34,6 +34,10 @@ AmbientCapabilities=
 ProtectSystem=strict
 ProtectHome=read-only
 PrivateTmp=yes
+# Full-access turns still receive bounded temporary filesystems. These tmpfs
+# mounts are charged to the service cgroup and cannot consume the host root FS.
+TemporaryFileSystem=/tmp:rw,nosuid,nodev,size=1G,nr_inodes=16384,mode=1777
+TemporaryFileSystem=/var/tmp:rw,nosuid,nodev,size=1G,nr_inodes=16384,mode=1777
 PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

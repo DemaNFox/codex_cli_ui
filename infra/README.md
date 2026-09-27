@@ -76,12 +76,16 @@ an 80 GiB / 1,310,720-inode ceiling is installed with:
 sudo scripts/install-bounded-storage.sh \
   --size-bytes 85899345920 \
   --inode-count 1310720 \
+  --project-root /srv/codex-projects \
   --service-user ai-chat-agent
 ```
 
 The host must have the requested capacity free because the image is allocated,
 not sparse. Validate a failure-and-recovery probe appropriate to the host and a
 stop/unmount/`mount -a`/restart cycle before relying on the boot-time boundary.
+Use a dedicated Web UI `CODEX_HOME` inside the bounded state directory; do not
+reuse an unbounded agent home. The systemd unit separately places `/tmp` and
+`/var/tmp` on byte- and inode-bounded tmpfs mounts charged to the service cgroup.
 
 ## Safe installation sequence
 
