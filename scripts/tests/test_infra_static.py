@@ -17,6 +17,7 @@ class InfraStaticTest(unittest.TestCase):
             "CapabilityBoundingSet=",
             "MemoryMax=4G",
             "KillMode=control-group",
+            "ProtectProc=invisible",
             "/run/docker.sock",
             "/opt/ai-chat-agents/state",
             "/opt/ai-chat-agent-release",
@@ -24,6 +25,7 @@ class InfraStaticTest(unittest.TestCase):
             self.assertIn(expected, unit)
         self.assertNotIn("User=root", unit)
         self.assertNotIn("SupplementaryGroups=docker", unit)
+        self.assertNotIn("ProcSubset=pid", unit)
 
         guard_unit = (ROOT / "infra/systemd/codex-web-ui-storage-guard@.service").read_text(
             encoding="utf-8"
