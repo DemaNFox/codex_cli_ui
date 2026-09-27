@@ -1,4 +1,5 @@
 import {
+  attachmentSchema,
   capabilitySchema,
   createProjectRequestSchema,
   loginRequestSchema,
@@ -12,6 +13,7 @@ import {
   threadListQuerySchema,
   userInputQuestionSchema,
   type PermissionPreset,
+  type Attachment,
   type PendingApproval,
   type Project,
   type SafeEvent,
@@ -23,9 +25,15 @@ import { createHash } from 'node:crypto';
 import { z } from 'zod';
 
 import type { AppServerClient, AppServerInbound } from './app-server.js';
+import {
+  MAX_ATTACHMENT_BYTES,
+  MAX_THREAD_ATTACHMENT_BYTES,
+  type AttachmentStore,
+  parseSingleFileMultipart,
+} from './attachment-store.js';
 import { AuthService, HttpError, type AuthContext } from './auth.js';
 import type { ServerConfig } from './config.js';
-import type { SqliteRepository } from './database.js';
+import type { AttachmentRecord, SqliteRepository } from './database.js';
 import {
   normalizeApproval,
   normalizeNotification,
@@ -42,6 +50,10 @@ import type { ProjectPathPolicy } from './path-policy.js';
 import { createSseDelivery } from './sse.js';
 
 const idParamsSchema = z.object({ id: z.string().min(1).max(200) });
+const attachmentParamsSchema = z.object({
+  id: z.string().min(1).max(200),
+  attachmentId: z.string().uuid(),
+});
 const projectPatchSchema = z
   .object({
     name: z.string().trim().min(1).max(120).optional(),
@@ -158,6 +170,57 @@ export interface ServerDependencies {
   readonly repository: SqliteRepository;
   readonly pathPolicy: ProjectPathPolicy;
   readonly appServer: AppServerClient;
+  readonly attachmentStore: AttachmentStore;
+}
+
+function publicAttachment(record: AttachmentRecord): Attachment {
+  return attachmentSchema.parse({
+    id: record.id,
+    threadId: record.threadId,
+    name: record.name,
+    mediaType: record.mimeType,
+    sizeBytes: record.size,
+    kind: record.kind,
+    createdAt: record.createdAt,
+    url: `/api/threads/${encodeURIComponent(record.threadId)}/attachments/${record.id}/content`,
+  });
+}
+
+function inputRecord(value: unknown): Record<string, unknown> | null {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+}
+
+function isUserMessageLifecycle(message: AppServerInbound): boolean {
+  if (!('method' in message) || !['item/started', 'item/completed'].includes(message.method))
+    return false;
+  const params = inputRecord(message.params);
+  return inputRecord(params?.item)?.type === 'userMessage';
+}
+
+function safeContentDisposition(name: string, inline: boolean): string {
+  const encoded = encodeURIComponent(name).replaceAll("'", '%27');
+  return `${inline ? 'inline' : 'attachment'}; filename="attachment"; filename*=UTF-8''${encoded}`;
+}
+
+function redactAttachmentStorage(value: unknown, storageRoot: string): unknown {
+  if (typeof value === 'string') {
+    const variants = new Set([
+      storageRoot,
+      storageRoot.replaceAll('\\', '/'),
+      storageRoot.replaceAll('/', '\\'),
+    ]);
+    let redacted = value;
+    for (const variant of variants) redacted = redacted.replaceAll(variant, '[attachment-storage]');
+    return redacted;
+  }
+  if (Array.isArray(value)) return value.map((item) => redactAttachmentStorage(item, storageRoot));
+  const record = inputRecord(value);
+  if (!record) return value;
+  return Object.fromEntries(
+    Object.entries(record).map(([key, item]) => [key, redactAttachmentStorage(item, storageRoot)]),
+  );
 }
 
 function statusType(value: z.infer<typeof rpcThreadSchema>['status']): Thread['status'] {
@@ -234,7 +297,7 @@ async function canonicalProjectPath(
 }
 
 export async function buildServer(dependencies: ServerDependencies): Promise<FastifyInstance> {
-  const { config, repository, pathPolicy, appServer } = dependencies;
+  const { config, repository, pathPolicy, appServer, attachmentStore } = dependencies;
   const app = Fastify({
     logger: false,
     bodyLimit: 128 * 1_024,
@@ -251,6 +314,11 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   let pendingTurnStarts = 0;
 
   await app.register(cookie);
+  app.addContentTypeParser(
+    /^multipart\/form-data(?:;.*)?$/i,
+    { parseAs: 'buffer', bodyLimit: MAX_ATTACHMENT_BYTES + 16_384 },
+    (_request, body, done) => done(null, body),
+  );
 
   const publish = (event: SafeEvent): void => {
     for (const listener of sseListeners.get(event.threadId) ?? []) listener(event);
@@ -486,7 +554,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       publish(event);
       return;
     }
-    const normalized = normalizeNotification(message, config.maxEventBytes);
+    // App-server echoes localImage and server-local file paths in userMessage lifecycle items.
+    // The safe user event is authored below from browser text plus public attachment metadata.
+    if (isUserMessageLifecycle(message)) return;
+    const normalized = normalizeNotification(
+      redactAttachmentStorage(message, attachmentStore.root) as AppServerInbound,
+      config.maxEventBytes,
+    );
     if (!normalized || !repository.getThread(normalized.threadId)) return;
     if (message.method === 'turn/started' && normalized.turnId)
       activeTurns.add(`${normalized.threadId}:${normalized.turnId}`);
@@ -519,6 +593,12 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       void reply
         .code(400)
         .send({ error: { code: 'INVALID_REQUEST', message: 'Request validation failed' } });
+      return;
+    }
+    if ('statusCode' in error && error.statusCode === 413) {
+      void reply
+        .code(413)
+        .send({ error: { code: 'ATTACHMENT_TOO_LARGE', message: 'Request failed' } });
       return;
     }
     const code = error.message === 'APP_SERVER_UNAVAILABLE' ? 503 : 500;
@@ -790,6 +870,101 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   app.post('/api/threads/:id/archive', async (request) => setArchive(request, true));
   app.post('/api/threads/:id/unarchive', async (request) => setArchive(request, false));
 
+  app.post(
+    '/api/threads/:id/attachments',
+    { bodyLimit: MAX_ATTACHMENT_BYTES + 16_384 },
+    async (request, reply) => {
+      csrfGuard(auth, request);
+      const id = parseId(request);
+      const thread = repository.getThread(id);
+      if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
+      if (thread.archived) throw new HttpError(409, 'THREAD_ARCHIVED');
+      const project = repository.getProject(thread.projectId);
+      if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+      if (!Buffer.isBuffer(request.body)) throw new HttpError(400, 'MULTIPART_FILE_REQUIRED');
+      const contentType = request.headers['content-type'];
+      if (typeof contentType !== 'string') throw new HttpError(415, 'ATTACHMENT_TYPE_REQUIRED');
+      const upload = parseSingleFileMultipart(contentType, request.body);
+      const record = await attachmentStore.withThreadLock(id, async () => {
+        if (repository.attachmentBytesForThread(id) + upload.bytes.length > MAX_THREAD_ATTACHMENT_BYTES)
+          throw new HttpError(413, 'THREAD_ATTACHMENT_STORAGE_EXHAUSTED');
+        const stored = await attachmentStore.write(project.id, id, upload.name, upload.bytes);
+        try {
+          return repository.createAttachment({
+            ...stored,
+            threadId: id,
+            name: upload.name,
+            mimeType: upload.mimeType,
+            kind: upload.kind,
+            size: upload.bytes.length,
+          });
+        } catch (error) {
+          await attachmentStore.remove(project.id, id, stored.storageName);
+          throw error;
+        }
+      });
+      repository.audit('attachment.upload', 'succeeded', {
+        threadId: id,
+        attachmentId: record.id,
+        kind: record.kind,
+        size: record.size,
+      });
+      return reply.code(201).send({ data: publicAttachment(record) });
+    },
+  );
+
+  app.get('/api/threads/:id/attachments', (request) => {
+    auth.authenticate(request);
+    const id = parseId(request);
+    if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    return { data: repository.listAttachments(id).map(publicAttachment) };
+  });
+
+  app.get('/api/threads/:id/attachments/:attachmentId/content', async (request, reply) => {
+    auth.authenticate(request);
+    const params = attachmentParamsSchema.parse(request.params);
+    const thread = repository.getThread(params.id);
+    if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    const record = repository.getAttachment(params.attachmentId);
+    if (!record || record.threadId !== params.id) throw new HttpError(404, 'ATTACHMENT_NOT_FOUND');
+    const project = repository.getProject(thread.projectId);
+    if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+    let body: Buffer;
+    try {
+      body = await attachmentStore.read(project.id, thread.id, record.storageName);
+    } catch {
+      throw new HttpError(410, 'ATTACHMENT_CONTENT_MISSING');
+    }
+    const inline = record.kind === 'image';
+    reply.header('Content-Type', record.mimeType);
+    reply.header('Content-Length', String(body.length));
+    reply.header('Content-Disposition', safeContentDisposition(record.name, inline));
+    return reply.send(body);
+  });
+
+  app.delete('/api/threads/:id/attachments/:attachmentId', async (request, reply) => {
+    csrfGuard(auth, request);
+    const params = attachmentParamsSchema.parse(request.params);
+    const thread = repository.getThread(params.id);
+    if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    const project = repository.getProject(thread.projectId);
+    if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+    await attachmentStore.withThreadLock(params.id, async () => {
+      const existing = repository.getAttachment(params.attachmentId);
+      if (!existing || existing.threadId !== params.id)
+        throw new HttpError(404, 'ATTACHMENT_NOT_FOUND');
+      if (existing.turnId !== null) throw new HttpError(409, 'ATTACHMENT_ALREADY_SENT');
+      const deleted = repository.deleteUnusedAttachment(params.attachmentId, params.id);
+      if (!deleted) throw new HttpError(409, 'ATTACHMENT_ALREADY_SENT');
+      await attachmentStore.remove(project.id, params.id, deleted.storageName);
+    });
+    repository.audit('attachment.delete', 'succeeded', {
+      threadId: params.id,
+      attachmentId: params.attachmentId,
+    });
+    return reply.code(204).send();
+  });
+
   app.post('/api/threads/:id/turns', async (request, reply) => {
     csrfGuard(auth, request);
     const id = parseId(request);
@@ -799,6 +974,14 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (thread.archived) throw new HttpError(409, 'THREAD_ARCHIVED');
     const project = repository.getProject(thread.projectId);
     if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+    if (new Set(input.attachmentIds).size !== input.attachmentIds.length)
+      throw new HttpError(400, 'ATTACHMENT_IDS_DUPLICATED');
+    const attachments = input.attachmentIds.map((attachmentId) => {
+      const attachment = repository.getAttachment(attachmentId);
+      if (!attachment || attachment.threadId !== id)
+        throw new HttpError(400, 'ATTACHMENT_NOT_AVAILABLE');
+      return attachment;
+    });
     const hash = requestHash(input);
     const operation = `turn:${id}`;
     const reservation = repository.reserveIdempotent(operation, input.idempotencyKey, hash);
@@ -813,12 +996,22 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           : 'IDEMPOTENCY_OUTCOME_UNKNOWN',
       );
     }
+    if (attachments.some((attachment) => attachment.turnId !== null)) {
+      repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
+      throw new HttpError(409, 'ATTACHMENT_ALREADY_SENT');
+    }
     if (activeTurns.size + pendingTurnStarts >= config.maxConcurrentTurns) {
       repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
       throw new HttpError(429, 'TURN_CAPACITY_EXHAUSTED');
     }
     pendingTurnStarts += 1;
     const preset = input.permissionPreset ?? project.defaultPermissionPreset;
+    const attachmentClaim = `pending:${input.idempotencyKey}`;
+    if (!repository.claimAttachments(id, input.attachmentIds, attachmentClaim)) {
+      pendingTurnStarts -= 1;
+      repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
+      throw new HttpError(409, 'ATTACHMENT_NOT_AVAILABLE');
+    }
     let result: z.infer<typeof turnResponseSchema>;
     let turnStartIssued = false;
     try {
@@ -836,12 +1029,31 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         loadedThreadGenerations.set(id, appServer.generation);
       }
       const turnCwd = await canonicalProjectPath(pathPolicy, project);
+      const appInput: Record<string, unknown>[] = [];
+      const fileReferences = attachments
+        .filter((attachment) => attachment.kind === 'file')
+        .map((attachment) =>
+          `${attachment.name}: ${attachmentStore.localPath(project.id, id, attachment.storageName)}`,
+        );
+      const appText =
+        fileReferences.length === 0
+          ? input.text
+          : `${input.text}${input.text.length > 0 ? '\n\n' : ''}[Codex Web attachment references (server-local; do not repeat paths):\n${fileReferences.join('\n')}\n]`;
+      if (appText.length > 0)
+        appInput.push({ type: 'text', text: appText, text_elements: [] });
+      for (const attachment of attachments) {
+        if (attachment.kind === 'image')
+          appInput.push({
+            type: 'localImage',
+            path: attachmentStore.localPath(project.id, id, attachment.storageName),
+          });
+      }
       turnStartIssued = true;
       result = turnResponseSchema.parse(
         await appServer.request('turn/start', {
           threadId: id,
           clientUserMessageId: input.idempotencyKey,
-          input: [{ type: 'text', text: input.text, text_elements: [] }],
+          input: appInput,
           cwd: turnCwd,
           model: input.model ?? project.defaultModel,
           effort: input.reasoningEffort ?? project.defaultReasoningEffort,
@@ -853,12 +1065,17 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       activeTurns.add(`${id}:${result.turn.id}`);
     } catch (error) {
       if (turnStartIssued) repository.markIdempotentUnknown(operation, input.idempotencyKey, hash);
-      else repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
+      else {
+        repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
+        repository.releaseAttachmentClaims(id, attachmentClaim);
+      }
       throw error;
     } finally {
       pendingTurnStarts -= 1;
     }
     const response = { data: { turnId: result.turn.id } };
+    if (attachments.length > 0)
+      repository.finalizeAttachmentClaims(id, attachmentClaim, result.turn.id);
     if (!repository.completeIdempotent(operation, input.idempotencyKey, hash, response))
       throw new HttpError(409, 'IDEMPOTENCY_OUTCOME_UNKNOWN');
     const userEvent = repository.appendEvent({
@@ -866,7 +1083,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       turnId: result.turn.id,
       kind: 'user-message',
       phase: 'completed',
-      payload: sanitizeEventPayload({ text: input.text }, config.maxEventBytes),
+      payload: sanitizeEventPayload(
+        { text: input.text, attachments: attachments.map(publicAttachment) },
+        config.maxEventBytes,
+      ),
     });
     publish(userEvent);
     repository.audit('turn.start', 'succeeded', {

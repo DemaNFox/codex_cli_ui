@@ -83,13 +83,29 @@ export const startThreadRequestSchema = z.object({
 });
 
 export const startTurnRequestSchema = z.object({
-  text: z.string().trim().min(1).max(100_000),
+  text: z.string().trim().max(100_000),
+  attachmentIds: z.array(z.string().uuid()).max(8).default([]),
   model: z.string().min(1).max(120).optional(),
   reasoningEffort: z.string().min(1).max(40).optional(),
   permissionPreset: permissionPresetSchema.optional(),
   approvalPolicy: approvalPolicySchema.optional(),
   idempotencyKey: z.string().uuid(),
+}).refine((value) => value.text.length > 0 || value.attachmentIds.length > 0, {
+  message: 'A turn requires text or at least one attachment',
 });
+
+export const attachmentKindSchema = z.enum(['image', 'file']);
+export const attachmentSchema = z.object({
+  id: z.string().uuid(),
+  threadId: z.string().min(1).max(200),
+  name: z.string().min(1).max(180),
+  mediaType: z.string().min(1).max(120),
+  sizeBytes: z.number().int().positive().max(20 * 1_024 * 1_024),
+  kind: attachmentKindSchema,
+  createdAt: z.string().datetime(),
+  url: z.string().startsWith('/api/threads/'),
+});
+export type Attachment = z.infer<typeof attachmentSchema>;
 
 export const steerTurnRequestSchema = z.object({
   text: z.string().trim().min(1).max(100_000),

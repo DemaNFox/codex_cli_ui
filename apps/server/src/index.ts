@@ -1,4 +1,5 @@
 import { CodexAppServerSupervisor } from './app-server.js';
+import { AttachmentStore } from './attachment-store.js';
 import { loadConfig } from './config.js';
 import { SqliteRepository } from './database.js';
 import { ProjectPathPolicy } from './path-policy.js';
@@ -12,6 +13,7 @@ const appServer = new CodexAppServerSupervisor({
   ...(config.codexHome === undefined ? {} : { codexHome: config.codexHome }),
   expectedVersion: config.codexVersionPin,
 });
-const server = await buildServer({ config, repository, pathPolicy, appServer });
+const attachmentStore = new AttachmentStore(config.attachmentStoragePath);
+const server = await buildServer({ config, repository, pathPolicy, appServer, attachmentStore });
 
 await server.listen({ host: config.host, port: config.port });

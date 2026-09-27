@@ -1,9 +1,11 @@
 import { z } from 'zod';
+import path from 'node:path';
 
 const envSchema = z.object({
   CODEX_WEB_HOST: z.string().default('127.0.0.1'),
   CODEX_WEB_PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
   CODEX_WEB_DATABASE_PATH: z.string().min(1).default('data/codex-web.sqlite3'),
+  CODEX_WEB_ATTACHMENT_STORAGE_PATH: z.string().min(1).optional(),
   CODEX_WEB_ADMIN_USERNAME: z.string().min(1).max(80),
   CODEX_WEB_ADMIN_PASSWORD_HASH: z.string().startsWith('$argon2id$'),
   CODEX_WEB_SESSION_SECRET: z.string().min(32),
@@ -23,6 +25,7 @@ export interface ServerConfig {
   readonly host: string;
   readonly port: number;
   readonly databasePath: string;
+  readonly attachmentStoragePath: string;
   readonly username: string;
   readonly passwordHash: string;
   readonly sessionSecret: string;
@@ -50,6 +53,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     host: parsed.CODEX_WEB_HOST,
     port: parsed.CODEX_WEB_PORT,
     databasePath: parsed.CODEX_WEB_DATABASE_PATH,
+    attachmentStoragePath:
+      parsed.CODEX_WEB_ATTACHMENT_STORAGE_PATH ??
+      path.join(path.dirname(parsed.CODEX_WEB_DATABASE_PATH), 'attachments'),
     username: parsed.CODEX_WEB_ADMIN_USERNAME,
     passwordHash: parsed.CODEX_WEB_ADMIN_PASSWORD_HASH,
     sessionSecret: parsed.CODEX_WEB_SESSION_SECRET,

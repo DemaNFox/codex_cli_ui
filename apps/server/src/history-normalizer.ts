@@ -52,16 +52,9 @@ function normalizeItem(
   if (!item || typeof item.type !== 'string') return null;
 
   if (item.type === 'userMessage') {
-    if (!Array.isArray(item.content)) return null;
-    const text = item.content
-      .map(record)
-      .filter(
-        (input): input is Record<string, unknown> =>
-          input !== null && input.type === 'text' && typeof input.text === 'string',
-      )
-      .map((input) => input.text as string)
-      .join('\n');
-    return textEvent(threadId, turnId, 'user-message', 'text', text, maxBytes);
+    // The app-server history may contain absolute localImage paths and server-only file references.
+    // User messages owned by this service are journaled at turn acceptance with safe attachment metadata.
+    return null;
   }
 
   if (item.type === 'agentMessage' && typeof item.text === 'string') {

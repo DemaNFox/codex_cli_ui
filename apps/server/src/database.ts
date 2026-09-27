@@ -1,4 +1,4 @@
-import type { PendingApproval, Project, SafeEvent, Thread } from '@codex-web/contracts';
+import type { Attachment, PendingApproval, Project, SafeEvent, Thread } from '@codex-web/contracts';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
@@ -43,6 +43,30 @@ interface EventRow {
   phase: SafeEvent['phase'];
   payload_json: string;
   created_at: string;
+}
+
+interface AttachmentRow {
+  id: string;
+  thread_id: string;
+  name: string;
+  mime_type: string;
+  kind: Attachment['kind'];
+  size_bytes: number;
+  storage_name: string;
+  turn_id: string | null;
+  created_at: string;
+}
+
+export interface AttachmentRecord {
+  id: string;
+  threadId: string;
+  name: string;
+  mimeType: string;
+  kind: Attachment['kind'];
+  size: number;
+  storageName: string;
+  turnId: string | null;
+  createdAt: string;
 }
 
 interface ApprovalRow {
@@ -97,6 +121,20 @@ function threadFromRow(row: ThreadRow): Thread {
       : [],
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+  };
+}
+
+function attachmentFromRow(row: AttachmentRow): AttachmentRecord {
+  return {
+    id: row.id,
+    threadId: row.thread_id,
+    name: row.name,
+    mimeType: row.mime_type,
+    kind: row.kind,
+    size: row.size_bytes,
+    storageName: row.storage_name,
+    turnId: row.turn_id,
+    createdAt: row.created_at,
   };
 }
 
@@ -160,6 +198,19 @@ export class SqliteRepository {
         updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS threads_project_idx ON threads(project_id, archived, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS attachments (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        name TEXT NOT NULL,
+        mime_type TEXT NOT NULL,
+        kind TEXT NOT NULL CHECK(kind IN ('image','file')),
+        size_bytes INTEGER NOT NULL CHECK(size_bytes > 0),
+        storage_name TEXT NOT NULL UNIQUE,
+        turn_id TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS attachments_thread_idx ON attachments(thread_id, created_at, id);
 
       CREATE TABLE IF NOT EXISTS thread_history_state (
         thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
@@ -469,6 +520,91 @@ export class SqliteRepository {
       .prepare('UPDATE threads SET archived=?,updated_at=? WHERE id=?')
       .run(archived ? 1 : 0, new Date().toISOString(), id);
     return this.getThread(id);
+  }
+
+  createAttachment(input: Omit<AttachmentRecord, 'turnId' | 'createdAt'>): AttachmentRecord {
+    const createdAt = new Date().toISOString();
+    this.database.prepare(
+      `INSERT INTO attachments(id,thread_id,name,mime_type,kind,size_bytes,storage_name,turn_id,created_at)
+       VALUES(?,?,?,?,?,?,?,NULL,?)`,
+    ).run(
+      input.id,
+      input.threadId,
+      input.name,
+      input.mimeType,
+      input.kind,
+      input.size,
+      input.storageName,
+      createdAt,
+    );
+    return this.getAttachment(input.id)!;
+  }
+
+  getAttachment(id: string): AttachmentRecord | undefined {
+    const row = this.database.prepare('SELECT * FROM attachments WHERE id=?').get(id) as
+      | AttachmentRow
+      | undefined;
+    return row && attachmentFromRow(row);
+  }
+
+  listAttachments(threadId: string): AttachmentRecord[] {
+    return (
+      this.database
+        .prepare('SELECT * FROM attachments WHERE thread_id=? ORDER BY created_at,id')
+        .all(threadId) as unknown as AttachmentRow[]
+    ).map(attachmentFromRow);
+  }
+
+  attachmentBytesForThread(threadId: string): number {
+    const row = this.database
+      .prepare('SELECT COALESCE(SUM(size_bytes),0) AS bytes FROM attachments WHERE thread_id=?')
+      .get(threadId) as { bytes: number };
+    return row.bytes;
+  }
+
+  deleteUnusedAttachment(id: string, threadId: string): AttachmentRecord | undefined {
+    const record = this.getAttachment(id);
+    if (!record || record.threadId !== threadId || record.turnId !== null) return undefined;
+    const deleted = this.database
+      .prepare('DELETE FROM attachments WHERE id=? AND thread_id=? AND turn_id IS NULL')
+      .run(id, threadId);
+    return deleted.changes === 1 ? record : undefined;
+  }
+
+  claimAttachments(threadId: string, ids: readonly string[], claimToken: string): boolean {
+    if (ids.length === 0) return true;
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      for (const id of ids) {
+        const changed = this.database
+          .prepare(
+            'UPDATE attachments SET turn_id=? WHERE id=? AND thread_id=? AND turn_id IS NULL',
+          )
+          .run(claimToken, id, threadId).changes;
+        if (changed !== 1) throw new Error('ATTACHMENT_CLAIM_FAILED');
+      }
+      this.database.exec('COMMIT');
+      return true;
+    } catch {
+      this.database.exec('ROLLBACK');
+      return false;
+    }
+  }
+
+  finalizeAttachmentClaims(threadId: string, claimToken: string, turnId: string): boolean {
+    return (
+      this.database
+        .prepare('UPDATE attachments SET turn_id=? WHERE thread_id=? AND turn_id=?')
+        .run(turnId, threadId, claimToken).changes > 0
+    );
+  }
+
+  releaseAttachmentClaims(threadId: string, claimToken: string): number {
+    return Number(
+      this.database
+        .prepare('UPDATE attachments SET turn_id=NULL WHERE thread_id=? AND turn_id=?')
+        .run(threadId, claimToken).changes,
+    );
   }
 
   isThreadHistoryHydrated(threadId: string): boolean {

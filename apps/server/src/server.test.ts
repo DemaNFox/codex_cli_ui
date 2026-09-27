@@ -1,4 +1,4 @@
-import type { SafeEvent } from '@codex-web/contracts';
+import type { Attachment, SafeEvent } from '@codex-web/contracts';
 import { hash } from 'argon2';
 import { EventEmitter } from 'node:events';
 import { mkdtemp, mkdir, rename, symlink, writeFile } from 'node:fs/promises';
@@ -14,9 +14,11 @@ import {
   type AppServerInbound,
   type RpcId,
 } from './app-server.js';
+import { AttachmentStore } from './attachment-store.js';
 import { loadConfig, type ServerConfig } from './config.js';
 import { SqliteRepository } from './database.js';
 import { normalizeNotification, sanitizeEventPayload } from './event-normalizer.js';
+import { normalizeThreadHistory } from './history-normalizer.js';
 import { ProjectPathPolicy } from './path-policy.js';
 import { buildServer } from './server.js';
 import { createSseDelivery } from './sse.js';
@@ -220,6 +222,7 @@ async function fixture(
     host: '127.0.0.1',
     port: 3000,
     databasePath: ':memory:',
+    attachmentStoragePath: path.join(temp, 'attachments'),
     username: 'owner',
     passwordHash,
     sessionSecret: '0123456789abcdef0123456789abcdef',
@@ -242,6 +245,7 @@ async function fixture(
     repository,
     pathPolicy: await ProjectPathPolicy.create([root]),
     appServer,
+    attachmentStore: new AttachmentStore(config.attachmentStoragePath),
   });
   openApps.push(app);
   await app.ready();
@@ -278,6 +282,34 @@ async function createProject(
   });
   expect(response.statusCode).toBe(201);
   return response.json<{ data: { id: string } }>().data;
+}
+
+async function createThread(
+  app: Awaited<ReturnType<typeof buildServer>>,
+  projectId: string,
+  headers: Record<string, string>,
+) {
+  const response = await app.inject({
+    method: 'POST',
+    url: '/api/threads',
+    headers,
+    payload: { projectId },
+  });
+  expect(response.statusCode).toBe(201);
+  return response.json<{ data: { id: string } }>().data.id;
+}
+
+function multipartFile(name: string, mimeType: string, bytes: Buffer, boundary = 'codex-web-test') {
+  return {
+    contentType: `multipart/form-data; boundary=${boundary}`,
+    body: Buffer.concat([
+      Buffer.from(
+        `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${name}"\r\nContent-Type: ${mimeType}\r\n\r\n`,
+      ),
+      bytes,
+      Buffer.from(`\r\n--${boundary}--\r\n`),
+    ]),
+  };
 }
 
 describe('security and repository boundary', () => {
@@ -393,6 +425,221 @@ describe('security and repository boundary', () => {
 });
 
 describe('Codex routes', () => {
+  it('uploads, downloads, lists and deletes a signature-checked attachment without exposing local paths', async () => {
+    const { app, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const png = multipartFile(
+      'diagram.png',
+      'image/png',
+      Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]),
+    );
+    const uploaded = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/attachments`,
+      headers: { ...session.headers, 'content-type': png.contentType },
+      payload: png.body,
+    });
+    expect(uploaded.statusCode).toBe(201);
+    const attachment = uploaded.json<{ data: Attachment }>().data;
+    expect(attachment).toMatchObject({
+      name: 'diagram.png',
+      mediaType: 'image/png',
+      kind: 'image',
+      sizeBytes: 12,
+      threadId,
+    });
+    expect(Object.keys(attachment).sort()).toEqual([
+      'createdAt', 'id', 'kind', 'mediaType', 'name', 'sizeBytes', 'threadId', 'url',
+    ]);
+
+    const listed = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/attachments`,
+      headers: { cookie: session.cookie },
+    });
+    expect(listed.json()).toEqual({ data: [attachment] });
+    const downloaded = await app.inject({
+      method: 'GET',
+      url: attachment.url,
+      headers: { cookie: session.cookie },
+    });
+    expect(downloaded.statusCode).toBe(200);
+    expect(downloaded.rawPayload).toEqual(png.body.subarray(png.body.indexOf(Buffer.from('\r\n\r\n')) + 4, png.body.lastIndexOf(Buffer.from('\r\n--'))));
+    expect(downloaded.headers['x-content-type-options']).toBe('nosniff');
+
+    const deleted = await app.inject({
+      method: 'DELETE',
+      url: `/api/threads/${threadId}/attachments/${attachment.id}`,
+      headers: session.headers,
+    });
+    expect(deleted.statusCode).toBe(204);
+  });
+
+  it('passes images as localImage and files as private server text while journaling safe metadata only', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const uploads = [
+      multipartFile('picture.png', 'image/png', Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1])),
+      multipartFile('notes.txt', 'text/plain', Buffer.from('hello attachment')),
+    ];
+    const attachments: Attachment[] = [];
+    for (const upload of uploads) {
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/threads/${threadId}/attachments`,
+        headers: { ...session.headers, 'content-type': upload.contentType },
+        payload: upload.body,
+      });
+      expect(response.statusCode).toBe(201);
+      attachments.push(response.json<{ data: Attachment }>().data);
+    }
+    const turn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: '',
+        attachmentIds: attachments.map((attachment) => attachment.id),
+        idempotencyKey: '00000000-0000-4000-8000-000000000099',
+      },
+    });
+    expect(turn.statusCode).toBe(202);
+    const request = [...appServer.requests].reverse().find((entry) => entry.method === 'turn/start')!;
+    const input = (request.params as { input: Record<string, unknown>[] }).input;
+    const localImage = input.find((item) => item.type === 'localImage')!;
+    expect(String(localImage.path)).toContain(attachments[0]!.id);
+    const privateText = String(input.find((item) => item.type === 'text')?.text);
+    expect(privateText).toContain('notes.txt:');
+    expect(privateText).toContain(attachments[1]!.id);
+    const userEvent = repository
+      .listEvents(threadId, 0)
+      .reverse()
+      .find((event) => event.kind === 'user-message')!;
+    expect(userEvent.payload).toEqual({ text: '', attachments });
+    expect(JSON.stringify(userEvent)).not.toContain(String(localImage.path));
+
+    appServer.emit({
+      method: 'item/completed',
+      params: {
+        threadId,
+        turnId: 'turn-1',
+        item: { type: 'userMessage', content: [{ type: 'localImage', path: localImage.path }] },
+      },
+    });
+    expect(repository.listEvents(threadId, 0).filter((event) => event.kind === 'tool')).toEqual([]);
+    appServer.emit({
+      method: 'item/agentMessage/delta',
+      params: { threadId, turnId: 'turn-1', delta: `read ${String(localImage.path)}` },
+    });
+    const agentEvent = repository
+      .listEvents(threadId, 0)
+      .find((event) => event.kind === 'agent-message');
+    expect(JSON.stringify(agentEvent)).not.toContain(String(localImage.path));
+    expect(JSON.stringify(agentEvent)).toContain('[attachment-storage]');
+    const hydrated = normalizeThreadHistory(
+      threadId,
+      [{
+        id: 'turn-history',
+        status: 'completed',
+        items: [{
+          type: 'userMessage',
+          content: [{
+            type: 'text',
+            text: `visible\n\n[Codex Web attachment references (server-local; do not repeat paths):\nsecret.txt: C:\\private\\secret.txt\n]`,
+          }],
+        }],
+      }],
+      4_096,
+    );
+    expect(hydrated.map((event) => event.kind)).toEqual(['turn']);
+    expect(JSON.stringify(hydrated)).not.toContain('C:\\private');
+  });
+
+  it('rejects traversal names, spoofed images, cross-thread IDs, duplicates and sent attachment reuse', async () => {
+    const { app, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const firstThread = await createThread(app, project.id, session.headers);
+    const secondThread = await createThread(app, project.id, session.headers);
+    for (const upload of [
+      multipartFile('../escape.txt', 'text/plain', Buffer.from('no')),
+      multipartFile('fake.png', 'image/png', Buffer.from('not an image')),
+      multipartFile('archive.zip', 'application/zip', Buffer.from('PK')),
+    ]) {
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/threads/${firstThread}/attachments`,
+        headers: { ...session.headers, 'content-type': upload.contentType },
+        payload: upload.body,
+      });
+      expect(response.statusCode).toBeGreaterThanOrEqual(400);
+      expect(response.statusCode).toBeLessThan(500);
+    }
+    const text = multipartFile('safe.txt', 'text/plain', Buffer.from('safe'));
+    const uploaded = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${firstThread}/attachments`,
+      headers: { ...session.headers, 'content-type': text.contentType },
+      payload: text.body,
+    });
+    const attachment = uploaded.json<{ data: Attachment }>().data;
+    const basePayload = { text: 'inspect', idempotencyKey: '00000000-0000-4000-8000-000000000101' };
+    const crossThread = await app.inject({
+      method: 'POST', url: `/api/threads/${secondThread}/turns`, headers: session.headers,
+      payload: { ...basePayload, attachmentIds: [attachment.id] },
+    });
+    expect(crossThread.statusCode).toBe(400);
+    const duplicate = await app.inject({
+      method: 'POST', url: `/api/threads/${firstThread}/turns`, headers: session.headers,
+      payload: { ...basePayload, attachmentIds: [attachment.id, attachment.id] },
+    });
+    expect(duplicate.statusCode).toBe(400);
+    const sent = await app.inject({
+      method: 'POST', url: `/api/threads/${firstThread}/turns`, headers: session.headers,
+      payload: { ...basePayload, attachmentIds: [attachment.id] },
+    });
+    expect(sent.statusCode).toBe(202);
+    const replayed = await app.inject({
+      method: 'POST', url: `/api/threads/${firstThread}/turns`, headers: session.headers,
+      payload: { ...basePayload, attachmentIds: [attachment.id] },
+    });
+    expect(replayed.statusCode).toBe(200);
+    expect(replayed.json()).toEqual(sent.json());
+    const reused = await app.inject({
+      method: 'POST', url: `/api/threads/${firstThread}/turns`, headers: session.headers,
+      payload: {
+        ...basePayload,
+        idempotencyKey: '00000000-0000-4000-8000-000000000102',
+        attachmentIds: [attachment.id],
+      },
+    });
+    expect(reused.statusCode).toBe(409);
+  });
+
+  it('allows inert Office documents but rejects generic zip uploads', async () => {
+    const { app, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    for (const [name, mimeType] of [
+      ['report.docx', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'],
+      ['sheet.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+      ['deck.pptx', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
+    ] as const) {
+      const upload = multipartFile(name, mimeType, Buffer.from([0x50, 0x4b, 0x03, 0x04, 1]));
+      const response = await app.inject({
+        method: 'POST', url: `/api/threads/${threadId}/attachments`,
+        headers: { ...session.headers, 'content-type': upload.contentType }, payload: upload.body,
+      });
+      expect(response.statusCode).toBe(201);
+      expect(response.json()).toMatchObject({ data: { name, mediaType: mimeType, kind: 'file' } });
+    }
+  });
+
   it('uses the exact initialized notification and never exposes upstream error details', async () => {
     expect(INITIALIZED_NOTIFICATION).toEqual({ method: 'initialized', params: {} });
     expect(INITIALIZE_PARAMS).toMatchObject({ capabilities: { experimentalApi: true } });
@@ -623,7 +870,6 @@ describe('Codex routes', () => {
     expect(first.statusCode).toBe(200);
     const firstEvents = first.json<{ events: { id: number; kind: string }[] }>().events;
     expect(firstEvents.map((event) => event.kind)).toEqual([
-      'user-message',
       'agent-message',
       'plan',
       'plan',
@@ -695,7 +941,7 @@ describe('Codex routes', () => {
     expect(response.statusCode).toBe(200);
     expect(
       response.json<{ events: { kind: string }[] }>().events.map((event) => event.kind),
-    ).toEqual(['warning', 'user-message', 'turn']);
+    ).toEqual(['warning', 'turn']);
     expect(repository.isThreadHistoryHydrated(thread.id)).toBe(true);
   });
 
