@@ -29,6 +29,22 @@ runtime secrets, Docker access or deployment credentials.
   the reconnect/UI projection and prevents one browser replay from exhausting
   the service cgroup.
 
+## Codex sandbox prerequisites
+
+Codex `workspace-write` uses Bubblewrap on Linux. Keep `ProtectProc=invisible`,
+but do not add `ProcSubset=pid`: Bubblewrap must read the kernel overflow UID
+and GID settings beneath `/proc/sys` while constructing the sandbox. On Ubuntu
+hosts that restrict unprivileged user namespaces through AppArmor, install a
+dedicated AppArmor profile which grants `userns` only to the exact, root-owned
+Codex and Bubblewrap executable paths. Do not disable the host-wide AppArmor
+restriction.
+
+`CODEX_BIN` must resolve to an executable the service can traverse. If the
+host's existing Codex wrapper or runtime lives below an `InaccessiblePaths`
+entry, install a dedicated root-owned, service-read-only Codex runtime outside
+that tree and point `CODEX_BIN` at its wrapper. Preserve the exact CLI version
+pin and re-run the health check after changing either the runtime or profile.
+
 ## Disk safety boundary
 
 `CODEX_WEB_MIN_FREE_BYTES`, `CODEX_WEB_MAX_DATABASE_BYTES` and
