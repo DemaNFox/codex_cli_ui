@@ -963,6 +963,9 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
+  const attachmentThreadRef = useRef<string | null>(null);
+  const activeUploadsRef = useRef(new Map<string, { threadId: string; abort: () => void }>());
   const [locallyResolvedRequests, setLocallyResolvedRequests] = useState<Set<string>>(
     () => new Set(),
   );
@@ -1021,6 +1024,10 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   }, [threadId]);
 
   useEffect(() => {
+    queuedAttachmentsRef.current = queuedAttachments;
+  }, [queuedAttachments]);
+
+  useEffect(() => {
     void Promise.all([api.projects(), api.models(), api.capabilities()])
       .then(([projectList, modelList, systemCapability]) => {
         setProjects(projectList);
@@ -1053,6 +1060,20 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   }, [projectId, archiveView]);
 
   useEffect(() => {
+    const previousThreadId = attachmentThreadRef.current;
+    attachmentThreadRef.current = threadId;
+    if (previousThreadId && previousThreadId !== threadId) {
+      for (const upload of activeUploadsRef.current.values()) {
+        if (upload.threadId === previousThreadId) upload.abort();
+      }
+      const previousQueue = queuedAttachmentsRef.current;
+      for (const item of previousQueue) {
+        if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+        if (item.uploaded)
+          void api.deleteAttachment(session.csrfToken, previousThreadId, item.uploaded.id);
+      }
+      queuedAttachmentsRef.current = [];
+    }
     setQueuedAttachments((current) => {
       current.forEach((item) => {
         if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
@@ -1071,37 +1092,9 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
           current.map((item) => (item.id === requestedThreadId ? history.data : item)),
         );
         mergeEvents(history.events, requestedThreadId);
-        const referencedIds = new Set(
-          history.events.flatMap((event) =>
-            attachmentsFrom(event).map((attachment) => attachment.id),
-          ),
+        setThreadAttachmentBytes(
+          attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
         );
-        const unused = attachments.filter((attachment) => !referencedIds.has(attachment.id));
-        if (unused.length === 0) {
-          setThreadAttachmentBytes(
-            attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
-          );
-          return;
-        }
-        void Promise.allSettled(
-          unused.map((attachment) =>
-            api.deleteAttachment(session.csrfToken, requestedThreadId, attachment.id),
-          ),
-        ).then((results) => {
-          if (cancelled) return;
-          const deletedIds = new Set(
-            results.flatMap((result, index) =>
-              result.status === 'fulfilled' ? [unused[index]!.id] : [],
-            ),
-          );
-          setThreadAttachmentBytes(
-            attachments.reduce(
-              (total, attachment) =>
-                total + (deletedIds.has(attachment.id) ? 0 : attachment.sizeBytes),
-              0,
-            ),
-          );
-        });
       })
       .catch((cause: unknown) => {
         if (!cancelled) setError(errorMessage(cause));
@@ -1241,6 +1234,10 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
             ),
           ),
         );
+        activeUploadsRef.current.set(item.localId, {
+          threadId: thread,
+          abort: upload.abort,
+        });
         try {
           const attachment = await upload.promise;
           setQueuedAttachments((current) =>
@@ -1260,6 +1257,8 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
             ),
           );
           throw cause;
+        } finally {
+          activeUploadsRef.current.delete(item.localId);
         }
       }),
     );
@@ -1302,7 +1301,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
       }
       setComposer('');
     } catch (cause) {
-      setError(errorMessage(cause));
+      if (attachmentThreadRef.current === threadId) setError(errorMessage(cause));
     } finally {
       setBusy(false);
     }

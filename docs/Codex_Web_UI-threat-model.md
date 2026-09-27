@@ -148,6 +148,7 @@ flowchart LR
   projects and releases, plus bounded `/tmp` and `/var/tmp` tmpfs mounts. Portable installations must
   establish equivalent administrator-enforced byte and inode bounds; the disk monitor remains a secondary
   fail-closed control rather than the hard quota.
-- Attachment upload itself has no idempotency key. A lost upload response can temporarily create an unused
-  duplicate; reopening the chat removes unreferenced staged rows, and the 50 MiB thread ceiling bounds the
-  failure. An ambiguous `turn/start` claim remains unavailable rather than risking duplicate execution.
+- Attachment upload itself has no idempotency key. A lost upload response can create an unused duplicate;
+  this tab cleans up only staged IDs it can prove it owns when navigating, while the 50 MiB thread ceiling
+  bounds reload and network-unknown leftovers. An ambiguous `turn/start` claim remains unavailable rather
+  than risking duplicate execution.

@@ -473,27 +473,29 @@ describe('App', () => {
     expect(download.hasAttribute('download')).toBe(true);
   });
 
-  it('cleans up an unused staged upload when a thread is reopened', async () => {
-    const orphan = {
-      id: 'attachment-orphan',
-      threadId: 'thread-1',
-      name: 'orphan.txt',
-      mediaType: 'text/plain',
-      kind: 'file',
-      sizeBytes: 12,
-      createdAt: '2026-09-27T10:10:00.000Z',
-      url: '/api/threads/thread-1/attachments/attachment-orphan/content',
-    };
+  it('cleans up only this tab staged upload when switching threads', async () => {
+    const secondThread = { ...thread, id: 'thread-2', name: 'Second task' };
     const fetchMock = installAuthenticatedApi((url, init) => {
-      if (url === '/api/threads/thread-1/attachments' && !init?.method)
-        return jsonResponse([orphan]);
+      if (url.includes('/api/threads?')) return jsonResponse([thread, secondThread]);
+      if (url === '/api/threads/thread-2') return jsonResponse({ data: secondThread, events: [] });
+      if (url === '/api/threads/thread-1/turns' && init?.method === 'POST')
+        return jsonResponse({ error: { message: 'turn rejected' } }, 500);
       return undefined;
     });
+    const user = userEvent.setup();
     render(<App />);
+    await screen.findAllByText('Frontend task');
+    await user.upload(
+      screen.getByLabelText('Выбрать вложения'),
+      new File(['staged'], 'staged.txt', { type: 'text/plain' }),
+    );
+    await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
+    expect(await screen.findByText('turn rejected')).not.toBeNull();
+    await user.click(screen.getByRole('button', { name: /^Second task/ }));
 
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
-        '/api/threads/thread-1/attachments/attachment-orphan',
+        '/api/threads/thread-1/attachments/attachment-1',
         expect.objectContaining({ method: 'DELETE' }),
       ),
     );
