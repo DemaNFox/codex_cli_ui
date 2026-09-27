@@ -183,11 +183,15 @@ if [[ ! -x $toolchain_dir/bin/pnpm || ! -x $toolchain_dir/bin/codex ]]; then
   cleanup_toolchain
 fi
 install_managed_link "$toolchain_dir/bin/pnpm" /usr/local/bin/pnpm
-install_managed_link "$toolchain_dir/bin/codex" /usr/local/bin/codex
+if [[ -e /usr/local/bin/codex && ! -L /usr/local/bin/codex ]]; then
+  printf 'Preserving existing unmanaged /usr/local/bin/codex; the service will use %s directly.\n' "$toolchain_dir/bin/codex"
+else
+  install_managed_link "$toolchain_dir/bin/codex" /usr/local/bin/codex
+fi
 
 [[ $(pnpm --version) == "$PNPM_VERSION" ]] || die 'pnpm version verification failed'
-[[ $(codex --version) == "codex-cli $CODEX_CLI_VERSION" ]] || die 'Codex CLI version verification failed'
-codex_real=$(realpath -e -- /usr/local/bin/codex)
+[[ $($toolchain_dir/bin/codex --version) == "codex-cli $CODEX_CLI_VERSION" ]] || die 'Codex CLI version verification failed'
+codex_real=$(realpath -e -- "$toolchain_dir/bin/codex")
 [[ -f $codex_real && -x $codex_real && $(stat -c '%u' "$codex_real") == 0 ]] || die 'Codex CLI must resolve to a root-owned executable'
 codex_mode=$(stat -c '%a' "$codex_real")
 (( (8#$codex_mode & 8#022) == 0 )) || die 'Codex CLI must not be group/world writable'

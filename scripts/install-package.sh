@@ -160,10 +160,10 @@ codex_bin=$(canonical_existing_file "$codex_bin")
 version_pin=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["codex"]["versionPin"])' "$package/release.json")
 [[ $(runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" --version) == "$version_pin" ]] || die "Codex must match package pin: $version_pin"
 if ! runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login status >/dev/null 2>&1; then
-  exec {tty_fd}<>/dev/tty || die "Codex login is required; rerun interactively or run: sudo -u $runner_user -H /usr/local/bin/codex login --device-auth"
+  exec {tty_fd}<>/dev/tty || die "Codex login is required; rerun interactively or run: sudo -u $runner_user -H $codex_bin login --device-auth"
   printf 'Codex is not authenticated for %s; starting device login. Never share the displayed device code.\n' "$runner_user" >&${tty_fd}
   runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login --device-auth <&${tty_fd} >&${tty_fd} 2>&${tty_fd} || \
-    die "Codex device login failed; retry with: sudo -u $runner_user -H /usr/local/bin/codex login --device-auth"
+    die "Codex device login failed; retry with: sudo -u $runner_user -H $codex_bin login --device-auth"
   exec {tty_fd}>&-
   runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login status >/dev/null 2>&1 || die 'Codex login did not produce an authenticated state'
 fi

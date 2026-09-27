@@ -31,6 +31,9 @@ Downloaded artifacts use exact versions and committed SHA-256/SHA-512 digests;
 there is no `curl | sh`, floating `latest` tag or root-owned Codex credential
 store. Use `--upgrade` explicitly to preserve the existing admin config
 while switching to a new immutable release.
+If `/usr/local/bin/codex` is already a regular host-managed executable, bootstrap
+preserves it; the service still uses the exact managed CLI path from its protected
+runner configuration.
 
 The API runs as `codex-web-ui-api`; Codex runs as the selected existing user.
 They communicate only through `/run/codex-web-ui/app-server.sock`. Web secrets

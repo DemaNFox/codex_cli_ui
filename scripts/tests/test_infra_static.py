@@ -139,6 +139,7 @@ class InfraStaticTest(unittest.TestCase):
             "sha256sum --check --strict --status",
             "sha512sum --check --strict --status",
             "/opt/codex-web-ui/runtime",
+            "Preserving existing unmanaged /usr/local/bin/codex",
         ):
             self.assertIn(expected, bootstrap)
         self.assertNotIn("curl |", bootstrap)
