@@ -9,6 +9,7 @@ import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import {
   INITIALIZED_NOTIFICATION,
   INITIALIZE_PARAMS,
+  CodexAppServerSupervisor,
   buildCodexEnvironment,
   type AppServerClient,
   type AppServerInbound,
@@ -41,6 +42,7 @@ class FakeAppServer implements AppServerClient {
   failNextRequestWith: Error | null = null;
   failTurnStartWith: Error | null = null;
   failNextResponseWith: Error | null = null;
+  failAccountStatusReads = false;
 
   blockTurnStarts(): { entered: Promise<void>; release: () => void } {
     let releaseGate!: () => void;
@@ -196,6 +198,40 @@ class FakeAppServer implements AppServerClient {
         })),
       };
     if (method === 'account/read') return { account: {}, requiresOpenaiAuth: true };
+    if (method === 'account/rateLimits/read') {
+      if (this.failAccountStatusReads) throw new Error('unsupported status method');
+      return {
+        accountId: 'private-account-id',
+        rateLimits: {
+          limitId: 'legacy',
+          primary: { usedPercent: 99 },
+        },
+        rateLimitsByLimitId: {
+          codex: {
+            limitId: 'codex',
+            limitName: 'Codex',
+            planType: 'plus',
+            primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+            secondary: null,
+            credits: { balance: 'secret' },
+          },
+        },
+      };
+    }
+    if (method === 'account/usage/read') {
+      if (this.failAccountStatusReads) throw new Error('unsupported status method');
+      return {
+        summary: {
+          lifetimeTokens: 10_000,
+          currentStreakDays: 2,
+          longestStreakDays: 5,
+          peakDailyTokens: 2_000,
+          longestRunningTurnSec: 60,
+          email: 'private@example.test',
+        },
+        dailyUsageBuckets: [{ startDate: '2026-09-27', tokens: 500 }],
+      };
+    }
     throw new Error(`Unexpected method: ${method}`);
   }
 }
@@ -329,6 +365,22 @@ function multipartFile(
 }
 
 describe('security and repository boundary', () => {
+  it('allowlists only the exact read-only account status methods', async () => {
+    const supervisor = new CodexAppServerSupervisor({
+      executable: 'codex',
+      expectedVersion: 'codex-cli 0.153.4',
+    });
+    await expect(supervisor.request('account/rateLimits/read', null)).rejects.toThrow(
+      'APP_SERVER_UNAVAILABLE',
+    );
+    await expect(supervisor.request('account/usage/read', null)).rejects.toThrow(
+      'APP_SERVER_UNAVAILABLE',
+    );
+    await expect(supervisor.request('account/credentials/read', {})).rejects.toThrow(
+      'APP_SERVER_METHOD_NOT_ALLOWED',
+    );
+  });
+
   it('hard-caps retained event count and serialized event bytes', () => {
     const environment = {
       CODEX_WEB_ADMIN_USERNAME: 'owner',
@@ -865,7 +917,43 @@ describe('Codex routes', () => {
     expect(capabilities.json()).toMatchObject({
       authenticated: true,
       codexVersion: 'codex-cli 0.153.4',
+      rateLimits: [
+        {
+          limitId: 'codex',
+          limitName: 'Codex',
+          planType: 'plus',
+          primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+          secondary: null,
+        },
+      ],
+      usage: {
+        summary: { lifetimeTokens: 10_000, currentStreakDays: 2 },
+        dailyUsageBuckets: [{ startDate: '2026-09-27', tokens: 500 }],
+      },
     });
+    expect(capabilities.body).not.toContain('private-account-id');
+    expect(capabilities.body).not.toContain('private@example.test');
+    expect(capabilities.body).not.toContain('balance');
+    appServer.failAccountStatusReads = true;
+    const degraded = await app.inject({
+      method: 'GET',
+      url: '/api/system/capabilities',
+      headers: { cookie: session.cookie },
+    });
+    expect(degraded.statusCode).toBe(200);
+    const degradedBody = degraded.json<{
+      authenticated: boolean;
+      rateLimits: unknown;
+      usage: unknown;
+      warnings: string[];
+    }>();
+    expect(degradedBody).toMatchObject({
+      authenticated: true,
+      rateLimits: null,
+      usage: null,
+    });
+    expect(degradedBody.warnings).toContain('Codex rate limits are unavailable.');
+    expect(degradedBody.warnings).toContain('Codex account usage is unavailable.');
     expect(appServer.requests.find((item) => item.method === 'thread/list')?.params).toMatchObject({
       sourceKinds: ['cli', 'vscode', 'appServer', 'exec'],
     });

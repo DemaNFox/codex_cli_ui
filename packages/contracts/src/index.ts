@@ -190,12 +190,47 @@ export const resolveApprovalRequestSchema = z.object({
   decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']),
 });
 
+export const rateLimitWindowSchema = z.object({
+  usedPercent: z.number().int().min(0).max(100),
+  windowDurationMins: z.number().int().positive().nullable(),
+  resetsAt: z.number().int().nonnegative().nullable(),
+});
+
+export const accountRateLimitSchema = z.object({
+  limitId: z.string().min(1).max(120).nullable(),
+  limitName: z.string().min(1).max(200).nullable(),
+  planType: z.string().min(1).max(80).nullable(),
+  primary: rateLimitWindowSchema.nullable(),
+  secondary: rateLimitWindowSchema.nullable(),
+});
+
+export const accountUsageSchema = z.object({
+  summary: z.object({
+    lifetimeTokens: z.number().int().nonnegative().nullable(),
+    currentStreakDays: z.number().int().nonnegative().nullable(),
+    longestStreakDays: z.number().int().nonnegative().nullable(),
+    peakDailyTokens: z.number().int().nonnegative().nullable(),
+    longestRunningTurnSec: z.number().int().nonnegative().nullable(),
+  }),
+  dailyUsageBuckets: z
+    .array(
+      z.object({
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        tokens: z.number().int().nonnegative(),
+      }),
+    )
+    .max(366)
+    .nullable(),
+});
+
 export const capabilitySchema = z.object({
   codexVersion: z.string(),
   authenticated: z.boolean(),
   appServerReady: z.boolean(),
   projectRoots: z.array(z.string()),
   skills: z.array(z.object({ name: z.string(), path: z.string(), enabled: z.boolean() })),
+  rateLimits: z.array(accountRateLimitSchema).nullable(),
+  usage: accountUsageSchema.nullable(),
   warnings: z.array(z.string()),
 });
 export type Capability = z.infer<typeof capabilitySchema>;

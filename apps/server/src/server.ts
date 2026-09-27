@@ -1,4 +1,6 @@
 import {
+  accountRateLimitSchema,
+  accountUsageSchema,
   attachmentSchema,
   capabilitySchema,
   createProjectRequestSchema,
@@ -151,6 +153,49 @@ const accountResponseSchema = z
   })
   .passthrough();
 
+const upstreamRateLimitWindowSchema = z.object({
+  usedPercent: z.number().int().min(0).max(100),
+  windowDurationMins: z.number().int().positive().nullable().optional(),
+  resetsAt: z.number().int().nonnegative().nullable().optional(),
+});
+
+const upstreamRateLimitSchema = z.object({
+  limitId: z.string().min(1).max(120).nullable().optional(),
+  limitName: z.string().min(1).max(200).nullable().optional(),
+  planType: z.string().min(1).max(80).nullable().optional(),
+  primary: upstreamRateLimitWindowSchema.nullable().optional(),
+  secondary: upstreamRateLimitWindowSchema.nullable().optional(),
+});
+
+const rateLimitsResponseSchema = z.object({
+  rateLimits: upstreamRateLimitSchema.passthrough(),
+  rateLimitsByLimitId: z
+    .record(z.string(), upstreamRateLimitSchema.passthrough())
+    .nullable()
+    .optional(),
+});
+
+const nullableUsageIntegerSchema = z.number().int().nonnegative().nullable();
+const usageResponseSchema = z.object({
+  summary: z.object({
+    lifetimeTokens: nullableUsageIntegerSchema.optional(),
+    currentStreakDays: nullableUsageIntegerSchema.optional(),
+    longestStreakDays: nullableUsageIntegerSchema.optional(),
+    peakDailyTokens: nullableUsageIntegerSchema.optional(),
+    longestRunningTurnSec: nullableUsageIntegerSchema.optional(),
+  }),
+  dailyUsageBuckets: z
+    .array(
+      z.object({
+        startDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        tokens: z.number().int().nonnegative(),
+      }),
+    )
+    .max(366)
+    .nullable()
+    .optional(),
+});
+
 const storedUserInputDetailsSchema = z.object({
   itemId: z.string(),
   isBlocking: z.boolean(),
@@ -255,6 +300,40 @@ function statusType(value: z.infer<typeof rpcThreadSchema>['status']): Thread['s
 
 function dateFromSeconds(value: number): string {
   return new Date(value * 1_000).toISOString();
+}
+
+function publicRateLimit(
+  snapshot: z.infer<typeof upstreamRateLimitSchema>,
+  fallbackLimitId?: string,
+) {
+  const window = (value: z.infer<typeof upstreamRateLimitWindowSchema> | null | undefined) =>
+    value === null || value === undefined
+      ? null
+      : {
+          usedPercent: value.usedPercent,
+          windowDurationMins: value.windowDurationMins ?? null,
+          resetsAt: value.resetsAt ?? null,
+        };
+  return accountRateLimitSchema.parse({
+    limitId: snapshot.limitId ?? fallbackLimitId ?? null,
+    limitName: snapshot.limitName ?? null,
+    planType: snapshot.planType ?? null,
+    primary: window(snapshot.primary),
+    secondary: window(snapshot.secondary),
+  });
+}
+
+function publicUsage(input: z.infer<typeof usageResponseSchema>) {
+  return accountUsageSchema.parse({
+    summary: {
+      lifetimeTokens: input.summary.lifetimeTokens ?? null,
+      currentStreakDays: input.summary.currentStreakDays ?? null,
+      longestStreakDays: input.summary.longestStreakDays ?? null,
+      peakDailyTokens: input.summary.peakDailyTokens ?? null,
+      longestRunningTurnSec: input.summary.longestRunningTurnSec ?? null,
+    },
+    dailyUsageBuckets: input.dailyUsageBuckets ?? null,
+  });
 }
 
 function mapThread(
@@ -1356,6 +1435,39 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (skills.data.some((entry) => !projectPaths.includes(entry.cwd)))
       throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
     const warnings: string[] = [];
+    let rateLimits: z.infer<typeof accountRateLimitSchema>[] | null = null;
+    let usage: z.infer<typeof accountUsageSchema> | null = null;
+    const [rateLimitsResult, usageResult] = await Promise.allSettled([
+      appServer.request('account/rateLimits/read', null),
+      appServer.request('account/usage/read', null),
+    ]);
+    if (rateLimitsResult.status === 'fulfilled') {
+      try {
+        const parsed = rateLimitsResponseSchema.parse(rateLimitsResult.value);
+        const buckets = parsed.rateLimitsByLimitId
+          ? Object.entries(parsed.rateLimitsByLimitId).sort(([left], [right]) =>
+              left.localeCompare(right),
+            )
+          : [];
+        rateLimits =
+          buckets.length > 0
+            ? buckets.map(([limitId, snapshot]) => publicRateLimit(snapshot, limitId))
+            : [publicRateLimit(parsed.rateLimits)];
+      } catch {
+        warnings.push('Codex rate limits are unavailable.');
+      }
+    } else {
+      warnings.push('Codex rate limits are unavailable.');
+    }
+    if (usageResult.status === 'fulfilled') {
+      try {
+        usage = publicUsage(usageResponseSchema.parse(usageResult.value));
+      } catch {
+        warnings.push('Codex account usage is unavailable.');
+      }
+    } else {
+      warnings.push('Codex account usage is unavailable.');
+    }
     if (skills.data.some((entry) => entry.errors.length > 0))
       warnings.push('One or more project skill scans reported errors.');
     const names = new Set(skills.data.flatMap((entry) => entry.skills.map((skill) => skill.name)));
@@ -1378,6 +1490,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           enabled: skill.enabled,
         })),
       ),
+      rateLimits,
+      usage,
       warnings,
     });
   });

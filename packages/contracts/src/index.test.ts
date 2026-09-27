@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   createProjectRequestSchema,
   attachmentSchema,
+  capabilitySchema,
   resolvePermissionRequestSchema,
   resolveUserInputRequestSchema,
   startTurnRequestSchema,
@@ -65,6 +66,46 @@ describe('contracts', () => {
     expect(resolvePermissionRequestSchema.parse({ decision: 'grant' }).scope).toBe('turn');
     expect(
       resolvePermissionRequestSchema.safeParse({ decision: 'grant', scope: 'session' }).success,
+    ).toBe(false);
+  });
+
+  it('accepts only bounded safe account status aggregates', () => {
+    const parsed = capabilitySchema.parse({
+      codexVersion: 'codex-cli 0.153.4',
+      authenticated: true,
+      appServerReady: true,
+      projectRoots: ['/srv/projects'],
+      skills: [],
+      rateLimits: [
+        {
+          limitId: 'codex',
+          limitName: 'Codex',
+          planType: 'plus',
+          primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+          secondary: null,
+          accountId: 'must-not-survive',
+        },
+      ],
+      usage: {
+        summary: {
+          lifetimeTokens: 10_000,
+          currentStreakDays: 2,
+          longestStreakDays: 5,
+          peakDailyTokens: 2_000,
+          longestRunningTurnSec: 60,
+          email: 'private@example.test',
+        },
+        dailyUsageBuckets: [{ startDate: '2026-09-27', tokens: 500 }],
+      },
+      warnings: [],
+    });
+    expect(parsed.rateLimits?.[0]).not.toHaveProperty('accountId');
+    expect(parsed.usage?.summary).not.toHaveProperty('email');
+    expect(
+      capabilitySchema.safeParse({
+        ...parsed,
+        rateLimits: [{ ...parsed.rateLimits?.[0], primary: { usedPercent: 101 } }],
+      }).success,
     ).toBe(false);
   });
 });
