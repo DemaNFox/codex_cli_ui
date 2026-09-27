@@ -362,9 +362,11 @@ function CreateProjectForm({
 function ContextMenu({
   label,
   children,
+  disabled = false,
 }: {
   label: string;
   children: (close: () => void) => ReactNode;
+  disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [position, setPosition] = useState({ top: 0, left: 8 });
@@ -398,6 +400,7 @@ function ContextMenu({
         aria-label={label}
         aria-haspopup="menu"
         aria-expanded={open}
+        disabled={disabled}
         onClick={(event) => {
           if (!open) {
             const rect = event.currentTarget.getBoundingClientRect();
@@ -430,6 +433,7 @@ function ProjectSidebar({
   onCreate,
   onLogout,
   username,
+  disabled,
 }: {
   projects: Project[];
   selectedId: string | null;
@@ -438,6 +442,7 @@ function ProjectSidebar({
   onCreate: (name: string, path: string) => Promise<void>;
   onLogout: () => void;
   username: string;
+  disabled: boolean;
 }) {
   const [creating, setCreating] = useState(false);
   return (
@@ -452,6 +457,7 @@ function ProjectSidebar({
           className="icon-button"
           onClick={() => setCreating(true)}
           aria-label="Добавить проект"
+          disabled={disabled}
         >
           ＋
         </button>
@@ -471,7 +477,11 @@ function ProjectSidebar({
             className={`project-row ${project.id === selectedId ? 'selected' : ''}`}
             key={project.id}
           >
-            <button className="project-button" onClick={() => onSelect(project.id)}>
+            <button
+              className="project-button"
+              onClick={() => onSelect(project.id)}
+              disabled={disabled}
+            >
               <span className="project-icon" aria-hidden="true">
                 ⌘
               </span>
@@ -480,7 +490,7 @@ function ProjectSidebar({
                 <small>{project.path}</small>
               </span>
             </button>
-            <ContextMenu label={`Меню проекта ${project.name}`}>
+            <ContextMenu label={`Меню проекта ${project.name}`} disabled={disabled}>
               {(close) => (
                 <button
                   role="menuitem"
@@ -520,6 +530,7 @@ function ThreadSidebar({
   onArchive,
   onRestore,
   onBack,
+  disabled,
 }: {
   project: Project | null;
   threads: Thread[];
@@ -530,6 +541,7 @@ function ThreadSidebar({
   onArchive: (id: string) => void;
   onRestore: (id: string) => void;
   onBack: () => void;
+  disabled: boolean;
 }) {
   return (
     <aside className="threads-panel" aria-label={archived ? 'Архивированные чаты' : 'Чаты'}>
@@ -539,14 +551,14 @@ function ThreadSidebar({
           <h2>{project?.name ?? 'Выберите проект'}</h2>
         </div>
         {archived ? (
-          <button className="ghost" onClick={onBack}>
+          <button className="ghost" onClick={onBack} disabled={disabled}>
             Назад
           </button>
         ) : (
           <button
             className="icon-button"
             onClick={onNew}
-            disabled={!project}
+            disabled={!project || disabled}
             aria-label="Новый чат"
           >
             ＋
@@ -559,11 +571,14 @@ function ThreadSidebar({
             className={`thread-row ${thread.id === selectedId ? 'selected' : ''}`}
             key={thread.id}
           >
-            <button onClick={() => onSelect(thread.id)}>
+            <button onClick={() => onSelect(thread.id)} disabled={disabled}>
               <strong>{thread.name || thread.preview || 'Новый чат'}</strong>
               <small>{new Date(thread.updatedAt).toLocaleString('ru')}</small>
             </button>
-            <ContextMenu label={`Меню чата ${thread.name || thread.preview || 'Новый чат'}`}>
+            <ContextMenu
+              label={`Меню чата ${thread.name || thread.preview || 'Новый чат'}`}
+              disabled={disabled}
+            >
               {(close) => (
                 <button
                   role="menuitem"
@@ -1353,6 +1368,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
         }}
         onCreate={createProject}
         username={session.username}
+        disabled={busy}
         onLogout={() => void api.logout(session.csrfToken).finally(onSignedOut)}
       />
       <ThreadSidebar
@@ -1369,6 +1385,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
           void api.unarchiveThread(session.csrfToken, id).then(() => refreshThreads())
         }
         onBack={() => setArchiveView(false)}
+        disabled={busy}
       />
       <section className="chat-panel">
         <header className="chat-toolbar">

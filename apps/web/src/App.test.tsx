@@ -376,6 +376,12 @@ describe('App', () => {
     await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
 
     await waitFor(() => expect(FakeXMLHttpRequest.instances).toHaveLength(1));
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: /^Frontend task/ }).disabled).toBe(
+      true,
+    );
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: /^AI Chat Bot/ }).disabled).toBe(
+      true,
+    );
     const upload = FakeXMLHttpRequest.instances[0]!;
     expect(upload.method).toBe('POST');
     expect(upload.url).toBe('/api/threads/thread-1/attachments');
