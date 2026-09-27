@@ -80,6 +80,7 @@ class InfraStaticTest(unittest.TestCase):
         update_script = (ROOT / "scripts/update-ubuntu.sh").read_text(encoding="utf-8")
         rollback_script = (ROOT / "scripts/rollback-ubuntu.sh").read_text(encoding="utf-8")
         release_script = (ROOT / "scripts/prepare-release.sh").read_text(encoding="utf-8")
+        health_script = (ROOT / "scripts/health-check.sh").read_text(encoding="utf-8")
         common = (ROOT / "scripts/lib/ubuntu-common.sh").read_text(encoding="utf-8")
         self.assertIn("release source and CODEX_HOME must not overlap", common)
         self.assertIn("release source contains forbidden sensitive/runtime file", common)
@@ -97,6 +98,7 @@ class InfraStaticTest(unittest.TestCase):
         self.assertNotIn("rm -rf", install_script + update_script + rollback_script)
         self.assertIn('@codex-web/server', release_script)
         self.assertIn('unlink -- "$self_link"', release_script)
+        self.assertIn('SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"', health_script)
 
 
 if __name__ == "__main__":
