@@ -1,0 +1,122 @@
+from __future__ import annotations
+
+import shutil
+import subprocess
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "scripts/install-bounded-storage.sh"
+
+
+def working_bash() -> str | None:
+    candidates: list[Path] = []
+    discovered = shutil.which("bash")
+    if discovered:
+        candidates.append(Path(discovered))
+    git = shutil.which("git")
+    if git:
+        git_root = Path(git).resolve().parent.parent
+        candidates.extend((git_root / "bin/bash.exe", git_root / "usr/bin/bash.exe"))
+    for candidate in candidates:
+        try:
+            subprocess.run(
+                [str(candidate), "--version"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError):
+            continue
+        return str(candidate)
+    return None
+
+
+class BoundedStorageInstallerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.source = SCRIPT.read_text(encoding="utf-8")
+
+    def test_installer_requires_explicit_hard_byte_and_inode_bounds(self) -> None:
+        for expected in (
+            "--size-bytes",
+            "--inode-count",
+            "fallocate --length",
+            'mkfs.ext4 -F -q -N "$inode_count"',
+            'actual_bytes -le $size_bytes',
+            'actual_inodes -le $inode_count',
+        ):
+            self.assertIn(expected, self.source)
+
+    def test_installer_uses_root_owned_ext4_and_persistent_fixed_mounts(self) -> None:
+        for expected in (
+            "require_root",
+            "chown root:root \"$IMAGE_PATH\"",
+            "chmod 0600 \"$IMAGE_PATH\"",
+            "mount -o loop,nodev,nosuid",
+            "/var/lib/codex-web-ui",
+            "/srv/codex-projects",
+            "/opt/codex-web-ui/releases",
+            "$IMAGE_PATH $VOLUME_ROOT ext4 loop,nodev,nosuid 0 2",
+            "none bind,nodev,nosuid,x-systemd.requires-mounts-for=",
+            "x-systemd.requires-mounts-for=$VOLUME_ROOT",
+            'findmnt --verify --tab-file "$FSTAB"',
+        ):
+            self.assertIn(expected, self.source)
+
+    def test_migration_is_fail_closed_and_keeps_recoverable_sources(self) -> None:
+        for expected in (
+            "trap rollback EXIT",
+            "systemctl stop \"$guard_timer\" \"$service_unit\"",
+            "rsync -aHAX --numeric-ids --one-file-system",
+            "--delete --checksum",
+            ".pre-bounded-${backup_suffix}",
+            "bounded storage migration failed; restoring original paths",
+            "$service_was_active && systemctl start \"$service_unit\"",
+            "Original data remains in rollback backups",
+        ):
+            self.assertIn(expected, self.source)
+        self.assertNotIn("rm -rf", self.source)
+
+    def test_help_and_dry_run_are_non_mutating(self) -> None:
+        bash = working_bash()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+        help_result = subprocess.run(
+            [bash, "scripts/install-bounded-storage.sh", "--help"],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+        )
+        self.assertIn("--size-bytes BYTES", help_result.stdout)
+        dry_run = subprocess.run(
+            [
+                bash,
+                "scripts/install-bounded-storage.sh",
+                "--size-bytes",
+                "1073741824",
+                "--inode-count",
+                "4096",
+                "--dry-run",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            cwd=ROOT,
+        )
+        self.assertIn("no changes made", dry_run.stdout)
+        self.assertIn("1073741824 bytes", dry_run.stdout)
+        self.assertIn("4096 inodes requested", dry_run.stdout)
+
+    def test_script_has_valid_bash_syntax(self) -> None:
+        bash = working_bash()
+        if bash is None:
+            self.skipTest("bash is unavailable")
+        subprocess.run(
+            [bash, "-n", "scripts/install-bounded-storage.sh"], check=True, cwd=ROOT
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
