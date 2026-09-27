@@ -886,7 +886,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       if (typeof contentType !== 'string') throw new HttpError(415, 'ATTACHMENT_TYPE_REQUIRED');
       const upload = parseSingleFileMultipart(contentType, request.body);
       const record = await attachmentStore.withThreadLock(id, async () => {
-        if (repository.attachmentBytesForThread(id) + upload.bytes.length > MAX_THREAD_ATTACHMENT_BYTES)
+        if (
+          repository.attachmentBytesForThread(id) + upload.bytes.length >
+          MAX_THREAD_ATTACHMENT_BYTES
+        )
           throw new HttpError(413, 'THREAD_ATTACHMENT_STORAGE_EXHAUSTED');
         const stored = await attachmentStore.write(project.id, id, upload.name, upload.bytes);
         try {
@@ -1032,15 +1035,15 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       const appInput: Record<string, unknown>[] = [];
       const fileReferences = attachments
         .filter((attachment) => attachment.kind === 'file')
-        .map((attachment) =>
-          `${attachment.name}: ${attachmentStore.localPath(project.id, id, attachment.storageName)}`,
+        .map(
+          (attachment) =>
+            `${attachment.name}: ${attachmentStore.localPath(project.id, id, attachment.storageName)}`,
         );
       const appText =
         fileReferences.length === 0
           ? input.text
           : `${input.text}${input.text.length > 0 ? '\n\n' : ''}[Codex Web attachment references (server-local; do not repeat paths):\n${fileReferences.join('\n')}\n]`;
-      if (appText.length > 0)
-        appInput.push({ type: 'text', text: appText, text_elements: [] });
+      if (appText.length > 0) appInput.push({ type: 'text', text: appText, text_elements: [] });
       for (const attachment of attachments) {
         if (attachment.kind === 'image')
           appInput.push({

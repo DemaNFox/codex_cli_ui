@@ -451,7 +451,14 @@ describe('Codex routes', () => {
       threadId,
     });
     expect(Object.keys(attachment).sort()).toEqual([
-      'createdAt', 'id', 'kind', 'mediaType', 'name', 'sizeBytes', 'threadId', 'url',
+      'createdAt',
+      'id',
+      'kind',
+      'mediaType',
+      'name',
+      'sizeBytes',
+      'threadId',
+      'url',
     ]);
 
     const listed = await app.inject({
@@ -466,7 +473,12 @@ describe('Codex routes', () => {
       headers: { cookie: session.cookie },
     });
     expect(downloaded.statusCode).toBe(200);
-    expect(downloaded.rawPayload).toEqual(png.body.subarray(png.body.indexOf(Buffer.from('\r\n\r\n')) + 4, png.body.lastIndexOf(Buffer.from('\r\n--'))));
+    expect(downloaded.rawPayload).toEqual(
+      png.body.subarray(
+        png.body.indexOf(Buffer.from('\r\n\r\n')) + 4,
+        png.body.lastIndexOf(Buffer.from('\r\n--')),
+      ),
+    );
     expect(downloaded.headers['x-content-type-options']).toBe('nosniff');
 
     const deleted = await app.inject({
@@ -508,7 +520,9 @@ describe('Codex routes', () => {
       },
     });
     expect(turn.statusCode).toBe(202);
-    const request = [...appServer.requests].reverse().find((entry) => entry.method === 'turn/start')!;
+    const request = [...appServer.requests]
+      .reverse()
+      .find((entry) => entry.method === 'turn/start')!;
     const input = (request.params as { input: Record<string, unknown>[] }).input;
     const localImage = input.find((item) => item.type === 'localImage')!;
     expect(String(localImage.path)).toContain(attachments[0]!.id);
@@ -542,17 +556,23 @@ describe('Codex routes', () => {
     expect(JSON.stringify(agentEvent)).toContain('[attachment-storage]');
     const hydrated = normalizeThreadHistory(
       threadId,
-      [{
-        id: 'turn-history',
-        status: 'completed',
-        items: [{
-          type: 'userMessage',
-          content: [{
-            type: 'text',
-            text: `visible\n\n[Codex Web attachment references (server-local; do not repeat paths):\nsecret.txt: C:\\private\\secret.txt\n]`,
-          }],
-        }],
-      }],
+      [
+        {
+          id: 'turn-history',
+          status: 'completed',
+          items: [
+            {
+              type: 'userMessage',
+              content: [
+                {
+                  type: 'text',
+                  text: `visible\n\n[Codex Web attachment references (server-local; do not repeat paths):\nsecret.txt: C:\\private\\secret.txt\n]`,
+                },
+              ],
+            },
+          ],
+        },
+      ],
       4_096,
     );
     expect(hydrated.map((event) => event.kind)).toEqual(['turn']);
@@ -589,28 +609,38 @@ describe('Codex routes', () => {
     const attachment = uploaded.json<{ data: Attachment }>().data;
     const basePayload = { text: 'inspect', idempotencyKey: '00000000-0000-4000-8000-000000000101' };
     const crossThread = await app.inject({
-      method: 'POST', url: `/api/threads/${secondThread}/turns`, headers: session.headers,
+      method: 'POST',
+      url: `/api/threads/${secondThread}/turns`,
+      headers: session.headers,
       payload: { ...basePayload, attachmentIds: [attachment.id] },
     });
     expect(crossThread.statusCode).toBe(400);
     const duplicate = await app.inject({
-      method: 'POST', url: `/api/threads/${firstThread}/turns`, headers: session.headers,
+      method: 'POST',
+      url: `/api/threads/${firstThread}/turns`,
+      headers: session.headers,
       payload: { ...basePayload, attachmentIds: [attachment.id, attachment.id] },
     });
     expect(duplicate.statusCode).toBe(400);
     const sent = await app.inject({
-      method: 'POST', url: `/api/threads/${firstThread}/turns`, headers: session.headers,
+      method: 'POST',
+      url: `/api/threads/${firstThread}/turns`,
+      headers: session.headers,
       payload: { ...basePayload, attachmentIds: [attachment.id] },
     });
     expect(sent.statusCode).toBe(202);
     const replayed = await app.inject({
-      method: 'POST', url: `/api/threads/${firstThread}/turns`, headers: session.headers,
+      method: 'POST',
+      url: `/api/threads/${firstThread}/turns`,
+      headers: session.headers,
       payload: { ...basePayload, attachmentIds: [attachment.id] },
     });
     expect(replayed.statusCode).toBe(200);
     expect(replayed.json()).toEqual(sent.json());
     const reused = await app.inject({
-      method: 'POST', url: `/api/threads/${firstThread}/turns`, headers: session.headers,
+      method: 'POST',
+      url: `/api/threads/${firstThread}/turns`,
+      headers: session.headers,
       payload: {
         ...basePayload,
         idempotencyKey: '00000000-0000-4000-8000-000000000102',
@@ -632,8 +662,10 @@ describe('Codex routes', () => {
     ] as const) {
       const upload = multipartFile(name, mimeType, Buffer.from([0x50, 0x4b, 0x03, 0x04, 1]));
       const response = await app.inject({
-        method: 'POST', url: `/api/threads/${threadId}/attachments`,
-        headers: { ...session.headers, 'content-type': upload.contentType }, payload: upload.body,
+        method: 'POST',
+        url: `/api/threads/${threadId}/attachments`,
+        headers: { ...session.headers, 'content-type': upload.contentType },
+        payload: upload.body,
       });
       expect(response.statusCode).toBe(201);
       expect(response.json()).toMatchObject({ data: { name, mediaType: mimeType, kind: 'file' } });

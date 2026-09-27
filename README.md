@@ -4,11 +4,13 @@ A self-hosted, single-operator browser client for an existing Codex CLI installa
 
 The service keeps Codex on the server and provides projects, durable chats, streamed progress, approvals,
 interactive questions, one-turn permission grants, model/reasoning selection, interruption and continuation
-from any browser. It uses the official Codex app-server protocol over local stdio; the app-server transport
+from any browser. Images and common project files can be attached to a turn by selecting, pasting or dropping
+them into the composer; image analysis is delegated to Codex and stored uploads remain inside the bounded
+application state. It uses the official Codex app-server protocol over local stdio; the app-server transport
 is never exposed publicly.
 
-Status: deployment candidate; activation still requires a hostname/TLS
-certificate and server-local login secrets.
+Status: the portable release has been deployed and verified on an Ubuntu reference host. A new host still
+requires its own HTTPS endpoint, bounded storage and server-local login secrets.
 
 ## Architecture
 

@@ -1,4 +1,5 @@
 import type {
+  Attachment,
   ApprovalPolicy,
   Capability,
   ModelOption,
@@ -82,6 +83,57 @@ export interface ThreadHistory {
   events: SafeEvent[];
 }
 
+export interface AttachmentUpload {
+  promise: Promise<Attachment>;
+  abort: () => void;
+}
+
+function uploadAttachment(
+  csrfToken: string,
+  threadId: string,
+  file: File,
+  onProgress: (percent: number) => void,
+): AttachmentUpload {
+  const xhr = new XMLHttpRequest();
+  const promise = new Promise<Attachment>((resolve, reject) => {
+    xhr.open('POST', `/api/threads/${encodeURIComponent(threadId)}/attachments`);
+    xhr.withCredentials = true;
+    xhr.setRequestHeader('X-CSRF-Token', csrfToken);
+    xhr.upload.addEventListener('progress', (event) => {
+      if (event.lengthComputable && event.total > 0) {
+        onProgress(Math.min(100, Math.round((event.loaded / event.total) * 100)));
+      }
+    });
+    xhr.addEventListener('load', () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        let message = `Загрузка завершилась с ошибкой (${xhr.status})`;
+        try {
+          const payload = JSON.parse(xhr.responseText) as { message?: unknown; error?: unknown };
+          if (typeof payload.message === 'string') message = payload.message;
+          else if (typeof payload.error === 'string') message = payload.error;
+        } catch {
+          // The response can intentionally have no JSON body.
+        }
+        reject(new ApiError(message, xhr.status));
+        return;
+      }
+      try {
+        const payload = JSON.parse(xhr.responseText) as Attachment | { data: Attachment };
+        resolve(unwrapData(payload));
+      } catch {
+        reject(new ApiError('Сервер вернул некорректный ответ загрузки', xhr.status));
+      }
+    });
+    xhr.addEventListener('error', () => reject(new ApiError('Не удалось загрузить файл', 0)));
+    xhr.addEventListener('abort', () => reject(new ApiError('Загрузка отменена', 0)));
+
+    const body = new FormData();
+    body.append('file', file, file.name);
+    xhr.send(body);
+  });
+  return { promise, abort: () => xhr.abort() };
+}
+
 export const api = {
   session: () => request<Session>('/api/auth/session'),
   login: (username: string, password: string) =>
@@ -105,6 +157,17 @@ export const api = {
     ),
   thread: (threadId: string) =>
     request<ThreadHistory>(`/api/threads/${encodeURIComponent(threadId)}`),
+  attachments: async (threadId: string) =>
+    asList(
+      await request<Attachment[] | { data: Attachment[] }>(
+        `/api/threads/${encodeURIComponent(threadId)}/attachments`,
+      ),
+    ),
+  deleteAttachment: (csrfToken: string, threadId: string, attachmentId: string) =>
+    request<void>(
+      `/api/threads/${encodeURIComponent(threadId)}/attachments/${encodeURIComponent(attachmentId)}`,
+      { method: 'DELETE', csrfToken },
+    ),
   startThread: (
     csrfToken: string,
     input: {
@@ -130,6 +193,7 @@ export const api = {
       permissionPreset: PermissionPreset;
       approvalPolicy: ApprovalPolicy;
       idempotencyKey: string;
+      attachmentIds?: string[];
     },
   ) =>
     request<{ turnId: string } | { data: { turnId: string } }>(
@@ -140,6 +204,7 @@ export const api = {
         body: input,
       },
     ).then(unwrapData),
+  uploadAttachment,
   steer: async (csrfToken: string, threadId: string, text: string, expectedTurnId: string) =>
     unwrapData(
       await request<{ turnId: string } | { data: { turnId: string } }>(
@@ -211,4 +276,13 @@ export const api = {
   capabilities: () => request<Capability>('/api/system/capabilities'),
 };
 
-export type { Capability, ModelOption, PendingApproval, Project, SafeEvent, Session, Thread };
+export type {
+  Attachment,
+  Capability,
+  ModelOption,
+  PendingApproval,
+  Project,
+  SafeEvent,
+  Session,
+  Thread,
+};

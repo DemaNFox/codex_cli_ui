@@ -524,26 +524,27 @@ export class SqliteRepository {
 
   createAttachment(input: Omit<AttachmentRecord, 'turnId' | 'createdAt'>): AttachmentRecord {
     const createdAt = new Date().toISOString();
-    this.database.prepare(
-      `INSERT INTO attachments(id,thread_id,name,mime_type,kind,size_bytes,storage_name,turn_id,created_at)
+    this.database
+      .prepare(
+        `INSERT INTO attachments(id,thread_id,name,mime_type,kind,size_bytes,storage_name,turn_id,created_at)
        VALUES(?,?,?,?,?,?,?,NULL,?)`,
-    ).run(
-      input.id,
-      input.threadId,
-      input.name,
-      input.mimeType,
-      input.kind,
-      input.size,
-      input.storageName,
-      createdAt,
-    );
+      )
+      .run(
+        input.id,
+        input.threadId,
+        input.name,
+        input.mimeType,
+        input.kind,
+        input.size,
+        input.storageName,
+        createdAt,
+      );
     return this.getAttachment(input.id)!;
   }
 
   getAttachment(id: string): AttachmentRecord | undefined {
     const row = this.database.prepare('SELECT * FROM attachments WHERE id=?').get(id) as
-      | AttachmentRow
-      | undefined;
+      AttachmentRow | undefined;
     return row && attachmentFromRow(row);
   }
 

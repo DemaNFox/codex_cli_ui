@@ -144,6 +144,8 @@ def main() -> int:
                     "events": [],
                 },
             )
+        elif path == "/api/threads/t1/attachments" and request.method == "GET":
+            payload(route, 200, {"data": []})
         elif path == "/api/threads/t1/archive":
             archived = True
             payload(route, 200, {"data": {"id": "t1", "archived": True}})
@@ -248,19 +250,35 @@ def main() -> int:
         if resolved_permission != {"decision": "grant", "scope": "turn"}:
             raise AssertionError("permission response is not constrained to one turn")
 
-        page.get_by_label("Архивировать чат").click()
+        project_menu = page.get_by_label("Меню проекта Demo")
+        project_menu.click()
+        archived_action = page.get_by_role("menuitem", name="Архивированные чаты")
+        archived_action.wait_for(state="visible")
+        menu_box = archived_action.bounding_box()
+        if not menu_box or menu_box["x"] < 0 or menu_box["x"] + menu_box["width"] > 1440:
+            raise AssertionError("project context menu is clipped on desktop")
+        page.keyboard.press("Escape")
+
+        page.get_by_label("Меню чата Переносимый чат").click()
+        page.get_by_role("menuitem", name="Архивировать чат").click()
         page.get_by_text("Здесь пока нет чатов.").wait_for()
         page.get_by_label("Меню проекта Demo").click()
-        page.get_by_role("button", name="Архивированные чаты").click()
+        page.get_by_role("menuitem", name="Архивированные чаты").click()
         page.get_by_label("Архивированные чаты").wait_for()
         page.get_by_role("strong").filter(has_text="Переносимый чат").wait_for()
-        page.get_by_label("Восстановить чат").click()
+        page.get_by_label("Меню чата Переносимый чат").click()
+        page.get_by_role("menuitem", name="Восстановить чат").click()
         page.get_by_text("Архив пуст.").wait_for()
 
         page.set_viewport_size({"width": 390, "height": 844})
         overflow = page.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth")
         if overflow:
             raise AssertionError("mobile layout has horizontal page overflow")
+        for label in ("Модель", "Уровень reasoning", "Уровень доступа", "Политика подтверждений"):
+            control = page.get_by_label(label)
+            box = control.bounding_box()
+            if not box or box["x"] < 0 or box["x"] + box["width"] > 390:
+                raise AssertionError(f"mobile control is outside the viewport: {label}")
         unexpected_console_errors = [
             error
             for error in console_errors

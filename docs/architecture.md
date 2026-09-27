@@ -25,6 +25,15 @@ Browser
 - Models and reasoning efforts come from `model/list`; the UI never hard-codes account availability.
 - `instructionSources` from thread start/resume and `skills/list` are visible in diagnostics so the operator can verify that `AGENTS.md` and required skills loaded.
 
+## Attachments
+
+- The browser uploads each attachment before starting a turn and receives only an opaque attachment ID plus safe display metadata. Uploads are scoped to their thread and stored beneath the bounded application-state directory; the original client path is never trusted.
+- A turn may claim at most eight already uploaded attachments. Each attachment is limited to 20 MiB and the durable total is limited to 50 MiB per thread. Deleting or archiving a chat does not escape the thread boundary.
+- PNG, JPEG and WebP images are signature-checked and passed to app-server as native `localImage` inputs. The UI renders them through an authenticated, thread-scoped content route.
+- Common text, source, PDF and office documents remain inert files in the Web API. Codex receives a backend-generated instruction containing only a server-verified internal path; the API does not parse, execute, unzip or embed their content.
+- App-server `userMessage` notifications are not copied into the public event journal. The backend writes one canonical user event containing only text and safe attachment metadata, preventing duplicated messages and internal-path disclosure during streaming or history hydration.
+- Attachment IDs cannot be used across threads. Content responses use `nosniff`; non-image files are downloads rather than active browser content.
+
 ## Permission presets
 
 - `read-only`: read project files and run non-mutating inspection.
@@ -59,6 +68,7 @@ dedicated bounded volume remains mandatory for a hard disk limit.
 - `POST /api/user-input-requests/:id/resolve` for typed `request_user_input` answers; secret answers are never persisted or echoed
 - `POST /api/permission-requests/:id/resolve` for an explicit deny or one-turn grant derived from the validated request
 - `GET /api/threads/:id/events` using SSE and `Last-Event-ID`
+- `POST/GET /api/threads/:id/attachments`, `GET/DELETE /api/threads/:id/attachments/:attachmentId`; uploads use multipart field `file`
 - `GET /api/system/capabilities` for safe version/auth/instruction/skill diagnostics
 
 All state-changing routes require an authenticated session, exact Origin and a session-bound CSRF token.

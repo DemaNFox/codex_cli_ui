@@ -9,28 +9,60 @@ import { HttpError } from './auth.js';
 export const MAX_ATTACHMENT_BYTES = 20 * 1_024 * 1_024;
 export const MAX_THREAD_ATTACHMENT_BYTES = 50 * 1_024 * 1_024;
 
-const MIME_RULES: Readonly<Record<string, { kind: Attachment['kind']; extensions: readonly string[] }>> = {
+const MIME_RULES: Readonly<
+  Record<string, { kind: Attachment['kind']; extensions: readonly string[] }>
+> = {
   'image/png': { kind: 'image', extensions: ['.png'] },
   'image/jpeg': { kind: 'image', extensions: ['.jpg', '.jpeg'] },
   'image/gif': { kind: 'image', extensions: ['.gif'] },
   'image/webp': { kind: 'image', extensions: ['.webp'] },
   'application/pdf': { kind: 'file', extensions: ['.pdf'] },
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': {
-    kind: 'file', extensions: ['.docx'],
+    kind: 'file',
+    extensions: ['.docx'],
   },
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': {
-    kind: 'file', extensions: ['.xlsx'],
+    kind: 'file',
+    extensions: ['.xlsx'],
   },
   'application/vnd.openxmlformats-officedocument.presentationml.presentation': {
-    kind: 'file', extensions: ['.pptx'],
+    kind: 'file',
+    extensions: ['.pptx'],
   },
   'application/json': { kind: 'file', extensions: ['.json'] },
   'text/plain': {
     kind: 'file',
     extensions: [
-      '.txt', '.log', '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.rb', '.rs',
-      '.go', '.java', '.kt', '.c', '.h', '.cpp', '.hpp', '.cs', '.sh', '.ps1', '.sql', '.toml',
-      '.yaml', '.yml', '.xml', '.html', '.css', '.scss', '.env.example',
+      '.txt',
+      '.log',
+      '.ts',
+      '.tsx',
+      '.js',
+      '.jsx',
+      '.mjs',
+      '.cjs',
+      '.py',
+      '.rb',
+      '.rs',
+      '.go',
+      '.java',
+      '.kt',
+      '.c',
+      '.h',
+      '.cpp',
+      '.hpp',
+      '.cs',
+      '.sh',
+      '.ps1',
+      '.sql',
+      '.toml',
+      '.yaml',
+      '.yml',
+      '.xml',
+      '.html',
+      '.css',
+      '.scss',
+      '.env.example',
     ],
   },
   'text/markdown': { kind: 'file', extensions: ['.md', '.markdown'] },
@@ -85,8 +117,10 @@ function validImageSignature(mimeType: string, bytes: Buffer): boolean {
     return false;
   }
   if (mimeType === 'image/webp')
-    return bytes.subarray(0, 4).toString('ascii') === 'RIFF' &&
-      bytes.subarray(8, 12).toString('ascii') === 'WEBP';
+    return (
+      bytes.subarray(0, 4).toString('ascii') === 'RIFF' &&
+      bytes.subarray(8, 12).toString('ascii') === 'WEBP'
+    );
   return true;
 }
 
@@ -204,7 +238,9 @@ export class AttachmentStore {
   async withThreadLock<T>(threadId: string, action: () => Promise<T>): Promise<T> {
     const previous = this.locks.get(threadId) ?? Promise.resolve();
     let release!: () => void;
-    const current = new Promise<void>((resolve) => { release = resolve; });
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     const queued = previous.then(() => current);
     this.locks.set(threadId, queued);
     await previous;
@@ -222,7 +258,10 @@ export class AttachmentStore {
   }
 
   localPath(projectId: string, threadId: string, storageName: string): string {
-    if (storageName !== path.basename(storageName) || !/^[0-9a-f-]{36}\.[a-z0-9.]{1,16}$/u.test(storageName))
+    if (
+      storageName !== path.basename(storageName) ||
+      !/^[0-9a-f-]{36}\.[a-z0-9.]{1,16}$/u.test(storageName)
+    )
       throw new Error('ATTACHMENT_STORAGE_NAME_INVALID');
     return path.join(
       this.root,
@@ -232,7 +271,12 @@ export class AttachmentStore {
     );
   }
 
-  async write(projectId: string, threadId: string, name: string, bytes: Buffer): Promise<{ id: string; storageName: string }> {
+  async write(
+    projectId: string,
+    threadId: string,
+    name: string,
+    bytes: Buffer,
+  ): Promise<{ id: string; storageName: string }> {
     const id = randomUUID();
     const storageName = this.storageName(id, name);
     const directory = path.dirname(this.localPath(projectId, threadId, storageName));

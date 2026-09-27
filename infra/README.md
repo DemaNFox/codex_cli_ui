@@ -29,6 +29,10 @@ runtime secrets, Docker access or deployment credentials.
   event. Codex rollout history remains authoritative; the bounded journal is
   the reconnect/UI projection and prevents one browser replay from exhausting
   the service cgroup.
+- Nginx accepts attachment requests up to 21 MiB so the API can enforce the
+  exact 20 MiB file limit after multipart overhead. The body timeout is 60
+  seconds. Keep both values aligned with the application contract rather than
+  raising the edge limit independently.
 
 ## Codex sandbox prerequisites
 

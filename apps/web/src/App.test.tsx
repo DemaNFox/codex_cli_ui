@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -93,6 +93,69 @@ class FakeEventSource {
   }
 }
 
+class FakeXMLHttpRequest extends EventTarget {
+  static instances: FakeXMLHttpRequest[] = [];
+  static autoRespond = true;
+  readonly upload = new EventTarget();
+  status = 0;
+  responseText = '';
+  withCredentials = false;
+  method = '';
+  url = '';
+  body: Document | XMLHttpRequestBodyInit | null = null;
+  headers = new Map<string, string>();
+
+  constructor() {
+    super();
+    FakeXMLHttpRequest.instances.push(this);
+  }
+
+  open(method: string, url: string) {
+    this.method = method;
+    this.url = url;
+  }
+
+  setRequestHeader(name: string, value: string) {
+    this.headers.set(name, value);
+  }
+
+  send(body: Document | XMLHttpRequestBodyInit | null) {
+    this.body = body;
+    if (FakeXMLHttpRequest.autoRespond) queueMicrotask(() => this.complete());
+  }
+
+  abort() {
+    this.dispatchEvent(new Event('abort'));
+  }
+
+  progress(loaded: number, total: number) {
+    this.upload.dispatchEvent(
+      new ProgressEvent('progress', { lengthComputable: true, loaded, total }),
+    );
+  }
+
+  complete(status = 201) {
+    const file = this.body instanceof FormData ? this.body.get('file') : null;
+    const name = file instanceof File ? file.name : 'attachment.bin';
+    const mediaType = file instanceof File ? file.type : 'application/octet-stream';
+    const sizeBytes = file instanceof File ? file.size : 0;
+    this.status = status;
+    this.responseText = JSON.stringify({
+      data: {
+        id: `attachment-${FakeXMLHttpRequest.instances.indexOf(this) + 1}`,
+        threadId: 'thread-1',
+        name,
+        mediaType,
+        kind: mediaType.startsWith('image/') ? 'image' : 'file',
+        sizeBytes,
+        createdAt: '2026-09-27T10:10:00.000Z',
+        url: `/api/threads/thread-1/attachments/attachment-1/content`,
+      },
+    });
+    this.dispatchEvent(new Event('load'));
+  }
+}
+
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
@@ -118,6 +181,9 @@ function installAuthenticatedApi(
     if (url === '/api/models') return Promise.resolve(jsonResponse(models));
     if (url === '/api/system/capabilities') return Promise.resolve(jsonResponse(capabilities));
     if (url.includes('/api/threads?')) return Promise.resolve(jsonResponse([thread]));
+    if (/^\/api\/threads\/[^/]+\/attachments$/.test(url)) {
+      return Promise.resolve(jsonResponse([]));
+    }
     if (url === '/api/threads/thread-1') {
       return Promise.resolve(jsonResponse({ data: thread, events: [] }));
     }
@@ -129,7 +195,18 @@ function installAuthenticatedApi(
 
 beforeEach(() => {
   FakeEventSource.instances = [];
+  FakeXMLHttpRequest.instances = [];
+  FakeXMLHttpRequest.autoRespond = true;
   vi.stubGlobal('EventSource', FakeEventSource);
+  vi.stubGlobal('XMLHttpRequest', FakeXMLHttpRequest);
+  Object.defineProperty(URL, 'createObjectURL', {
+    configurable: true,
+    value: vi.fn(() => 'blob:preview'),
+  });
+  Object.defineProperty(URL, 'revokeObjectURL', {
+    configurable: true,
+    value: vi.fn(() => undefined),
+  });
 });
 
 describe('App', () => {
@@ -192,6 +269,31 @@ describe('App', () => {
     expect(source?.close).toHaveBeenCalledOnce();
   });
 
+  it('keeps primary controls available and opens compact project/thread menus', async () => {
+    installAuthenticatedApi();
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findAllByText('Frontend task');
+
+    expect(screen.getByRole('button', { name: 'Диагностика' })).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Прикрепить файлы' })).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Отправить сообщение' })).not.toBeNull();
+
+    const projectMenu = screen.getByRole('button', { name: 'Меню проекта AI Chat Bot' });
+    await user.click(projectMenu);
+    expect(projectMenu.getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByRole('menuitem', { name: 'Архивированные чаты' })).not.toBeNull();
+    await user.keyboard('{Escape}');
+    expect(projectMenu.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByRole('menuitem', { name: 'Архивированные чаты' })).toBeNull();
+
+    const threadMenu = screen.getByRole('button', { name: 'Меню чата Frontend task' });
+    await user.click(threadMenu);
+    expect(screen.getByRole('menuitem', { name: 'Архивировать чат' })).not.toBeNull();
+    fireEvent.mouseDown(document.body);
+    expect(screen.queryByRole('menuitem', { name: 'Архивировать чат' })).toBeNull();
+  });
+
   it('steers an active turn and can interrupt it', async () => {
     const fetchMock = installAuthenticatedApi();
     const user = userEvent.setup();
@@ -230,6 +332,147 @@ describe('App', () => {
     });
   });
 
+  it('queues files from picker, clipboard and drop, then removes them before upload', async () => {
+    installAuthenticatedApi();
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findAllByText('Frontend task');
+
+    const pickerFile = new File(['picker'], 'picker.txt', { type: 'text/plain' });
+    await user.upload(screen.getByLabelText('Выбрать вложения'), pickerFile);
+    expect(await screen.findByText('picker.txt')).not.toBeNull();
+
+    const textarea = screen.getByLabelText('Сообщение Codex');
+    fireEvent.paste(textarea, {
+      clipboardData: { files: [new File(['paste'], 'paste.png', { type: 'image/png' })] },
+    });
+    expect(await screen.findByText('paste.png')).not.toBeNull();
+
+    const composer = textarea.closest('.composer');
+    expect(composer).not.toBeNull();
+    fireEvent.drop(composer!, {
+      dataTransfer: {
+        files: [new File(['drop'], 'drop.md', { type: 'text/markdown' })],
+        types: ['Files'],
+      },
+    });
+    expect(await screen.findByText('drop.md')).not.toBeNull();
+
+    await user.click(screen.getByRole('button', { name: 'Удалить picker.txt' }));
+    expect(screen.queryByText('picker.txt')).toBeNull();
+    expect(FakeXMLHttpRequest.instances).toHaveLength(0);
+  });
+
+  it('uploads queued attachments with progress and sends their ids with the message', async () => {
+    FakeXMLHttpRequest.autoRespond = false;
+    const fetchMock = installAuthenticatedApi();
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findAllByText('Frontend task');
+
+    const file = new File(['1234567890'], 'evidence.png', { type: 'image/png' });
+    await user.upload(screen.getByLabelText('Выбрать вложения'), file);
+    await user.type(screen.getByLabelText('Сообщение Codex'), 'Проверь изображение');
+    await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
+
+    await waitFor(() => expect(FakeXMLHttpRequest.instances).toHaveLength(1));
+    const upload = FakeXMLHttpRequest.instances[0]!;
+    expect(upload.method).toBe('POST');
+    expect(upload.url).toBe('/api/threads/thread-1/attachments');
+    expect(upload.headers.get('X-CSRF-Token')).toBe('csrf-token');
+    expect(upload.body).toBeInstanceOf(FormData);
+    act(() => upload.progress(5, 10));
+    expect(await screen.findByText('Загрузка 50%')).not.toBeNull();
+    act(() => upload.complete());
+
+    await waitFor(() => {
+      const turnCall = fetchMock.mock.calls.find(([input]) => requestUrl(input).endsWith('/turns'));
+      expect(turnCall).toBeDefined();
+      const requestBody = turnCall?.[1]?.body;
+      expect(typeof requestBody).toBe('string');
+      expect(JSON.parse(requestBody as string)).toEqual(
+        expect.objectContaining({
+          text: 'Проверь изображение',
+          attachmentIds: ['attachment-1'],
+        }),
+      );
+    });
+    await waitFor(() => expect(screen.queryByText('evidence.png')).toBeNull());
+  });
+
+  it('keeps a failed upload queued with an accessible error for retry', async () => {
+    FakeXMLHttpRequest.autoRespond = false;
+    installAuthenticatedApi();
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findAllByText('Frontend task');
+
+    await user.upload(
+      screen.getByLabelText('Выбрать вложения'),
+      new File(['broken'], 'broken.txt', { type: 'text/plain' }),
+    );
+    await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
+    await waitFor(() => expect(FakeXMLHttpRequest.instances).toHaveLength(1));
+    act(() => FakeXMLHttpRequest.instances[0]!.complete(500));
+
+    expect(
+      (await screen.findAllByText('Загрузка завершилась с ошибкой (500)')).length,
+    ).toBeGreaterThan(0);
+    expect(screen.getByText('broken.txt')).not.toBeNull();
+    expect(
+      screen.getByRole<HTMLButtonElement>('button', { name: 'Удалить broken.txt' }).disabled,
+    ).toBe(false);
+  });
+
+  it('renders persisted image and file attachments from chat history accessibly', async () => {
+    const attachmentEvent = {
+      id: 40,
+      threadId: 'thread-1',
+      turnId: 'turn-with-files',
+      kind: 'user-message',
+      phase: 'completed',
+      payload: {
+        text: 'Материалы задачи',
+        attachments: [
+          {
+            id: 'image-1',
+            threadId: 'thread-1',
+            name: 'макет.png',
+            mediaType: 'image/png',
+            kind: 'image',
+            sizeBytes: 512,
+            createdAt: '2026-09-27T10:00:00.000Z',
+            url: '/api/threads/thread-1/attachments/image-1/content',
+          },
+          {
+            id: 'file-1',
+            threadId: 'thread-1',
+            name: 'требования.pdf',
+            mediaType: 'application/pdf',
+            kind: 'file',
+            sizeBytes: 2048,
+            createdAt: '2026-09-27T10:00:00.000Z',
+            url: '/api/threads/thread-1/attachments/file-1/content',
+          },
+        ],
+      },
+      createdAt: '2026-09-27T10:01:00.000Z',
+    };
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') {
+        return jsonResponse({ data: thread, events: [attachmentEvent] });
+      }
+      return undefined;
+    });
+    render(<App />);
+
+    const image = await screen.findByRole('img', { name: 'макет.png' });
+    expect(image.getAttribute('src')).toBe('/api/threads/thread-1/attachments/image-1/content');
+    const download = screen.getByRole('link', { name: /требования\.pdf/ });
+    expect(download.getAttribute('href')).toBe('/api/threads/thread-1/attachments/file-1/content');
+    expect(download.hasAttribute('download')).toBe(true);
+  });
+
   it('opens a project archive and restores a chat', async () => {
     const archivedThread = { ...thread, id: 'thread-old', name: 'Старый чат', archived: true };
     const archivedEvent = {
@@ -255,11 +498,12 @@ describe('App', () => {
     render(<App />);
 
     await user.click(await screen.findByLabelText('Меню проекта AI Chat Bot'));
-    await user.click(screen.getByRole('button', { name: 'Архивированные чаты' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Архивированные чаты' }));
     expect((await screen.findAllByText('Старый чат')).length).toBeGreaterThan(0);
     expect(await screen.findByText('Сохранённый ответ из архива')).not.toBeNull();
     expect(screen.getByLabelText<HTMLTextAreaElement>('Сообщение Codex').disabled).toBe(true);
-    await user.click(screen.getByRole('button', { name: 'Восстановить чат' }));
+    await user.click(screen.getByRole('button', { name: 'Меню чата Старый чат' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Восстановить чат' }));
 
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
@@ -295,7 +539,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: /Импортированный чат/ }));
+    await user.click(await screen.findByRole('button', { name: /^Импортированный чат/ }));
     expect(await screen.findByText('История с сервера')).not.toBeNull();
     await waitFor(() => expect(FakeEventSource.instances.at(-1)?.url).toContain('thread-imported'));
 

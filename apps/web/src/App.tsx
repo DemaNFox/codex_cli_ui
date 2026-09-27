@@ -1,4 +1,14 @@
-import { FormEvent, useEffect, useMemo, useState } from 'react';
+import {
+  ClipboardEvent,
+  DragEvent,
+  FormEvent,
+  type ReactNode,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import { createPortal } from 'react-dom';
 import type {
   ApprovalPolicy,
   PermissionPreset,
@@ -8,6 +18,7 @@ import type {
 
 import { ApiError, api } from './api.js';
 import type {
+  Attachment,
   Capability,
   ModelOption,
   PendingApproval,
@@ -19,6 +30,88 @@ import type {
 import { useThreadEvents } from './useThreadEvents.js';
 
 type LoadState = 'loading' | 'ready' | 'signed-out';
+
+const MAX_ATTACHMENTS_PER_TURN = 8;
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const MAX_THREAD_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+
+interface QueuedAttachment {
+  localId: string;
+  file: File;
+  previewUrl: string | null;
+  progress: number;
+  status: 'queued' | 'uploading' | 'uploaded' | 'error';
+  uploaded: Attachment | null;
+  error: string | null;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} Б`;
+  if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} КБ`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
+}
+
+function attachmentsFrom(event: SafeEvent): Attachment[] {
+  if (!Array.isArray(event.payload.attachments)) return [];
+  return event.payload.attachments.filter((item): item is Attachment => {
+    if (!item || typeof item !== 'object') return false;
+    const value = item as Record<string, unknown>;
+    return (
+      typeof value.id === 'string' &&
+      typeof value.threadId === 'string' &&
+      typeof value.name === 'string' &&
+      typeof value.mediaType === 'string' &&
+      (value.kind === 'image' || value.kind === 'file') &&
+      typeof value.sizeBytes === 'number' &&
+      typeof value.createdAt === 'string' &&
+      typeof value.url === 'string'
+    );
+  });
+}
+
+function safeAttachmentUrl(value: string): string | null {
+  return value.startsWith('/api/threads/') ? value : null;
+}
+
+function AttachmentList({ attachments }: { attachments: Attachment[] }) {
+  if (!attachments.length) return null;
+  return (
+    <ul className="message-attachments" aria-label="Вложения сообщения">
+      {attachments.map((attachment) => {
+        const url = safeAttachmentUrl(attachment.url);
+        return (
+          <li key={attachment.id}>
+            {attachment.kind === 'image' && url ? (
+              <a
+                href={url}
+                target="_blank"
+                rel="noreferrer"
+                aria-label={`Открыть ${attachment.name}`}
+              >
+                <img src={url} alt={attachment.name} loading="lazy" />
+                <span>{attachment.name}</span>
+              </a>
+            ) : url ? (
+              <a href={url} download={attachment.name}>
+                <span className="attachment-file-icon" aria-hidden="true">
+                  ↧
+                </span>
+                <span>
+                  <strong>{attachment.name}</strong>
+                  <small>{formatBytes(attachment.sizeBytes)}</small>
+                </span>
+              </a>
+            ) : (
+              <span className="attachment-unavailable">
+                {attachment.name} · вложение недоступно
+              </span>
+            )}
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Неизвестная ошибка';
@@ -40,7 +133,15 @@ function valueText(value: unknown): string | null {
 }
 
 function eventText(event: SafeEvent): string {
-  return valueText(event.payload) ?? `${event.kind}: ${event.phase}`;
+  const text = valueText(event.payload);
+  if (text) return text;
+  if (
+    (event.kind === 'user-message' || event.kind === 'agent-message') &&
+    Array.isArray(event.payload.attachments)
+  ) {
+    return '';
+  }
+  return `${event.kind}: ${event.phase}`;
 }
 
 function eventTitle(event: SafeEvent): string {
@@ -258,6 +359,69 @@ function CreateProjectForm({
   );
 }
 
+function ContextMenu({
+  label,
+  children,
+}: {
+  label: string;
+  children: (close: () => void) => ReactNode;
+}) {
+  const [open, setOpen] = useState(false);
+  const [position, setPosition] = useState({ top: 0, left: 8 });
+  const rootRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeOutside = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (!rootRef.current?.contains(target) && !menuRef.current?.contains(target)) setOpen(false);
+    };
+    document.addEventListener('mousedown', closeOutside);
+    return () => document.removeEventListener('mousedown', closeOutside);
+  }, [open]);
+
+  return (
+    <div
+      className="row-menu"
+      ref={rootRef}
+      onKeyDown={(event) => {
+        if (event.key === 'Escape') {
+          setOpen(false);
+          rootRef.current?.querySelector<HTMLButtonElement>('.menu-trigger')?.focus();
+        }
+      }}
+    >
+      <button
+        type="button"
+        className="icon-button menu-trigger"
+        aria-label={label}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={(event) => {
+          if (!open) {
+            const rect = event.currentTarget.getBoundingClientRect();
+            setPosition({
+              top: rect.bottom + 4,
+              left: Math.max(8, Math.min(window.innerWidth - 188, rect.right - 180)),
+            });
+          }
+          setOpen((value) => !value);
+        }}
+      >
+        ⋯
+      </button>
+      {open &&
+        createPortal(
+          <div className="menu-popover" role="menu" style={position} ref={menuRef}>
+            {children(() => setOpen(false))}
+          </div>,
+          document.body,
+        )}
+    </div>
+  );
+}
+
 function ProjectSidebar({
   projects,
   selectedId,
@@ -316,12 +480,19 @@ function ProjectSidebar({
                 <small>{project.path}</small>
               </span>
             </button>
-            <details className="row-menu">
-              <summary aria-label={`Меню проекта ${project.name}`}>⋯</summary>
-              <div className="menu-popover">
-                <button onClick={() => onShowArchived(project.id)}>Архивированные чаты</button>
-              </div>
-            </details>
+            <ContextMenu label={`Меню проекта ${project.name}`}>
+              {(close) => (
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    close();
+                    onShowArchived(project.id);
+                  }}
+                >
+                  Архивированные чаты
+                </button>
+              )}
+            </ContextMenu>
           </div>
         ))}
       </nav>
@@ -392,14 +563,20 @@ function ThreadSidebar({
               <strong>{thread.name || thread.preview || 'Новый чат'}</strong>
               <small>{new Date(thread.updatedAt).toLocaleString('ru')}</small>
             </button>
-            <button
-              className="icon-button subtle"
-              aria-label={archived ? 'Восстановить чат' : 'Архивировать чат'}
-              title={archived ? 'Восстановить' : 'Архивировать'}
-              onClick={() => (archived ? onRestore(thread.id) : onArchive(thread.id))}
-            >
-              {archived ? '↺' : '⌑'}
-            </button>
+            <ContextMenu label={`Меню чата ${thread.name || thread.preview || 'Новый чат'}`}>
+              {(close) => (
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    close();
+                    if (archived) onRestore(thread.id);
+                    else onArchive(thread.id);
+                  }}
+                >
+                  {archived ? 'Восстановить чат' : 'Архивировать чат'}
+                </button>
+              )}
+            </ContextMenu>
           </div>
         ))}
         {!threads.length && (
@@ -673,13 +850,16 @@ function Transcript({ events }: { events: SafeEvent[] }) {
     <div className="transcript" aria-live="polite">
       {displayEvents.map((event) => {
         if (event.kind === 'user-message' || event.kind === 'agent-message') {
+          const attachments = attachmentsFrom(event);
+          const text = eventText(event);
           return (
             <article
               className={`message ${event.kind === 'user-message' ? 'user' : 'agent'}`}
               key={event.id}
             >
               <span className="message-role">{event.kind === 'user-message' ? 'Вы' : 'Codex'}</span>
-              <div className="message-text">{eventText(event)}</div>
+              {text && <div className="message-text">{text}</div>}
+              <AttachmentList attachments={attachments} />
             </article>
           );
         }
@@ -776,8 +956,13 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   const [permission, setPermission] = useState<PermissionPreset>('workspace-write');
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>('on-request');
   const [composer, setComposer] = useState('');
+  const [queuedAttachments, setQueuedAttachments] = useState<QueuedAttachment[]>([]);
+  const [threadAttachmentBytes, setThreadAttachmentBytes] = useState(0);
+  const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
+  const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const [locallyResolvedRequests, setLocallyResolvedRequests] = useState<Set<string>>(
     () => new Set(),
   );
@@ -868,17 +1053,27 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   }, [projectId, archiveView]);
 
   useEffect(() => {
+    setQueuedAttachments((current) => {
+      current.forEach((item) => {
+        if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+      });
+      return [];
+    });
+    setAttachmentNotice(null);
+    setThreadAttachmentBytes(0);
     if (!threadId) return;
     const requestedThreadId = threadId;
     let cancelled = false;
-    void api
-      .thread(requestedThreadId)
-      .then((history) => {
+    void Promise.all([api.thread(requestedThreadId), api.attachments(requestedThreadId)])
+      .then(([history, attachments]) => {
         if (cancelled) return;
         setThreads((current) =>
           current.map((item) => (item.id === requestedThreadId ? history.data : item)),
         );
         mergeEvents(history.events, requestedThreadId);
+        setThreadAttachmentBytes(
+          attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
+        );
       })
       .catch((cause: unknown) => {
         if (!cancelled) setError(errorMessage(cause));
@@ -939,15 +1134,125 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     }
   }
 
+  function queueFiles(files: File[]) {
+    if (!threadId || archiveView) return;
+    if (active) {
+      setAttachmentNotice(
+        'Вложения нельзя добавить во время активной задачи. Дождитесь её завершения или остановите задачу.',
+      );
+      return;
+    }
+    setAttachmentNotice(null);
+    setQueuedAttachments((current) => {
+      const next = [...current];
+      let totalBytes =
+        threadAttachmentBytes + current.reduce((total, item) => total + item.file.size, 0);
+      for (const file of files) {
+        if (next.length >= MAX_ATTACHMENTS_PER_TURN) {
+          setAttachmentNotice(`Можно прикрепить не более ${MAX_ATTACHMENTS_PER_TURN} файлов.`);
+          break;
+        }
+        if (file.size > MAX_ATTACHMENT_BYTES) {
+          setAttachmentNotice(`Файл «${file.name}» больше 20 МБ.`);
+          continue;
+        }
+        if (totalBytes + file.size > MAX_THREAD_ATTACHMENT_BYTES) {
+          setAttachmentNotice('Для вложений этого чата превышен лимит 50 МБ.');
+          continue;
+        }
+        const previewUrl =
+          file.type.startsWith('image/') && typeof URL.createObjectURL === 'function'
+            ? URL.createObjectURL(file)
+            : null;
+        next.push({
+          localId: crypto.randomUUID(),
+          file,
+          previewUrl,
+          progress: 0,
+          status: 'queued',
+          uploaded: null,
+          error: null,
+        });
+        totalBytes += file.size;
+      }
+      return next;
+    });
+  }
+
+  async function removeQueuedAttachment(localId: string) {
+    const item = queuedAttachments.find((candidate) => candidate.localId === localId);
+    if (!item || item.status === 'uploading') return;
+    if (item.uploaded && threadId) {
+      try {
+        await api.deleteAttachment(session.csrfToken, threadId, item.uploaded.id);
+      } catch (cause) {
+        setError(errorMessage(cause));
+        return;
+      }
+    }
+    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+    setQueuedAttachments((current) => current.filter((candidate) => candidate.localId !== localId));
+  }
+
+  async function uploadQueued(thread: string): Promise<Attachment[]> {
+    const snapshot = queuedAttachments;
+    return Promise.all(
+      snapshot.map(async (item) => {
+        if (item.uploaded) return item.uploaded;
+        setQueuedAttachments((current) =>
+          current.map((candidate) =>
+            candidate.localId === item.localId
+              ? { ...candidate, status: 'uploading', progress: 0, error: null }
+              : candidate,
+          ),
+        );
+        const upload = api.uploadAttachment(session.csrfToken, thread, item.file, (progress) =>
+          setQueuedAttachments((current) =>
+            current.map((candidate) =>
+              candidate.localId === item.localId ? { ...candidate, progress } : candidate,
+            ),
+          ),
+        );
+        try {
+          const attachment = await upload.promise;
+          setQueuedAttachments((current) =>
+            current.map((candidate) =>
+              candidate.localId === item.localId
+                ? { ...candidate, status: 'uploaded', progress: 100, uploaded: attachment }
+                : candidate,
+            ),
+          );
+          return attachment;
+        } catch (cause) {
+          setQueuedAttachments((current) =>
+            current.map((candidate) =>
+              candidate.localId === item.localId
+                ? { ...candidate, status: 'error', error: errorMessage(cause) }
+                : candidate,
+            ),
+          );
+          throw cause;
+        }
+      }),
+    );
+  }
+
   async function send() {
     const text = composer.trim();
-    if (!threadId || archiveView || !text) return;
+    if (!threadId || archiveView || (!text && !queuedAttachments.length)) return;
+    if (active && queuedAttachments.length) {
+      setAttachmentNotice(
+        'Вложения нельзя отправить во время активной задачи. Дождитесь её завершения или удалите вложения.',
+      );
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
       if (active && activeTurnId) {
         await api.steer(session.csrfToken, threadId, text, activeTurnId);
       } else {
+        const attachments = await uploadQueued(threadId);
         await api.startTurn(session.csrfToken, threadId, {
           text,
           ...(model ? { model } : {}),
@@ -955,7 +1260,17 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
           permissionPreset: permission,
           approvalPolicy,
           idempotencyKey: crypto.randomUUID(),
+          attachmentIds: attachments.map((attachment) => attachment.id),
         });
+        setThreadAttachmentBytes(
+          (current) =>
+            current + attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
+        );
+        queuedAttachments.forEach((item) => {
+          if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+        });
+        setQueuedAttachments([]);
+        setAttachmentNotice(null);
       }
       setComposer('');
     } catch (cause) {
@@ -1147,7 +1462,93 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
               </select>
             </label>
           </div>
-          <div className="composer">
+          <div
+            className={`composer ${dragActive ? 'drag-active' : ''}`}
+            onDragEnter={(event: DragEvent<HTMLDivElement>) => {
+              if (
+                !active &&
+                !archiveView &&
+                threadId &&
+                event.dataTransfer.types.includes('Files')
+              ) {
+                event.preventDefault();
+                setDragActive(true);
+              }
+            }}
+            onDragOver={(event: DragEvent<HTMLDivElement>) => {
+              if (
+                !active &&
+                !archiveView &&
+                threadId &&
+                event.dataTransfer.types.includes('Files')
+              ) {
+                event.preventDefault();
+                event.dataTransfer.dropEffect = 'copy';
+              }
+            }}
+            onDragLeave={(event: DragEvent<HTMLDivElement>) => {
+              if (!event.currentTarget.contains(event.relatedTarget as Node | null))
+                setDragActive(false);
+            }}
+            onDrop={(event: DragEvent<HTMLDivElement>) => {
+              event.preventDefault();
+              setDragActive(false);
+              queueFiles(Array.from(event.dataTransfer.files));
+            }}
+          >
+            <input
+              ref={fileInputRef}
+              className="visually-hidden"
+              type="file"
+              multiple
+              aria-label="Выбрать вложения"
+              onChange={(event) => {
+                queueFiles(Array.from(event.target.files ?? []));
+                event.target.value = '';
+              }}
+              disabled={!threadId || archiveView || active || busy}
+            />
+            {queuedAttachments.length > 0 && (
+              <ul className="attachment-queue" aria-label="Вложения к отправке">
+                {queuedAttachments.map((item) => (
+                  <li className={item.status === 'error' ? 'failed' : ''} key={item.localId}>
+                    {item.previewUrl ? (
+                      <img src={item.previewUrl} alt="" />
+                    ) : (
+                      <span className="attachment-file-icon" aria-hidden="true">
+                        ＋
+                      </span>
+                    )}
+                    <span className="queued-file-copy">
+                      <strong>{item.file.name}</strong>
+                      <small>
+                        {item.status === 'uploading'
+                          ? `Загрузка ${item.progress}%`
+                          : item.status === 'error'
+                            ? item.error
+                            : `${formatBytes(item.file.size)}${item.status === 'uploaded' ? ' · загружено' : ''}`}
+                      </small>
+                      {item.status === 'uploading' && (
+                        <progress
+                          value={item.progress}
+                          max="100"
+                          aria-label={`Загрузка ${item.file.name}`}
+                        />
+                      )}
+                    </span>
+                    <button
+                      type="button"
+                      className="remove-attachment"
+                      aria-label={`Удалить ${item.file.name}`}
+                      disabled={item.status === 'uploading' || busy}
+                      onClick={() => void removeQueuedAttachment(item.localId)}
+                    >
+                      ×
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            )}
             <textarea
               aria-label={active ? 'Уточнение для активной задачи' : 'Сообщение Codex'}
               placeholder={
@@ -1161,6 +1562,13 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
               }
               value={composer}
               onChange={(event) => setComposer(event.target.value)}
+              onPaste={(event: ClipboardEvent<HTMLTextAreaElement>) => {
+                const files = Array.from(event.clipboardData.files);
+                if (files.length) {
+                  event.preventDefault();
+                  queueFiles(files);
+                }
+              }}
               onKeyDown={(event) => {
                 if (event.key === 'Enter' && !event.shiftKey) {
                   event.preventDefault();
@@ -1171,14 +1579,36 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
               rows={3}
             />
             <button
+              type="button"
+              className="attach-button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={!threadId || archiveView || active || busy}
+              aria-label="Прикрепить файлы"
+              title={active ? 'Вложения недоступны во время активной задачи' : 'Прикрепить файлы'}
+            >
+              ＋
+            </button>
+            <button
               className="send-button"
               onClick={() => void send()}
-              disabled={!threadId || archiveView || !composer.trim() || busy}
+              disabled={
+                !threadId ||
+                archiveView ||
+                (!composer.trim() && !queuedAttachments.length) ||
+                (active && queuedAttachments.length > 0) ||
+                busy
+              }
               aria-label={active ? 'Направить задачу' : 'Отправить сообщение'}
             >
               {active ? '↗' : '↑'}
             </button>
           </div>
+          {(attachmentNotice || (active && queuedAttachments.length > 0)) && (
+            <p className="attachment-notice" role="status">
+              {attachmentNotice ??
+                'Вложения нельзя отправить во время активной задачи. Дождитесь её завершения или удалите вложения.'}
+            </p>
+          )}
           <p className="composer-hint">Enter — отправить · Shift+Enter — новая строка</p>
         </div>
       </section>
