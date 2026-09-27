@@ -106,10 +106,13 @@ class BoundedStorageInstallerTest(unittest.TestCase):
             "bounded storage migration failed; restoring original paths",
             "systemctl start \"$service_unit\"",
             "service did not become healthy after bounded storage migration",
+            '"$SCRIPT_DIR/health-check.sh"',
+            '--config "$CONFIG"',
             "Original data remains in rollback backups",
         ):
             self.assertIn(expected, self.source)
         self.assertNotIn("rm -rf", self.source)
+        self.assertNotIn("http://127.0.0.1:3210/api/health", self.source)
 
     def test_help_and_dry_run_are_non_mutating(self) -> None:
         bash = working_bash()

@@ -82,7 +82,7 @@ fi
 
 require_root
 for command in awk cat chmod chown cp curl date df fallocate find findmnt getent grep id install \
-  mkfs.ext4 mktemp mount mountpoint mv realpath rmdir rsync sed seq sleep stat systemctl umount unlink; do
+  mkfs.ext4 mktemp mount mountpoint mv python3 realpath rmdir rsync sed stat systemctl umount unlink; do
   require_command "$command"
 done
 validate_service_user "$service_user"
@@ -385,15 +385,10 @@ done
 $timer_was_active && systemctl start "$guard_timer"
 if $service_was_active; then
   systemctl start "$service_unit"
-  healthy=false
-  for _ in $(seq 1 30); do
-    if curl --fail --silent http://127.0.0.1:3210/api/health >/dev/null; then
-      healthy=true
-      break
-    fi
-    sleep 1
-  done
-  $healthy || die 'service did not become healthy after bounded storage migration'
+  "$SCRIPT_DIR/health-check.sh" \
+    --service-user "$service_user" \
+    --timeout 30 \
+    --config "$CONFIG" || die 'service did not become healthy after bounded storage migration'
 fi
 migration_complete=true
 trap - EXIT INT TERM
