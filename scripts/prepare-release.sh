@@ -25,6 +25,12 @@ pnpm install --frozen-lockfile
 pnpm verify
 mkdir -p "$output/apps"
 pnpm --filter @codex-web/server deploy --prod --legacy "$output/apps/server"
+self_link="$output/apps/server/node_modules/.pnpm/node_modules/@codex-web/server"
+[[ -L $self_link ]] || {
+  printf 'prepare-release: expected generated server self-link is missing\n' >&2
+  exit 1
+}
+unlink -- "$self_link"
 mkdir -p "$output/apps/web"
 cp -a apps/web/dist "$output/apps/web/dist"
 
