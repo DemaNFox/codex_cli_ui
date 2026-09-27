@@ -211,6 +211,7 @@ fi
 
 [[ -n $output ]] || die '--output is required in build mode'
 [[ -n $target_arch ]] || die '--arch is required in build mode'
+[[ $(uname -s) == Linux ]] || die 'package build mode requires Linux so pnpm dependency links remain portable'
 [[ $output = /* ]] || die 'output must be absolute'
 [[ ! -e $output ]] || die 'output already exists'
 case "$archive" in none|tar.gz|tar.zst) ;; *) die 'archive must be none, tar.gz or tar.zst' ;; esac

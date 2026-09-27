@@ -144,6 +144,8 @@ class InfraStaticTest(unittest.TestCase):
         self.assertNotIn("curl |", bootstrap)
         self.assertNotIn("@latest", bootstrap)
         self.assertNotIn("@alpha", bootstrap)
+        package_builder = (ROOT / "scripts/prepare-package.sh").read_text(encoding="utf-8")
+        self.assertIn("package build mode requires Linux", package_builder)
 
     def test_device_login_never_runs_as_root_or_captures_the_code(self) -> None:
         installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")

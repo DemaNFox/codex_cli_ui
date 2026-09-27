@@ -74,7 +74,9 @@ scripts/prepare-release.sh --output /tmp/codex-web-ui-release
 ```
 
 `scripts/prepare-package.sh --output /tmp/package --arch linux-x64 --archive tar.gz`
-creates a checksummed, architecture-specific application package. The package
+creates a checksummed, architecture-specific application package when run on
+Linux. Package assembly intentionally refuses a Windows host because Windows
+junction semantics cannot preserve pnpm's Linux dependency graph. The package
 still downloads its checksum-pinned Node.js/pnpm/Codex toolchain during first
 installation; it is not an air-gapped bundle. Deployment,
 TLS, storage bounds and upgrades are documented in [infra/README.md](infra/README.md). Required
