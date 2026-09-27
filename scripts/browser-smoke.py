@@ -387,14 +387,94 @@ def main() -> int:
         overflow = page.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth")
         if overflow:
             raise AssertionError("mobile layout has horizontal page overflow")
+
+        navigation = page.get_by_label("Навигация")
+        navigation.wait_for(state="hidden")
+        page.get_by_role("button", name="Открыть навигацию").click()
+        navigation.wait_for(state="visible")
+        page.wait_for_function(
+            "() => document.getElementById('workspace-navigation')?.contains(document.activeElement)"
+        )
+        page.wait_for_function(
+            "() => (document.getElementById('workspace-navigation')?.getBoundingClientRect().x ?? -1) >= -0.5"
+        )
+        if not navigation.evaluate("element => element.contains(document.activeElement)"):
+            raise AssertionError("mobile navigation did not receive keyboard focus")
+        navigation_box = navigation.bounding_box()
+        if (
+            not navigation_box
+            or navigation_box["x"] < -1
+            or navigation_box["x"] + navigation_box["width"] > 391
+        ):
+            raise AssertionError(f"mobile navigation drawer is outside the viewport: {navigation_box}")
+        logout = page.get_by_role("button", name="Выйти")
+        logout.scroll_into_view_if_needed()
+        logout_box = logout.bounding_box()
+        if not logout_box or logout_box["y"] < 0 or logout_box["y"] + logout_box["height"] > 600:
+            raise AssertionError("mobile drawer does not expose the session logout control")
+        page.keyboard.press("Shift+Tab")
+        if not navigation.evaluate("element => element.contains(document.activeElement)"):
+            raise AssertionError("keyboard focus escaped the mobile navigation drawer")
+        page.keyboard.press("Escape")
+        navigation.wait_for(state="hidden")
+        page.wait_for_function(
+            "() => document.querySelector('.mobile-nav-toggle') === document.activeElement"
+        )
+        if not page.get_by_role("button", name="Открыть навигацию").evaluate(
+            "element => element === document.activeElement"
+        ):
+            raise AssertionError("mobile navigation did not restore focus to its toggle")
+        page.get_by_role("button", name="Открыть навигацию").click()
+        navigation.wait_for(state="visible")
+        page.locator(".project-button").click()
+        page.locator(".project-button").click()
+        navigation.wait_for(state="hidden")
+        page.get_by_role("heading", name="Переносимый чат").wait_for()
+
+        mobile_transcript = page.locator(".conversation-scroll").evaluate(
+            "element => ({scrollHeight: element.scrollHeight, clientHeight: element.clientHeight})"
+        )
+        if mobile_transcript["clientHeight"] < 240:
+            raise AssertionError("mobile transcript has too little usable height")
+        if mobile_transcript["scrollHeight"] <= mobile_transcript["clientHeight"]:
+            raise AssertionError("long mobile transcript is not independently scrollable")
+
+        runtime_toggle = page.get_by_role("button", name="Параметры", exact=False)
+        if runtime_toggle.get_attribute("aria-expanded") != "false":
+            raise AssertionError("mobile runtime settings must be collapsed initially")
+        runtime_toggle.click()
         for label in ("Модель", "Уровень reasoning", "Уровень доступа", "Политика подтверждений"):
             control = page.get_by_label(label)
             box = control.bounding_box()
             if not box or box["x"] < 0 or box["x"] + box["width"] > 390:
                 raise AssertionError(f"mobile control is outside the viewport: {label}")
+        runtime_toggle.click()
         mobile_composer = page.locator(".composer-wrap").bounding_box()
         if not mobile_composer or mobile_composer["y"] + mobile_composer["height"] > 600:
             raise AssertionError("composer is pushed below the constrained mobile viewport")
+
+        composer.fill("/sta")
+        mobile_palette = page.get_by_role("listbox", name="Команды Codex")
+        mobile_palette.wait_for(state="visible")
+        palette_box = mobile_palette.bounding_box()
+        if not palette_box or palette_box["y"] < 0 or palette_box["y"] + palette_box["height"] > 600:
+            raise AssertionError("mobile slash-command palette is clipped outside the viewport")
+        page.get_by_role("option", name="/status Статус, лимиты и использование").click()
+        composer.press("Enter")
+        page.get_by_label("Статус Codex").wait_for()
+        page.get_by_label("Закрыть диагностику").click()
+
+        page.set_viewport_size({"width": 390, "height": 780})
+        if page.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth"):
+            raise AssertionError("tall mobile layout has horizontal page overflow")
+        tall_transcript_height = page.locator(".conversation-scroll").evaluate(
+            "element => element.clientHeight"
+        )
+        if tall_transcript_height < 400:
+            raise AssertionError("tall mobile layout does not give the transcript enough height")
+        tall_composer = page.locator(".composer-wrap").bounding_box()
+        if not tall_composer or tall_composer["y"] + tall_composer["height"] > 780:
+            raise AssertionError("composer is pushed below the tall mobile viewport")
         unexpected_console_errors = [
             error
             for error in console_errors

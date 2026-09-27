@@ -81,3 +81,7 @@ The single navigation sidebar expands each project into its chat list, offers gl
 actions and keeps a cross-project recent list. The project context menu exposes an archived-chat view scoped
 to that project. Archived threads can be inspected and restored without mixing them into the active thread
 list. The transcript owns the scroll container while the composer remains in a fixed grid row.
+At `820px` and below, the navigation is an off-canvas drawer with focus containment, Escape close and focus
+return. Runtime model, reasoning, permission and approval controls remain available behind a compact toggle;
+their collapsed state reserves the constrained viewport for the independently scrolling transcript and the
+composer. The account/logout row remains reachable inside the drawer.

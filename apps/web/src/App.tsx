@@ -552,6 +552,8 @@ function NavigationSidebar({
   onLogout,
   username,
   disabled,
+  mobileOpen,
+  onMobileClose,
 }: {
   projects: Project[];
   threads: Thread[];
@@ -571,6 +573,8 @@ function NavigationSidebar({
   onLogout: () => void;
   username: string;
   disabled: boolean;
+  mobileOpen: boolean;
+  onMobileClose: () => void;
 }) {
   const [creating, setCreating] = useState(false);
   const [expandedProjectId, setExpandedProjectId] = useState<string | null>(selectedProjectId);
@@ -619,10 +623,22 @@ function NavigationSidebar({
     });
 
   return (
-    <aside className="navigation-sidebar" aria-label="Навигация">
+    <aside
+      id="workspace-navigation"
+      className={`navigation-sidebar ${mobileOpen ? 'mobile-open' : ''}`}
+      aria-label="Навигация"
+    >
       <div className="app-brand">
         <span className="mini-mark">C</span>
         <strong>Codex Server</strong>
+        <button
+          className="mobile-nav-close"
+          type="button"
+          onClick={onMobileClose}
+          aria-label="Закрыть навигацию"
+        >
+          ×
+        </button>
       </div>
       <button className="new-chat-button" onClick={onNew} disabled={!projects.length || disabled}>
         <span aria-hidden="true">＋</span>
@@ -1180,6 +1196,8 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   const [threadId, setThreadId] = useState<string | null>(null);
   const [archiveView, setArchiveView] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
+  const [mobileRuntimeOpen, setMobileRuntimeOpen] = useState(false);
   const [statusRefreshing, setStatusRefreshing] = useState(false);
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState('');
@@ -1193,6 +1211,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const mobileNavigationToggleRef = useRef<HTMLButtonElement>(null);
   const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
   const attachmentThreadRef = useRef<string | null>(null);
   const activeUploadsRef = useRef(new Map<string, { threadId: string; abort: () => void }>());
@@ -1256,6 +1275,46 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   useEffect(() => {
     queuedAttachmentsRef.current = queuedAttachments;
   }, [queuedAttachments]);
+
+  useEffect(() => {
+    if (!mobileNavigationOpen) return;
+    const navigation = document.getElementById('workspace-navigation');
+    if (!navigation) return;
+    const focusableSelector =
+      'button:not(:disabled), a[href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])';
+    const focusable = () =>
+      [...navigation.querySelectorAll<HTMLElement>(focusableSelector)].filter(
+        (element) => element.offsetParent !== null,
+      );
+    navigation.querySelector<HTMLElement>('.mobile-nav-close')?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setMobileNavigationOpen(false);
+        window.setTimeout(() => mobileNavigationToggleRef.current?.focus());
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const controls = focusable();
+      if (!controls.length) return;
+      const first = controls[0]!;
+      const last = controls.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [mobileNavigationOpen]);
+
+  function closeMobileNavigation() {
+    setMobileNavigationOpen(false);
+    window.setTimeout(() => mobileNavigationToggleRef.current?.focus());
+  }
 
   useEffect(() => {
     void Promise.all([api.projects(), api.models(), api.capabilities()])
@@ -1642,14 +1701,22 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
         onSelectProject={(id) => {
           setProjectId(id);
           setArchiveView(false);
+          setMobileNavigationOpen(false);
         }}
         onSelectThread={(nextProjectId, nextThreadId) => {
           setProjectId(nextProjectId);
           setArchiveView(false);
           setThreadId(nextThreadId);
+          setMobileNavigationOpen(false);
         }}
-        onNew={() => void newThread(projectId ?? projects[0]?.id ?? null)}
-        onNewInProject={(id) => void newThread(id)}
+        onNew={() => {
+          setMobileNavigationOpen(false);
+          void newThread(projectId ?? projects[0]?.id ?? null);
+        }}
+        onNewInProject={(id) => {
+          setMobileNavigationOpen(false);
+          void newThread(id);
+        }}
         onShowArchived={(id) => {
           setProjectId(id);
           setArchiveView(true);
@@ -1660,11 +1727,32 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
         onCreate={createProject}
         username={session.username}
         disabled={busy}
+        mobileOpen={mobileNavigationOpen}
+        onMobileClose={closeMobileNavigation}
         onLogout={() => void api.logout(session.csrfToken).finally(onSignedOut)}
       />
+      {mobileNavigationOpen && (
+        <button
+          className="mobile-nav-backdrop"
+          type="button"
+          onClick={closeMobileNavigation}
+          aria-label="Закрыть навигацию"
+        />
+      )}
       <section className="chat-panel">
         <header className="chat-toolbar">
-          <div>
+          <button
+            ref={mobileNavigationToggleRef}
+            className="mobile-nav-toggle"
+            type="button"
+            onClick={() => setMobileNavigationOpen(true)}
+            aria-controls="workspace-navigation"
+            aria-expanded={mobileNavigationOpen}
+            aria-label="Открыть навигацию"
+          >
+            ☰
+          </button>
+          <div className="chat-heading">
             <h1>{selectedThread?.name || selectedThread?.preview || 'Новый чат'}</h1>
             <span className={`live-status ${active ? 'running' : ''}`}>
               <i />
@@ -1741,7 +1829,28 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
               )}
             </div>
           )}
-          <div className="runtime-selectors">
+          <button
+            className="mobile-runtime-toggle"
+            type="button"
+            aria-expanded={mobileRuntimeOpen}
+            aria-controls="runtime-selectors"
+            onClick={() => setMobileRuntimeOpen((current) => !current)}
+          >
+            <span>Параметры</span>
+            <small>
+              {modelOption?.displayName || model || 'Модель'} ·{' '}
+              {permission === 'full-access'
+                ? 'Полный доступ'
+                : permission === 'read-only'
+                  ? 'Чтение'
+                  : 'Рабочая папка'}
+            </small>
+            <i aria-hidden="true">{mobileRuntimeOpen ? '⌃' : '⌄'}</i>
+          </button>
+          <div
+            id="runtime-selectors"
+            className={`runtime-selectors ${mobileRuntimeOpen ? 'mobile-expanded' : ''}`}
+          >
             <label>
               Модель
               <select

@@ -302,6 +302,25 @@ describe('App', () => {
     expect(screen.getByRole('button', { name: 'Прикрепить файлы' })).not.toBeNull();
     expect(screen.getByRole('button', { name: 'Отправить сообщение' })).not.toBeNull();
 
+    const navigationToggle = screen.getByRole('button', { name: 'Открыть навигацию' });
+    const navigation = screen.getByRole('complementary', { name: 'Навигация' });
+    expect(navigationToggle.getAttribute('aria-expanded')).toBe('false');
+    expect(navigation.classList.contains('mobile-open')).toBe(false);
+    await user.click(navigationToggle);
+    expect(navigationToggle.getAttribute('aria-expanded')).toBe('true');
+    expect(navigation.classList.contains('mobile-open')).toBe(true);
+    await user.keyboard('{Escape}');
+    expect(navigation.classList.contains('mobile-open')).toBe(false);
+    expect(document.activeElement).toBe(navigationToggle);
+
+    const runtimeToggle = screen.getByRole('button', { name: /Параметры/ });
+    const runtimeSelectors = document.querySelector('#runtime-selectors');
+    expect(runtimeToggle.getAttribute('aria-expanded')).toBe('false');
+    expect(runtimeSelectors?.classList.contains('mobile-expanded')).toBe(false);
+    await user.click(runtimeToggle);
+    expect(runtimeToggle.getAttribute('aria-expanded')).toBe('true');
+    expect(runtimeSelectors?.classList.contains('mobile-expanded')).toBe(true);
+
     const projectMenu = screen.getByRole('button', { name: 'Меню проекта AI Chat Bot' });
     await user.click(projectMenu);
     expect(projectMenu.getAttribute('aria-expanded')).toBe('true');
