@@ -1322,6 +1322,42 @@ describe('Codex routes', () => {
     expect(appServer.requests.filter((item) => item.method === 'thread/resume')).toHaveLength(1);
   });
 
+  it('serves hydrated journal history when a post-restart metadata refresh fails', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const thread = (
+      await app.inject({
+        method: 'POST',
+        url: '/api/threads',
+        headers: session.headers,
+        payload: { projectId: project.id },
+      })
+    ).json<{ data: { id: string } }>().data;
+    repository.appendEvent({
+      threadId: thread.id,
+      turnId: null,
+      kind: 'warning',
+      phase: 'state',
+      payload: { message: 'retained safe history' },
+    });
+
+    appServer.restart();
+    appServer.failNextRequestWith = new Error('thread/read unavailable');
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${thread.id}`,
+      headers: { cookie: session.headers.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      data: { id: thread.id },
+      events: [{ kind: 'warning', payload: { message: 'retained safe history' } }],
+    });
+    expect(appServer.requests.filter((item) => item.method === 'thread/read')).toHaveLength(1);
+  });
+
   it('marks an ambiguous turn/start failure unknown and never retries it', async () => {
     const { app, appServer, projectPath } = await fixture();
     const session = await login(app);

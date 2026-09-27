@@ -857,11 +857,17 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const id = parseId(request);
     const existing = repository.getThread(id);
     if (!existing) throw new HttpError(404, 'THREAD_NOT_FOUND');
-    const thread = !repository.isThreadHistoryHydrated(id)
-      ? await hydrateThreadHistory(existing)
-      : loadedThreadGenerations.get(id) === appServer.generation
-        ? existing
-        : (await readThreadFromAppServer(existing, false)).thread;
+    let thread = existing;
+    if (!repository.isThreadHistoryHydrated(id)) {
+      thread = await hydrateThreadHistory(existing);
+    } else if (loadedThreadGenerations.get(id) !== appServer.generation) {
+      try {
+        thread = (await readThreadFromAppServer(existing, false)).thread;
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        repository.audit('thread.refresh', 'failed', { threadId: id });
+      }
+    }
     return { data: thread, events: repository.listEvents(id, 0) };
   });
 
