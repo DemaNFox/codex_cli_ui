@@ -87,6 +87,7 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("atomic_symlink", install_script)
         self.assertIn('chown root:root "$config"', install_script)
         self.assertIn('chmod 0600 "$config"', install_script)
+        self.assertIn('/usr/local/libexec', install_script)
         self.assertNotIn('chown root:"$service_group" "$config"', install_script)
         self.assertIn("--check-releases --additional-releases 1", install_script)
         self.assertIn("--check-releases --additional-releases 1", update_script)

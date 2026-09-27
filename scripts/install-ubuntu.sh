@@ -74,7 +74,7 @@ for root in "${project_roots[@]}"; do
   canonical_roots+=("$root")
 done
 
-install -d -m 0755 /opt/codex-web-ui/releases /etc/codex-web-ui
+install -d -m 0755 /opt/codex-web-ui/releases /etc/codex-web-ui /usr/local/libexec
 
 release_dir="/opt/codex-web-ui/releases/$release_id"
 config=/etc/codex-web-ui/codex-web-ui.env
