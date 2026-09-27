@@ -140,6 +140,7 @@ class InfraStaticTest(unittest.TestCase):
             "sha512sum --check --strict --status",
             "/opt/codex-web-ui/runtime",
             "Preserving existing unmanaged /usr/local/bin/codex",
+            'chmod 0755 "$toolchain_stage"',
         ):
             self.assertIn(expected, bootstrap)
         self.assertNotIn("curl |", bootstrap)

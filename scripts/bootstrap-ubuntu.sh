@@ -178,6 +178,7 @@ if [[ ! -x $toolchain_dir/bin/pnpm || ! -x $toolchain_dir/bin/codex ]]; then
   [[ $($toolchain_stage/bin/codex --version) == "codex-cli $CODEX_CLI_VERSION" ]] || die 'staged Codex CLI version verification failed'
   chown -R root:root "$toolchain_stage"
   chmod -R go-w "$toolchain_stage"
+  chmod 0755 "$toolchain_stage"
   mv -- "$toolchain_stage" "$toolchain_dir"
   trap - EXIT
   cleanup_toolchain
