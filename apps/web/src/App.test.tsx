@@ -446,6 +446,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
     await screen.findAllByText('Frontend task');
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
 
     const pickerFile = new File(['picker'], 'picker.txt', { type: 'text/plain' });
     await user.upload(screen.getByLabelText('Выбрать вложения'), pickerFile);
