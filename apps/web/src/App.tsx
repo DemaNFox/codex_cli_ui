@@ -51,6 +51,19 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
 }
 
+function formatResetTime(value: number | null): string {
+  return value === null ? 'неизвестно' : new Date(value * 1000).toLocaleString('ru');
+}
+
+function formatMetric(value: number | null): string {
+  return value === null ? 'нет данных' : value.toLocaleString('ru');
+}
+
+const SLASH_COMMANDS = [
+  { command: '/status', label: 'Статус, лимиты и использование' },
+  { command: '/skills', label: 'Доступные скиллы и instruction sources' },
+] as const;
+
 function attachmentsFrom(event: SafeEvent): Attachment[] {
   if (!Array.isArray(event.payload.attachments)) return [];
   return event.payload.attachments.filter((item): item is Attachment => {
@@ -145,6 +158,15 @@ function eventText(event: SafeEvent): string {
 }
 
 function eventTitle(event: SafeEvent): string {
+  if (event.kind === 'tool') {
+    const preview = eventPreview(event);
+    if (preview === 'команда')
+      return event.phase === 'completed' ? 'Выполнил команду' : 'Выполняет команду';
+    if (preview === 'изменение файлов')
+      return event.phase === 'completed' ? 'Изменил файлы' : 'Изменяет файлы';
+    if (preview === 'анализ')
+      return event.phase === 'completed' ? 'Завершил анализ' : 'Анализирует';
+  }
   const titles: Partial<Record<SafeEvent['kind'], Partial<Record<SafeEvent['phase'], string>>>> = {
     plan: { started: 'Составляет план', completed: 'План обновлён', failed: 'План не выполнен' },
     command: {
@@ -224,6 +246,25 @@ function eventIdentity(event: SafeEvent): string | null {
       return `${event.turnId ?? 'thread'}:${event.kind}:${candidate}`;
   }
   return null;
+}
+
+function mergeActivityPayload(
+  started: Record<string, unknown>,
+  finished: Record<string, unknown>,
+): Record<string, unknown> {
+  const startedItem =
+    started.item && typeof started.item === 'object'
+      ? (started.item as Record<string, unknown>)
+      : null;
+  const finishedItem =
+    finished.item && typeof finished.item === 'object'
+      ? (finished.item as Record<string, unknown>)
+      : null;
+  return {
+    ...started,
+    ...finished,
+    ...(startedItem || finishedItem ? { item: { ...startedItem, ...finishedItem } } : {}),
+  };
 }
 
 function pendingApprovalFrom(event: SafeEvent): PendingApproval | null {
@@ -492,32 +533,101 @@ function ContextMenu({
   );
 }
 
-function ProjectSidebar({
+function NavigationSidebar({
   projects,
-  selectedId,
-  onSelect,
+  threads,
+  recentThreads,
+  selectedProjectId,
+  selectedThreadId,
+  archived,
+  onSelectProject,
+  onSelectThread,
+  onNew,
+  onNewInProject,
   onShowArchived,
+  onArchive,
+  onRestore,
+  onBack,
   onCreate,
   onLogout,
   username,
   disabled,
 }: {
   projects: Project[];
-  selectedId: string | null;
-  onSelect: (id: string) => void;
+  threads: Thread[];
+  recentThreads: Thread[];
+  selectedProjectId: string | null;
+  selectedThreadId: string | null;
+  archived: boolean;
+  onSelectProject: (id: string) => void;
+  onSelectThread: (projectId: string, threadId: string) => void;
+  onNew: () => void;
+  onNewInProject: (projectId: string) => void;
   onShowArchived: (id: string) => void;
+  onArchive: (id: string) => void;
+  onRestore: (id: string) => void;
+  onBack: () => void;
   onCreate: (name: string, path: string) => Promise<void>;
   onLogout: () => void;
   username: string;
   disabled: boolean;
 }) {
   const [creating, setCreating] = useState(false);
+  const [expandedProjectId, setExpandedProjectId] = useState<string | null>(selectedProjectId);
+  useEffect(() => {
+    if (selectedProjectId) setExpandedProjectId(selectedProjectId);
+  }, [selectedProjectId]);
+
+  const threadRows = (items: Thread[], showProject: boolean, archivedRows = false) =>
+    items.map((thread) => {
+      const project = projects.find((candidate) => candidate.id === thread.projectId);
+      return (
+        <div
+          className={`thread-row ${thread.id === selectedThreadId ? 'selected' : ''}`}
+          key={thread.id}
+        >
+          <button
+            aria-label={`${showProject ? 'Открыть недавний чат' : 'Открыть чат проекта'} ${thread.name || thread.preview || 'Новый чат'}`}
+            onClick={() => onSelectThread(thread.projectId, thread.id)}
+            disabled={disabled}
+          >
+            <strong>{thread.name || thread.preview || 'Новый чат'}</strong>
+            <small>
+              {showProject && project ? `${project.name} · ` : ''}
+              {new Date(thread.updatedAt).toLocaleString('ru')}
+            </small>
+          </button>
+          <ContextMenu
+            label={`${showProject ? 'Меню недавнего чата' : 'Меню чата проекта'} ${thread.name || thread.preview || 'Новый чат'}`}
+            disabled={disabled}
+          >
+            {(close) => (
+              <button
+                role="menuitem"
+                onClick={() => {
+                  close();
+                  if (archivedRows) onRestore(thread.id);
+                  else onArchive(thread.id);
+                }}
+              >
+                {archivedRows ? 'Восстановить чат' : 'Архивировать чат'}
+              </button>
+            )}
+          </ContextMenu>
+        </div>
+      );
+    });
+
   return (
-    <aside className="projects-panel" aria-label="Проекты">
+    <aside className="navigation-sidebar" aria-label="Навигация">
       <div className="app-brand">
         <span className="mini-mark">C</span>
         <strong>Codex Server</strong>
       </div>
+      <button className="new-chat-button" onClick={onNew} disabled={!projects.length || disabled}>
+        <span aria-hidden="true">＋</span>
+        Новый чат
+      </button>
       <div className="section-heading">
         <span>Проекты</span>
         <button
@@ -538,132 +648,87 @@ function ProjectSidebar({
           onCancel={() => setCreating(false)}
         />
       )}
-      <nav className="project-list">
+      <nav className="project-list" aria-label="Проекты">
         {projects.map((project) => (
-          <div
-            className={`project-row ${project.id === selectedId ? 'selected' : ''}`}
-            key={project.id}
-          >
-            <button
-              className="project-button"
-              onClick={() => onSelect(project.id)}
-              disabled={disabled}
-            >
-              <span className="project-icon" aria-hidden="true">
-                ⌘
-              </span>
-              <span>
-                <strong>{project.name}</strong>
-                <small>{project.path}</small>
-              </span>
-            </button>
-            <ContextMenu label={`Меню проекта ${project.name}`} disabled={disabled}>
-              {(close) => (
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    close();
-                    onShowArchived(project.id);
-                  }}
-                >
-                  Архивированные чаты
-                </button>
-              )}
-            </ContextMenu>
+          <div className="project-group" key={project.id}>
+            <div className={`project-row ${project.id === selectedProjectId ? 'selected' : ''}`}>
+              <button
+                className="project-button"
+                aria-expanded={expandedProjectId === project.id}
+                onClick={() => {
+                  const next = expandedProjectId === project.id ? null : project.id;
+                  setExpandedProjectId(next);
+                  if (next) onSelectProject(project.id);
+                }}
+                disabled={disabled}
+              >
+                <span className="project-chevron" aria-hidden="true">
+                  {expandedProjectId === project.id ? '⌄' : '›'}
+                </span>
+                <span>
+                  <strong>{project.name}</strong>
+                  <small>{project.path}</small>
+                </span>
+              </button>
+              <button
+                className="icon-button subtle"
+                aria-label={`Новый чат в проекте ${project.name}`}
+                title="Новый чат в проекте"
+                disabled={disabled}
+                onClick={() => onNewInProject(project.id)}
+              >
+                ＋
+              </button>
+              <ContextMenu label={`Меню проекта ${project.name}`} disabled={disabled}>
+                {(close) => (
+                  <button
+                    role="menuitem"
+                    onClick={() => {
+                      close();
+                      setExpandedProjectId(project.id);
+                      onShowArchived(project.id);
+                    }}
+                  >
+                    Архивированные чаты
+                  </button>
+                )}
+              </ContextMenu>
+            </div>
+            {expandedProjectId === project.id && project.id === selectedProjectId && (
+              <div className="project-threads">
+                {archived && (
+                  <div className="archive-heading">
+                    <span>Архив</span>
+                    <button className="ghost" onClick={onBack} disabled={disabled}>
+                      Назад
+                    </button>
+                  </div>
+                )}
+                {threadRows(threads, false, archived)}
+                {!threads.length && (
+                  <p className="empty-hint">{archived ? 'Архив пуст.' : 'Здесь пока нет чатов.'}</p>
+                )}
+              </div>
+            )}
           </div>
         ))}
       </nav>
       {!projects.length && !creating && (
         <p className="empty-hint">Добавьте первый проект на сервере.</p>
       )}
+      <div className="section-heading recent-heading">
+        <span>Недавние</span>
+      </div>
+      <nav className="recent-list" aria-label="Недавние чаты">
+        {threadRows(recentThreads, true)}
+        {!recentThreads.length && <p className="empty-hint">Недавних чатов пока нет.</p>}
+      </nav>
       <div className="account-row">
         <span className="avatar">{username.slice(0, 1).toUpperCase()}</span>
         <span>{username}</span>
         <button className="ghost" onClick={onLogout}>
           Выйти
         </button>
-      </div>
-    </aside>
-  );
-}
-
-function ThreadSidebar({
-  project,
-  threads,
-  selectedId,
-  archived,
-  onSelect,
-  onNew,
-  onArchive,
-  onRestore,
-  onBack,
-  disabled,
-}: {
-  project: Project | null;
-  threads: Thread[];
-  selectedId: string | null;
-  archived: boolean;
-  onSelect: (id: string) => void;
-  onNew: () => void;
-  onArchive: (id: string) => void;
-  onRestore: (id: string) => void;
-  onBack: () => void;
-  disabled: boolean;
-}) {
-  return (
-    <aside className="threads-panel" aria-label={archived ? 'Архивированные чаты' : 'Чаты'}>
-      <header className="thread-header">
-        <div>
-          <p className="eyebrow">{archived ? 'АРХИВ' : 'ПРОЕКТ'}</p>
-          <h2>{project?.name ?? 'Выберите проект'}</h2>
-        </div>
-        {archived ? (
-          <button className="ghost" onClick={onBack} disabled={disabled}>
-            Назад
-          </button>
-        ) : (
-          <button
-            className="icon-button"
-            onClick={onNew}
-            disabled={!project || disabled}
-            aria-label="Новый чат"
-          >
-            ＋
-          </button>
-        )}
-      </header>
-      <div className="thread-list">
-        {threads.map((thread) => (
-          <div
-            className={`thread-row ${thread.id === selectedId ? 'selected' : ''}`}
-            key={thread.id}
-          >
-            <button onClick={() => onSelect(thread.id)} disabled={disabled}>
-              <strong>{thread.name || thread.preview || 'Новый чат'}</strong>
-              <small>{new Date(thread.updatedAt).toLocaleString('ru')}</small>
-            </button>
-            <ContextMenu
-              label={`Меню чата ${thread.name || thread.preview || 'Новый чат'}`}
-              disabled={disabled}
-            >
-              {(close) => (
-                <button
-                  role="menuitem"
-                  onClick={() => {
-                    close();
-                    if (archived) onRestore(thread.id);
-                    else onArchive(thread.id);
-                  }}
-                >
-                  {archived ? 'Восстановить чат' : 'Архивировать чат'}
-                </button>
-              )}
-            </ContextMenu>
-          </div>
-        ))}
-        {!threads.length && (
-          <p className="empty-hint">{archived ? 'Архив пуст.' : 'Здесь пока нет чатов.'}</p>
-        )}
       </div>
     </aside>
   );
@@ -896,13 +961,25 @@ function PermissionCard({
 function Transcript({ events }: { events: SafeEvent[] }) {
   const displayEvents = useMemo(() => {
     const output: SafeEvent[] = [];
+    const startedActivities = new Map<string, SafeEvent>();
     const finishedActivities = new Set(
       events
         .filter((event) => event.phase === 'completed' || event.phase === 'failed')
         .map(eventIdentity)
         .filter((identity): identity is string => identity !== null),
     );
-    for (const event of events) {
+    for (const sourceEvent of events) {
+      const sourceIdentity = eventIdentity(sourceEvent);
+      if (sourceEvent.phase === 'started' && sourceIdentity)
+        startedActivities.set(sourceIdentity, sourceEvent);
+      const started = sourceIdentity ? startedActivities.get(sourceIdentity) : null;
+      const event =
+        started && (sourceEvent.phase === 'completed' || sourceEvent.phase === 'failed')
+          ? {
+              ...sourceEvent,
+              payload: mergeActivityPayload(started.payload, sourceEvent.payload),
+            }
+          : sourceEvent;
       if (
         event.kind === 'approval' ||
         event.kind === 'user-input' ||
@@ -914,6 +991,7 @@ function Transcript({ events }: { events: SafeEvent[] }) {
         continue;
       const identity = eventIdentity(event);
       if (event.phase === 'started' && identity && finishedActivities.has(identity)) continue;
+      if (event.kind === 'tool' && event.phase !== 'failed' && !eventPreview(event)) continue;
       if (event.kind === 'agent-message' && event.phase === 'delta') {
         const previous = output.at(-1);
         if (previous?.kind === 'agent-message' && previous.turnId === event.turnId) {
@@ -995,11 +1073,11 @@ function Diagnostics({
   onClose: () => void;
 }) {
   return (
-    <aside className="diagnostics" aria-label="Диагностика">
+    <aside className="diagnostics" aria-label="Статус Codex">
       <header>
         <div>
-          <p className="eyebrow">SYSTEM</p>
-          <h2>Диагностика</h2>
+          <p className="eyebrow">CODEX STATUS</p>
+          <h2>Статус</h2>
         </div>
         <button className="icon-button" onClick={onClose} aria-label="Закрыть диагностику">
           ×
@@ -1017,6 +1095,52 @@ function Diagnostics({
             <dt>App Server</dt>
             <dd>{capability.appServerReady ? 'готов' : 'недоступен'}</dd>
           </dl>
+          <h3>Лимиты</h3>
+          {capability.rateLimits?.length ? (
+            <div className="rate-limit-list">
+              {capability.rateLimits.map((limit, limitIndex) => (
+                <section className="rate-limit" key={limit.limitId ?? `limit-${limitIndex}`}>
+                  <strong>{limit.limitName ?? limit.limitId ?? 'Лимит Codex'}</strong>
+                  <small>{limit.planType ?? 'текущий план'}</small>
+                  {[limit.primary, limit.secondary].filter(Boolean).map((window, index) => (
+                    <div className="rate-window" key={`${limit.limitId}:${index}`}>
+                      <span>
+                        {window!.usedPercent}% использовано ·{' '}
+                        {window!.windowDurationMins === null
+                          ? 'окно неизвестно'
+                          : `${window!.windowDurationMins} мин.`}
+                      </span>
+                      <progress
+                        max="100"
+                        value={window!.usedPercent}
+                        aria-label={`${limit.limitName ?? limit.limitId ?? 'Лимит Codex'}: использовано ${window!.usedPercent}%`}
+                      />
+                      <small>Сброс: {formatResetTime(window!.resetsAt)}</small>
+                    </div>
+                  ))}
+                </section>
+              ))}
+            </div>
+          ) : (
+            <p className="empty-hint compact">Данные о лимитах недоступны.</p>
+          )}
+          {capability.usage && (
+            <>
+              <h3>Использование</h3>
+              <dl className="status-grid">
+                <dt>Всего токенов</dt>
+                <dd>{formatMetric(capability.usage.summary.lifetimeTokens)}</dd>
+                <dt>Пиковый день</dt>
+                <dd>{formatMetric(capability.usage.summary.peakDailyTokens)}</dd>
+                <dt>Текущая серия</dt>
+                <dd>
+                  {capability.usage.summary.currentStreakDays === null
+                    ? 'нет данных'
+                    : `${capability.usage.summary.currentStreakDays} дн.`}
+                </dd>
+              </dl>
+            </>
+          )}
           <h3>Instruction sources</h3>
           <ul className="path-list">
             {thread?.instructionSources.map((path) => (
@@ -1049,12 +1173,14 @@ function Diagnostics({
 function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: () => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
+  const [recentThreads, setRecentThreads] = useState<Thread[]>([]);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [capability, setCapability] = useState<Capability | null>(null);
   const [projectId, setProjectId] = useState<string | null>(null);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [archiveView, setArchiveView] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [statusRefreshing, setStatusRefreshing] = useState(false);
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState('');
   const [permission, setPermission] = useState<PermissionPreset>('workspace-write');
@@ -1141,6 +1267,9 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
         const defaultModel = modelList.find((item) => item.isDefault) ?? modelList[0];
         setModel((current) => current || defaultModel?.id || '');
         setEffort((current) => current || defaultModel?.defaultReasoningEffort || '');
+        void refreshRecentThreads(projectList).catch((cause: unknown) =>
+          setError(errorMessage(cause)),
+        );
       })
       .catch((cause: unknown) => setError(errorMessage(cause)));
   }, []);
@@ -1195,6 +1324,9 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
         setThreads((current) =>
           current.map((item) => (item.id === requestedThreadId ? history.data : item)),
         );
+        setRecentThreads((current) =>
+          current.map((item) => (item.id === requestedThreadId ? history.data : item)),
+        );
         mergeEvents(history.events, requestedThreadId);
         setThreadAttachmentBytes(
           attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
@@ -1227,6 +1359,18 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     if (selectId) setThreadId(selectId);
   }
 
+  async function refreshRecentThreads(sourceProjects = projects) {
+    const projectThreads = await Promise.all(
+      sourceProjects.map((project) => api.threads(project.id, false)),
+    );
+    setRecentThreads(
+      projectThreads
+        .flat()
+        .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+        .slice(0, 20),
+    );
+  }
+
   async function createProject(name: string, path: string) {
     try {
       const project = await api.createProject(session.csrfToken, { name, path });
@@ -1239,23 +1383,49 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     }
   }
 
-  async function newThread() {
-    if (!projectId) return;
+  async function newThread(targetProjectId = projectId) {
+    if (!targetProjectId) return;
+    const targetProject = projects.find((project) => project.id === targetProjectId) ?? null;
     setBusy(true);
     try {
       const thread = await api.startThread(session.csrfToken, {
-        projectId,
-        ...(model ? { model } : {}),
-        ...(effort ? { reasoningEffort: effort } : {}),
-        permissionPreset: permission,
+        projectId: targetProjectId,
+        ...(targetProject?.defaultModel || model
+          ? { model: targetProject?.defaultModel || model }
+          : {}),
+        ...(targetProject?.defaultReasoningEffort || effort
+          ? { reasoningEffort: targetProject?.defaultReasoningEffort || effort }
+          : {}),
+        permissionPreset: targetProject?.defaultPermissionPreset ?? permission,
         approvalPolicy,
       });
-      setThreads((current) => [thread, ...current]);
+      setProjectId(targetProjectId);
+      setArchiveView(false);
+      setThreads((current) => (targetProjectId === projectId ? [thread, ...current] : [thread]));
+      setRecentThreads((current) => [thread, ...current.filter((item) => item.id !== thread.id)]);
       setThreadId(thread.id);
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function archiveThread(id: string) {
+    try {
+      await api.archiveThread(session.csrfToken, id);
+      await Promise.all([refreshThreads(), refreshRecentThreads()]);
+    } catch (cause) {
+      setError(errorMessage(cause));
+    }
+  }
+
+  async function restoreThread(id: string) {
+    try {
+      await api.unarchiveThread(session.csrfToken, id);
+      await Promise.all([refreshThreads(), refreshRecentThreads()]);
+    } catch (cause) {
+      setError(errorMessage(cause));
     }
   }
 
@@ -1370,6 +1540,11 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
 
   async function send() {
     const text = composer.trim();
+    if (text === '/status' || text === '/skills') {
+      await openStatus();
+      setComposer('');
+      return;
+    }
     if (!threadId || archiveView || (!text && !queuedAttachments.length)) return;
     if (active && queuedAttachments.length) {
       setAttachmentNotice(
@@ -1411,6 +1586,19 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     }
   }
 
+  async function openStatus() {
+    setShowDiagnostics(true);
+    setStatusRefreshing(true);
+    setError(null);
+    try {
+      setCapability(await api.capabilities());
+    } catch (cause) {
+      setError(errorMessage(cause));
+    } finally {
+      setStatusRefreshing(false);
+    }
+  }
+
   async function resolveApproval(
     approvalId: string,
     decision: 'accept' | 'acceptForSession' | 'decline' | 'cancel',
@@ -1444,37 +1632,35 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
 
   return (
     <main className={`workspace ${showDiagnostics ? 'with-diagnostics' : ''}`}>
-      <ProjectSidebar
+      <NavigationSidebar
         projects={projects}
-        selectedId={projectId}
-        onSelect={(id) => {
+        threads={threads}
+        recentThreads={recentThreads}
+        selectedProjectId={projectId}
+        selectedThreadId={threadId}
+        archived={archiveView}
+        onSelectProject={(id) => {
           setProjectId(id);
           setArchiveView(false);
         }}
+        onSelectThread={(nextProjectId, nextThreadId) => {
+          setProjectId(nextProjectId);
+          setArchiveView(false);
+          setThreadId(nextThreadId);
+        }}
+        onNew={() => void newThread(projectId ?? projects[0]?.id ?? null)}
+        onNewInProject={(id) => void newThread(id)}
         onShowArchived={(id) => {
           setProjectId(id);
           setArchiveView(true);
         }}
+        onArchive={(id) => void archiveThread(id)}
+        onRestore={(id) => void restoreThread(id)}
+        onBack={() => setArchiveView(false)}
         onCreate={createProject}
         username={session.username}
         disabled={busy}
         onLogout={() => void api.logout(session.csrfToken).finally(onSignedOut)}
-      />
-      <ThreadSidebar
-        project={selectedProject}
-        threads={threads}
-        selectedId={threadId}
-        archived={archiveView}
-        onSelect={setThreadId}
-        onNew={() => void newThread()}
-        onArchive={(id) =>
-          void api.archiveThread(session.csrfToken, id).then(() => refreshThreads())
-        }
-        onRestore={(id) =>
-          void api.unarchiveThread(session.csrfToken, id).then(() => refreshThreads())
-        }
-        onBack={() => setArchiveView(false)}
-        disabled={busy}
       />
       <section className="chat-panel">
         <header className="chat-toolbar">
@@ -1496,10 +1682,11 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
             )}
             <button
               className="ghost"
-              onClick={() => setShowDiagnostics((value) => !value)}
+              onClick={() => (showDiagnostics ? setShowDiagnostics(false) : void openStatus())}
               aria-expanded={showDiagnostics}
+              disabled={statusRefreshing}
             >
-              Диагностика
+              {statusRefreshing ? 'Обновление…' : 'Статус'}
             </button>
           </div>
         </header>
@@ -1536,6 +1723,24 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
           ))}
         </div>
         <div className="composer-wrap">
+          {composer.startsWith('/') && !composer.includes(' ') && (
+            <div className="slash-palette" role="listbox" aria-label="Команды Codex">
+              {SLASH_COMMANDS.filter(({ command }) => command.startsWith(composer)).map(
+                ({ command, label }) => (
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={composer === command}
+                    key={command}
+                    onClick={() => setComposer(command)}
+                  >
+                    <strong>{command}</strong>
+                    <span>{label}</span>
+                  </button>
+                ),
+              )}
+            </div>
+          )}
           <div className="runtime-selectors">
             <label>
               Модель
@@ -1742,7 +1947,9 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
                 'Вложения нельзя отправить во время активной задачи. Дождитесь её завершения или удалите вложения.'}
             </p>
           )}
-          <p className="composer-hint">Enter — отправить · Shift+Enter — новая строка</p>
+          <p className="composer-hint">
+            Enter — отправить · Shift+Enter — новая строка · / — команды
+          </p>
         </div>
       </section>
       {showDiagnostics && (

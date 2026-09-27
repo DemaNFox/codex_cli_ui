@@ -89,7 +89,37 @@ def main() -> int:
                     "codexVersion": "codex-cli 0.153.4",
                     "appServerReady": True,
                     "authenticated": True,
-                    "skills": [],
+                    "projectRoots": ["/srv/projects"],
+                    "skills": [
+                        {
+                            "name": "multi-agent-orchestrator",
+                            "path": "/srv/codex/skills/multi-agent-orchestrator",
+                            "enabled": True,
+                        }
+                    ],
+                    "rateLimits": [
+                        {
+                            "limitId": "codex",
+                            "limitName": "Codex",
+                            "planType": "plus",
+                            "primary": {
+                                "usedPercent": 31,
+                                "windowDurationMins": 300,
+                                "resetsAt": 1800000000,
+                            },
+                            "secondary": None,
+                        }
+                    ],
+                    "usage": {
+                        "summary": {
+                            "lifetimeTokens": 123456,
+                            "currentStreakDays": 4,
+                            "longestStreakDays": 8,
+                            "peakDailyTokens": 23456,
+                            "longestRunningTurnSec": 321,
+                        },
+                        "dailyUsageBuckets": None,
+                    },
                     "warnings": [],
                 },
             )
@@ -141,7 +171,20 @@ def main() -> int:
                         "createdAt": "2026-09-27T12:00:00.000Z",
                         "updatedAt": "2026-09-27T12:00:00.000Z",
                     },
-                    "events": [],
+                    "events": [
+                        {
+                            "id": index,
+                            "threadId": "t1",
+                            "turnId": f"history-{index}",
+                            "kind": "agent-message",
+                            "phase": "completed",
+                            "payload": {
+                                "text": f"Историческое сообщение {index}: длинный чат остаётся прокручиваемым."
+                            },
+                            "createdAt": "2026-09-27T11:59:00.000Z",
+                        }
+                        for index in range(1, 49)
+                    ],
                 },
             )
         elif path == "/api/threads/t1/attachments" and request.method == "GET":
@@ -155,7 +198,7 @@ def main() -> int:
         elif path == "/api/threads/t1/events":
             events = [
                 {
-                    "id": 1,
+                    "id": 101,
                     "threadId": "t1",
                     "turnId": None,
                     "kind": "thread",
@@ -164,25 +207,27 @@ def main() -> int:
                     "createdAt": "2026-09-27T12:00:00.000Z",
                 },
                 {
-                    "id": 2,
+                    "id": 102,
                     "threadId": "t1",
                     "turnId": "turn-1",
                     "kind": "tool",
                     "phase": "started",
-                    "payload": {"item": {"id": "command-1", "type": "commandExecution"}},
+                    "payload": {
+                        "item": {"id": "tool-1", "type": "mcpToolCall", "name": "GitHub"}
+                    },
                     "createdAt": "2026-09-27T12:00:00.100Z",
                 },
                 {
-                    "id": 3,
+                    "id": 103,
                     "threadId": "t1",
                     "turnId": "turn-1",
                     "kind": "tool",
                     "phase": "completed",
-                    "payload": {"item": {"id": "command-1", "type": "commandExecution"}},
+                    "payload": {"item": {"id": "tool-1", "status": "completed"}},
                     "createdAt": "2026-09-27T12:00:00.200Z",
                 },
                 {
-                    "id": 4,
+                    "id": 104,
                     "threadId": "t1",
                     "turnId": "turn-1",
                     "kind": "command",
@@ -191,7 +236,7 @@ def main() -> int:
                     "createdAt": "2026-09-27T12:00:00.300Z",
                 },
                 {
-                    "id": 5,
+                    "id": 105,
                     "threadId": "t1",
                     "turnId": "turn-1",
                     "kind": "user-input",
@@ -218,7 +263,7 @@ def main() -> int:
                     "createdAt": "2026-09-27T12:00:01.000Z",
                 },
                 {
-                    "id": 6,
+                    "id": 106,
                     "threadId": "t1",
                     "turnId": "turn-1",
                     "kind": "permission-approval",
@@ -268,7 +313,7 @@ def main() -> int:
         page.get_by_role("button", name="Войти").click()
         page.get_by_role("heading", name="Переносимый чат").wait_for()
 
-        page.get_by_text("Выполнил действие").wait_for()
+        page.get_by_text("GitHub").wait_for()
         if page.locator(".activity-card").count():
             raise AssertionError("legacy activity cards are still rendered")
         if page.get_by_text("Состояние чата").count():
@@ -278,6 +323,27 @@ def main() -> int:
         command_row = page.locator("details.activity-row").filter(has_text="Выполнил команду")
         command_row.get_by_text("Выполнил команду").click()
         command_row.get_by_text("All tests passed").wait_for()
+
+        if page.get_by_label("Навигация").count() != 1:
+            raise AssertionError("workspace must use one unified navigation sidebar")
+        transcript_metrics = page.locator(".conversation-scroll").evaluate(
+            "element => ({scrollHeight: element.scrollHeight, clientHeight: element.clientHeight})"
+        )
+        if transcript_metrics["scrollHeight"] <= transcript_metrics["clientHeight"]:
+            raise AssertionError("long transcript is not isolated in its own scroll container")
+        composer_box = page.locator(".composer-wrap").bounding_box()
+        if not composer_box or composer_box["y"] + composer_box["height"] > 900:
+            raise AssertionError("composer is pushed below the desktop viewport")
+
+        composer = page.get_by_label("Сообщение Codex")
+        composer.fill("/sta")
+        page.get_by_role("listbox", name="Команды Codex").wait_for()
+        page.get_by_role("option", name="/status Статус, лимиты и использование").click()
+        composer.press("Enter")
+        page.get_by_label("Статус Codex").wait_for()
+        page.get_by_text("31% использовано · 300 мин.").wait_for()
+        page.get_by_text("multi-agent-orchestrator", exact=True).wait_for()
+        page.get_by_label("Закрыть диагностику").click()
 
         page.get_by_label("Вопросы Codex").wait_for()
         secret = page.get_by_label("Секрет: ответ")
@@ -306,18 +372,18 @@ def main() -> int:
             raise AssertionError("project context menu is clipped on desktop")
         page.keyboard.press("Escape")
 
-        page.get_by_label("Меню чата Переносимый чат").click()
+        page.get_by_label("Меню чата проекта Переносимый чат").click()
         page.get_by_role("menuitem", name="Архивировать чат").click()
         page.get_by_text("Здесь пока нет чатов.").wait_for()
         page.get_by_label("Меню проекта Demo").click()
         page.get_by_role("menuitem", name="Архивированные чаты").click()
-        page.get_by_label("Архивированные чаты").wait_for()
+        page.get_by_text("Архив", exact=True).wait_for()
         page.get_by_role("strong").filter(has_text="Переносимый чат").wait_for()
-        page.get_by_label("Меню чата Переносимый чат").click()
+        page.get_by_label("Меню чата проекта Переносимый чат").click()
         page.get_by_role("menuitem", name="Восстановить чат").click()
         page.get_by_text("Архив пуст.").wait_for()
 
-        page.set_viewport_size({"width": 390, "height": 844})
+        page.set_viewport_size({"width": 390, "height": 600})
         overflow = page.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth")
         if overflow:
             raise AssertionError("mobile layout has horizontal page overflow")
@@ -326,6 +392,9 @@ def main() -> int:
             box = control.bounding_box()
             if not box or box["x"] < 0 or box["x"] + box["width"] > 390:
                 raise AssertionError(f"mobile control is outside the viewport: {label}")
+        mobile_composer = page.locator(".composer-wrap").bounding_box()
+        if not mobile_composer or mobile_composer["y"] + mobile_composer["height"] > 600:
+            raise AssertionError("composer is pushed below the constrained mobile viewport")
         unexpected_console_errors = [
             error
             for error in console_errors
@@ -336,7 +405,7 @@ def main() -> int:
         browser.close()
 
     print(
-        "browser-smoke: login, secret user-input, one-turn permission, archive/restore, mobile layout passed"
+        "browser-smoke: unified sidebar, long-chat scroll, status/skills, archive/restore and constrained layout passed"
     )
     return 0
 

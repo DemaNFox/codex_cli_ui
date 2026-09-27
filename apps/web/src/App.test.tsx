@@ -56,6 +56,25 @@ const capabilities = {
   skills: [
     { name: 'multi-agent-orchestrator', path: '/etc/codex/skills/orchestrator', enabled: true },
   ],
+  rateLimits: [
+    {
+      limitId: 'codex',
+      limitName: 'Codex',
+      planType: 'plus',
+      primary: { usedPercent: 27, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+      secondary: null,
+    },
+  ],
+  usage: {
+    summary: {
+      lifetimeTokens: 123456,
+      currentStreakDays: 4,
+      longestStreakDays: 9,
+      peakDailyTokens: 23456,
+      longestRunningTurnSec: 321,
+    },
+    dailyUsageBuckets: null,
+  },
   warnings: [],
 };
 
@@ -275,7 +294,11 @@ describe('App', () => {
     render(<App />);
     await screen.findAllByText('Frontend task');
 
-    expect(screen.getByRole('button', { name: 'Диагностика' })).not.toBeNull();
+    expect(screen.getByRole('complementary', { name: 'Навигация' })).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Новый чат' })).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Новый чат в проекте AI Chat Bot' })).not.toBeNull();
+    expect(screen.getByRole('navigation', { name: 'Недавние чаты' })).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Статус' })).not.toBeNull();
     expect(screen.getByRole('button', { name: 'Прикрепить файлы' })).not.toBeNull();
     expect(screen.getByRole('button', { name: 'Отправить сообщение' })).not.toBeNull();
 
@@ -287,7 +310,7 @@ describe('App', () => {
     expect(projectMenu.getAttribute('aria-expanded')).toBe('false');
     expect(screen.queryByRole('menuitem', { name: 'Архивированные чаты' })).toBeNull();
 
-    const threadMenu = screen.getByRole('button', { name: 'Меню чата Frontend task' });
+    const threadMenu = screen.getByRole('button', { name: 'Меню чата проекта Frontend task' });
     await user.click(threadMenu);
     expect(screen.getByRole('menuitem', { name: 'Архивировать чат' })).not.toBeNull();
     fireEvent.mouseDown(document.body);
@@ -320,7 +343,7 @@ describe('App', () => {
         turnId: 'turn-1',
         kind: 'tool',
         phase: 'started',
-        payload: { item: { id: 'item-1', type: 'commandExecution' } },
+        payload: { item: { id: 'unnamed-item', type: 'dynamicToolCall' } },
         createdAt: '2026-09-27T10:01:02.000Z',
       },
       {
@@ -329,17 +352,35 @@ describe('App', () => {
         turnId: 'turn-1',
         kind: 'tool',
         phase: 'completed',
-        payload: { item: { id: 'item-1', type: 'commandExecution' } },
+        payload: { item: { id: 'unnamed-item' } },
         createdAt: '2026-09-27T10:01:03.000Z',
       },
       {
         id: 5,
         threadId: 'thread-1',
         turnId: 'turn-1',
+        kind: 'tool',
+        phase: 'started',
+        payload: { item: { id: 'item-1', type: 'mcpToolCall', name: 'GitHub' } },
+        createdAt: '2026-09-27T10:01:04.000Z',
+      },
+      {
+        id: 6,
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        kind: 'tool',
+        phase: 'completed',
+        payload: { item: { id: 'item-1', status: 'completed' } },
+        createdAt: '2026-09-27T10:01:05.000Z',
+      },
+      {
+        id: 7,
+        threadId: 'thread-1',
+        turnId: 'turn-1',
         kind: 'command',
         phase: 'completed',
         payload: { command: 'pnpm test', output: 'All tests passed' },
-        createdAt: '2026-09-27T10:01:04.000Z',
+        createdAt: '2026-09-27T10:01:06.000Z',
       },
     ];
     installAuthenticatedApi((url) => {
@@ -349,7 +390,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    expect(await screen.findByText('Выполнил действие')).not.toBeNull();
+    expect(await screen.findByText('GitHub')).not.toBeNull();
     expect(screen.queryByText('Состояние чата')).toBeNull();
     expect(screen.queryByText('Состояние задачи')).toBeNull();
     expect(screen.queryByText('Использует инструмент')).toBeNull();
@@ -437,6 +478,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
     await screen.findAllByText('Frontend task');
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
 
     const file = new File(['1234567890'], 'evidence.png', { type: 'image/png' });
     await user.upload(screen.getByLabelText('Выбрать вложения'), file);
@@ -444,9 +486,11 @@ describe('App', () => {
     await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
 
     await waitFor(() => expect(FakeXMLHttpRequest.instances).toHaveLength(1));
-    expect(screen.getByRole<HTMLButtonElement>('button', { name: /^Frontend task/ }).disabled).toBe(
-      true,
-    );
+    expect(
+      screen.getByRole<HTMLButtonElement>('button', {
+        name: 'Открыть чат проекта Frontend task',
+      }).disabled,
+    ).toBe(true);
     expect(screen.getByRole<HTMLButtonElement>('button', { name: /^AI Chat Bot/ }).disabled).toBe(
       true,
     );
@@ -480,10 +524,16 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
     await screen.findAllByText('Frontend task');
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
 
     await user.upload(
       screen.getByLabelText('Выбрать вложения'),
       new File(['broken'], 'broken.txt', { type: 'text/plain' }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole<HTMLButtonElement>('button', { name: 'Отправить сообщение' }).disabled,
+      ).toBe(false),
     );
     await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
     await waitFor(() => expect(FakeXMLHttpRequest.instances).toHaveLength(1));
@@ -559,13 +609,19 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
     await screen.findAllByText('Frontend task');
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
     await user.upload(
       screen.getByLabelText('Выбрать вложения'),
       new File(['staged'], 'staged.txt', { type: 'text/plain' }),
     );
+    await waitFor(() =>
+      expect(
+        screen.getByRole<HTMLButtonElement>('button', { name: 'Отправить сообщение' }).disabled,
+      ).toBe(false),
+    );
     await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
     expect(await screen.findByText('turn rejected')).not.toBeNull();
-    await user.click(screen.getByRole('button', { name: /^Second task/ }));
+    await user.click(screen.getByRole('button', { name: 'Открыть чат проекта Second task' }));
 
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
@@ -604,7 +660,7 @@ describe('App', () => {
     expect((await screen.findAllByText('Старый чат')).length).toBeGreaterThan(0);
     expect(await screen.findByText('Сохранённый ответ из архива')).not.toBeNull();
     expect(screen.getByLabelText<HTMLTextAreaElement>('Сообщение Codex').disabled).toBe(true);
-    await user.click(screen.getByRole('button', { name: 'Меню чата Старый чат' }));
+    await user.click(screen.getByRole('button', { name: 'Меню чата проекта Старый чат' }));
     await user.click(screen.getByRole('menuitem', { name: 'Восстановить чат' }));
 
     await waitFor(() =>
@@ -641,7 +697,9 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: /^Импортированный чат/ }));
+    await user.click(
+      await screen.findByRole('button', { name: 'Открыть чат проекта Импортированный чат' }),
+    );
     expect(await screen.findByText('История с сервера')).not.toBeNull();
     await waitFor(() => expect(FakeEventSource.instances.at(-1)?.url).toContain('thread-imported'));
 
@@ -868,12 +926,22 @@ describe('App', () => {
     await waitFor(() => expect(screen.queryByLabelText('Запрос дополнительных прав')).toBeNull());
   });
 
-  it('shows loaded instruction sources and skills in diagnostics', async () => {
+  it('opens status and skills through slash commands without sending a model turn', async () => {
     installAuthenticatedApi();
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Диагностика' }));
+    const composer = await screen.findByLabelText('Сообщение Codex');
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+    await user.type(composer, '/sta');
+    expect(screen.getByRole('listbox', { name: 'Команды Codex' })).not.toBeNull();
+    await user.click(screen.getByRole('option', { name: /\/status/ }));
+    await user.click(composer);
+    await user.keyboard('{Enter}');
+
+    expect(await screen.findByRole('complementary', { name: 'Статус Codex' })).not.toBeNull();
+    expect(screen.getByText('27% использовано · 300 мин.')).not.toBeNull();
+    expect(screen.getByText((content) => content.replace(/\s/g, '') === '123456')).not.toBeNull();
     expect(await screen.findByText('/srv/projects/ai-chat-bot/AGENTS.md')).not.toBeNull();
     expect(screen.getByText('multi-agent-orchestrator')).not.toBeNull();
     expect(screen.getByText('1.2.3')).not.toBeNull();

@@ -23,7 +23,9 @@ Browser
 - Codex rollout files remain the source of truth for Codex conversation history. SQLite stores the local project registry, thread-to-project mapping, UI metadata, sessions, audit records and a bounded reconnect journal.
 - A project is a display name plus a canonical existing directory under an allowlisted root. Codex has no separate project entity; thread `cwd` binds execution to a project.
 - Models and reasoning efforts come from `model/list`; the UI never hard-codes account availability.
-- `instructionSources` from thread start/resume and `skills/list` are visible in diagnostics so the operator can verify that `AGENTS.md` and required skills loaded.
+- `instructionSources` from thread start/resume and `skills/list` are visible in the status drawer so the operator can verify that `AGENTS.md` and required skills loaded.
+- The backend reads account rate limits and aggregate usage through the app-server read-only account methods. Its public projection omits account identity, email, credits, authentication material and unknown upstream fields; an unsupported optional method degrades to `null` plus a static warning.
+- The browser handles `/status` and `/skills` locally instead of sending them as model turns. Other text, including unknown slash-prefixed text, remains an ordinary Codex prompt.
 
 ## Attachments
 
@@ -71,9 +73,11 @@ dedicated bounded volume remains mandatory for a hard disk limit.
 - `POST /api/permission-requests/:id/resolve` for an explicit deny or one-turn grant derived from the validated request
 - `GET /api/threads/:id/events` using SSE and `Last-Event-ID`
 - `POST/GET /api/threads/:id/attachments`, `GET/DELETE /api/threads/:id/attachments/:attachmentId`; uploads use multipart field `file`
-- `GET /api/system/capabilities` for safe version/auth/instruction/skill diagnostics
+- `GET /api/system/capabilities` for safe version/auth/instruction/skill, rate-limit and aggregate-usage status
 
 All state-changing routes require an authenticated session, exact Origin and a session-bound CSRF token.
 
-The project context menu exposes an archived-chat view scoped to that project. Archived threads can be
-inspected and restored without mixing them into the active thread list.
+The single navigation sidebar expands each project into its chat list, offers global and per-project new-chat
+actions and keeps a cross-project recent list. The project context menu exposes an archived-chat view scoped
+to that project. Archived threads can be inspected and restored without mixing them into the active thread
+list. The transcript owns the scroll container while the composer remains in a fixed grid row.

@@ -9,6 +9,11 @@ them into the composer; image analysis is delegated to Codex and stored uploads 
 application state. It uses the official Codex app-server protocol over local stdio; the app-server transport
 is never exposed publicly.
 
+The workspace uses one navigation sidebar: projects expand to their chats, each project has its own new-chat
+action and archived chats remain recoverable from the project menu. The composer stays pinned while a long
+transcript scrolls independently. `/status` opens safe Codex account limits and aggregate usage; `/skills`
+opens the same status surface at the loaded skills and instruction-source inventory.
+
 Status: the portable release has been deployed and verified on an Ubuntu reference host. A new host still
 requires its own HTTPS endpoint, bounded storage and server-local login secrets.
 
