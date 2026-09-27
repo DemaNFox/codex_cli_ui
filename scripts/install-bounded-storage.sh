@@ -72,8 +72,8 @@ EOF
 fi
 
 require_root
-for command in awk cat chmod chown date df fallocate findmnt getent grep id install \
-  mkfs.ext4 mktemp mount mountpoint mv realpath rmdir rsync stat systemctl umount; do
+for command in awk cat chmod chown curl date df fallocate findmnt getent grep id install \
+  mkfs.ext4 mktemp mount mountpoint mv realpath rmdir rsync seq sleep stat systemctl umount; do
   require_command "$command"
 done
 validate_service_user "$service_user"
@@ -249,7 +249,18 @@ done
 [[ $(stat -c %U:%G -- "$IMAGE_PATH") == root:root ]] || die 'backing image is not root-owned'
 
 $timer_was_active && systemctl start "$guard_timer"
-$service_was_active && systemctl start "$service_unit"
+if $service_was_active; then
+  systemctl start "$service_unit"
+  healthy=false
+  for _ in $(seq 1 30); do
+    if curl --fail --silent http://127.0.0.1:3210/api/health >/dev/null; then
+      healthy=true
+      break
+    fi
+    sleep 1
+  done
+  $healthy || die 'service did not become healthy after bounded storage migration'
+fi
 migration_complete=true
 trap - EXIT INT TERM
 

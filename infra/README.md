@@ -64,6 +64,24 @@ non-current release beneath `/opt/codex-web-ui/releases`, preserve any required
 rollback artifact, and remove that exact directory through the host's reviewed
 operations procedure before retrying the update.
 
+For a standalone Ubuntu host, `scripts/install-bounded-storage.sh` provides the
+portable bounded-volume path after the three target directories exist. It
+requires explicit byte and inode ceilings, preallocates a root-owned `0600`
+ext4 image, checksum-verifies the migration, persists the loop and bind mounts,
+and keeps timestamped source directories for reviewed rollback. For example,
+an 80 GiB / 1,310,720-inode ceiling is installed with:
+
+```sh
+sudo scripts/install-bounded-storage.sh \
+  --size-bytes 85899345920 \
+  --inode-count 1310720 \
+  --service-user ai-chat-agent
+```
+
+The host must have the requested capacity free because the image is allocated,
+not sparse. Validate a failure-and-recovery probe appropriate to the host and a
+stop/unmount/`mount -a`/restart cycle before relying on the boot-time boundary.
+
 ## Safe installation sequence
 
 1. Build a verified minimal release outside `CODEX_HOME` with
@@ -74,19 +92,26 @@ operations procedure before retrying the update.
 2. Run `scripts/install-ubuntu.sh` without `--start`. It creates no credentials.
 3. Populate `/etc/codex-web-ui/codex-web-ui.env` through a protected channel;
    keep it `root:root 0600`.
-4. Verify and install the self-contained required skill bundle with
+4. Install the bounded storage boundary described above before exposing the
+   service. Do not remove its timestamped source backups until health and
+   remount recovery have been verified.
+5. Verify and install the self-contained required skill bundle with
    `sudo scripts/install-skills.sh --codex-home /absolute/codex/home`. The exact
    vendored file set in `skills/bundle/bundle.manifest.json` is enforced and
    existing skill versions are backed up. Updating the bundle is a reviewed
    source change: run `skill-bundle.py build` from an explicit skill source root,
    inspect the diff and regenerate the committed checksums; never use the whole
    local or server `CODEX_HOME` as that source.
-5. Install the Nginx template with existing TLS certificate/key paths using
+6. On Ubuntu hosts with restricted user namespaces, install the exact-path
+   AppArmor exception using the root-owned native Codex and Bubblewrap binaries:
+   `sudo scripts/install-apparmor.sh --codex-bin /absolute/native/codex --bwrap-bin /absolute/bwrap`.
+   The installer validates and loads only the two scoped `userns` profiles.
+7. Install the Nginx template with existing TLS certificate/key paths using
    `scripts/install-nginx.sh`; review `nginx -t` before `--reload`.
    On a shared host where ports 80/443 are already owned, pass distinct
    `--http-port` and `--https-port` values and include the HTTPS port in
    `CODEX_WEB_PUBLIC_ORIGIN`.
-6. Start `codex-web-ui@USER.service` and run
+8. Start `codex-web-ui@USER.service` and run
    `sudo scripts/health-check.sh`. The check needs root only to read the
    protected environment and never prints secret values.
 

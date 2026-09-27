@@ -72,7 +72,8 @@ class BoundedStorageInstallerTest(unittest.TestCase):
             "--delete --checksum",
             ".pre-bounded-${backup_suffix}",
             "bounded storage migration failed; restoring original paths",
-            "$service_was_active && systemctl start \"$service_unit\"",
+            "systemctl start \"$service_unit\"",
+            "service did not become healthy after bounded storage migration",
             "Original data remains in rollback backups",
         ):
             self.assertIn(expected, self.source)
