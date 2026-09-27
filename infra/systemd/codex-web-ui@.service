@@ -33,8 +33,10 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 ProtectSystem=strict
 ProtectHome=read-only
-PrivateTmp=yes
-# Full-access turns still receive bounded temporary filesystems. These tmpfs
+# TemporaryFileSystem already creates a private mount namespace; PrivateTmp's
+# later bind mounts would hide these hard limits, so it must remain disabled.
+PrivateTmp=no
+# Full-access turns receive bounded temporary filesystems. These tmpfs
 # mounts are charged to the service cgroup and cannot consume the host root FS.
 TemporaryFileSystem=/tmp:rw,nosuid,nodev,size=1G,nr_inodes=16384,mode=1777
 TemporaryFileSystem=/var/tmp:rw,nosuid,nodev,size=1G,nr_inodes=16384,mode=1777

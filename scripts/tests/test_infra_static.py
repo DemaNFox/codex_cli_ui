@@ -18,6 +18,7 @@ class InfraStaticTest(unittest.TestCase):
             "MemoryMax=4G",
             "KillMode=control-group",
             "ProtectProc=invisible",
+            "PrivateTmp=no",
             "TemporaryFileSystem=/tmp:rw,nosuid,nodev,size=1G,nr_inodes=16384,mode=1777",
             "TemporaryFileSystem=/var/tmp:rw,nosuid,nodev,size=1G,nr_inodes=16384,mode=1777",
             "/run/docker.sock",
