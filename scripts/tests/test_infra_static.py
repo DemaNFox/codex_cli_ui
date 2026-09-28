@@ -184,13 +184,13 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn('rm -f -- "$drain_marker"', installer)
         self.assertIn('rm -rf --one-file-system -- "$release_dir"', installer)
 
-        update_begin = updater.index('bash "$source_dir/scripts/graceful-drain.sh" \\\n  --begin')
+        update_begin = updater.index('bash "$SCRIPT_DIR/graceful-drain.sh" \\\n  --begin')
         update_copy = updater.index('copy_release "$source_dir" "$release_dir"')
         update_switch = updater.index('atomic_symlink "$release_dir" /opt/codex-web-ui/current')
         update_health = updater.index(
             'if ! "$SCRIPT_DIR/health-check.sh" --timeout "$health_timeout" --service-user "$service_user"'
         )
-        update_release = updater.rindex('bash "$source_dir/scripts/graceful-drain.sh" \\\n  --release')
+        update_release = updater.rindex('bash "$SCRIPT_DIR/graceful-drain.sh" \\\n  --release')
         self.assertLess(update_begin, update_copy)
         self.assertLess(update_copy, update_switch)
         self.assertLess(update_switch, update_health)
