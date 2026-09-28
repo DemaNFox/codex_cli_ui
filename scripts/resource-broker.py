@@ -616,10 +616,13 @@ def _read_socket_request(sock: socket.socket) -> dict[str, Any]:
     return value
 
 
-def _serve(fd: int, broker: ResourceBroker) -> int:
+def _serve(fd: int, broker: ResourceBroker, api_user: str = API_USER) -> int:
     if not hasattr(os, "geteuid") or os.geteuid() != 0 or pwd is None:
         raise BrokerError("BROKER_NOT_ROOT", "resource broker must run as root")
-    expected_uid = pwd.getpwnam(API_USER).pw_uid
+    try:
+        expected_uid = pwd.getpwnam(api_user).pw_uid
+    except KeyError as error:
+        raise BrokerError("PEER_IDENTITY_INVALID", "resource broker API identity does not exist") from error
     sock = socket.socket(fileno=fd)
     credentials = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
     _pid, uid, _gid = struct.unpack("3i", credentials)
@@ -646,6 +649,7 @@ def _serve(fd: int, broker: ResourceBroker) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--api-user", default=API_USER)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--serve-fd", type=int)
     group.add_argument("--initialize", action="store_true")
@@ -665,7 +669,7 @@ def main() -> int:
                 sys.stdout.write(json.dumps(response, separators=(",", ":"), sort_keys=True) + "\n")
                 return 0
             assert arguments.serve_fd is not None
-            return _serve(arguments.serve_fd, broker)
+            return _serve(arguments.serve_fd, broker, arguments.api_user)
         except BrokerError as error:
             sys.stderr.write(f"resource broker: {error.code}: {error}\n")
             return 1

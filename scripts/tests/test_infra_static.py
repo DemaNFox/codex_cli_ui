@@ -234,7 +234,7 @@ class InfraStaticTest(unittest.TestCase):
         updater = (ROOT / "scripts/update-ubuntu.sh").read_text(encoding="utf-8")
         common = (ROOT / "scripts/lib/ubuntu-common.sh").read_text(encoding="utf-8")
 
-        managed_paths = (
+        portable_managed_paths = (
             "/etc/systemd/system/codex-web-ui@.service",
             "/etc/systemd/system/codex-web-ui-app-server@.service",
             "/etc/systemd/system/codex-web-ui-resource-broker.socket",
@@ -244,7 +244,18 @@ class InfraStaticTest(unittest.TestCase):
             "/etc/codex-web-ui/resource-limits.json",
             "/etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf",
         )
-        for script in (installer, updater):
+        legacy_managed_paths = (
+            "/etc/systemd/system/codex-web-ui-resource-broker.socket",
+            "/etc/systemd/system/codex-web-ui-resource-broker@.service",
+            "/etc/systemd/system/codex-web-ui-workload.slice",
+            "/usr/local/libexec/codex-web-ui-resource-broker",
+            "/etc/codex-web-ui/resource-limits.json",
+            "/etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf",
+        )
+        for script, managed_paths in (
+            (installer, portable_managed_paths),
+            (updater, legacy_managed_paths),
+        ):
             for path in managed_paths:
                 self.assertIn(path, script)
             self.assertIn("snapshot_activation_file", script)
@@ -280,13 +291,22 @@ class InfraStaticTest(unittest.TestCase):
             self.assertLess(rollback, restart)
 
         for unit in (
-            "codex-web-ui@.service",
-            "codex-web-ui-app-server@.service",
             "codex-web-ui-resource-broker.socket",
             "codex-web-ui-resource-broker@.service",
             "codex-web-ui-workload.slice",
         ):
             self.assertIn(unit, updater)
+        resource_units = updater[
+            updater.index("resource_units=(") : updater.index(")", updater.index("resource_units=("))
+        ]
+        self.assertNotIn("codex-web-ui@.service", resource_units)
+        self.assertNotIn("codex-web-ui-app-server@.service", resource_units)
+        self.assertIn('SocketUser=$service_user', updater)
+        self.assertIn('--serve-fd 0 --api-user $service_user', updater)
+        self.assertIn('Slice=codex-web-ui-workload.slice', updater)
+        self.assertIn('legacy_resource_drop_in_dir_was_present=false', updater)
+        self.assertIn('[[ -e $legacy_resource_drop_in_dir || -L $legacy_resource_drop_in_dir ]]', updater)
+        self.assertIn('rmdir -- "$legacy_resource_drop_in_dir"', updater)
         helper_install = (
             'install -m 0755 "$release_dir/scripts/resource-broker.py" '
             "/usr/local/libexec/codex-web-ui-resource-broker"
@@ -307,13 +327,26 @@ class InfraStaticTest(unittest.TestCase):
         reconcile = updater.index(
             "/usr/local/libexec/codex-web-ui-resource-broker --initialize", socket_restart
         )
-        api_restart = updater.index('systemctl restart "codex-web-ui@${service_user}.service"', reconcile)
+        api_restart = updater.index(
+            'systemctl restart "codex-web-ui@${service_user}.service"', socket_restart
+        )
         self.assertLess(helper, reload)
         self.assertLess(reload, slice_start)
         self.assertLess(slice_start, socket_enable)
         self.assertLess(socket_enable, socket_restart)
-        self.assertLess(socket_restart, reconcile)
-        self.assertLess(reconcile, api_restart)
+        self.assertLess(socket_restart, api_restart)
+        self.assertLess(api_restart, reconcile)
+
+        portable_restart = installer.index(
+            "systemctl restart codex-web-ui-resource-broker.socket "
+            "codex-web-ui-app-server.socket codex-web-ui@api.service"
+        )
+        portable_reconcile = installer.index(
+            "/usr/local/libexec/codex-web-ui-resource-broker --initialize", portable_restart
+        )
+        portable_health = installer.index('"$package/scripts/health-check.sh"', portable_reconcile)
+        self.assertLess(portable_restart, portable_reconcile)
+        self.assertLess(portable_reconcile, portable_health)
 
         for expected in (
             "snapshot_activation_file()",

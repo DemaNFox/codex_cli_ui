@@ -438,7 +438,6 @@ chown root:root "$config" "$runner_config"
 CODEX_WEB_CONFIG="$config" /usr/local/libexec/codex-web-ui-validate-config
 systemctl daemon-reload
 systemctl start codex-web-ui-workload.slice
-/usr/local/libexec/codex-web-ui-resource-broker --initialize >/dev/null
 if ! $external_proxy; then
   domain=${public_origin#https://}
   "$package/scripts/install-nginx.sh" --domain "$domain" --tls-cert "$tls_cert" --tls-key "$tls_key" --reload
@@ -447,6 +446,7 @@ if $start_service; then
   systemctl enable codex-web-ui-resource-broker.socket codex-web-ui-app-server.socket codex-web-ui@api.service codex-web-ui-storage-guard@api.timer
   systemctl stop 'codex-web-ui-app-server@*.service' >/dev/null 2>&1 || true
   systemctl restart codex-web-ui-resource-broker.socket codex-web-ui-app-server.socket codex-web-ui@api.service codex-web-ui-storage-guard@api.timer
+  /usr/local/libexec/codex-web-ui-resource-broker --initialize >/dev/null
   "$package/scripts/health-check.sh" --service-user api --timeout 45
   if $drain_engaged; then
     bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user api --timeout 45
@@ -454,7 +454,7 @@ if $start_service; then
   printf 'Codex Web UI %s is installed at %s\n' "$release_id" "$public_origin"
 else
   if $drain_engaged; then rm -f -- "$drain_marker"; fi
-  printf 'Codex Web UI %s is installed but not started; establish hard storage bounds, then enable the API, app-server socket, resource-broker socket and storage timer.\n' "$release_id"
+  printf 'Codex Web UI %s is installed but not started; establish hard storage bounds, enable the API, app-server socket, resource-broker socket and storage timer, then run the resource broker with --initialize.\n' "$release_id"
 fi
 activation_complete=true
 if [[ -n $runner_config_backup ]]; then rm -f -- "$runner_config_backup"; fi
