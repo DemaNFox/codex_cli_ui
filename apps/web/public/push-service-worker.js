@@ -12,13 +12,11 @@ self.addEventListener('push', (event) => {
     payload = {};
   }
 
-  const threadName = boundedText(payload.threadName, 80);
   const threadId = boundedText(payload.threadId, 128);
   const safeThreadId = threadId && /^[A-Za-z0-9._:-]+$/.test(threadId) ? threadId : null;
-  const title = threadName ? `Codex · ${threadName}` : 'Codex';
 
   event.waitUntil(
-    self.registration.showNotification(title, {
+    self.registration.showNotification('Codex', {
       body: 'Работа в чате завершена.',
       tag: safeThreadId ? `codex-thread:${safeThreadId}` : 'codex-chat',
       data: { url: '/' },

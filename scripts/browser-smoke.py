@@ -559,7 +559,7 @@ def main() -> int:
             {"source": worker_source},
         )
         if hostile_notification != {
-            "title": "Codex · Безопасный чат",
+            "title": "Codex",
             "options": {
                 "body": "Работа в чате завершена.",
                 "tag": "codex-chat",
