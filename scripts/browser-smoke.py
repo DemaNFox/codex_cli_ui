@@ -325,6 +325,24 @@ def main() -> int:
             payload(route, 200, {"data": {"id": "t1", "archived": False}})
         elif path == "/api/threads/t1/events":
             events = [
+                *[
+                    {
+                        "id": 97 + index,
+                        "threadId": "t1",
+                        "turnId": "turn-1",
+                        "kind": "tool",
+                        "phase": "completed",
+                        "payload": {
+                            "item": {
+                                "id": f"reasoning-{index}",
+                                "type": "reasoning",
+                                "status": "completed",
+                            }
+                        },
+                        "createdAt": f"2026-09-27T11:59:5{index}.000Z",
+                    }
+                    for index in range(4)
+                ],
                 {
                     "id": 101,
                     "threadId": "t1",
@@ -448,6 +466,16 @@ def main() -> int:
             raise AssertionError("thread lifecycle noise is still rendered")
         if page.get_by_text("Использует инструмент").count():
             raise AssertionError("completed tool lifecycle was not collapsed")
+        activity_group = page.get_by_role("region", name="Ход работы: 6 действий")
+        activity_group.wait_for()
+        if activity_group.locator(".activity-row").count() != 3:
+            raise AssertionError("collapsed activity group must show exactly three latest actions")
+        activity_toggle = activity_group.locator(".activity-group-toggle")
+        if "6 действий" not in activity_toggle.inner_text():
+            raise AssertionError("activity spoiler does not expose the total action count")
+        activity_toggle.click()
+        if activity_group.locator(".activity-row").count() != 6:
+            raise AssertionError("expanded activity group does not expose the full action history")
         command_row = page.locator("details.activity-row").filter(has_text="Выполнил команду")
         command_row.get_by_text("Выполнил команду").click()
         command_row.get_by_text("All tests passed").wait_for()

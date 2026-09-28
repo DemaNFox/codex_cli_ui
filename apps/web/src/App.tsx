@@ -74,6 +74,31 @@ function formatDuration(startedAt: string, completedAt: string | null): string {
   return minutes ? `${minutes} мин. ${seconds} сек.` : `${seconds} сек.`;
 }
 
+function useActiveTurnDuration(
+  events: SafeEvent[],
+  activeTurnId: string | null,
+  active: boolean,
+): string | null {
+  const startedAt = useMemo(() => {
+    if (!active || !activeTurnId) return null;
+    const timestamps = events
+      .filter((event) => event.turnId === activeTurnId)
+      .map((event) => Date.parse(event.createdAt))
+      .filter(Number.isFinite);
+    return timestamps.length ? new Date(Math.min(...timestamps)).toISOString() : null;
+  }, [active, activeTurnId, events]);
+  const [now, setNow] = useState(() => new Date().toISOString());
+
+  useEffect(() => {
+    if (!active || !startedAt) return undefined;
+    setNow(new Date().toISOString());
+    const timer = window.setInterval(() => setNow(new Date().toISOString()), 1000);
+    return () => window.clearInterval(timer);
+  }, [active, startedAt]);
+
+  return startedAt ? formatDuration(startedAt, now) : null;
+}
+
 function formatResetTime(value: number | null): string {
   return value === null ? 'неизвестно' : new Date(value * 1000).toLocaleString('ru');
 }
@@ -1160,6 +1185,65 @@ function PermissionCard({
   );
 }
 
+function ActivityEvent({ event }: { event: SafeEvent }) {
+  const preview = eventPreview(event);
+  const details = eventText(event);
+  const hasDetails = details !== `${event.kind}: ${event.phase}` && details !== preview;
+  const content = (
+    <>
+      <span className="activity-dot" aria-hidden="true" />
+      <span className="activity-title">{eventTitle(event)}</span>
+      {preview && <small>{preview}</small>}
+      <time className="event-time" dateTime={event.createdAt}>
+        {formatEventDateTime(event.createdAt)}
+      </time>
+    </>
+  );
+  return hasDetails ? (
+    <details className={`activity-row ${event.kind}`} open={event.kind === 'error'}>
+      <summary>{content}</summary>
+      <pre>{details}</pre>
+    </details>
+  ) : (
+    <div className={`activity-row ${event.kind}`}>
+      <div className="activity-line">{content}</div>
+    </div>
+  );
+}
+
+function ActivityGroup({ events }: { events: SafeEvent[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const firstEvent = events[0];
+  if (!firstEvent) return null;
+  const visibleEvents = expanded ? events : events.slice(-3);
+  const duration = formatDuration(firstEvent.createdAt, events.at(-1)?.createdAt ?? null);
+
+  return (
+    <section className="activity-group" aria-label={`Ход работы: ${events.length} действий`}>
+      <button
+        className="activity-group-toggle"
+        type="button"
+        aria-expanded={expanded}
+        onClick={() => setExpanded((current) => !current)}
+      >
+        <span>Ход работы</span>
+        <small>
+          {events.length} действий · {duration}
+        </small>
+        <i aria-hidden="true">{expanded ? '⌃' : '⌄'}</i>
+      </button>
+      <div className="activity-group-items">
+        {visibleEvents.map((event) => (
+          <ActivityEvent event={event} key={event.id} />
+        ))}
+      </div>
+      {!expanded && events.length > 3 && (
+        <p className="activity-group-hint">Показаны 3 последних действия</p>
+      )}
+    </section>
+  );
+}
+
 function Transcript({ events }: { events: SafeEvent[] }) {
   const displayEvents = useMemo(() => {
     const output: SafeEvent[] = [];
@@ -1210,6 +1294,24 @@ function Transcript({ events }: { events: SafeEvent[] }) {
     }
     return output;
   }, [events]);
+  const blocks = useMemo(() => {
+    const output: Array<
+      { type: 'message'; event: SafeEvent } | { type: 'activities'; events: SafeEvent[] }
+    > = [];
+    for (const event of displayEvents) {
+      if (event.kind === 'user-message' || event.kind === 'agent-message') {
+        output.push({ type: 'message', event });
+        continue;
+      }
+      const previous = output.at(-1);
+      if (previous?.type === 'activities' && previous.events.at(-1)?.turnId === event.turnId) {
+        previous.events.push(event);
+      } else {
+        output.push({ type: 'activities', events: [event] });
+      }
+    }
+    return output;
+  }, [displayEvents]);
 
   if (!displayEvents.length) {
     return (
@@ -1223,21 +1325,21 @@ function Transcript({ events }: { events: SafeEvent[] }) {
 
   return (
     <div className="transcript" aria-live="polite">
-      {displayEvents.map((event) => {
-        if (event.kind === 'user-message' || event.kind === 'agent-message') {
-          const attachments = attachmentsFrom(event);
-          const text = eventText(event);
+      {blocks.map((block) => {
+        if (block.type === 'message') {
+          const attachments = attachmentsFrom(block.event);
+          const text = eventText(block.event);
           return (
             <article
-              className={`message ${event.kind === 'user-message' ? 'user' : 'agent'}`}
-              key={event.id}
+              className={`message ${block.event.kind === 'user-message' ? 'user' : 'agent'}`}
+              key={block.event.id}
             >
               <div className="message-meta">
                 <span className="message-role">
-                  {event.kind === 'user-message' ? 'Вы' : 'Codex'}
+                  {block.event.kind === 'user-message' ? 'Вы' : 'Codex'}
                 </span>
-                <time className="event-time" dateTime={event.createdAt}>
-                  {formatEventDateTime(event.createdAt)}
+                <time className="event-time" dateTime={block.event.createdAt}>
+                  {formatEventDateTime(block.event.createdAt)}
                 </time>
               </div>
               {text && <div className="message-text">{text}</div>}
@@ -1245,32 +1347,11 @@ function Transcript({ events }: { events: SafeEvent[] }) {
             </article>
           );
         }
-        const preview = eventPreview(event);
-        const details = eventText(event);
-        const hasDetails = details !== `${event.kind}: ${event.phase}` && details !== preview;
-        const content = (
-          <>
-            <span className="activity-dot" aria-hidden="true" />
-            <span className="activity-title">{eventTitle(event)}</span>
-            {preview && <small>{preview}</small>}
-            <time className="event-time" dateTime={event.createdAt}>
-              {formatEventDateTime(event.createdAt)}
-            </time>
-          </>
-        );
-        return hasDetails ? (
-          <details
-            className={`activity-row ${event.kind}`}
-            key={event.id}
-            open={event.kind === 'error'}
-          >
-            <summary>{content}</summary>
-            <pre>{details}</pre>
-          </details>
-        ) : (
-          <div className={`activity-row ${event.kind}`} key={event.id}>
-            <div className="activity-line">{content}</div>
-          </div>
+        return (
+          <ActivityGroup
+            events={block.events}
+            key={`activities-${block.events[0]?.id ?? 'empty'}`}
+          />
         );
       })}
     </div>
@@ -1722,6 +1803,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   const lastTurnEvent = turnEvents.at(-1);
   const active = selectedThread?.status === 'active';
   const activeTurnId = active ? selectedThread.activeTurnId : null;
+  const activeTurnDuration = useActiveTurnDuration(events, activeTurnId, active);
   const approvals = useMemo(() => {
     const pending = new Map<string, PendingApproval>();
     for (const event of events) {
@@ -2494,7 +2576,11 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
             <h1>{selectedThread?.name || selectedThread?.preview || 'Новый чат'}</h1>
             <span className={`live-status ${active ? 'running' : ''}`}>
               <i />
-              {active ? 'Codex работает' : streamState === 'offline' ? 'Нет подключения' : 'Готов'}
+              {active
+                ? `Codex работает${activeTurnDuration ? ` уже ${activeTurnDuration}` : ''}`
+                : streamState === 'offline'
+                  ? 'Нет подключения'
+                  : 'Готов'}
             </span>
           </div>
           <div className="toolbar-actions">

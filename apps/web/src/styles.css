@@ -771,8 +771,56 @@ button:disabled {
   color: var(--accent);
   background: #252c31;
 }
+.activity-group {
+  display: grid;
+  gap: 0.65rem;
+  width: min(44rem, 100%);
+  min-width: 0;
+  padding: 0.65rem 0.75rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 0.75rem;
+  background: rgba(255, 255, 255, 0.012);
+}
+.activity-group-toggle {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.6rem;
+  width: 100%;
+  min-width: 0;
+  padding: 0.2rem 0;
+  color: #d9e0e5;
+  background: transparent;
+  text-align: left;
+  font-size: 0.8rem;
+  font-weight: 700;
+}
+.activity-group-toggle small {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.7rem;
+  font-weight: 500;
+}
+.activity-group-toggle i {
+  color: var(--muted);
+  font-style: normal;
+}
+.activity-group-items {
+  display: grid;
+  min-width: 0;
+  gap: 0.65rem;
+}
+.activity-group-hint {
+  margin: 0;
+  color: #69737c;
+  font-size: 0.66rem;
+}
 .activity-row {
   position: relative;
+  min-width: 0;
   max-width: 44rem;
   color: #aeb6bd;
   font-size: 0.78rem;

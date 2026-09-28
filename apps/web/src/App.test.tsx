@@ -711,6 +711,69 @@ describe('App', () => {
     expect(screen.getByText('All tests passed')).not.toBeNull();
   });
 
+  it('collapses long activity runs to the latest three actions with a total and duration', async () => {
+    const events = Array.from({ length: 6 }, (_, index) => ({
+      id: index + 1,
+      threadId: 'thread-1',
+      turnId: 'turn-activity',
+      kind: 'command',
+      phase: 'completed',
+      payload: { command: `step-${index + 1}` },
+      createdAt: `2026-09-27T10:01:0${index}.000Z`,
+    }));
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const group = await screen.findByRole('region', { name: 'Ход работы: 6 действий' });
+    const toggle = group.querySelector<HTMLButtonElement>('.activity-group-toggle');
+    expect(toggle?.textContent).toContain('6 действий · 5 сек.');
+    if (!toggle) throw new Error('activity group toggle was not rendered');
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(group.querySelectorAll('.activity-row')).toHaveLength(3);
+    expect(screen.getByText('Показаны 3 последних действия')).not.toBeNull();
+
+    await user.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(group.querySelectorAll('.activity-row')).toHaveLength(6);
+    expect(screen.queryByText('Показаны 3 последних действия')).toBeNull();
+  });
+
+  it('shows elapsed time for the active task in the toolbar', async () => {
+    const startedAt = new Date(Date.now() - 5_000).toISOString();
+    const activeThread = {
+      ...thread,
+      status: 'active',
+      activeTurnId: 'turn-elapsed',
+    };
+    installAuthenticatedApi((url) => {
+      if (url.includes('/api/threads?')) return jsonResponse([activeThread]);
+      if (url === '/api/threads/thread-1') {
+        return jsonResponse({
+          data: activeThread,
+          events: [
+            {
+              id: 1,
+              threadId: 'thread-1',
+              turnId: 'turn-elapsed',
+              kind: 'turn',
+              phase: 'started',
+              payload: { status: 'inProgress' },
+              createdAt: startedAt,
+            },
+          ],
+        });
+      }
+      return undefined;
+    });
+    render(<App />);
+
+    expect(await screen.findByText(/Codex работает уже [5-9] сек\./)).not.toBeNull();
+  });
+
   it('steers an active turn and can interrupt it', async () => {
     const fetchMock = installAuthenticatedApi();
     const user = userEvent.setup();
