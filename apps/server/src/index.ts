@@ -4,6 +4,7 @@ import { OpenAIAudioTranscriptionClient } from './audio-transcription.js';
 import { loadConfig } from './config.js';
 import { SqliteRepository } from './database.js';
 import { ProjectPathPolicy } from './path-policy.js';
+import { WebPushSender } from './push-notifications.js';
 import { UnixResourceBrokerClient } from './resource-broker.js';
 import { buildServer } from './server.js';
 
@@ -22,6 +23,9 @@ const resourceBroker = new UnixResourceBrokerClient(config.resourceBrokerSocket)
 const transcriptionClient = config.openAiApiKey
   ? new OpenAIAudioTranscriptionClient(config.openAiApiKey, config.transcriptionModel)
   : undefined;
+const pushSender = config.vapid
+  ? new WebPushSender(config.vapid.publicKey, config.vapid.privateKey, config.vapid.subject)
+  : undefined;
 const server = await buildServer({
   config,
   repository,
@@ -30,6 +34,7 @@ const server = await buildServer({
   attachmentStore,
   resourceBroker,
   ...(transcriptionClient ? { transcriptionClient } : {}),
+  ...(pushSender ? { pushSender } : {}),
 });
 
 await server.listen({ host: config.host, port: config.port });

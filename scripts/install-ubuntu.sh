@@ -108,6 +108,9 @@ if [[ ! -e $config ]]; then
     printf 'CODEX_WEB_ADMIN_USERNAME=\n'
     printf 'CODEX_WEB_ADMIN_PASSWORD_HASH=\n'
     printf 'CODEX_WEB_SESSION_SECRET=\n'
+    printf 'CODEX_WEB_VAPID_PUBLIC_KEY=\n'
+    printf 'CODEX_WEB_VAPID_PRIVATE_KEY=\n'
+    printf 'CODEX_WEB_VAPID_SUBJECT=\n'
     printf '# Optional voice transcription; leave OPENAI_API_KEY empty to disable it.\n'
     printf 'OPENAI_API_KEY=\n'
     printf 'CODEX_WEB_TRANSCRIPTION_MODEL=gpt-transcribe\n'
@@ -124,6 +127,8 @@ fi
 [[ -f $config && ! -L $config ]] || die 'configuration must be a regular non-symlink file'
 chown root:root "$config"
 chmod 0600 "$config"
+
+/usr/local/bin/node "$REPO_ROOT/scripts/setup-push.mjs" --config "$config"
 
 python3 "$SCRIPT_DIR/storage-guard.py" --config "$config" --check-releases
 

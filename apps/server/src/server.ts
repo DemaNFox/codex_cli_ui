@@ -10,6 +10,8 @@ import {
   resolveApprovalRequestSchema,
   resolveUserInputRequestSchema,
   resourceLimitSnapshotSchema,
+  pushSubscriptionSchema,
+  pushSubscriptionStatusRequestSchema,
   startThreadRequestSchema,
   startTurnRequestSchema,
   steerTurnRequestSchema,
@@ -26,6 +28,7 @@ import {
   type SafeEvent,
   type Subagent,
   type Thread,
+  type PushSubscriptionInput,
 } from '@codex-web/contracts';
 import cookie from '@fastify/cookie';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
@@ -48,7 +51,7 @@ import {
 } from './attachment-store.js';
 import { AuthService, HttpError, type AuthContext } from './auth.js';
 import type { ServerConfig } from './config.js';
-import type { AttachmentRecord, SqliteRepository } from './database.js';
+import { PushStorageLimitError, type AttachmentRecord, type SqliteRepository } from './database.js';
 import {
   normalizeApproval,
   normalizeNotification,
@@ -62,6 +65,12 @@ import {
   validateUserInputAnswers,
 } from './interaction-normalizer.js';
 import type { ProjectPathPolicy } from './path-policy.js';
+import {
+  PushNotificationDispatcher,
+  isAllowedPushEndpoint,
+  type PushNotificationPayload,
+  type PushSender,
+} from './push-notifications.js';
 import {
   ResourceBrokerError,
   type BrokerResourceSnapshot,
@@ -256,6 +265,7 @@ export interface ServerDependencies {
   readonly attachmentStore: AttachmentStore;
   readonly resourceBroker?: ResourceBroker;
   readonly transcriptionClient?: AudioTranscriptionClient;
+  readonly pushSender?: PushSender;
   readonly upgradeDrainPath?: string;
 }
 
@@ -306,6 +316,14 @@ function completedAgentMessage(
     phase: 'completed',
     payload: sanitizeEventPayload({ text: item.text }, maxBytes),
   };
+}
+
+function terminalPushStatus(message: AppServerInbound): PushNotificationPayload['status'] {
+  const params = inputRecord('params' in message ? message.params : null);
+  const turn = inputRecord(params?.turn);
+  if (turn?.status === 'interrupted') return 'interrupted';
+  if (turn?.status === 'failed') return 'failed';
+  return 'completed';
 }
 
 function safeContentDisposition(name: string, inline: boolean): string {
@@ -451,6 +469,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1',
   });
   const auth = new AuthService(config, repository);
+  const pushDispatcher = dependencies.pushSender
+    ? new PushNotificationDispatcher(repository, dependencies.pushSender)
+    : undefined;
   const sseListeners = new Map<string, Set<SseListener>>();
   const activeTurns = new Set<string>();
   const approvalGenerations = new Map<string, number>();
@@ -952,7 +973,12 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
     if (message.method === 'turn/completed' && normalized.turnId) {
       activeTurns.delete(`${normalized.threadId}:${normalized.turnId}`);
-      repository.updateThreadRuntime(normalized.threadId, { status: 'idle', activeTurnId: null });
+      const thread = repository.updateThreadRuntime(normalized.threadId, {
+        status: 'idle',
+        activeTurnId: null,
+      });
+      if (thread)
+        pushDispatcher?.enqueue(thread.id, normalized.turnId, terminalPushStatus(message));
       void applyPendingResourcesWhenIdle();
     }
     if (message.method === 'thread/status/changed') {
@@ -1026,12 +1052,14 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
 
   app.addHook('onReady', async () => {
     await appServer.start();
+    pushDispatcher?.start();
     if (dependencies.resourceBroker) void reconcileStartupResources();
   });
   app.addHook('onClose', async () => {
     serverClosing = true;
     if (resourceStartupRetry) clearTimeout(resourceStartupRetry);
     unsubscribe();
+    await pushDispatcher?.close();
     await appServer.stop();
     repository.close();
   });
@@ -1570,6 +1598,46 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const id = parseId(request);
     if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
     return { data: repository.listAttachments(id).map(publicAttachment) };
+  });
+
+  const requirePushThread = (request: FastifyRequest): string => {
+    csrfGuard(auth, request);
+    const threadId = parseId(request);
+    if (!repository.getThread(threadId)) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    if (!pushDispatcher) throw new HttpError(503, 'PUSH_NOTIFICATIONS_UNAVAILABLE');
+    return threadId;
+  };
+
+  app.post('/api/threads/:id/push-subscriptions/status', (request) => {
+    const threadId = requirePushThread(request);
+    const input = pushSubscriptionStatusRequestSchema.parse(request.body);
+    return { subscribed: repository.hasPushSubscription(threadId, input.endpoint) };
+  });
+
+  app.put('/api/threads/:id/push-subscriptions', (request) => {
+    const threadId = requirePushThread(request);
+    const input: PushSubscriptionInput = pushSubscriptionSchema.parse(request.body);
+    if (!isAllowedPushEndpoint(input.endpoint))
+      throw new HttpError(400, 'PUSH_ENDPOINT_NOT_ALLOWED', 'Push endpoint is not allowed');
+    let subscriptionId: string;
+    try {
+      subscriptionId = repository.upsertPushSubscription(threadId, input);
+    } catch (error) {
+      if (error instanceof PushStorageLimitError)
+        throw new HttpError(429, 'PUSH_SUBSCRIPTION_LIMIT_REACHED');
+      throw error;
+    }
+    repository.audit('push.subscription', 'subscribed', { threadId, subscriptionId });
+    return { subscribed: true };
+  });
+
+  app.delete('/api/threads/:id/push-subscriptions', (request) => {
+    const threadId = requirePushThread(request);
+    const input = pushSubscriptionStatusRequestSchema.parse(request.body);
+    const subscriptionId = repository.removeThreadPushSubscription(threadId, input.endpoint);
+    pushDispatcher?.cancel(threadId, subscriptionId);
+    repository.audit('push.subscription', 'unsubscribed', { threadId, subscriptionId });
+    return { subscribed: false };
   });
 
   app.get('/api/threads/:id/attachments/:attachmentId/content', async (request, reply) => {
@@ -2132,6 +2200,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         model: config.transcriptionModel,
         maxBytes: MAX_TRANSCRIPTION_BYTES,
         maxDurationSeconds: MAX_TRANSCRIPTION_DURATION_SECONDS,
+      },
+      notifications: {
+        available: pushDispatcher !== undefined,
+        vapidPublicKey: config.vapid?.publicKey ?? null,
       },
       warnings,
     });

@@ -449,6 +449,7 @@ fi
 if [[ -z $(sed -n 's/^CODEX_WEB_ADMIN_PASSWORD_HASH=//p' "$config") ]]; then
   /usr/local/bin/node "$package/scripts/setup-admin.mjs" --config "$config"
 fi
+/usr/local/bin/node "$package/scripts/setup-push.mjs" --config "$config"
 umask 077
 {
   printf 'CODEX_BIN=%s\nCODEX_HOME=%s\n' "$codex_bin" "$codex_home"

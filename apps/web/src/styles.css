@@ -574,6 +574,19 @@ button:disabled {
   display: flex;
   align-items: center;
   gap: 0.4rem;
+  flex: 0 0 auto;
+}
+.push-notification-toggle {
+  width: 2.35rem;
+  height: 2.35rem;
+  border: 1px solid var(--border-soft);
+  background: #171b1f;
+  font-size: 1rem;
+}
+.push-notification-toggle.enabled {
+  color: var(--accent);
+  border-color: rgba(215, 255, 100, 0.35);
+  background: rgba(215, 255, 100, 0.08);
 }
 .live-status {
   display: inline-flex;
@@ -1832,6 +1845,7 @@ button:disabled {
   }
   .toolbar-actions {
     align-items: flex-start;
+    min-width: 0;
   }
   .runtime-selectors {
     grid-template-columns: repeat(2, minmax(0, 1fr));

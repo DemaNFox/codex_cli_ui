@@ -1,0 +1,11 @@
+{
+  "name": "Codex Server",
+  "short_name": "Codex",
+  "description": "Локальный интерфейс для чатов Codex",
+  "lang": "ru",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#090b0d",
+  "theme_color": "#0b0d10"
+}

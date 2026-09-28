@@ -18,11 +18,13 @@ import type {
 
 export class ApiError extends Error {
   readonly status: number;
+  readonly code: string | null;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code: string | null = null) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -48,6 +50,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 
   if (!response.ok) {
     let message = `Запрос завершился с ошибкой (${response.status})`;
+    let code: string | null = null;
     try {
       const payload = (await response.json()) as {
         message?: unknown;
@@ -63,10 +66,18 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       ) {
         message = payload.error.message;
       }
+      if (
+        payload.error &&
+        typeof payload.error === 'object' &&
+        'code' in payload.error &&
+        typeof payload.error.code === 'string'
+      ) {
+        code = payload.error.code;
+      }
     } catch {
       // The response can intentionally have no JSON body.
     }
-    throw new ApiError(message, response.status);
+    throw new ApiError(message, response.status, code);
   }
 
   if (response.status === 204) return undefined as T;
@@ -91,6 +102,10 @@ export interface ThreadHistory {
 export interface AttachmentUpload {
   promise: Promise<Attachment>;
   abort: () => void;
+}
+
+export interface PushSubscriptionStatus {
+  subscribed: boolean;
 }
 
 function uploadAttachment(
@@ -353,6 +368,38 @@ export const api = {
         },
       ),
     ),
+  pushSubscriptionStatus: async (csrfToken: string, threadId: string, endpoint: string) =>
+    unwrapData(
+      await request<PushSubscriptionStatus | { data: PushSubscriptionStatus }>(
+        `/api/threads/${encodeURIComponent(threadId)}/push-subscriptions/status`,
+        {
+          method: 'POST',
+          csrfToken,
+          body: { endpoint },
+        },
+      ),
+    ),
+  savePushSubscription: async (
+    csrfToken: string,
+    threadId: string,
+    subscription: PushSubscriptionJSON,
+  ) =>
+    unwrapData(
+      await request<PushSubscriptionStatus | { data: PushSubscriptionStatus }>(
+        `/api/threads/${encodeURIComponent(threadId)}/push-subscriptions`,
+        {
+          method: 'PUT',
+          csrfToken,
+          body: subscription,
+        },
+      ),
+    ),
+  deletePushSubscription: (csrfToken: string, threadId: string, endpoint: string) =>
+    request<void>(`/api/threads/${encodeURIComponent(threadId)}/push-subscriptions`, {
+      method: 'DELETE',
+      csrfToken,
+      body: { endpoint },
+    }),
   resolveApproval: (
     csrfToken: string,
     approvalId: string,

@@ -115,6 +115,9 @@ class InfraStaticTest(unittest.TestCase):
             "CODEX_WEB_ADMIN_PASSWORD_HASH",
             "CODEX_WEB_SESSION_SECRET",
             "OPENAI_API_KEY",
+            "CODEX_WEB_VAPID_PUBLIC_KEY",
+            "CODEX_WEB_VAPID_PRIVATE_KEY",
+            "CODEX_WEB_VAPID_SUBJECT",
         ):
             self.assertIn(f"{name}=\n", environment)
         self.assertIn('CODEX_WEB_CODEX_VERSION_PIN="codex-cli 0.153.4"', environment)
@@ -139,6 +142,7 @@ class InfraStaticTest(unittest.TestCase):
             "login --device-auth",
             "installation exists; rerun with --upgrade",
             "setup-admin.mjs",
+            "setup-push.mjs",
             "--external-proxy",
             "codex-web-ui-app-server.socket",
             "codex-web-ui-resource-broker.socket",
@@ -421,7 +425,15 @@ class InfraStaticTest(unittest.TestCase):
         self.assertNotIn("rm -rf", install_script + update_script + rollback_script)
         self.assertIn('@codex-web/server', release_script)
         self.assertIn('--config.inject-workspace-packages=true deploy --prod', release_script)
-        self.assertIn("'@codex-web/contracts', '@fastify/cookie', 'argon2', 'fastify', 'zod'", release_script)
+        for dependency in (
+            "'@codex-web/contracts'",
+            "'@fastify/cookie'",
+            "'argon2'",
+            "'fastify'",
+            "'web-push'",
+            "'zod'",
+        ):
+            self.assertIn(dependency, release_script)
         self.assertNotIn('deploy --prod --legacy', release_script)
         self.assertIn('SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"', health_script)
 

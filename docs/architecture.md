@@ -132,6 +132,8 @@ that derived ceiling is rejected.
 - `POST/GET /api/threads/:id/attachments`, `GET/DELETE /api/threads/:id/attachments/:attachmentId`; uploads use multipart field `file`
 - `GET /api/system/capabilities` for safe version/auth/instruction/skill, rate-limit and aggregate-usage status
 - `POST /api/audio/transcriptions` for bounded ephemeral speech-to-text; uploads use multipart field `file`
+- `POST /api/threads/:id/push-subscriptions/status`, plus `PUT` and `DELETE` on
+  `/api/threads/:id/push-subscriptions`, for a CSRF-protected per-device chat subscription
 - `GET/PUT /api/system/resource-limits` and `POST /api/system/resource-limits/apply` for the
   authenticated, CSRF-protected resource policy workflow
 
@@ -160,6 +162,24 @@ At `820px` and below, the navigation is an off-canvas drawer with focus containm
 return. Runtime model, reasoning, permission and approval controls remain available behind a compact toggle;
 their collapsed state reserves the constrained viewport for the independently scrolling transcript and the
 composer. The account/logout row remains reachable inside the drawer.
+
+## Browser notifications
+
+- Notifications are opt-in per chat and per browser device. The toolbar first performs an explicit
+  user-gesture permission request, registers the same-origin Service Worker and submits the resulting standard
+  PushSubscription through authenticated, exact-Origin and CSRF-protected routes.
+- SQLite stores the endpoint and its Web Push key material because the server needs them to deliver while no
+  page is open. API responses expose only the configured public VAPID key and a boolean membership result;
+  endpoints and private key material are never listed, audited or logged.
+- A unique terminal turn event creates at most one delivery per mapped subscription. A bounded durable queue
+  resumes after restart, retries transient failures with backoff and removes an endpoint after a push service
+  reports it gone. Delivery failures never change the Codex turn result.
+- Payloads contain only an opaque chat identifier and a generic terminal result. They do not contain the chat
+  name, prompts, answers, commands, tool output, filenames or attachment metadata. Clicking a
+  notification focuses an existing same-origin page or opens the Web UI.
+- VAPID credentials are generated once on the target host during installation and stored in the existing
+  root-owned mode-0600 Web environment. Missing configuration or unsupported browser APIs disable only this
+  optional capability.
 
 ## Upgrade drain
 
