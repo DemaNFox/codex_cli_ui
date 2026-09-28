@@ -257,6 +257,8 @@ class ResourceBrokerStaticTest(unittest.TestCase):
     def test_broker_has_fixed_slice_and_no_shell_execution(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         self.assertIn('TARGET_SLICE = "codex-web-ui-workload.slice"', source)
+        self.assertIn('parser.add_argument("--api-user", default=API_USER)', source)
+        self.assertIn("_serve(arguments.serve_fd, broker, arguments.api_user)", source)
         self.assertIn("socket.SO_PEERCRED", source)
         self.assertIn("uid != expected_uid", source)
         self.assertNotIn("shell=True", source)

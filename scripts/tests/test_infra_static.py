@@ -234,7 +234,7 @@ class InfraStaticTest(unittest.TestCase):
         updater = (ROOT / "scripts/update-ubuntu.sh").read_text(encoding="utf-8")
         common = (ROOT / "scripts/lib/ubuntu-common.sh").read_text(encoding="utf-8")
 
-        managed_paths = (
+        portable_managed_paths = (
             "/etc/systemd/system/codex-web-ui@.service",
             "/etc/systemd/system/codex-web-ui-app-server@.service",
             "/etc/systemd/system/codex-web-ui-resource-broker.socket",
@@ -244,7 +244,18 @@ class InfraStaticTest(unittest.TestCase):
             "/etc/codex-web-ui/resource-limits.json",
             "/etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf",
         )
-        for script in (installer, updater):
+        legacy_managed_paths = (
+            "/etc/systemd/system/codex-web-ui-resource-broker.socket",
+            "/etc/systemd/system/codex-web-ui-resource-broker@.service",
+            "/etc/systemd/system/codex-web-ui-workload.slice",
+            "/usr/local/libexec/codex-web-ui-resource-broker",
+            "/etc/codex-web-ui/resource-limits.json",
+            "/etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf",
+        )
+        for script, managed_paths in (
+            (installer, portable_managed_paths),
+            (updater, legacy_managed_paths),
+        ):
             for path in managed_paths:
                 self.assertIn(path, script)
             self.assertIn("snapshot_activation_file", script)
@@ -280,13 +291,22 @@ class InfraStaticTest(unittest.TestCase):
             self.assertLess(rollback, restart)
 
         for unit in (
-            "codex-web-ui@.service",
-            "codex-web-ui-app-server@.service",
             "codex-web-ui-resource-broker.socket",
             "codex-web-ui-resource-broker@.service",
             "codex-web-ui-workload.slice",
         ):
             self.assertIn(unit, updater)
+        resource_units = updater[
+            updater.index("resource_units=(") : updater.index(")", updater.index("resource_units=("))
+        ]
+        self.assertNotIn("codex-web-ui@.service", resource_units)
+        self.assertNotIn("codex-web-ui-app-server@.service", resource_units)
+        self.assertIn('SocketUser=$service_user', updater)
+        self.assertIn('--serve-fd 0 --api-user $service_user', updater)
+        self.assertIn('Slice=codex-web-ui-workload.slice', updater)
+        self.assertIn('legacy_resource_drop_in_dir_was_present=false', updater)
+        self.assertIn('[[ -e $legacy_resource_drop_in_dir || -L $legacy_resource_drop_in_dir ]]', updater)
+        self.assertIn('rmdir -- "$legacy_resource_drop_in_dir"', updater)
         helper_install = (
             'install -m 0755 "$release_dir/scripts/resource-broker.py" '
             "/usr/local/libexec/codex-web-ui-resource-broker"

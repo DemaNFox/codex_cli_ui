@@ -25,7 +25,7 @@ while (($#)); do
 done
 
 require_root
-for command in python3 install stat mktemp rm systemctl; do require_command "$command"; done
+for command in python3 install stat mktemp rm rmdir grep systemctl; do require_command "$command"; done
 validate_service_user "$service_user"
 service_group=$(id -gn "$service_user")
 validate_release_id "$release_id"
@@ -68,31 +68,31 @@ chown root:"$service_group" /var/lib/codex-web-ui/previous-release
 chmod 0640 /var/lib/codex-web-ui/previous-release
 
 resource_units=(
-  codex-web-ui@.service
-  codex-web-ui-app-server@.service
-  codex-web-ui-resource-broker.socket
-  codex-web-ui-resource-broker@.service
   codex-web-ui-workload.slice
 )
 resource_rollback_keys=(
-  api-unit
-  app-server-unit
   broker-socket-unit
   broker-service-unit
   workload-slice-unit
   broker-helper
   resource-policy
   resource-drop-in
+  legacy-resource-drop-in
 )
+legacy_resource_drop_in="/etc/systemd/system/codex-web-ui@${service_user}.service.d/50-resource-boundary.conf"
+legacy_resource_drop_in_dir=${legacy_resource_drop_in%/*}
+legacy_resource_drop_in_dir_was_present=false
+if [[ -d $legacy_resource_drop_in_dir && ! -L $legacy_resource_drop_in_dir ]]; then
+  legacy_resource_drop_in_dir_was_present=true
+fi
 resource_rollback_paths=(
-  /etc/systemd/system/codex-web-ui@.service
-  /etc/systemd/system/codex-web-ui-app-server@.service
   /etc/systemd/system/codex-web-ui-resource-broker.socket
   /etc/systemd/system/codex-web-ui-resource-broker@.service
   /etc/systemd/system/codex-web-ui-workload.slice
   /usr/local/libexec/codex-web-ui-resource-broker
   /etc/codex-web-ui/resource-limits.json
   /etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf
+  "$legacy_resource_drop_in"
 )
 resource_rollback_dir=
 cleanup_resource_snapshot() {
@@ -133,6 +133,11 @@ restore_resource_boundary() {
     restore_activation_file \
       "$resource_rollback_dir" "${resource_rollback_keys[$index]}" "${resource_rollback_paths[$index]}" || return 1
   done
+  if ! $legacy_resource_drop_in_dir_was_present && \
+    [[ -e $legacy_resource_drop_in_dir || -L $legacy_resource_drop_in_dir ]]; then
+    [[ -d $legacy_resource_drop_in_dir && ! -L $legacy_resource_drop_in_dir ]] || return 1
+    rmdir -- "$legacy_resource_drop_in_dir" || return 1
+  fi
   systemctl daemon-reload || return 1
   if $workload_slice_was_active; then systemctl start codex-web-ui-workload.slice || return 1; fi
   if $broker_socket_was_enabled; then systemctl enable codex-web-ui-resource-broker.socket || return 1; fi
@@ -183,6 +188,20 @@ systemctl stop codex-web-ui-resource-broker.socket 'codex-web-ui-resource-broker
 for unit in "${resource_units[@]}"; do
   install -m 0644 "$release_dir/infra/systemd/$unit" "/etc/systemd/system/$unit"
 done
+socket_unit="$resource_rollback_dir/broker-socket.rendered"
+sed "s/^SocketUser=codex-web-ui-api$/SocketUser=$service_user/" \
+  "$release_dir/infra/systemd/codex-web-ui-resource-broker.socket" >"$socket_unit"
+grep -qx "SocketUser=$service_user" "$socket_unit" || die 'resource broker socket user rendering failed'
+install -m 0644 "$socket_unit" /etc/systemd/system/codex-web-ui-resource-broker.socket
+broker_service_unit="$resource_rollback_dir/broker-service.rendered"
+sed "s|--serve-fd 0$|--serve-fd 0 --api-user $service_user|" \
+  "$release_dir/infra/systemd/codex-web-ui-resource-broker@.service" >"$broker_service_unit"
+grep -q -- "--serve-fd 0 --api-user $service_user$" "$broker_service_unit" || \
+  die 'resource broker API identity rendering failed'
+install -m 0644 "$broker_service_unit" /etc/systemd/system/codex-web-ui-resource-broker@.service
+install -d -m 0755 "$legacy_resource_drop_in_dir"
+printf '[Service]\nSlice=codex-web-ui-workload.slice\n' >"$legacy_resource_drop_in"
+chmod 0644 "$legacy_resource_drop_in"
 install -m 0755 "$release_dir/scripts/resource-broker.py" /usr/local/libexec/codex-web-ui-resource-broker
 systemctl daemon-reload
 systemctl start codex-web-ui-workload.slice
