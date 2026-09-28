@@ -230,6 +230,32 @@ def main() -> int:
                     },
                     "events": [
                         {
+                            "id": 0,
+                            "threadId": "t1",
+                            "turnId": "history-0",
+                            "kind": "user-message",
+                            "phase": "completed",
+                            "payload": {
+                                "text": "Проверка_очень_длинной_неразрывной_строки_которая_не_должна_расширять_мобильный_чат_за_границы_экрана",
+                                "attachments": [
+                                    {
+                                        "id": f"attachment-{attachment_index}",
+                                        "threadId": "t1",
+                                        "name": f"{attachment_index:02d}_очень-длинное-название-вложения-которое-не-должно-ломать-мобильную-верстку.md",
+                                        "mediaType": "text/markdown",
+                                        "kind": "file",
+                                        "sizeBytes": 4096,
+                                        "createdAt": "2026-09-27T11:58:00.000Z",
+                                        "url": f"/api/threads/t1/attachments/attachment-{attachment_index}",
+                                    }
+                                    for attachment_index in range(1, 4)
+                                ],
+                            },
+                            "createdAt": "2026-09-27T11:58:00.000Z",
+                        }
+                    ]
+                    + [
+                        {
                             "id": index,
                             "threadId": "t1",
                             "turnId": f"history-{index}",
@@ -435,7 +461,7 @@ def main() -> int:
             raise AssertionError("long transcript is not isolated in its own scroll container")
         first_time = page.locator(".message time").first
         first_time.wait_for()
-        if first_time.get_attribute("datetime") != "2026-09-27T11:59:00.000Z":
+        if first_time.get_attribute("datetime") != "2026-09-27T11:58:00.000Z":
             raise AssertionError("message timestamp lost its canonical server time")
         if page.get_by_label("Уровень доступа").input_value() != "full-access":
             raise AssertionError("server-owned runtime preferences were not restored")
@@ -570,6 +596,39 @@ def main() -> int:
         page.locator(".project-button").click()
         navigation.wait_for(state="hidden")
         page.get_by_role("heading", name="Релиз без обрыва").wait_for()
+
+        mobile_widths = page.locator(
+            ".conversation-scroll, .transcript, .message, .message-attachments"
+        ).evaluate_all(
+            "elements => elements.map(element => ({className: element.className, clientWidth: element.clientWidth, scrollWidth: element.scrollWidth}))"
+        )
+        overflowing = [
+            item for item in mobile_widths if item["scrollWidth"] > item["clientWidth"] + 1
+        ]
+        if overflowing:
+            raise AssertionError(f"mobile transcript content overflows horizontally: {overflowing}")
+
+        page.get_by_role("button", name="Открыть навигацию").click()
+        navigation.wait_for(state="visible")
+        page.get_by_label("Меню чата проекта Релиз без обрыва").click()
+        page.get_by_role("menuitem", name="Переименовать").click()
+        rename_dialog = page.get_by_role("dialog", name="Переименовать чат")
+        rename_box = rename_dialog.bounding_box()
+        rename_input_box = page.get_by_label("Название").bounding_box()
+        if (
+            not rename_box
+            or rename_box["x"] < 0
+            or rename_box["x"] + rename_box["width"] > 390
+            or not rename_input_box
+            or rename_input_box["x"] < rename_box["x"]
+            or rename_input_box["x"] + rename_input_box["width"] > rename_box["x"] + rename_box["width"]
+        ):
+            raise AssertionError(
+                f"mobile rename dialog is outside the viewport: dialog={rename_box}, input={rename_input_box}"
+            )
+        page.get_by_role("button", name="Отмена").click()
+        page.keyboard.press("Escape")
+        navigation.wait_for(state="hidden")
 
         mobile_transcript = page.locator(".conversation-scroll").evaluate(
             "element => ({scrollHeight: element.scrollHeight, clientHeight: element.clientHeight})"
