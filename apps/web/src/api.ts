@@ -7,6 +7,7 @@ import type {
   PermissionPreset,
   Project,
   ResolveUserInputRequest,
+  RuntimePreferences,
   SafeEvent,
   Session,
   Thread,
@@ -139,6 +140,21 @@ export const api = {
   login: (username: string, password: string) =>
     request<Session>('/api/auth/login', { method: 'POST', body: { username, password } }),
   logout: (csrfToken: string) => request<void>('/api/auth/logout', { method: 'POST', csrfToken }),
+  runtimePreferences: async () =>
+    unwrapData(
+      await request<RuntimePreferences | { data: RuntimePreferences }>('/api/preferences/runtime'),
+    ),
+  updateRuntimePreferences: async (
+    csrfToken: string,
+    input: Omit<RuntimePreferences, 'updatedAt'>,
+  ) =>
+    unwrapData(
+      await request<RuntimePreferences | { data: RuntimePreferences }>('/api/preferences/runtime', {
+        method: 'PUT',
+        csrfToken,
+        body: input,
+      }),
+    ),
   projects: async () => asList(await request<Project[] | { data: Project[] }>('/api/projects')),
   createProject: async (csrfToken: string, input: { name: string; path: string }) =>
     unwrapData(
@@ -157,6 +173,14 @@ export const api = {
     ),
   thread: (threadId: string) =>
     request<ThreadHistory>(`/api/threads/${encodeURIComponent(threadId)}`),
+  renameThread: async (csrfToken: string, threadId: string, name: string) =>
+    unwrapData(
+      await request<Thread | { data: Thread }>(`/api/threads/${encodeURIComponent(threadId)}`, {
+        method: 'PATCH',
+        csrfToken,
+        body: { name },
+      }),
+    ),
   attachments: async (threadId: string) =>
     asList(
       await request<Attachment[] | { data: Attachment[] }>(
@@ -282,6 +306,7 @@ export type {
   ModelOption,
   PendingApproval,
   Project,
+  RuntimePreferences,
   SafeEvent,
   Session,
   Thread,

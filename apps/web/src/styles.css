@@ -416,6 +416,30 @@ button:disabled {
 .menu-popover button:hover {
   background: #2d343a;
 }
+.dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(5, 7, 9, 0.72);
+}
+.rename-dialog {
+  width: min(26rem, 100%);
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.8rem;
+  background: var(--panel);
+  box-shadow: 0 1.2rem 3rem rgba(0, 0, 0, 0.5);
+}
+.rename-dialog h2 {
+  margin: 0 0 1rem;
+  font-size: 1rem;
+}
+.rename-dialog label {
+  margin-bottom: 1rem;
+}
 .account-row {
   flex: 0 0 auto;
   display: flex;
@@ -615,8 +639,24 @@ button:disabled {
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
+.message-meta {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
 .message.user .message-role {
   text-align: right;
+}
+.message.user .message-meta {
+  justify-content: flex-end;
+}
+.event-time {
+  flex: 0 0 auto;
+  color: #69737c;
+  font-size: 0.65rem;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 .message-text {
   white-space: pre-wrap;
@@ -709,6 +749,7 @@ button:disabled {
 .activity-line {
   display: flex;
   align-items: baseline;
+  flex-wrap: wrap;
   gap: 0.45rem;
   min-height: 1.35rem;
   padding-left: 1.15rem;
@@ -751,6 +792,9 @@ button:disabled {
   color: var(--muted);
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.activity-row .event-time {
+  margin-left: auto;
 }
 .activity-row pre,
 .approval-card pre {
@@ -1092,6 +1136,11 @@ button:disabled {
   color: #ffc0be;
   background: rgba(255, 113, 111, 0.1);
   border: 1px solid rgba(255, 113, 111, 0.22);
+}
+.notice.success {
+  color: #dff79c;
+  background: rgba(215, 255, 100, 0.08);
+  border: 1px solid rgba(215, 255, 100, 0.2);
 }
 .notice.warning {
   color: #ffe3a5;

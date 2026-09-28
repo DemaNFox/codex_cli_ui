@@ -25,12 +25,13 @@ def payload(route: Route, status: int, body: object) -> None:
 def main() -> int:
     signed_in = False
     archived = False
+    thread_name = "Переносимый чат"
     console_errors: list[str] = []
     resolved_user_input: dict[str, object] | None = None
     resolved_permission: dict[str, object] | None = None
 
     def api(route: Route) -> None:
-        nonlocal signed_in, archived, resolved_user_input, resolved_permission
+        nonlocal signed_in, archived, thread_name, resolved_user_input, resolved_permission
         request = route.request
         parsed = urlparse(request.url)
         path = parsed.path
@@ -80,6 +81,18 @@ def main() -> int:
                         }
                     ]
                 },
+            )
+        elif path == "/api/preferences/runtime":
+            requested = request.post_data_json if request.method == "PUT" else {
+                "model": "gpt-6-astra",
+                "reasoningEffort": "high",
+                "permissionPreset": "full-access",
+                "approvalPolicy": "on-request",
+            }
+            payload(
+                route,
+                200,
+                {"data": {**requested, "updatedAt": "2026-09-27T12:00:00.000Z"}},
             )
         elif path == "/api/system/capabilities":
             payload(
@@ -134,10 +147,11 @@ def main() -> int:
                         {
                             "id": "t1",
                             "projectId": "p1",
-                            "name": "Переносимый чат",
+                            "name": thread_name,
                             "preview": "Проверка архива",
                             "archived": archived,
                             "status": "idle",
+                            "activeTurnId": None,
                             "model": "gpt-6-astra",
                             "reasoningEffort": "high",
                             "permissionPreset": "workspace-write",
@@ -159,10 +173,11 @@ def main() -> int:
                     "data": {
                         "id": "t1",
                         "projectId": "p1",
-                        "name": "Переносимый чат",
+                        "name": thread_name,
                         "preview": "Проверка архива",
                         "archived": archived,
                         "status": "idle",
+                        "activeTurnId": None,
                         "model": "gpt-6-astra",
                         "reasoningEffort": "high",
                         "permissionPreset": "workspace-write",
@@ -185,6 +200,27 @@ def main() -> int:
                         }
                         for index in range(1, 49)
                     ],
+                },
+            )
+        elif path == "/api/threads/t1" and request.method == "PATCH":
+            thread_name = request.post_data_json["name"]
+            payload(
+                route,
+                200,
+                {
+                    "data": {
+                        "id": "t1",
+                        "projectId": "p1",
+                        "name": thread_name,
+                        "preview": "Проверка архива",
+                        "archived": archived,
+                        "status": "idle",
+                        "activeTurnId": None,
+                        "model": "gpt-6-astra",
+                        "instructionSources": ["/srv/projects/demo/AGENTS.md"],
+                        "createdAt": "2026-09-27T12:00:00.000Z",
+                        "updatedAt": "2026-09-27T12:05:00.000Z",
+                    }
                 },
             )
         elif path == "/api/threads/t1/attachments" and request.method == "GET":
@@ -331,6 +367,12 @@ def main() -> int:
         )
         if transcript_metrics["scrollHeight"] <= transcript_metrics["clientHeight"]:
             raise AssertionError("long transcript is not isolated in its own scroll container")
+        first_time = page.locator(".message time").first
+        first_time.wait_for()
+        if first_time.get_attribute("datetime") != "2026-09-27T11:59:00.000Z":
+            raise AssertionError("message timestamp lost its canonical server time")
+        if page.get_by_label("Уровень доступа").input_value() != "full-access":
+            raise AssertionError("server-owned runtime preferences were not restored")
         composer_box = page.locator(".composer-wrap").bounding_box()
         if not composer_box or composer_box["y"] + composer_box["height"] > 900:
             raise AssertionError("composer is pushed below the desktop viewport")
@@ -373,13 +415,19 @@ def main() -> int:
         page.keyboard.press("Escape")
 
         page.get_by_label("Меню чата проекта Переносимый чат").click()
+        page.get_by_role("menuitem", name="Переименовать").click()
+        page.get_by_label("Название").fill("Релиз без обрыва")
+        page.get_by_role("button", name="Сохранить").click()
+        page.get_by_role("heading", name="Релиз без обрыва").wait_for()
+
+        page.get_by_label("Меню чата проекта Релиз без обрыва").click()
         page.get_by_role("menuitem", name="Архивировать чат").click()
         page.get_by_text("Здесь пока нет чатов.").wait_for()
         page.get_by_label("Меню проекта Demo").click()
         page.get_by_role("menuitem", name="Архивированные чаты").click()
         page.get_by_text("Архив", exact=True).wait_for()
-        page.get_by_role("strong").filter(has_text="Переносимый чат").wait_for()
-        page.get_by_label("Меню чата проекта Переносимый чат").click()
+        page.get_by_role("strong").filter(has_text="Релиз без обрыва").wait_for()
+        page.get_by_label("Меню чата проекта Релиз без обрыва").click()
         page.get_by_role("menuitem", name="Восстановить чат").click()
         page.get_by_text("Архив пуст.").wait_for()
 
@@ -445,7 +493,7 @@ def main() -> int:
         page.locator(".project-button").click()
         page.locator(".project-button").click()
         navigation.wait_for(state="hidden")
-        page.get_by_role("heading", name="Переносимый чат").wait_for()
+        page.get_by_role("heading", name="Релиз без обрыва").wait_for()
 
         mobile_transcript = page.locator(".conversation-scroll").evaluate(
             "element => ({scrollHeight: element.scrollHeight, clientHeight: element.clientHeight})"
@@ -501,7 +549,7 @@ def main() -> int:
         browser.close()
 
     print(
-        "browser-smoke: unified sidebar, long-chat scroll, status/skills, archive/restore and constrained layout passed"
+        "browser-smoke: rename, unified sidebar, long-chat scroll, status/skills, archive/restore and constrained layout passed"
     )
     return 0
 

@@ -1,4 +1,11 @@
-import type { Attachment, PendingApproval, Project, SafeEvent, Thread } from '@codex-web/contracts';
+import type {
+  Attachment,
+  PendingApproval,
+  Project,
+  RuntimePreferences,
+  SafeEvent,
+  Thread,
+} from '@codex-web/contracts';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
@@ -29,6 +36,7 @@ interface ThreadRow {
   preview: string;
   model: string | null;
   status: Thread['status'];
+  active_turn_id: string | null;
   archived: number;
   instruction_sources_json: string;
   created_at: string;
@@ -115,6 +123,7 @@ function threadFromRow(row: ThreadRow): Thread {
     preview: row.preview,
     model: row.model,
     status: row.status,
+    activeTurnId: row.active_turn_id,
     archived: row.archived === 1,
     instructionSources: Array.isArray(sources)
       ? sources.filter((item): item is string => typeof item === 'string')
@@ -192,12 +201,22 @@ export class SqliteRepository {
         preview TEXT NOT NULL,
         model TEXT,
         status TEXT NOT NULL CHECK(status IN ('notLoaded','idle','active','systemError','unknown')),
+        active_turn_id TEXT,
         archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
         instruction_sources_json TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS threads_project_idx ON threads(project_id, archived, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS runtime_preferences (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        model TEXT,
+        reasoning_effort TEXT,
+        permission_preset TEXT NOT NULL CHECK(permission_preset IN ('read-only','workspace-write','full-access')),
+        approval_policy TEXT NOT NULL CHECK(approval_policy IN ('untrusted','on-request','never')),
+        updated_at TEXT NOT NULL
+      );
 
       CREATE TABLE IF NOT EXISTS attachments (
         id TEXT PRIMARY KEY,
@@ -265,6 +284,15 @@ export class SqliteRepository {
     `);
     this.migrateApprovalResolvingState();
     this.migrateIdempotencyState();
+    this.migrateThreadActiveTurn();
+  }
+
+  private migrateThreadActiveTurn(): void {
+    const columns = this.database.prepare('PRAGMA table_info(threads)').all() as unknown as {
+      name: string;
+    }[];
+    if (!columns.some((column) => column.name === 'active_turn_id'))
+      this.database.exec('ALTER TABLE threads ADD COLUMN active_turn_id TEXT');
   }
 
   private migrateApprovalResolvingState(): void {
@@ -476,12 +504,59 @@ export class SqliteRepository {
     );
   }
 
+  getRuntimePreferences(): RuntimePreferences {
+    const row = this.database.prepare('SELECT * FROM runtime_preferences WHERE id=1').get() as
+      | {
+          model: string | null;
+          reasoning_effort: string | null;
+          permission_preset: RuntimePreferences['permissionPreset'];
+          approval_policy: RuntimePreferences['approvalPolicy'];
+          updated_at: string;
+        }
+      | undefined;
+    return row
+      ? {
+          model: row.model,
+          reasoningEffort: row.reasoning_effort,
+          permissionPreset: row.permission_preset,
+          approvalPolicy: row.approval_policy,
+          updatedAt: row.updated_at,
+        }
+      : {
+          model: null,
+          reasoningEffort: null,
+          permissionPreset: 'workspace-write',
+          approvalPolicy: 'on-request',
+          updatedAt: new Date(0).toISOString(),
+        };
+  }
+
+  setRuntimePreferences(input: Omit<RuntimePreferences, 'updatedAt'>): RuntimePreferences {
+    const updatedAt = new Date().toISOString();
+    this.database
+      .prepare(
+        `INSERT INTO runtime_preferences(id,model,reasoning_effort,permission_preset,approval_policy,updated_at)
+         VALUES(1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+         model=excluded.model,reasoning_effort=excluded.reasoning_effort,
+         permission_preset=excluded.permission_preset,approval_policy=excluded.approval_policy,
+         updated_at=excluded.updated_at`,
+      )
+      .run(
+        input.model,
+        input.reasoningEffort,
+        input.permissionPreset,
+        input.approvalPolicy,
+        updatedAt,
+      );
+    return this.getRuntimePreferences();
+  }
+
   upsertThread(thread: Thread): Thread {
     this.database
       .prepare(
-        `INSERT INTO threads(id,project_id,name,preview,model,status,archived,instruction_sources_json,created_at,updated_at)
-      VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
-      name=excluded.name,preview=excluded.preview,model=excluded.model,status=excluded.status,archived=excluded.archived,
+        `INSERT INTO threads(id,project_id,name,preview,model,status,active_turn_id,archived,instruction_sources_json,created_at,updated_at)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+      name=excluded.name,preview=excluded.preview,model=excluded.model,status=excluded.status,active_turn_id=excluded.active_turn_id,archived=excluded.archived,
       instruction_sources_json=excluded.instruction_sources_json,updated_at=excluded.updated_at`,
       )
       .run(
@@ -491,6 +566,7 @@ export class SqliteRepository {
         thread.preview,
         thread.model,
         thread.status,
+        thread.activeTurnId,
         thread.archived ? 1 : 0,
         JSON.stringify(thread.instructionSources),
         thread.createdAt,
@@ -520,6 +596,27 @@ export class SqliteRepository {
       .prepare('UPDATE threads SET archived=?,updated_at=? WHERE id=?')
       .run(archived ? 1 : 0, new Date().toISOString(), id);
     return this.getThread(id);
+  }
+
+  updateThreadRuntime(
+    id: string,
+    patch: Partial<Pick<Thread, 'name' | 'status' | 'activeTurnId'>>,
+  ): Thread | undefined {
+    const current = this.getThread(id);
+    if (!current) return undefined;
+    const updated = { ...current, ...patch, updatedAt: new Date().toISOString() };
+    this.database
+      .prepare('UPDATE threads SET name=?,status=?,active_turn_id=?,updated_at=? WHERE id=?')
+      .run(updated.name, updated.status, updated.activeTurnId, updated.updatedAt, id);
+    return this.getThread(id);
+  }
+
+  resetActiveThreadRuntime(): void {
+    this.database
+      .prepare(
+        "UPDATE threads SET status=CASE WHEN status='active' THEN 'notLoaded' ELSE status END,active_turn_id=NULL WHERE active_turn_id IS NOT NULL OR status='active'",
+      )
+      .run();
   }
 
   createAttachment(input: Omit<AttachmentRecord, 'turnId' | 'createdAt'>): AttachmentRecord {

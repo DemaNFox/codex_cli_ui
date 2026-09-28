@@ -6,6 +6,7 @@ import {
   capabilitySchema,
   resolvePermissionRequestSchema,
   resolveUserInputRequestSchema,
+  updateRuntimePreferencesRequestSchema,
   startTurnRequestSchema,
 } from './index.js';
 
@@ -16,6 +17,25 @@ describe('contracts', () => {
 
   it('requires an idempotency key for a turn', () => {
     expect(startTurnRequestSchema.safeParse({ text: 'test' }).success).toBe(false);
+  });
+
+  it('validates the complete account runtime preference tuple', () => {
+    expect(
+      updateRuntimePreferencesRequestSchema.safeParse({
+        model: 'gpt-test',
+        reasoningEffort: 'high',
+        permissionPreset: 'full-access',
+        approvalPolicy: 'never',
+      }).success,
+    ).toBe(true);
+    expect(
+      updateRuntimePreferencesRequestSchema.safeParse({
+        model: 'gpt-test',
+        reasoningEffort: 'high',
+        permissionPreset: 'root',
+        approvalPolicy: 'never',
+      }).success,
+    ).toBe(false);
   });
 
   it('allows attachment-only turns and bounds safe attachment metadata', () => {

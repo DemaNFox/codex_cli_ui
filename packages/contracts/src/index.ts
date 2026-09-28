@@ -6,6 +6,19 @@ export type PermissionPreset = z.infer<typeof permissionPresetSchema>;
 export const approvalPolicySchema = z.enum(['untrusted', 'on-request', 'never']);
 export type ApprovalPolicy = z.infer<typeof approvalPolicySchema>;
 
+export const runtimePreferencesSchema = z.object({
+  model: z.string().min(1).max(120).nullable(),
+  reasoningEffort: z.string().min(1).max(40).nullable(),
+  permissionPreset: permissionPresetSchema,
+  approvalPolicy: approvalPolicySchema,
+  updatedAt: z.string().datetime(),
+});
+export type RuntimePreferences = z.infer<typeof runtimePreferencesSchema>;
+
+export const updateRuntimePreferencesRequestSchema = runtimePreferencesSchema.omit({
+  updatedAt: true,
+});
+
 export const loginRequestSchema = z.object({
   username: z.string().trim().min(1).max(80),
   password: z.string().min(12).max(1024),
@@ -61,6 +74,7 @@ export const threadSchema = z.object({
   preview: z.string(),
   model: z.string().nullable(),
   status: threadStatusSchema,
+  activeTurnId: z.string().nullable(),
   archived: z.boolean(),
   instructionSources: z.array(z.string()),
   createdAt: z.string().datetime(),

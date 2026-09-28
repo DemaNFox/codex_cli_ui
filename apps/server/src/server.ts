@@ -13,6 +13,7 @@ import {
   startTurnRequestSchema,
   steerTurnRequestSchema,
   threadListQuerySchema,
+  updateRuntimePreferencesRequestSchema,
   userInputQuestionSchema,
   type PermissionPreset,
   type Attachment,
@@ -24,6 +25,7 @@ import {
 import cookie from '@fastify/cookie';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
+import { lstatSync } from 'node:fs';
 import { z } from 'zod';
 
 import type { AppServerClient, AppServerInbound } from './app-server.js';
@@ -66,6 +68,14 @@ const projectPatchSchema = z
   .refine((value) => Object.keys(value).length > 0);
 const threadPatchSchema = z.object({ name: z.string().trim().min(1).max(200) });
 const interruptBodySchema = z.object({ turnId: z.string().min(1).max(200) });
+const threadStatusChangedSchema = z.object({
+  threadId: z.string().min(1),
+  status: z.object({ type: z.enum(['notLoaded', 'idle', 'active', 'systemError']) }).passthrough(),
+});
+const threadNameUpdatedSchema = z.object({
+  threadId: z.string().min(1),
+  threadName: z.string().nullable().optional(),
+});
 const eventCursorSchema = z
   .union([z.number(), z.string().regex(/^\d+$/).transform(Number)])
   .pipe(z.number().int().min(0).max(Number.MAX_SAFE_INTEGER));
@@ -216,6 +226,7 @@ export interface ServerDependencies {
   readonly pathPolicy: ProjectPathPolicy;
   readonly appServer: AppServerClient;
   readonly attachmentStore: AttachmentStore;
+  readonly upgradeDrainPath?: string;
 }
 
 function publicAttachment(record: AttachmentRecord): Attachment {
@@ -342,14 +353,17 @@ function mapThread(
   archived: boolean,
   instructionSources: readonly string[] = [],
   responseModel?: string,
+  existing?: Thread,
 ): Thread {
+  const status = statusType(rpcThread.status);
   return {
     id: rpcThread.id,
     projectId,
     name: rpcThread.name ?? null,
     preview: rpcThread.preview,
     model: responseModel ?? rpcThread.model ?? null,
-    status: statusType(rpcThread.status),
+    status,
+    activeTurnId: status === 'active' ? (existing?.activeTurnId ?? null) : null,
     archived,
     instructionSources: [...instructionSources],
     createdAt: dateFromSeconds(rpcThread.createdAt),
@@ -413,7 +427,17 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const loadedThreadGenerations = new Map<string, number>();
   const historyHydrations = new Map<string, Promise<Thread>>();
   repository.markPendingIdempotencyUnknown();
+  repository.resetActiveThreadRuntime();
   let pendingTurnStarts = 0;
+  const upgradeDrainPath =
+    dependencies.upgradeDrainPath ?? '/var/lib/codex-web-ui/data/upgrade-drain';
+  const upgradeDrainRequested = (): boolean => {
+    try {
+      return lstatSync(upgradeDrainPath).isFile();
+    } catch {
+      return false;
+    }
+  };
 
   await app.register(cookie);
   app.addContentTypeParser(
@@ -471,6 +495,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         existing.archived,
         existing.instructionSources,
         result.model,
+        existing,
       ),
     );
     return { thread, turns: result.thread.turns };
@@ -497,6 +522,39 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     } finally {
       if (historyHydrations.get(existing.id) === hydration) historyHydrations.delete(existing.id);
     }
+  };
+
+  const throwTurnCommandFailure = async (
+    thread: Thread,
+    error: unknown,
+    onOutcomeUnknown?: () => void,
+  ): Promise<never> => {
+    if (error instanceof Error && error.message === 'APP_SERVER_UNAVAILABLE') throw error;
+    let confirmedInactive = false;
+    try {
+      const reconciled = await readThreadFromAppServer(thread, false);
+      if (reconciled.thread.status !== 'active') {
+        confirmedInactive = true;
+        for (const activeTurn of activeTurns) {
+          if (activeTurn.startsWith(`${thread.id}:`)) activeTurns.delete(activeTurn);
+        }
+      }
+    } catch {
+      // An unavailable reread cannot safely classify the command as rejected.
+    }
+    if (confirmedInactive) {
+      throw new HttpError(
+        409,
+        'TURN_NOT_ACTIVE',
+        'Активная задача уже завершена или недоступна. Обновите чат.',
+      );
+    }
+    onOutcomeUnknown?.();
+    throw new HttpError(
+      502,
+      'TURN_COMMAND_OUTCOME_UNKNOWN',
+      'Codex не подтвердил команду. Задача всё ещё активна; обновите чат перед повтором.',
+    );
   };
 
   const persistInteractionRequest = (
@@ -671,16 +729,46 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       normalizeNotification(redactedMessage, config.maxEventBytes);
     if (!normalized || !repository.getThread(normalized.threadId)) return;
     if (normalized.phase === 'delta') return;
-    if (message.method === 'turn/started' && normalized.turnId)
+    if (message.method === 'turn/started' && normalized.turnId) {
       activeTurns.add(`${normalized.threadId}:${normalized.turnId}`);
+      repository.updateThreadRuntime(normalized.threadId, {
+        status: 'active',
+        activeTurnId: normalized.turnId,
+      });
+    }
     if (message.method === 'turn/completed' && normalized.turnId) {
       activeTurns.delete(`${normalized.threadId}:${normalized.turnId}`);
+      repository.updateThreadRuntime(normalized.threadId, { status: 'idle', activeTurnId: null });
+    }
+    if (message.method === 'thread/status/changed') {
+      const status = threadStatusChangedSchema.safeParse(message.params);
+      if (status.success) {
+        const nextStatus = statusType(status.data.status);
+        repository.updateThreadRuntime(normalized.threadId, {
+          status: nextStatus,
+          ...(nextStatus === 'active' ? {} : { activeTurnId: null }),
+        });
+        if (nextStatus !== 'active') {
+          for (const activeTurn of activeTurns) {
+            if (activeTurn.startsWith(`${normalized.threadId}:`)) activeTurns.delete(activeTurn);
+          }
+        }
+      }
+    }
+    if (message.method === 'thread/name/updated') {
+      const name = threadNameUpdatedSchema.safeParse(message.params);
+      if (name.success && name.data.threadName !== undefined)
+        repository.updateThreadRuntime(normalized.threadId, { name: name.data.threadName });
     }
     if (message.method === 'thread/archived')
       repository.setThreadArchived(normalized.threadId, true);
     if (message.method === 'thread/unarchived')
       repository.setThreadArchived(normalized.threadId, false);
-    publish(repository.appendEvent(normalized));
+    const persistedNotification =
+      message.method === 'turn/started' || message.method === 'turn/completed'
+        ? { ...normalized, payload: { ...normalized.payload, runtime: true } }
+        : normalized;
+    publish(repository.appendEvent(persistedNotification));
   };
   const unsubscribe = appServer.subscribe(onAppServerMessage);
 
@@ -728,9 +816,19 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
 
   app.get('/api/health', (_request, reply) => {
     const ready = appServer.ready;
+    const requested = upgradeDrainRequested();
+    const activeTurnCount = activeTurns.size;
     return reply.code(ready ? 200 : 503).send({
       status: ready ? 'ready' : 'degraded',
       appServerReady: ready,
+      upgradeDrain: {
+        supported: true,
+        requested,
+        acceptingNewTurns: !requested,
+        activeTurns: activeTurnCount,
+        pendingTurnStarts,
+        idle: requested && activeTurnCount === 0 && pendingTurnStarts === 0,
+      },
       codexVersion: config.codexVersionPin,
     });
   });
@@ -767,6 +865,19 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     auth.clearSessionCookie(reply);
     repository.audit('auth.logout', 'succeeded');
     return { loggedOut: true };
+  });
+
+  app.get('/api/preferences/runtime', (request) => {
+    auth.authenticate(request);
+    return { data: repository.getRuntimePreferences() };
+  });
+
+  app.put('/api/preferences/runtime', (request) => {
+    csrfGuard(auth, request);
+    const input = updateRuntimePreferencesRequestSchema.parse(request.body);
+    const preferences = repository.setRuntimePreferences(input);
+    repository.audit('runtime_preferences.update', 'succeeded');
+    return { data: preferences };
   });
 
   app.get('/api/projects', (request) => {
@@ -875,7 +986,14 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         if (rpcThread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
         const existing = repository.getThread(rpcThread.id);
         repository.upsertThread(
-          mapThread(rpcThread, project.id, query.archived, existing?.instructionSources ?? []),
+          mapThread(
+            rpcThread,
+            project.id,
+            query.archived,
+            existing?.instructionSources ?? [],
+            undefined,
+            existing,
+          ),
         );
       }
       const nextCursor = remote.nextCursor ?? null;
@@ -1137,6 +1255,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           : 'IDEMPOTENCY_OUTCOME_UNKNOWN',
       );
     }
+    if (upgradeDrainRequested()) {
+      repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
+      throw new HttpError(503, 'SERVICE_DRAINING');
+    }
     if (attachments.some((attachment) => attachment.turnId !== null)) {
       repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
       throw new HttpError(409, 'ATTACHMENT_ALREADY_SENT');
@@ -1204,6 +1326,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         }),
       );
       activeTurns.add(`${id}:${result.turn.id}`);
+      repository.updateThreadRuntime(id, { status: 'active', activeTurnId: result.turn.id });
     } catch (error) {
       if (turnStartIssued) repository.markIdempotentUnknown(operation, input.idempotencyKey, hash);
       else {
@@ -1241,15 +1364,42 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   app.post('/api/threads/:id/steer', async (request, reply) => {
     csrfGuard(auth, request);
     const id = parseId(request);
-    if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    const thread = repository.getThread(id);
+    if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
     const input = steerTurnRequestSchema.parse(request.body);
-    const result = z.object({ turnId: z.string() }).parse(
-      await appServer.request('turn/steer', {
-        threadId: id,
-        expectedTurnId: input.expectedTurnId,
-        input: [{ type: 'text', text: input.text, text_elements: [] }],
-      }),
-    );
+    let result: { turnId: string };
+    try {
+      result = z.object({ turnId: z.string() }).parse(
+        await appServer.request('turn/steer', {
+          threadId: id,
+          expectedTurnId: input.expectedTurnId,
+          input: [{ type: 'text', text: input.text, text_elements: [] }],
+        }),
+      );
+    } catch (error) {
+      return throwTurnCommandFailure(thread, error, () => {
+        publish(
+          repository.appendEvent({
+            threadId: id,
+            turnId: input.expectedTurnId,
+            kind: 'user-message',
+            phase: 'state',
+            payload: {
+              ...sanitizeEventPayload({ text: input.text }, config.maxEventBytes),
+              outcomeUnknown: true,
+            },
+          }),
+        );
+      });
+    }
+    const userEvent = repository.appendEvent({
+      threadId: id,
+      turnId: result.turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: sanitizeEventPayload({ text: input.text }, config.maxEventBytes),
+    });
+    publish(userEvent);
     repository.audit('turn.steer', 'succeeded', { threadId: id, turnId: result.turnId });
     return reply.code(202).send({ data: result });
   });
@@ -1257,10 +1407,22 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   app.post('/api/threads/:id/interrupt', async (request) => {
     csrfGuard(auth, request);
     const id = parseId(request);
-    if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    const thread = repository.getThread(id);
+    if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
     const input = interruptBodySchema.parse(request.body);
-    await appServer.request('turn/interrupt', { threadId: id, turnId: input.turnId });
-    activeTurns.delete(`${id}:${input.turnId}`);
+    try {
+      await appServer.request('turn/interrupt', { threadId: id, turnId: input.turnId });
+    } catch (error) {
+      return throwTurnCommandFailure(thread, error);
+    }
+    const event = repository.appendEvent({
+      threadId: id,
+      turnId: input.turnId,
+      kind: 'turn',
+      phase: 'state',
+      payload: { status: 'interruptRequested', runtime: true },
+    });
+    publish(event);
     repository.audit('turn.interrupt', 'succeeded', { threadId: id, turnId: input.turnId });
     return { data: { interrupted: true } };
   });

@@ -29,6 +29,7 @@ const thread = {
   preview: 'Build UI',
   model: 'gpt-test',
   status: 'idle',
+  activeTurnId: null,
   archived: false,
   instructionSources: ['/srv/projects/ai-chat-bot/AGENTS.md'],
   createdAt: '2026-09-27T10:00:00.000Z',
@@ -197,6 +198,18 @@ function installAuthenticatedApi(
     if (overridden) return Promise.resolve(overridden);
     if (url === '/api/auth/session') return Promise.resolve(jsonResponse(session));
     if (url === '/api/projects') return Promise.resolve(jsonResponse([project]));
+    if (url === '/api/preferences/runtime')
+      return Promise.resolve(
+        jsonResponse({
+          data: {
+            model: 'gpt-test',
+            reasoningEffort: 'medium',
+            permissionPreset: 'workspace-write',
+            approvalPolicy: 'on-request',
+            updatedAt: '2026-09-27T10:00:00.000Z',
+          },
+        }),
+      );
     if (url === '/api/models') return Promise.resolve(jsonResponse(models));
     if (url === '/api/system/capabilities') return Promise.resolve(jsonResponse(capabilities));
     if (url.includes('/api/threads?')) return Promise.resolve(jsonResponse([thread]));
@@ -340,8 +353,70 @@ describe('App', () => {
     expect(screen.queryByRole('menuitem', { name: 'Архивировать чат' })).toBeNull();
   });
 
+  it('loads and saves the last server-owned runtime parameters', async () => {
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/preferences/runtime' && init?.method === 'PUT') {
+        if (typeof init.body !== 'string') throw new TypeError('expected serialized preferences');
+        const parsed: unknown = JSON.parse(init.body);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          throw new TypeError('expected preference object');
+        }
+        const body = parsed as Record<string, unknown>;
+        return jsonResponse({
+          data: { ...body, updatedAt: '2026-09-27T11:00:00.000Z' },
+        });
+      }
+      if (url === '/api/preferences/runtime') {
+        return jsonResponse({
+          data: {
+            model: 'gpt-test',
+            reasoningEffort: 'low',
+            permissionPreset: 'full-access',
+            approvalPolicy: 'never',
+            updatedAt: '2026-09-27T10:00:00.000Z',
+          },
+        });
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByLabelText('Уровень reasoning');
+    await waitFor(() =>
+      expect(screen.getByLabelText<HTMLSelectElement>('Уровень reasoning').value).toBe('low'),
+    );
+    expect(screen.getByLabelText<HTMLSelectElement>('Уровень доступа').value).toBe('full-access');
+    expect(screen.getByLabelText<HTMLSelectElement>('Политика подтверждений').value).toBe('never');
+
+    await user.selectOptions(screen.getByLabelText('Уровень доступа'), 'workspace-write');
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/preferences/runtime',
+        expect.objectContaining({
+          method: 'PUT',
+          body: JSON.stringify({
+            model: 'gpt-test',
+            reasoningEffort: 'low',
+            permissionPreset: 'workspace-write',
+            approvalPolicy: 'never',
+          }),
+        }),
+      ),
+    );
+  });
+
   it('keeps execution history compact and removes redundant lifecycle noise', async () => {
     const events = [
+      {
+        id: 0,
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        kind: 'user-message',
+        phase: 'completed',
+        payload: { text: 'Вчерашнее задание' },
+        createdAt: '2026-09-27T10:00:59.000Z',
+      },
       {
         id: 1,
         threadId: 'thread-1',
@@ -414,10 +489,24 @@ describe('App', () => {
     render(<App />);
 
     expect(await screen.findByText('GitHub')).not.toBeNull();
+    expect(
+      screen
+        .getByText('Вчерашнее задание')
+        .closest('article')
+        ?.querySelector('time')
+        ?.getAttribute('dateTime'),
+    ).toBe('2026-09-27T10:00:59.000Z');
     expect(screen.queryByText('Состояние чата')).toBeNull();
     expect(screen.queryByText('Состояние задачи')).toBeNull();
     expect(screen.queryByText('Использует инструмент')).toBeNull();
     const command = screen.getByText('Выполнил команду').closest('details');
+    expect(
+      screen
+        .getByText('GitHub')
+        .closest('.activity-row')
+        ?.querySelector('time')
+        ?.getAttribute('dateTime'),
+    ).toBe('2026-09-27T10:01:05.000Z');
     expect(command?.classList.contains('activity-row')).toBe(true);
     expect(document.querySelector('.activity-card')).toBeNull();
     expect(command?.open).toBe(false);
@@ -439,7 +528,7 @@ describe('App', () => {
         turnId: 'turn-active',
         kind: 'turn',
         phase: 'started',
-        payload: { status: 'inProgress' },
+        payload: { status: 'inProgress', runtime: true },
         createdAt: '2026-09-27T10:01:00.000Z',
       });
     });
@@ -447,7 +536,9 @@ describe('App', () => {
     const input = await screen.findByLabelText('Уточнение для активной задачи');
     await user.type(input, 'Сначала исправь тесты');
     await user.click(screen.getByRole('button', { name: 'Направить задачу' }));
+    expect((await screen.findByRole('status')).textContent).toContain('Уточнение принято');
     await user.click(screen.getByRole('button', { name: 'Остановить' }));
+    expect((await screen.findByRole('status')).textContent).toContain('Запрос на остановку принят');
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
@@ -462,6 +553,93 @@ describe('App', () => {
         }),
       );
     });
+  });
+
+  it('shows an interrupt failure and restores the stop control', async () => {
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1/interrupt')
+        return jsonResponse(
+          { error: { message: 'Активная задача уже завершена. Обновите чат.' } },
+          409,
+        );
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+    act(() => {
+      FakeEventSource.instances.at(-1)?.emit({
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-active',
+        kind: 'turn',
+        phase: 'started',
+        payload: { status: 'inProgress', runtime: true },
+        createdAt: '2026-09-27T10:01:00.000Z',
+      });
+    });
+
+    await user.click(await screen.findByRole('button', { name: 'Остановить' }));
+    expect((await screen.findByRole('alert')).textContent).toContain(
+      'Активная задача уже завершена',
+    );
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Остановить' }).disabled).toBe(
+      false,
+    );
+  });
+
+  it('keeps server-reported work active when the retained turn start has rolled over', async () => {
+    const activeThread = {
+      ...thread,
+      status: 'active',
+      activeTurnId: 'turn-current',
+      updatedAt: '2026-09-27T10:10:00.000Z',
+    };
+    const retainedEvents = [
+      {
+        id: 20,
+        threadId: 'thread-1',
+        turnId: 'turn-old',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T10:01:00.000Z',
+      },
+      {
+        id: 21,
+        threadId: 'thread-1',
+        turnId: 'turn-current',
+        kind: 'tool',
+        phase: 'completed',
+        payload: { item: { id: 'item-current', status: 'completed' } },
+        createdAt: '2026-09-27T10:09:00.000Z',
+      },
+    ];
+    const fetchMock = installAuthenticatedApi((url) => {
+      if (url.includes('/api/threads?')) return jsonResponse([activeThread]);
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: activeThread, events: retainedEvents });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const input = await screen.findByLabelText('Уточнение для активной задачи');
+    await user.type(input, 'Проверь текущий прогресс');
+    await user.click(screen.getByRole('button', { name: 'Направить задачу' }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/threads/thread-1/steer',
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({
+            text: 'Проверь текущий прогресс',
+            expectedTurnId: 'turn-current',
+          }),
+        }),
+      ),
+    );
   });
 
   it('queues files from picker, clipboard and drop, then removes them before upload', async () => {
@@ -732,6 +910,73 @@ describe('App', () => {
     });
 
     expect(screen.getAllByText('История с сервера')).toHaveLength(1);
+  });
+
+  it('renames a chat and keeps the server result in navigation and the heading', async () => {
+    const renamed = { ...thread, name: 'Проверка релиза' };
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1' && init?.method === 'PATCH') {
+        return jsonResponse({ data: renamed });
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findAllByText('Frontend task');
+
+    await user.click(screen.getByRole('button', { name: 'Открыть недавний чат Frontend task' }));
+    await user.click(screen.getByRole('button', { name: 'Меню недавнего чата Frontend task' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Переименовать' }));
+    const input = screen.getByRole('textbox', { name: 'Название' });
+    await user.clear(input);
+    await user.type(input, 'Проверка релиза');
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/threads/thread-1',
+        expect.objectContaining({ method: 'PATCH' }),
+      ),
+    );
+    expect((await screen.findAllByText('Проверка релиза')).length).toBeGreaterThan(1);
+  });
+
+  it('applies the first native Codex topic name from the server stream', async () => {
+    installAuthenticatedApi();
+    render(<App />);
+    await screen.findAllByText('Frontend task');
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+
+    act(() => {
+      FakeEventSource.instances.at(-1)?.emit({
+        id: 8,
+        threadId: 'thread-1',
+        turnId: null,
+        kind: 'thread',
+        phase: 'state',
+        payload: { threadId: 'thread-1', threadName: 'Безопасное обновление сервиса' },
+        createdAt: '2026-09-27T10:05:00.000Z',
+      });
+    });
+
+    expect((await screen.findAllByText('Безопасное обновление сервиса')).length).toBeGreaterThan(1);
+  });
+
+  it('refreshes server-owned navigation when another device changes it', async () => {
+    let remoteName = 'Frontend task';
+    installAuthenticatedApi((url) => {
+      if (url.includes('/api/threads?')) return jsonResponse([{ ...thread, name: remoteName }]);
+      return undefined;
+    });
+    render(<App />);
+    await screen.findAllByText('Frontend task');
+
+    remoteName = 'Изменено с телефона';
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+
+    expect((await screen.findAllByText('Изменено с телефона')).length).toBeGreaterThan(0);
   });
 
   it('resolves an approval and removes it after the completion event', async () => {

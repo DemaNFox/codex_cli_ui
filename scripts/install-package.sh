@@ -41,6 +41,7 @@ external_proxy=false
 mode=install
 start_service=true
 resuming_bootstrap=false
+drain_marker=/var/lib/codex-web-ui/data/upgrade-drain
 
 usage() {
   cat <<'EOF'
@@ -95,7 +96,7 @@ bootstrap_args=()
 $external_proxy || bootstrap_args+=(--install-nginx)
 "$SCRIPT_DIR/bootstrap-ubuntu.sh" "${bootstrap_args[@]}"
 export PATH="/usr/local/bin:$PATH"
-for command in getent install realpath sha256sum systemctl runuser python3 node stat groupadd useradd cut date readlink find chown chmod sed rm; do require_command "$command"; done
+for command in getent install realpath sha256sum systemctl runuser python3 node stat groupadd useradd cut date readlink find chown chmod sed rm curl mktemp sleep; do require_command "$command"; done
 [[ -x /usr/local/bin/node && $(/usr/local/bin/node -p 'process.versions.node.split(".")[0]') == 22 ]] || die 'managed Node.js 22 is required at /usr/local/bin/node'
 package=$(canonical_existing_dir "$package")
 case "$(uname -m)" in x86_64) target=linux-x64 ;; aarch64) target=linux-arm64 ;; *) die 'unsupported CPU architecture' ;; esac
@@ -230,6 +231,31 @@ revision=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["gitR
 release_id="$(date -u +%Y%m%dT%H%M%SZ)-$revision"
 release_dir="/opt/codex-web-ui/releases/$release_id"
 if [[ -e $config ]]; then python3 "$package/scripts/storage-guard.py" --config "$config" --check-releases --additional-releases 1; fi
+drain_started=false
+if [[ $mode == upgrade ]]; then
+  drain_args=(--begin --config "$config" --service-user api)
+  bash "$package/scripts/graceful-drain.sh" "${drain_args[@]}"
+  drain_started=true
+  clear_pre_activation_drain() {
+    local status=$?
+    trap - EXIT INT TERM
+    case "$release_dir" in
+      /opt/codex-web-ui/releases/*)
+        if [[ -e $release_dir ]] && ! rm -rf --one-file-system -- "$release_dir"; then
+          printf 'Pre-activation cleanup retained incomplete release: %s\n' "$release_dir" >&2
+        fi
+        ;;
+      *) printf 'Refusing unsafe incomplete release cleanup: %s\n' "$release_dir" >&2 ;;
+    esac
+    if ! bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user api --timeout 45; then
+      printf 'Failed to release the pre-activation drain cleanly.\n' >&2
+    fi
+    exit "$status"
+  }
+  trap clear_pre_activation_drain EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+fi
 copy_release "$package" "$release_dir"
 previous=$(readlink -f /opt/codex-web-ui/current 2>/dev/null || true)
 if [[ -n $previous ]]; then
@@ -243,11 +269,10 @@ if [[ -f $runner_config ]]; then
   runner_config_backup=$(mktemp /etc/codex-web-ui/.runner-config.rollback.XXXXXX)
   install -m 0600 -o root -g root "$runner_config" "$runner_config_backup"
 fi
-atomic_symlink "$release_dir" /opt/codex-web-ui/current
 activation_complete=false
 rollback_activation() {
   local status=$?
-  trap - ERR INT TERM
+  trap - EXIT INT TERM
   if ! $activation_complete; then
     printf 'Activation failed; restoring the previous release.\n' >&2
     if [[ -n $previous ]]; then
@@ -261,11 +286,20 @@ rollback_activation() {
       rm -f -- "$runner_config"
     fi
     systemctl daemon-reload >/dev/null 2>&1 || true
-    systemctl restart codex-web-ui@api.service >/dev/null 2>&1 || true
+    if systemctl restart codex-web-ui@api.service >/dev/null 2>&1 && \
+      "$package/scripts/health-check.sh" --service-user api --timeout 45 >/dev/null 2>&1; then
+      if $drain_started; then
+        bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user api --timeout 45 || \
+          printf 'Rollback is healthy but the drain could not be released.\n' >&2
+      fi
+    else
+      printf 'Rollback release failed its health check; the drain remains engaged.\n' >&2
+    fi
   fi
   exit "$status"
 }
-trap rollback_activation ERR INT TERM
+trap rollback_activation EXIT
+atomic_symlink "$release_dir" /opt/codex-web-ui/current
 
 for unit in codex-web-ui@.service codex-web-ui-app-server.socket codex-web-ui-app-server@.service codex-web-ui-storage-guard@.service codex-web-ui-storage-guard@.timer; do
   install -m 0644 "$package/infra/systemd/$unit" "/etc/systemd/system/$unit"
@@ -319,10 +353,14 @@ if $start_service; then
   systemctl stop 'codex-web-ui-app-server@*.service' >/dev/null 2>&1 || true
   systemctl restart codex-web-ui-app-server.socket codex-web-ui@api.service codex-web-ui-storage-guard@api.timer
   "$package/scripts/health-check.sh" --service-user api --timeout 45
+  if $drain_started; then
+    bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user api --timeout 45
+  fi
   printf 'Codex Web UI %s is installed at %s\n' "$release_id" "$public_origin"
 else
+  if $drain_started; then rm -f -- "$drain_marker"; fi
   printf 'Codex Web UI %s is installed but not started; establish hard storage bounds, then enable the API, socket and storage timer.\n' "$release_id"
 fi
 activation_complete=true
 if [[ -n $runner_config_backup ]]; then rm -f -- "$runner_config_backup"; fi
-trap - ERR INT TERM
+trap - EXIT INT TERM

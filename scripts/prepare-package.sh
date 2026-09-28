@@ -61,6 +61,7 @@ expected = os.environ.get("EXPECTED_ARCH", "")
 required = (
     "install.sh",
     "scripts/install-package.sh",
+    "scripts/graceful-drain.sh",
     "scripts/bootstrap-ubuntu.sh",
     "apps/server/dist/index.js",
     "apps/web/dist/index.html",

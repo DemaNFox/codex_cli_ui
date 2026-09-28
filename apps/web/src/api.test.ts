@@ -20,6 +20,7 @@ const thread = {
   preview: 'New thread',
   model: null,
   status: 'idle' as const,
+  activeTurnId: null,
   archived: false,
   instructionSources: [],
   createdAt: '2026-09-27T10:00:00.000Z',
@@ -41,6 +42,18 @@ describe('api response envelopes', () => {
         const url =
           typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
         if (url === '/api/projects') return Promise.resolve(response({ data: project }));
+        if (url === '/api/preferences/runtime')
+          return Promise.resolve(
+            response({
+              data: {
+                model: 'gpt-test',
+                reasoningEffort: 'medium',
+                permissionPreset: 'workspace-write',
+                approvalPolicy: 'on-request',
+                updatedAt: '2026-09-27T10:00:00.000Z',
+              },
+            }),
+          );
         if (url === '/api/threads') return Promise.resolve(response({ data: thread }));
         if (url.endsWith('/turns'))
           return Promise.resolve(response({ data: { turnId: 'turn-1' } }));
@@ -80,6 +93,10 @@ describe('api response envelopes', () => {
     await expect(api.unarchiveThread('csrf', thread.id)).resolves.toEqual(thread);
     await expect(api.interrupt('csrf', thread.id, 'turn-1')).resolves.toEqual({
       interrupted: true,
+    });
+    await expect(api.runtimePreferences()).resolves.toMatchObject({
+      model: 'gpt-test',
+      permissionPreset: 'workspace-write',
     });
   });
 });

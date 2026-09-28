@@ -1,7 +1,7 @@
 import type { Attachment, SafeEvent } from '@codex-web/contracts';
 import { hash } from 'argon2';
 import { EventEmitter } from 'node:events';
-import { mkdtemp, mkdir, rename, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rename, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createNetServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -62,6 +62,11 @@ class FakeAppServer implements AppServerClient {
   setThreadTurns(threadId: string, turns: unknown[]): void {
     const thread = this.threads.get(threadId);
     if (thread) thread.turns = turns;
+  }
+
+  setThreadStatus(threadId: string, type: 'notLoaded' | 'idle' | 'active' | 'systemError'): void {
+    const thread = this.threads.get(threadId);
+    if (thread) thread.status = { type };
   }
 
   setThreadListPageSize(size: number): void {
@@ -269,7 +274,7 @@ async function fixture(
   const config: ServerConfig = {
     host: '127.0.0.1',
     port: 3000,
-    databasePath: ':memory:',
+    databasePath: path.join(temp, 'codex-web.sqlite3'),
     attachmentStoragePath: path.join(temp, 'attachments'),
     username: 'owner',
     passwordHash,
@@ -289,16 +294,26 @@ async function fixture(
   seed?.({ repository, projectPath });
   const appServer = new FakeAppServer();
   const attachmentStore = attachmentStoreFactory(config.attachmentStoragePath);
+  const upgradeDrainPath = path.join(temp, 'upgrade-drain');
   const app = await buildServer({
     config,
     repository,
     pathPolicy: await ProjectPathPolicy.create([root]),
     appServer,
     attachmentStore,
+    upgradeDrainPath,
   });
   openApps.push(app);
   await app.ready();
-  return { app, repository, appServer, attachmentStore, projectPath, root };
+  return {
+    app,
+    repository,
+    appServer,
+    attachmentStore,
+    projectPath,
+    root,
+    upgradeDrainPath,
+  };
 }
 
 async function login(app: Awaited<ReturnType<typeof buildServer>>) {
@@ -1454,6 +1469,388 @@ describe('Codex routes', () => {
     expect(response.json()).toMatchObject({ status: 'degraded', appServerReady: false });
   });
 
+  it('persists turn status and native thread name projections from notifications', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-projection', status: 'inProgress', items: [] } },
+    });
+    expect(repository.getThread(threadId)?.status).toBe('active');
+
+    appServer.emit({
+      method: 'thread/name/updated',
+      params: { threadId, threadName: 'Native first topic' },
+    });
+    expect(repository.getThread(threadId)?.name).toBe('Native first topic');
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: 'turn-projection', status: 'completed', items: [] } },
+    });
+    expect(repository.getThread(threadId)?.status).toBe('idle');
+
+    appServer.emit({
+      method: 'thread/status/changed',
+      params: { threadId, status: { type: 'systemError' } },
+    });
+    expect(repository.getThread(threadId)?.status).toBe('systemError');
+
+    const history = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(history.statusCode).toBe(200);
+    expect(history.json<{ data: { name: string; status: string } }>().data).toMatchObject({
+      name: 'Native first topic',
+      status: 'systemError',
+    });
+  });
+
+  it('persists and broadcasts one sanitized steer message to two sessions', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const firstSession = await login(app);
+    const secondSession = await login(app);
+    const project = await createProject(app, projectPath, firstSession.headers);
+    const threadId = await createThread(app, project.id, firstSession.headers);
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-live', status: 'inProgress', items: [] } },
+    });
+
+    const address = await app.listen({ host: '127.0.0.1', port: 0 });
+    const connect = async (cookie: string) => {
+      const response = await fetch(`${address}/api/threads/${threadId}/events?after=0`, {
+        headers: { cookie },
+      });
+      expect(response.status).toBe(200);
+      expect(response.body).not.toBeNull();
+      return response.body!.getReader();
+    };
+    const readUntil = async (
+      reader: ReadableStreamDefaultReader<Uint8Array>,
+      marker: string,
+    ): Promise<string> => {
+      const decoder = new TextDecoder();
+      let output = '';
+      while (!output.includes(marker)) {
+        const chunk = await reader.read();
+        expect(chunk.done).toBe(false);
+        output += decoder.decode(chunk.value, { stream: true });
+      }
+      return output;
+    };
+    const [firstReader, secondReader] = await Promise.all([
+      connect(firstSession.cookie),
+      connect(secondSession.cookie),
+    ]);
+    await Promise.all([
+      readUntil(firstReader, 'event: turn'),
+      readUntil(secondReader, 'event: turn'),
+    ]);
+
+    const steered = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/steer`,
+      headers: secondSession.headers,
+      payload: { text: 'follow-up token=private-value', expectedTurnId: 'turn-live' },
+    });
+    expect(steered.statusCode).toBe(202);
+    const liveCopies = await Promise.all([
+      readUntil(firstReader, 'event: user-message'),
+      readUntil(secondReader, 'event: user-message'),
+    ]);
+    await Promise.all([firstReader.cancel(), secondReader.cancel()]);
+    expect(liveCopies).toHaveLength(2);
+    for (const copy of liveCopies) {
+      expect(copy).toContain('follow-up token[REDACTED]');
+      expect(copy).not.toContain('private-value');
+    }
+
+    const replay = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: firstSession.cookie },
+    });
+    const userMessages = replay
+      .json<{ events: SafeEvent[] }>()
+      .events.filter((event) => event.kind === 'user-message');
+    expect(userMessages).toHaveLength(1);
+    expect(userMessages[0]).toMatchObject({
+      threadId,
+      turnId: 'turn-live',
+      payload: { text: 'follow-up token[REDACTED]' },
+    });
+    expect(
+      repository.listEvents(threadId, 0).filter((event) => event.kind === 'user-message'),
+    ).toHaveLength(1);
+  });
+
+  it('persists interrupt acknowledgement and keeps the turn active until Codex completes it', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-stop', status: 'inProgress', items: [] } },
+    });
+
+    const stopped = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/interrupt`,
+      headers: session.headers,
+      payload: { turnId: 'turn-stop' },
+    });
+    expect(stopped.statusCode).toBe(200);
+    expect(repository.getThread(threadId)).toMatchObject({
+      status: 'active',
+      activeTurnId: 'turn-stop',
+    });
+    expect(repository.listEvents(threadId, 0).at(-1)).toMatchObject({
+      turnId: 'turn-stop',
+      kind: 'turn',
+      phase: 'state',
+      payload: { status: 'interruptRequested' },
+    });
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      upgradeDrain: { activeTurns: 1 },
+    });
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: 'turn-stop', status: 'interrupted', items: [] } },
+    });
+    expect(repository.getThread(threadId)).toMatchObject({ status: 'idle', activeTurnId: null });
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      upgradeDrain: { activeTurns: 0 },
+    });
+  });
+
+  it('reconciles a stale interrupt target and returns an actionable conflict', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-stale', status: 'inProgress', items: [] } },
+    });
+    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_FAILED');
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/interrupt`,
+      headers: session.headers,
+      payload: { turnId: 'turn-stale' },
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({
+      error: {
+        code: 'TURN_NOT_ACTIVE',
+        message: 'Активная задача уже завершена или недоступна. Обновите чат.',
+      },
+    });
+    expect(repository.getThread(threadId)).toMatchObject({ status: 'idle', activeTurnId: null });
+  });
+
+  it('keeps an ambiguous failed steer visible while the authoritative thread stays active', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-ambiguous', status: 'inProgress', items: [] } },
+    });
+    appServer.setThreadStatus(threadId, 'active');
+    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_TIMEOUT');
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/steer`,
+      headers: session.headers,
+      payload: { expectedTurnId: 'turn-ambiguous', text: 'check the uncertain result' },
+    });
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({
+      error: { code: 'TURN_COMMAND_OUTCOME_UNKNOWN' },
+    });
+    expect(repository.getThread(threadId)).toMatchObject({
+      status: 'active',
+      activeTurnId: 'turn-ambiguous',
+    });
+    expect(repository.listEvents(threadId, 0).at(-1)).toMatchObject({
+      turnId: 'turn-ambiguous',
+      kind: 'user-message',
+      phase: 'state',
+      payload: { text: 'check the uncertain result', outcomeUnknown: true },
+    });
+  });
+
+  it('reports an ambiguous failed interrupt without declaring the active turn finished', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-ambiguous-stop', status: 'inProgress', items: [] } },
+    });
+    appServer.setThreadStatus(threadId, 'active');
+    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_TIMEOUT');
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/interrupt`,
+      headers: session.headers,
+      payload: { turnId: 'turn-ambiguous-stop' },
+    });
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({
+      error: { code: 'TURN_COMMAND_OUTCOME_UNKNOWN' },
+    });
+    expect(repository.getThread(threadId)).toMatchObject({
+      status: 'active',
+      activeTurnId: 'turn-ambiguous-stop',
+    });
+  });
+
+  it('stores one account runtime preference tuple on the server', async () => {
+    const { app } = await fixture();
+    const session = await login(app);
+    const initial = await app.inject({
+      method: 'GET',
+      url: '/api/preferences/runtime',
+      headers: { cookie: session.cookie },
+    });
+    expect(initial.statusCode).toBe(200);
+    expect(initial.json()).toMatchObject({
+      data: {
+        model: null,
+        reasoningEffort: null,
+        permissionPreset: 'workspace-write',
+        approvalPolicy: 'on-request',
+      },
+    });
+
+    const saved = await app.inject({
+      method: 'PUT',
+      url: '/api/preferences/runtime',
+      headers: session.headers,
+      payload: {
+        model: 'gpt-test',
+        reasoningEffort: 'high',
+        permissionPreset: 'full-access',
+        approvalPolicy: 'never',
+      },
+    });
+    expect(saved.statusCode).toBe(200);
+    expect(saved.json()).toMatchObject({
+      data: {
+        model: 'gpt-test',
+        reasoningEffort: 'high',
+        permissionPreset: 'full-access',
+        approvalPolicy: 'never',
+      },
+    });
+    const replay = await app.inject({
+      method: 'GET',
+      url: '/api/preferences/runtime',
+      headers: { cookie: session.cookie },
+    });
+    expect(replay.json()).toEqual(saved.json());
+  });
+
+  it('drains only new turns and reports pending plus active work in health', async () => {
+    const { app, appServer, projectPath, upgradeDrainPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const key = '99999999-9999-4999-8999-999999999999';
+
+    await writeFile(upgradeDrainPath, 'upgrade\n');
+    const drainingHealth = await app.inject({ method: 'GET', url: '/api/health' });
+    expect(drainingHealth.statusCode).toBe(200);
+    expect(drainingHealth.json()).toMatchObject({
+      upgradeDrain: {
+        supported: true,
+        requested: true,
+        acceptingNewTurns: false,
+        activeTurns: 0,
+        pendingTurnStarts: 0,
+        idle: true,
+      },
+    });
+    const rejected = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'wait for upgrade', idempotencyKey: key },
+    });
+    expect(rejected.statusCode).toBe(503);
+    expect(rejected.json()).toMatchObject({ error: { code: 'SERVICE_DRAINING' } });
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(0);
+
+    const steered = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/steer`,
+      headers: session.headers,
+      payload: { text: 'still reachable', expectedTurnId: 'existing-turn' },
+    });
+    expect(steered.statusCode).toBe(202);
+
+    await unlink(upgradeDrainPath);
+    const gate = appServer.blockTurnStarts();
+    const pendingTurn = app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'continue after upgrade', idempotencyKey: key },
+    });
+    await gate.entered;
+    const pendingHealth = await app.inject({ method: 'GET', url: '/api/health' });
+    expect(pendingHealth.json()).toMatchObject({
+      upgradeDrain: {
+        requested: false,
+        acceptingNewTurns: true,
+        activeTurns: 0,
+        pendingTurnStarts: 1,
+        idle: false,
+      },
+    });
+    gate.release();
+    expect((await pendingTurn).statusCode).toBe(202);
+    const activeHealth = await app.inject({ method: 'GET', url: '/api/health' });
+    expect(activeHealth.json()).toMatchObject({
+      upgradeDrain: {
+        requested: false,
+        acceptingNewTurns: true,
+        activeTurns: 1,
+        pendingTurnStarts: 0,
+        idle: false,
+      },
+    });
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: 'turn-1', status: 'completed', items: [] } },
+    });
+    const idleHealth = await app.inject({ method: 'GET', url: '/api/health' });
+    expect(idleHealth.json()).toMatchObject({
+      upgradeDrain: {
+        requested: false,
+        acceptingNewTurns: true,
+        activeTurns: 0,
+        pendingTurnStarts: 0,
+        idle: false,
+      },
+    });
+  });
+
   it('enforces global turn capacity, releases on completion, and replays idempotent starts', async () => {
     const { app, appServer, projectPath } = await fixture(1);
     const session = await login(app);
@@ -1826,6 +2223,7 @@ describe('Codex routes', () => {
         preview: '',
         model: null,
         status: 'idle',
+        activeTurnId: null,
         archived: false,
         instructionSources: [],
         createdAt: now,

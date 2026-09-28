@@ -23,6 +23,17 @@ Browser
   environment or SQLite; it receives read-only attachment access and explicit project/Codex-home paths.
 - JSON-RPC requests are correlated by generated numeric IDs. Server-initiated approval and input requests are recorded as pending UI actions.
 - The backend projects safe, normalized events to per-thread SSE streams. Reconnect uses the last event ID and the durable event journal.
+- Projects, thread metadata, authenticated sessions and the safe event journal are server-owned. Browsers keep
+  only transient view/composer state: a second authenticated device loads the same project and chat inventory,
+  hydrates the selected transcript from the server and then follows it through SSE. Active-turn steering is
+  also written as a canonical user event so it remains visible after reconnect and on every device.
+- The thread projection stores the current active turn ID instead of asking the browser to infer it from a
+  bounded event journal. A process restart clears that runtime-only projection before Codex is queried, so an
+  old `inProgress` history row cannot create a phantom running task. Interrupt acceptance is journaled and
+  broadcast as `interruptRequested`; the turn remains active until Codex emits its terminal notification.
+- The single administrator's last model, reasoning effort, permission preset and approval policy are stored as
+  one atomic server-side preference tuple. They follow the account between devices and are not reset when the
+  operator switches projects.
 - Codex rollout files remain the source of truth for Codex conversation history. SQLite stores the local project registry, thread-to-project mapping, UI metadata, sessions, audit records and a bounded reconnect journal.
 - A project is a display name plus a canonical existing directory under an allowlisted root. Codex has no separate project entity; thread `cwd` binds execution to a project.
 - Models and reasoning efforts come from `model/list`; the UI never hard-codes account availability.
@@ -92,7 +103,30 @@ The single navigation sidebar expands each project into its chat list, offers gl
 actions and keeps a cross-project recent list. The project context menu exposes an archived-chat view scoped
 to that project. Archived threads can be inspected and restored without mixing them into the active thread
 list. The transcript owns the scroll container while the composer remains in a fixed grid row.
+Thread menus allow a server-persisted manual rename. Until the operator renames it, the first native
+`thread/name/updated` notification from Codex supplies the topic name after the initial task. Open clients
+apply that notification immediately; background and visibility refreshes reconcile project/thread navigation
+changed from another device.
+Messages and visible execution stages render their persisted ISO event time in the browser's local timezone.
+For live work this is the server receipt time. Older history first imported from Codex may only have the import
+time when the protocol item did not expose a trustworthy occurrence timestamp.
 At `820px` and below, the navigation is an off-canvas drawer with focus containment, Escape close and focus
 return. Runtime model, reasoning, permission and approval controls remain available behind a compact toggle;
 their collapsed state reserves the constrained viewport for the independently scrolling transcript and the
 composer. The account/logout row remains reachable inside the drawer.
+
+## Upgrade drain
+
+Package upgrades are fail-closed around active Codex work. The installer requests a drain before switching the
+`current` release: new turn starts are rejected, while reads, SSE, steering, interruption and pending user
+interactions remain available from desktop or phone. Activation proceeds only after the running API reports
+zero active and pending turn starts. An unavailable or unverifiable drain leaves the old release running.
+An active legacy release that lacks this health contract is never upgraded in place: the installer fails
+closed. Its one-time migration requires an external maintenance fence that blocks new turn submissions,
+followed by a verified idle state and a stopped API with no app-server runners. Later drain-aware upgrades
+prove idleness through the running service without taking the monitoring and steering surface away.
+
+This drain prevents planned upgrades from destroying work; it is not crash recovery. An unexpected API or
+runner process failure can still terminate an in-flight Codex turn because the private app-server process is
+bound to that connection. Preserving computation across such a crash would require a durable broker outside
+the API lifecycle.

@@ -39,6 +39,23 @@ codex_home=$(canonical_existing_dir "$codex_home")
 source_dir=$(validate_release_source "${source_dir:?--source is required}" "$codex_home")
 
 release_dir="/opt/codex-web-ui/releases/$release_id"
+bash "$source_dir/scripts/graceful-drain.sh" \
+  --begin --config "$config" --service-user "$service_user" --timeout "$health_timeout"
+pre_activation_cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+  if [[ -e $release_dir ]]; then
+    printf 'Pre-activation cleanup retained incomplete release: %s\n' "$release_dir" >&2
+  fi
+  if ! bash "$source_dir/scripts/graceful-drain.sh" \
+    --release --config "$config" --service-user "$service_user" --timeout "$health_timeout"; then
+    printf 'Failed to release the pre-activation drain cleanly.\n' >&2
+  fi
+  exit "$status"
+}
+trap pre_activation_cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 python3 "$SCRIPT_DIR/storage-guard.py" --config "$config" --check-releases --additional-releases 1
 copy_release "$source_dir" "$release_dir"
 previous=$(readlink -f /opt/codex-web-ui/current) || die 'current release link is missing'
@@ -47,14 +64,35 @@ printf '%s\n' "$previous" >/var/lib/codex-web-ui/previous-release
 chown root:"$service_group" /var/lib/codex-web-ui/previous-release
 chmod 0640 /var/lib/codex-web-ui/previous-release
 
+activation_complete=false
+rollback_activation() {
+  local status=$?
+  trap - EXIT INT TERM
+  if ! $activation_complete; then
+    printf 'Activation failed; restoring the previous release.\n' >&2
+    atomic_symlink "$previous" /opt/codex-web-ui/current
+    if systemctl restart "codex-web-ui@${service_user}.service"; then
+      if "$SCRIPT_DIR/health-check.sh" --timeout "$health_timeout" --service-user "$service_user"; then
+        bash "$source_dir/scripts/graceful-drain.sh" \
+          --release --config "$config" --service-user "$service_user" --timeout "$health_timeout" || \
+          printf 'Rollback is healthy but the drain could not be released.\n' >&2
+      else
+        printf 'Rollback release failed its health check; the drain remains engaged.\n' >&2
+      fi
+    else
+      printf 'Rollback release could not be restarted.\n' >&2
+    fi
+  fi
+  exit "$status"
+}
+trap rollback_activation EXIT
 atomic_symlink "$release_dir" /opt/codex-web-ui/current
 systemctl restart "codex-web-ui@${service_user}.service"
 if ! "$SCRIPT_DIR/health-check.sh" --timeout "$health_timeout" --service-user "$service_user"; then
-  printf 'New release failed health check; restoring %s\n' "$previous" >&2
-  atomic_symlink "$previous" /opt/codex-web-ui/current
-  systemctl restart "codex-web-ui@${service_user}.service"
-  "$SCRIPT_DIR/health-check.sh" --timeout "$health_timeout" --service-user "$service_user" || \
-    die 'rollback release also failed health check'
-  die 'update rolled back after failed health check'
+  die 'update failed health check and will be rolled back'
 fi
+bash "$source_dir/scripts/graceful-drain.sh" \
+  --release --config "$config" --service-user "$service_user" --timeout "$health_timeout"
+activation_complete=true
+trap - EXIT INT TERM
 printf 'Updated Codex Web UI to %s. Previous release retained at %s.\n' "$release_id" "$previous"

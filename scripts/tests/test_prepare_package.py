@@ -48,6 +48,7 @@ class PreparePackageTest(unittest.TestCase):
         files = {
             "install.sh": "#!/usr/bin/env bash\n",
             "scripts/install-package.sh": "#!/usr/bin/env bash\n",
+            "scripts/graceful-drain.sh": "#!/usr/bin/env bash\n",
             "scripts/bootstrap-ubuntu.sh": "#!/usr/bin/env bash\n",
             "apps/server/dist/index.js": "console.log('server');\n",
             "apps/web/dist/index.html": "<!doctype html>\n",

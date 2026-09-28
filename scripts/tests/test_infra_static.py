@@ -103,6 +103,7 @@ class InfraStaticTest(unittest.TestCase):
     def test_portable_installer_has_explicit_secure_bootstrap(self) -> None:
         wrapper = (ROOT / "install.sh").read_text(encoding="utf-8")
         installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        drain = (ROOT / "scripts/graceful-drain.sh").read_text(encoding="utf-8")
         bootstrap = (ROOT / "scripts/bootstrap-ubuntu.sh").read_text(encoding="utf-8")
         self.assertIn("prepare-package.sh", wrapper)
         self.assertIn("bootstrap-ubuntu.sh", wrapper)
@@ -122,14 +123,29 @@ class InfraStaticTest(unittest.TestCase):
             "exec {tty_fd}<>/dev/tty",
             "runner_config_backup=",
             "load_toolchain_pins",
-            "trap rollback_activation ERR INT TERM",
+            "trap rollback_activation EXIT",
             "systemctl restart codex-web-ui-app-server.socket codex-web-ui@api.service",
+            'bash "$package/scripts/graceful-drain.sh" "${drain_args[@]}"',
+            'bash "$package/scripts/graceful-drain.sh" --release',
+            "trap clear_pre_activation_drain EXIT",
             "--check-releases --additional-releases 1",
         ):
             self.assertIn(expected, installer)
         self.assertNotIn("http://", installer)
         self.assertNotIn('source "$PACKAGE_ROOT/infra/toolchain.env"', installer)
         self.assertNotIn('source "$REPO_ROOT/infra/toolchain.env"', bootstrap)
+        self.assertNotIn("--confirm-legacy-idle", wrapper)
+        for expected in (
+            "marker=/var/lib/codex-web-ui/data/upgrade-drain",
+            "activeTurns",
+            "pendingTurnStarts",
+            'drain.get("acceptingNewTurns") is False',
+            "installed API lacks drain telemetry",
+            "fence external turn admission",
+            "verify all app-server runners are inactive",
+            "activation was not attempted",
+        ):
+            self.assertIn(expected, drain)
         for expected in (
             "NODE_LINUX_X64_SHA256",
             "PNPM_TARBALL_SHA512",
@@ -148,6 +164,63 @@ class InfraStaticTest(unittest.TestCase):
         self.assertNotIn("@alpha", bootstrap)
         package_builder = (ROOT / "scripts/prepare-package.sh").read_text(encoding="utf-8")
         self.assertIn("package build mode requires Linux", package_builder)
+
+    def test_upgrade_drain_precedes_every_activation_side_effect(self) -> None:
+        installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        updater = (ROOT / "scripts/update-ubuntu.sh").read_text(encoding="utf-8")
+        begin = installer.index('bash "$package/scripts/graceful-drain.sh" "${drain_args[@]}"')
+        copy = installer.index('copy_release "$package" "$release_dir"')
+        switch = installer.index('atomic_symlink "$release_dir" /opt/codex-web-ui/current')
+        runner_stop = installer.index("systemctl stop 'codex-web-ui-app-server@*.service'")
+        release = installer.rindex('bash "$package/scripts/graceful-drain.sh" --release')
+        post_switch_health = installer.index(
+            '"$package/scripts/health-check.sh" --service-user api --timeout 45'
+        )
+        self.assertLess(begin, copy)
+        self.assertLess(copy, switch)
+        self.assertLess(begin, switch)
+        self.assertLess(switch, runner_stop)
+        self.assertLess(post_switch_health, release)
+        self.assertIn('rm -f -- "$drain_marker"', installer)
+        self.assertIn('rm -rf --one-file-system -- "$release_dir"', installer)
+
+        update_begin = updater.index('bash "$source_dir/scripts/graceful-drain.sh" \\\n  --begin')
+        update_copy = updater.index('copy_release "$source_dir" "$release_dir"')
+        update_switch = updater.index('atomic_symlink "$release_dir" /opt/codex-web-ui/current')
+        update_health = updater.index(
+            'if ! "$SCRIPT_DIR/health-check.sh" --timeout "$health_timeout" --service-user "$service_user"'
+        )
+        update_release = updater.rindex('bash "$source_dir/scripts/graceful-drain.sh" \\\n  --release')
+        self.assertLess(update_begin, update_copy)
+        self.assertLess(update_copy, update_switch)
+        self.assertLess(update_switch, update_health)
+        self.assertLess(update_health, update_release)
+        self.assertIn('--service-user "$service_user"', updater)
+        self.assertIn('trap rollback_activation EXIT', updater)
+        self.assertIn('Rollback release failed its health check; the drain remains engaged.', updater)
+        self.assertNotIn('rm -f -- "$drain_marker"', updater)
+        self.assertIn('Rollback is healthy but the drain could not be released.', updater)
+
+    def test_drain_health_contract_is_fail_closed(self) -> None:
+        drain = (ROOT / "scripts/graceful-drain.sh").read_text(encoding="utf-8")
+        requested_checks = (
+            'drain.get("requested") is True',
+            'drain.get("acceptingNewTurns") is False',
+            'drain.get("idle") is True',
+            "active == 0",
+            "pending == 0",
+        )
+        released_checks = (
+            'drain.get("requested") is False',
+            'drain.get("acceptingNewTurns") is True',
+            'drain.get("idle") is False',
+        )
+        for expected in requested_checks + released_checks:
+            self.assertIn(expected, drain)
+        self.assertIn('if "upgradeDrain" not in value:', drain)
+        self.assertNotIn("legacy_idle_confirmed", drain)
+        self.assertNotIn("systemctl stop codex-web-ui@api.service", drain)
+        self.assertIn("fence external turn admission", drain)
 
     def test_device_login_never_runs_as_root_or_captures_the_code(self) -> None:
         installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")

@@ -145,6 +145,12 @@ do not install the isolated socket/runner topology and must not be used for a
 new portable installation or upgrade. `install.sh` and
 `scripts/install-package.sh` are the supported lifecycle entry points.
 
+The retained `update-ubuntu.sh` path still uses the same fail-closed graceful
+drain protocol as the package upgrader so an existing single-identity host can
+be migrated safely. If its installed API predates drain telemetry, externally
+fence access, wait for active work to finish, stop the legacy API and verify
+that no app-server runner remains before invoking the updater.
+
 The following steps describe the underlying controls for maintainers, not an
 alternative installation path:
 
@@ -183,3 +189,37 @@ alternative installation path:
 Updates atomically switch `current`, restart the service, and automatically
 restore the prior release if health fails. Rollback accepts only an existing
 release beneath `/opt/codex-web-ui/releases`; neither path deletes releases.
+
+Before an upgrade changes `current` or stops a service, the installer creates
+`/var/lib/codex-web-ui/data/upgrade-drain`. A drain-aware API keeps reads, SSE,
+steering, interruption and pending approval/input resolution available, rejects
+new turn starts, and reports the drain state from `/api/health`. Activation
+begins only after health proves both `activeTurns` and `pendingTurnStarts` are
+zero. If that proof times out or the response is malformed, the marker is
+removed and the old release remains active; no symlink or service is changed.
+
+The first upgrade from a release whose health response has no `upgradeDrain`
+object cannot close the race between checking idle and stopping that legacy
+API. The installer therefore refuses to upgrade an active legacy API. Put its
+public endpoint behind an external maintenance fence that blocks new turn
+submissions, wait until all work is idle, stop `codex-web-ui@api.service`, and
+verify that no `codex-web-ui-app-server@*.service` runner remains active before
+rerunning the upgrade. The installer accepts that already-stopped state; it
+never turns an operator assertion into a false safety guarantee. Subsequent
+drain-aware upgrades use this fail-closed health contract:
+
+```text
+upgradeDrain: {
+  supported: true,
+  requested: boolean,
+  acceptingNewTurns: boolean,
+  activeTurns: non-negative integer,
+  pendingTurnStarts: non-negative integer,
+  idle: boolean
+}
+```
+
+During a requested drain, `idle` is true only when both counts are zero and new
+turns are blocked. `/api/health` remains HTTP 200 while the app-server is ready.
+After the new API passes its health check, the installer removes the marker and
+waits for health to confirm that turn admission is enabled again.

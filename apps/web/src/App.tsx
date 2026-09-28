@@ -23,6 +23,7 @@ import type {
   ModelOption,
   PendingApproval,
   Project,
+  RuntimePreferences,
   SafeEvent,
   Session,
   Thread,
@@ -34,6 +35,10 @@ type LoadState = 'loading' | 'ready' | 'signed-out';
 const MAX_ATTACHMENTS_PER_TURN = 8;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_THREAD_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const EVENT_TIME_FORMATTER = new Intl.DateTimeFormat('ru-RU', {
+  dateStyle: 'short',
+  timeStyle: 'medium',
+});
 
 interface QueuedAttachment {
   localId: string;
@@ -57,6 +62,11 @@ function formatResetTime(value: number | null): string {
 
 function formatMetric(value: number | null): string {
   return value === null ? 'нет данных' : value.toLocaleString('ru');
+}
+
+function formatEventDateTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : EVENT_TIME_FORMATTER.format(date);
 }
 
 const SLASH_COMMANDS = [
@@ -158,6 +168,8 @@ function eventText(event: SafeEvent): string {
 }
 
 function eventTitle(event: SafeEvent): string {
+  if (event.kind === 'turn' && event.payload.status === 'interruptRequested')
+    return 'Остановка запрошена';
   if (event.kind === 'tool') {
     const preview = eventPreview(event);
     if (preview === 'команда')
@@ -547,6 +559,7 @@ function NavigationSidebar({
   onShowArchived,
   onArchive,
   onRestore,
+  onRename,
   onBack,
   onCreate,
   onLogout,
@@ -568,6 +581,7 @@ function NavigationSidebar({
   onShowArchived: (id: string) => void;
   onArchive: (id: string) => void;
   onRestore: (id: string) => void;
+  onRename: (id: string, name: string) => Promise<void>;
   onBack: () => void;
   onCreate: (name: string, path: string) => Promise<void>;
   onLogout: () => void;
@@ -577,6 +591,7 @@ function NavigationSidebar({
   onMobileClose: () => void;
 }) {
   const [creating, setCreating] = useState(false);
+  const [renameTarget, setRenameTarget] = useState<Thread | null>(null);
   const [expandedProjectId, setExpandedProjectId] = useState<string | null>(selectedProjectId);
   useEffect(() => {
     if (selectedProjectId) setExpandedProjectId(selectedProjectId);
@@ -606,16 +621,27 @@ function NavigationSidebar({
             disabled={disabled}
           >
             {(close) => (
-              <button
-                role="menuitem"
-                onClick={() => {
-                  close();
-                  if (archivedRows) onRestore(thread.id);
-                  else onArchive(thread.id);
-                }}
-              >
-                {archivedRows ? 'Восстановить чат' : 'Архивировать чат'}
-              </button>
+              <>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    close();
+                    setRenameTarget(thread);
+                  }}
+                >
+                  Переименовать
+                </button>
+                <button
+                  role="menuitem"
+                  onClick={() => {
+                    close();
+                    if (archivedRows) onRestore(thread.id);
+                    else onArchive(thread.id);
+                  }}
+                >
+                  {archivedRows ? 'Восстановить чат' : 'Архивировать чат'}
+                </button>
+              </>
             )}
           </ContextMenu>
         </div>
@@ -750,7 +776,80 @@ function NavigationSidebar({
           Выйти
         </button>
       </div>
+      {renameTarget && (
+        <RenameThreadDialog
+          thread={renameTarget}
+          onCancel={() => setRenameTarget(null)}
+          onRename={async (name) => {
+            await onRename(renameTarget.id, name);
+            setRenameTarget(null);
+          }}
+        />
+      )}
     </aside>
+  );
+}
+
+function RenameThreadDialog({
+  thread,
+  onRename,
+  onCancel,
+}: {
+  thread: Thread;
+  onRename: (name: string) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [name, setName] = useState(thread.name || thread.preview || '');
+  const [busy, setBusy] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => inputRef.current?.select(), []);
+
+  async function submit(event: FormEvent) {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      await onRename(name.trim());
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return createPortal(
+    <div
+      className="dialog-backdrop"
+      onMouseDown={(event) => event.target === event.currentTarget && onCancel()}
+    >
+      <form
+        className="rename-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="rename-thread-title"
+        onSubmit={(event) => void submit(event)}
+        onKeyDown={(event) => event.key === 'Escape' && onCancel()}
+      >
+        <h2 id="rename-thread-title">Переименовать чат</h2>
+        <label>
+          Название
+          <input
+            ref={inputRef}
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            maxLength={200}
+            required
+          />
+        </label>
+        <div className="button-row">
+          <button className="primary" disabled={busy || !name.trim()}>
+            {busy ? 'Сохраняем…' : 'Сохранить'}
+          </button>
+          <button type="button" className="ghost" onClick={onCancel} disabled={busy}>
+            Отмена
+          </button>
+        </div>
+      </form>
+    </div>,
+    document.body,
   );
 }
 
@@ -1006,7 +1105,9 @@ function Transcript({ events }: { events: SafeEvent[] }) {
         event.kind === 'permission-approval' ||
         event.kind === 'thread' ||
         event.kind === 'usage' ||
-        (event.kind === 'turn' && event.phase !== 'failed')
+        (event.kind === 'turn' &&
+          event.phase !== 'failed' &&
+          event.payload.status !== 'interruptRequested')
       )
         continue;
       const identity = eventIdentity(event);
@@ -1048,7 +1149,14 @@ function Transcript({ events }: { events: SafeEvent[] }) {
               className={`message ${event.kind === 'user-message' ? 'user' : 'agent'}`}
               key={event.id}
             >
-              <span className="message-role">{event.kind === 'user-message' ? 'Вы' : 'Codex'}</span>
+              <div className="message-meta">
+                <span className="message-role">
+                  {event.kind === 'user-message' ? 'Вы' : 'Codex'}
+                </span>
+                <time className="event-time" dateTime={event.createdAt}>
+                  {formatEventDateTime(event.createdAt)}
+                </time>
+              </div>
               {text && <div className="message-text">{text}</div>}
               <AttachmentList attachments={attachments} />
             </article>
@@ -1062,6 +1170,9 @@ function Transcript({ events }: { events: SafeEvent[] }) {
             <span className="activity-dot" aria-hidden="true" />
             <span className="activity-title">{eventTitle(event)}</span>
             {preview && <small>{preview}</small>}
+            <time className="event-time" dateTime={event.createdAt}>
+              {formatEventDateTime(event.createdAt)}
+            </time>
           </>
         );
         return hasDetails ? (
@@ -1211,27 +1322,28 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   const [queuedAttachments, setQueuedAttachments] = useState<QueuedAttachment[]>([]);
   const [threadAttachmentBytes, setThreadAttachmentBytes] = useState(0);
   const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
+  const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [interrupting, setInterrupting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mobileNavigationToggleRef = useRef<HTMLButtonElement>(null);
   const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
   const attachmentThreadRef = useRef<string | null>(null);
   const activeUploadsRef = useRef(new Map<string, { threadId: string; abort: () => void }>());
+  const preferencesWriteRef = useRef<Promise<void>>(Promise.resolve());
   const [locallyResolvedRequests, setLocallyResolvedRequests] = useState<Set<string>>(
     () => new Set(),
   );
   const { events, streamState, mergeEvents } = useThreadEvents(threadId);
 
-  const selectedProject = projects.find((item) => item.id === projectId) ?? null;
   const selectedThread = threads.find((item) => item.id === threadId) ?? null;
   const modelOption = models.find((item) => item.id === model) ?? null;
   const turnEvents = events.filter((event) => event.kind === 'turn');
   const lastTurnEvent = turnEvents.at(-1);
-  const active =
-    lastTurnEvent?.phase === 'started' || lastTurnEvent?.payload.status === 'inProgress';
-  const activeTurnId = active ? lastTurnEvent?.turnId : null;
+  const active = selectedThread?.status === 'active';
+  const activeTurnId = active ? selectedThread.activeTurnId : null;
   const approvals = useMemo(() => {
     const pending = new Map<string, PendingApproval>();
     for (const event of events) {
@@ -1274,7 +1386,48 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
 
   useEffect(() => {
     setLocallyResolvedRequests(new Set());
+    setActionNotice(null);
   }, [threadId]);
+
+  useEffect(() => {
+    const nameEvent = [...events]
+      .reverse()
+      .find((event) => event.kind === 'thread' && Object.hasOwn(event.payload, 'threadName'));
+    if (!nameEvent) return;
+    const nextName =
+      typeof nameEvent.payload.threadName === 'string' ? nameEvent.payload.threadName : null;
+    const update = (item: Thread) =>
+      item.id === nameEvent.threadId &&
+      Date.parse(nameEvent.createdAt) >= Date.parse(item.updatedAt)
+        ? { ...item, name: nextName, updatedAt: nameEvent.createdAt }
+        : item;
+    setThreads((current) => current.map(update));
+    setRecentThreads((current) => current.map(update));
+  }, [events]);
+
+  useEffect(() => {
+    if (!lastTurnEvent || lastTurnEvent.payload.runtime !== true) return;
+    const status: Thread['status'] =
+      lastTurnEvent.phase === 'started' ||
+      lastTurnEvent.payload.status === 'inProgress' ||
+      lastTurnEvent.payload.status === 'interruptRequested'
+        ? 'active'
+        : lastTurnEvent.phase === 'failed'
+          ? 'systemError'
+          : 'idle';
+    const update = (item: Thread) =>
+      item.id === lastTurnEvent.threadId &&
+      Date.parse(lastTurnEvent.createdAt) >= Date.parse(item.updatedAt)
+        ? {
+            ...item,
+            status,
+            activeTurnId: status === 'active' ? lastTurnEvent.turnId : null,
+            updatedAt: lastTurnEvent.createdAt,
+          }
+        : item;
+    setThreads((current) => current.map(update));
+    setRecentThreads((current) => current.map(update));
+  }, [lastTurnEvent]);
 
   useEffect(() => {
     queuedAttachmentsRef.current = queuedAttachments;
@@ -1320,16 +1473,50 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     window.setTimeout(() => mobileNavigationToggleRef.current?.focus());
   }
 
+  function persistRuntimePreferences(input: Omit<RuntimePreferences, 'updatedAt'>) {
+    preferencesWriteRef.current = preferencesWriteRef.current
+      .catch(() => undefined)
+      .then(async () => {
+        await api.updateRuntimePreferences(session.csrfToken, input);
+      })
+      .catch((cause: unknown) =>
+        setError(`Не удалось сохранить параметры: ${errorMessage(cause)}`),
+      );
+  }
+
+  function rememberRuntimePreferences(patch: Partial<Omit<RuntimePreferences, 'updatedAt'>>): void {
+    const next = {
+      model: patch.model === undefined ? model || null : patch.model,
+      reasoningEffort: patch.reasoningEffort === undefined ? effort || null : patch.reasoningEffort,
+      permissionPreset: patch.permissionPreset ?? permission,
+      approvalPolicy: patch.approvalPolicy ?? approvalPolicy,
+    };
+    setModel(next.model ?? '');
+    setEffort(next.reasoningEffort ?? '');
+    setPermission(next.permissionPreset);
+    setApprovalPolicy(next.approvalPolicy);
+    persistRuntimePreferences(next);
+  }
+
   useEffect(() => {
-    void Promise.all([api.projects(), api.models(), api.capabilities()])
-      .then(([projectList, modelList, systemCapability]) => {
+    void Promise.all([api.projects(), api.models(), api.capabilities(), api.runtimePreferences()])
+      .then(([projectList, modelList, systemCapability, preferences]) => {
         setProjects(projectList);
         setModels(modelList);
         setCapability(systemCapability);
         setProjectId((current) => current ?? projectList[0]?.id ?? null);
-        const defaultModel = modelList.find((item) => item.isDefault) ?? modelList[0];
-        setModel((current) => current || defaultModel?.id || '');
-        setEffort((current) => current || defaultModel?.defaultReasoningEffort || '');
+        const defaultModel = modelList.find((item) => item.isDefault) ?? modelList[0] ?? null;
+        const preferredModel =
+          modelList.find((item) => item.id === preferences.model) ?? defaultModel;
+        const preferredEffort = preferredModel?.supportedReasoningEfforts.some(
+          (item) => item.reasoningEffort === preferences.reasoningEffort,
+        )
+          ? (preferences.reasoningEffort ?? '')
+          : (preferredModel?.defaultReasoningEffort ?? '');
+        setModel(preferredModel?.id ?? '');
+        setEffort(preferredEffort);
+        setPermission(preferences.permissionPreset);
+        setApprovalPolicy(preferences.approvalPolicy);
         void refreshRecentThreads(projectList).catch((cause: unknown) =>
           setError(errorMessage(cause)),
         );
@@ -1354,6 +1541,50 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
       })
       .catch((cause: unknown) => setError(errorMessage(cause)));
   }, [projectId, archiveView]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let refreshing = false;
+
+    const refreshServerNavigation = async () => {
+      if (refreshing || document.visibilityState === 'hidden') return;
+      refreshing = true;
+      try {
+        const projectList = await api.projects();
+        const activeThreads = await Promise.all(
+          projectList.map((project) => api.threads(project.id, false)),
+        );
+        const archivedThreads =
+          archiveView && projectId ? await api.threads(projectId, true) : null;
+        if (cancelled) return;
+        setProjects(projectList);
+        const selectedIndex = projectList.findIndex((project) => project.id === projectId);
+        if (selectedIndex >= 0)
+          setThreads(archiveView ? (archivedThreads ?? []) : (activeThreads[selectedIndex] ?? []));
+        setRecentThreads(
+          activeThreads
+            .flat()
+            .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+            .slice(0, 20),
+        );
+      } catch {
+        // The selected-thread SSE remains authoritative while a background refresh is unavailable.
+      } finally {
+        refreshing = false;
+      }
+    };
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') void refreshServerNavigation();
+    };
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    const timer = window.setInterval(() => void refreshServerNavigation(), 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [archiveView, projectId]);
 
   useEffect(() => {
     const previousThreadId = attachmentThreadRef.current;
@@ -1403,18 +1634,6 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     };
   }, [mergeEvents, session.csrfToken, threadId]);
 
-  useEffect(() => {
-    if (!selectedProject) return;
-    setModel(
-      selectedProject.defaultModel ||
-        models.find((item) => item.isDefault)?.id ||
-        models[0]?.id ||
-        '',
-    );
-    setEffort(selectedProject.defaultReasoningEffort || '');
-    setPermission(selectedProject.defaultPermissionPreset);
-  }, [selectedProject?.id, models]);
-
   async function refreshThreads(selectId?: string) {
     if (!projectId) return;
     const items = await api.threads(projectId, archiveView);
@@ -1448,18 +1667,13 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
 
   async function newThread(targetProjectId = projectId) {
     if (!targetProjectId) return;
-    const targetProject = projects.find((project) => project.id === targetProjectId) ?? null;
     setBusy(true);
     try {
       const thread = await api.startThread(session.csrfToken, {
         projectId: targetProjectId,
-        ...(targetProject?.defaultModel || model
-          ? { model: targetProject?.defaultModel || model }
-          : {}),
-        ...(targetProject?.defaultReasoningEffort || effort
-          ? { reasoningEffort: targetProject?.defaultReasoningEffort || effort }
-          : {}),
-        permissionPreset: targetProject?.defaultPermissionPreset ?? permission,
+        ...(model ? { model } : {}),
+        ...(effort ? { reasoningEffort: effort } : {}),
+        permissionPreset: permission,
         approvalPolicy,
       });
       setProjectId(targetProjectId);
@@ -1489,6 +1703,17 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
       await Promise.all([refreshThreads(), refreshRecentThreads()]);
     } catch (cause) {
       setError(errorMessage(cause));
+    }
+  }
+
+  async function renameThread(id: string, name: string) {
+    try {
+      const updated = await api.renameThread(session.csrfToken, id, name);
+      setThreads((current) => current.map((item) => (item.id === id ? updated : item)));
+      setRecentThreads((current) => current.map((item) => (item.id === id ? updated : item)));
+    } catch (cause) {
+      setError(errorMessage(cause));
+      throw cause;
     }
   }
 
@@ -1609,6 +1834,10 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
       return;
     }
     if (!threadId || archiveView || (!text && !queuedAttachments.length)) return;
+    if (active && !activeTurnId) {
+      setError('Активная задача потеряла идентификатор после переподключения. Обновите чат.');
+      return;
+    }
     if (active && queuedAttachments.length) {
       setAttachmentNotice(
         'Вложения нельзя отправить во время активной задачи. Дождитесь её завершения или удалите вложения.',
@@ -1617,9 +1846,11 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     }
     setBusy(true);
     setError(null);
+    setActionNotice(active ? 'Передаём уточнение активной задаче…' : 'Передаём задачу Codex…');
     try {
       if (active && activeTurnId) {
         await api.steer(session.csrfToken, threadId, text, activeTurnId);
+        setActionNotice('Уточнение принято активной задачей.');
       } else {
         const attachments = await uploadQueued(threadId);
         await api.startTurn(session.csrfToken, threadId, {
@@ -1640,12 +1871,35 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
         });
         setQueuedAttachments([]);
         setAttachmentNotice(null);
+        setActionNotice('Задача принята Codex.');
       }
       setComposer('');
     } catch (cause) {
+      setActionNotice(null);
       if (attachmentThreadRef.current === threadId) setError(errorMessage(cause));
     } finally {
       setBusy(false);
+    }
+  }
+
+  async function interruptActiveTurn() {
+    if (!threadId || !activeTurnId || interrupting) return;
+    const interruptedThreadId = threadId;
+    const interruptedTurnId = activeTurnId;
+    setInterrupting(true);
+    setError(null);
+    setActionNotice('Отправляем запрос на остановку…');
+    try {
+      await api.interrupt(session.csrfToken, interruptedThreadId, interruptedTurnId);
+      if (attachmentThreadRef.current === interruptedThreadId)
+        setActionNotice('Запрос на остановку принят. Ждём завершения задачи.');
+    } catch (cause) {
+      if (attachmentThreadRef.current === interruptedThreadId) {
+        setActionNotice(null);
+        setError(errorMessage(cause));
+      }
+    } finally {
+      setInterrupting(false);
     }
   }
 
@@ -1727,6 +1981,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
         }}
         onArchive={(id) => void archiveThread(id)}
         onRestore={(id) => void restoreThread(id)}
+        onRename={renameThread}
         onBack={() => setArchiveView(false)}
         onCreate={createProject}
         username={session.username}
@@ -1764,12 +2019,13 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
             </span>
           </div>
           <div className="toolbar-actions">
-            {active && threadId && activeTurnId && (
+            {active && threadId && (
               <button
                 className="danger"
-                onClick={() => void api.interrupt(session.csrfToken, threadId, activeTurnId)}
+                disabled={interrupting || !activeTurnId}
+                onClick={() => void interruptActiveTurn()}
               >
-                Остановить
+                {interrupting ? 'Останавливаем…' : 'Остановить'}
               </button>
             )}
             <button
@@ -1788,6 +2044,11 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
             <button onClick={() => setError(null)} aria-label="Закрыть ошибку">
               ×
             </button>
+          </div>
+        )}
+        {!error && actionNotice && (
+          <div className="notice success global-error" role="status">
+            <span>{actionNotice}</span>
           </div>
         )}
         <div className="conversation-scroll">
@@ -1862,8 +2123,10 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
                 value={model}
                 onChange={(event) => {
                   const next = models.find((item) => item.id === event.target.value);
-                  setModel(event.target.value);
-                  setEffort(next?.defaultReasoningEffort || '');
+                  rememberRuntimePreferences({
+                    model: event.target.value,
+                    reasoningEffort: next?.defaultReasoningEffort ?? null,
+                  });
                 }}
               >
                 {models.map((item) => (
@@ -1878,7 +2141,9 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
               <select
                 aria-label="Уровень reasoning"
                 value={effort}
-                onChange={(event) => setEffort(event.target.value)}
+                onChange={(event) =>
+                  rememberRuntimePreferences({ reasoningEffort: event.target.value || null })
+                }
               >
                 <option value="">По умолчанию</option>
                 {modelOption?.supportedReasoningEfforts.map((item) => (
@@ -1893,7 +2158,11 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
               <select
                 aria-label="Уровень доступа"
                 value={permission}
-                onChange={(event) => setPermission(event.target.value as PermissionPreset)}
+                onChange={(event) =>
+                  rememberRuntimePreferences({
+                    permissionPreset: event.target.value as PermissionPreset,
+                  })
+                }
               >
                 <option value="read-only">Только чтение</option>
                 <option value="workspace-write">Рабочая папка</option>
@@ -1905,7 +2174,11 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
               <select
                 aria-label="Политика подтверждений"
                 value={approvalPolicy}
-                onChange={(event) => setApprovalPolicy(event.target.value as ApprovalPolicy)}
+                onChange={(event) =>
+                  rememberRuntimePreferences({
+                    approvalPolicy: event.target.value as ApprovalPolicy,
+                  })
+                }
               >
                 <option value="untrusted">Для недоверенных</option>
                 <option value="on-request">По запросу</option>
