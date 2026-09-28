@@ -254,10 +254,23 @@ class InfraStaticTest(unittest.TestCase):
             self.assertIn("workload_slice_was_active", script)
             self.assertIn("restore_resource_boundary", script)
             self.assertIn("Rollback could not restore the previous resource boundary exactly.", script)
+            provisional_handler_start = script.index("cleanup_resource_snapshot()")
+            snapshot_dir = script.index('resource_rollback_dir=$(mktemp -d')
+            provisional_trap = script.index("trap cleanup_resource_snapshot EXIT", snapshot_dir)
+            snapshot_call = script.index("snapshot_activation_file", provisional_trap)
+            rollback_trap = script.index("trap rollback_activation EXIT", snapshot_call)
             self.assertLess(
-                script.index('resource_rollback_dir=$(mktemp -d'),
+                snapshot_dir,
                 script.index('atomic_symlink "$release_dir" /opt/codex-web-ui/current'),
             )
+            self.assertLess(provisional_handler_start, snapshot_dir)
+            self.assertLess(snapshot_dir, provisional_trap)
+            self.assertLess(provisional_trap, snapshot_call)
+            self.assertLess(snapshot_call, rollback_trap)
+            provisional_handler = script[
+                provisional_handler_start:snapshot_dir
+            ]
+            self.assertIn('remove_activation_backup "$resource_rollback_dir"', provisional_handler)
             rollback = script.index("if ! restore_resource_boundary; then")
             restart = script.index("systemctl restart", rollback)
             self.assertLess(rollback, restart)

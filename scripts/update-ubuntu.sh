@@ -45,7 +45,7 @@ bash "$SCRIPT_DIR/graceful-drain.sh" \
 drain_engaged=false
 [[ -f $drain_marker ]] && drain_engaged=true
 pre_activation_cleanup() {
-  local status=$?
+  local status=${1:-$?}
   trap - EXIT INT TERM
   if [[ -e $release_dir ]]; then
     printf 'Pre-activation cleanup retained incomplete release: %s\n' "$release_dir" >&2
@@ -94,7 +94,18 @@ resource_rollback_paths=(
   /etc/codex-web-ui/resource-limits.json
   /etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf
 )
+resource_rollback_dir=
+cleanup_resource_snapshot() {
+  local status=$?
+  trap - EXIT INT TERM
+  remove_activation_backup "$resource_rollback_dir" || \
+    printf 'Incomplete resource snapshot could not be removed: %s\n' "$resource_rollback_dir" >&2
+  pre_activation_cleanup "$status"
+}
 resource_rollback_dir=$(mktemp -d /var/lib/codex-web-ui/.activation-rollback.XXXXXX)
+trap cleanup_resource_snapshot EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 for index in "${!resource_rollback_paths[@]}"; do
   snapshot_activation_file \
     "$resource_rollback_dir" "${resource_rollback_keys[$index]}" "${resource_rollback_paths[$index]}"

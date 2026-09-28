@@ -238,7 +238,7 @@ if [[ $mode == upgrade ]]; then
   bash "$package/scripts/graceful-drain.sh" "${drain_args[@]}"
   [[ -f $drain_marker ]] && drain_engaged=true
   clear_pre_activation_drain() {
-    local status=$?
+    local status=${1:-$?}
     trap - EXIT INT TERM
     case "$release_dir" in
       /opt/codex-web-ui/releases/*)
@@ -290,7 +290,19 @@ resource_rollback_paths=(
   /etc/codex-web-ui/resource-limits.json
   /etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf
 )
+resource_rollback_dir=
+cleanup_resource_snapshot() {
+  local status=$?
+  trap - EXIT INT TERM
+  remove_activation_backup "$resource_rollback_dir" || \
+    printf 'Incomplete resource snapshot could not be removed: %s\n' "$resource_rollback_dir" >&2
+  if [[ $mode == upgrade ]]; then clear_pre_activation_drain "$status"; fi
+  exit "$status"
+}
 resource_rollback_dir=$(mktemp -d /var/lib/codex-web-ui/.activation-rollback.XXXXXX)
+trap cleanup_resource_snapshot EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 for index in "${!resource_rollback_paths[@]}"; do
   snapshot_activation_file \
     "$resource_rollback_dir" "${resource_rollback_keys[$index]}" "${resource_rollback_paths[$index]}"
