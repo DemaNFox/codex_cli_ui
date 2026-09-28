@@ -2614,6 +2614,27 @@ describe('Codex routes', () => {
     expect(stale.statusCode).toBe(409);
     expect(appServer.responses.some((response) => response.id === 85)).toBe(false);
   });
+  it('reconciles the stored default resource policy when the server starts idle', async () => {
+    const broker = new FakeResourceBroker();
+    const { app, repository } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      broker,
+    );
+    for (
+      let attempt = 0;
+      attempt < 20 && repository.getResourceLimits().state !== 'applied';
+      attempt += 1
+    )
+      await new Promise((resolve) => setImmediate(resolve));
+    expect(repository.getResourceLimits().state).toBe('applied');
+    expect(broker.applyRequests).toEqual([
+      { mode: 'auto', cpuQuotaPercent: null, memoryMaxBytes: null, tasksMax: null },
+    ]);
+    await app.close();
+  });
+
   it('applies bounded resource policies and rejects host-overcommit requests', async () => {
     const broker = new FakeResourceBroker();
     const { app } = await fixture(2, undefined, (root) => new AttachmentStore(root), broker);

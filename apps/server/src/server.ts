@@ -2009,5 +2009,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     });
   });
 
+  if (dependencies.resourceBroker) applyPendingResourcesWhenIdle();
+
   return app;
 }
