@@ -32,6 +32,32 @@ const envSchema = z.object({
     .string()
     .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/)
     .default('gpt-transcribe'),
+  CODEX_WEB_VAPID_PUBLIC_KEY: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z
+      .string()
+      .regex(/^[A-Za-z0-9_-]+$/)
+      .min(32)
+      .max(512)
+      .optional(),
+  ),
+  CODEX_WEB_VAPID_PRIVATE_KEY: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z
+      .string()
+      .regex(/^[A-Za-z0-9_-]+$/)
+      .min(32)
+      .max(512)
+      .optional(),
+  ),
+  CODEX_WEB_VAPID_SUBJECT: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z
+      .string()
+      .max(512)
+      .refine((value) => value.startsWith('mailto:') || value.startsWith('https://'))
+      .optional(),
+  ),
 });
 
 export interface ServerConfig {
@@ -57,6 +83,11 @@ export interface ServerConfig {
   readonly maxConcurrentTurns: number;
   readonly openAiApiKey?: string;
   readonly transcriptionModel: string;
+  readonly vapid?: {
+    readonly publicKey: string;
+    readonly privateKey: string;
+    readonly subject: string;
+  };
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
@@ -68,6 +99,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     .map((root) => root.trim())
     .filter(Boolean);
   if (roots.length === 0) throw new Error('PROJECT_ROOTS must contain at least one path');
+  const vapidValues = [
+    parsed.CODEX_WEB_VAPID_PUBLIC_KEY,
+    parsed.CODEX_WEB_VAPID_PRIVATE_KEY,
+    parsed.CODEX_WEB_VAPID_SUBJECT,
+  ];
+  if (
+    vapidValues.some((value) => value !== undefined) &&
+    vapidValues.some((value) => value === undefined)
+  )
+    throw new Error(
+      'VAPID configuration must provide public key, private key and subject together',
+    );
 
   return {
     host: parsed.CODEX_WEB_HOST,
@@ -96,5 +139,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     maxConcurrentTurns: parsed.CODEX_WEB_MAX_CONCURRENT_TURNS,
     ...(parsed.OPENAI_API_KEY === undefined ? {} : { openAiApiKey: parsed.OPENAI_API_KEY }),
     transcriptionModel: parsed.CODEX_WEB_TRANSCRIPTION_MODEL,
+    ...(parsed.CODEX_WEB_VAPID_PUBLIC_KEY === undefined
+      ? {}
+      : {
+          vapid: {
+            publicKey: parsed.CODEX_WEB_VAPID_PUBLIC_KEY,
+            privateKey: parsed.CODEX_WEB_VAPID_PRIVATE_KEY!,
+            subject: parsed.CODEX_WEB_VAPID_SUBJECT!,
+          },
+        }),
   };
 }

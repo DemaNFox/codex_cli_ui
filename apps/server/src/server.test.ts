@@ -25,6 +25,8 @@ import { normalizeNotification, sanitizeEventPayload } from './event-normalizer.
 import { normalizeThreadHistory } from './history-normalizer.js';
 import { ProjectPathPolicy } from './path-policy.js';
 import type { BrokerResourceSnapshot, ResourceBroker } from './resource-broker.js';
+import type { PushNotificationPayload, PushSender } from './push-notifications.js';
+import type { PushSubscriptionInput } from '@codex-web/contracts';
 import { buildServer } from './server.js';
 import { createSseDelivery } from './sse.js';
 
@@ -327,6 +329,20 @@ class FakeAudioTranscriptionClient implements AudioTranscriptionClient {
   }
 }
 
+class FakePushSender implements PushSender {
+  readonly calls: { subscription: PushSubscriptionInput; payload: PushNotificationPayload }[] = [];
+  readonly deliveries: { subscription: PushSubscriptionInput; payload: PushNotificationPayload }[] =
+    [];
+  failures: Error[] = [];
+
+  async send(subscription: PushSubscriptionInput, payload: PushNotificationPayload): Promise<void> {
+    this.calls.push({ subscription, payload });
+    const failure = this.failures.shift();
+    if (failure !== undefined) throw failure;
+    this.deliveries.push({ subscription, payload });
+  }
+}
+
 let passwordHash: string;
 const openApps: Awaited<ReturnType<typeof buildServer>>[] = [];
 
@@ -343,6 +359,7 @@ async function fixture(
   attachmentStoreFactory: (root: string) => AttachmentStore = (root) => new AttachmentStore(root),
   resourceBroker?: ResourceBroker,
   transcriptionClient?: AudioTranscriptionClient,
+  pushSender?: PushSender,
 ) {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-server-'));
   const root = path.join(temp, 'projects');
@@ -368,6 +385,15 @@ async function fixture(
     maxConcurrentTurns,
     resourceBrokerSocket: path.join(temp, 'resource-broker.sock'),
     transcriptionModel: 'gpt-transcribe',
+    ...(pushSender
+      ? {
+          vapid: {
+            publicKey: 'A'.repeat(64),
+            privateKey: 'B'.repeat(64),
+            subject: 'mailto:owner@codex.test',
+          },
+        }
+      : {}),
   };
   const repository = new SqliteRepository(':memory:', config.eventRetentionPerThread);
   seed?.({ repository, projectPath });
@@ -383,6 +409,7 @@ async function fixture(
     upgradeDrainPath,
     ...(resourceBroker ? { resourceBroker } : {}),
     ...(transcriptionClient ? { transcriptionClient } : {}),
+    ...(pushSender ? { pushSender } : {}),
   });
   openApps.push(app);
   await app.ready();
@@ -589,6 +616,24 @@ describe('security and repository boundary', () => {
     });
     expect(loadConfig(environment)).not.toHaveProperty('openAiApiKey');
     expect(loadConfig({ ...environment, OPENAI_API_KEY: '' })).not.toHaveProperty('openAiApiKey');
+    expect(loadConfig(environment)).not.toHaveProperty('vapid');
+    expect(
+      loadConfig({
+        ...environment,
+        CODEX_WEB_VAPID_PUBLIC_KEY: 'A'.repeat(64),
+        CODEX_WEB_VAPID_PRIVATE_KEY: 'B'.repeat(64),
+        CODEX_WEB_VAPID_SUBJECT: 'mailto:owner@codex.test',
+      }),
+    ).toMatchObject({
+      vapid: {
+        publicKey: 'A'.repeat(64),
+        privateKey: 'B'.repeat(64),
+        subject: 'mailto:owner@codex.test',
+      },
+    });
+    expect(() =>
+      loadConfig({ ...environment, CODEX_WEB_VAPID_PUBLIC_KEY: 'A'.repeat(64) }),
+    ).toThrow('VAPID configuration must provide');
     expect(
       loadConfig({
         ...environment,
@@ -3214,6 +3259,178 @@ describe('Codex routes', () => {
       headers: { cookie: session.cookie },
     });
     expect(current.json<{ data: { state: string } }>().data.state).toBe('applied');
+  });
+
+  it('protects per-thread push subscription status, upsert and removal with auth and CSRF', async () => {
+    const sender = new FakePushSender();
+    const { app, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      sender,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const firstThread = await createThread(app, project.id, session.headers);
+    const secondThread = await createThread(app, project.id, session.headers);
+    const subscription = {
+      endpoint: 'https://push.example.test/device-one',
+      expirationTime: null,
+      keys: { p256dh: 'p'.repeat(65), auth: 'a'.repeat(24) },
+    };
+
+    const unauthenticated = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${firstThread}/push-subscriptions/status`,
+      headers: { origin: 'https://codex.test' },
+      payload: { endpoint: subscription.endpoint },
+    });
+    expect(unauthenticated.statusCode).toBe(401);
+    const missingCsrf = await app.inject({
+      method: 'PUT',
+      url: `/api/threads/${firstThread}/push-subscriptions`,
+      headers: { origin: 'https://codex.test', cookie: session.cookie },
+      payload: subscription,
+    });
+    expect(missingCsrf.statusCode).toBe(403);
+
+    const subscribed = await app.inject({
+      method: 'PUT',
+      url: `/api/threads/${firstThread}/push-subscriptions`,
+      headers: session.headers,
+      payload: subscription,
+    });
+    expect(subscribed.statusCode).toBe(200);
+    expect(subscribed.json()).toEqual({ subscribed: true });
+    const firstStatus = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${firstThread}/push-subscriptions/status`,
+      headers: session.headers,
+      payload: { endpoint: subscription.endpoint },
+    });
+    expect(firstStatus.json()).toEqual({ subscribed: true });
+    const isolatedStatus = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${secondThread}/push-subscriptions/status`,
+      headers: session.headers,
+      payload: { endpoint: subscription.endpoint },
+    });
+    expect(isolatedStatus.json()).toEqual({ subscribed: false });
+
+    const removed = await app.inject({
+      method: 'DELETE',
+      url: `/api/threads/${firstThread}/push-subscriptions`,
+      headers: session.headers,
+      payload: { endpoint: subscription.endpoint },
+    });
+    expect(removed.json()).toEqual({ subscribed: false });
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: `/api/threads/${firstThread}/push-subscriptions/status`,
+          headers: session.headers,
+          payload: { endpoint: subscription.endpoint },
+        })
+      ).json(),
+    ).toEqual({ subscribed: false });
+
+    const capabilities = await app.inject({
+      method: 'GET',
+      url: '/api/system/capabilities',
+      headers: { cookie: session.cookie },
+    });
+    expect(capabilities.json()).toMatchObject({
+      notifications: { available: true, vapidPublicKey: 'A'.repeat(64) },
+    });
+  });
+
+  it('fails closed when Web Push is unconfigured without affecting chat endpoints', async () => {
+    const { app, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/push-subscriptions/status`,
+      headers: session.headers,
+      payload: { endpoint: 'https://push.example.test/unavailable' },
+    });
+    expect(response.statusCode).toBe(503);
+    const capabilities = await app.inject({
+      method: 'GET',
+      url: '/api/system/capabilities',
+      headers: { cookie: session.cookie },
+    });
+    expect(capabilities.json()).toMatchObject({
+      notifications: { available: false, vapidPublicKey: null },
+    });
+  });
+
+  it('deduplicates safe terminal push delivery, retries transient errors and removes stale devices', async () => {
+    const sender = new FakePushSender();
+    sender.failures.push(new Error('temporary push failure'));
+    const { app, appServer, repository, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      sender,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    repository.updateThreadRuntime(threadId, { name: 'Build chat' });
+    const subscription = {
+      endpoint: 'https://push.example.test/retry-device',
+      expirationTime: null,
+      keys: { p256dh: 'p'.repeat(65), auth: 'a'.repeat(24) },
+    };
+    await app.inject({
+      method: 'PUT',
+      url: `/api/threads/${threadId}/push-subscriptions`,
+      headers: session.headers,
+      payload: subscription,
+    });
+
+    const completed = {
+      method: 'turn/completed' as const,
+      params: { threadId, turn: { id: 'turn-push-one', status: 'completed', items: [] } },
+    };
+    appServer.emit(completed);
+    appServer.emit(completed);
+    await vi.waitFor(() => expect(sender.deliveries).toHaveLength(1), { timeout: 3_000 });
+    expect(sender.calls).toHaveLength(2);
+    expect(sender.deliveries[0]?.payload).toEqual({
+      threadId,
+      threadName: 'Build chat',
+      status: 'completed',
+    });
+    expect(Object.keys(sender.deliveries[0]!.payload).sort()).toEqual([
+      'status',
+      'threadId',
+      'threadName',
+    ]);
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: 'turn-push-interrupted', status: 'interrupted', items: [] } },
+    });
+    await vi.waitFor(() => expect(sender.deliveries).toHaveLength(2));
+    expect(sender.deliveries[1]?.payload.status).toBe('interrupted');
+
+    sender.failures.push(Object.assign(new Error('stale subscription'), { statusCode: 410 }));
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: 'turn-push-stale', status: 'completed', items: [] } },
+    });
+    await vi.waitFor(
+      () => expect(repository.hasPushSubscription(threadId, subscription.endpoint)).toBe(false),
+      { timeout: 2_000 },
+    );
   });
 });
 

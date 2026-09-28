@@ -7,11 +7,13 @@ import type {
   SafeEvent,
   Subagent,
   Thread,
+  PushSubscriptionInput,
 } from '@codex-web/contracts';
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import type { PushNotificationPayload } from './push-notifications.js';
 
 interface SessionRow {
   id: string;
@@ -81,6 +83,25 @@ interface SubagentRow {
   started_at: string;
   last_activity_at: string;
   completed_at: string | null;
+}
+
+interface PushDeliveryRow {
+  id: string;
+  subscription_id: string;
+  endpoint: string;
+  expiration_time: number | null;
+  p256dh: string;
+  auth: string;
+  payload_json: string;
+  attempts: number;
+}
+
+export interface ClaimedPushDelivery {
+  readonly id: string;
+  readonly subscriptionId: string;
+  readonly subscription: PushSubscriptionInput;
+  readonly payload: PushNotificationPayload;
+  readonly attempt: number;
 }
 
 export interface StoredResourceLimits {
@@ -357,6 +378,48 @@ export class SqliteRepository {
         metadata_json TEXT NOT NULL,
         created_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id TEXT PRIMARY KEY,
+        endpoint TEXT NOT NULL UNIQUE,
+        expiration_time INTEGER,
+        p256dh TEXT NOT NULL,
+        auth TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS thread_push_subscriptions (
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        subscription_id TEXT NOT NULL REFERENCES push_subscriptions(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY(thread_id, subscription_id)
+      );
+      CREATE INDEX IF NOT EXISTS thread_push_subscription_idx
+        ON thread_push_subscriptions(subscription_id, thread_id);
+
+      CREATE TABLE IF NOT EXISTS push_deliveries (
+        id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        turn_id TEXT NOT NULL,
+        subscription_id TEXT NOT NULL REFERENCES push_subscriptions(id) ON DELETE CASCADE,
+        payload_json TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts BETWEEN 0 AND 5),
+        next_attempt_at INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(thread_id, turn_id, subscription_id)
+      );
+      CREATE INDEX IF NOT EXISTS push_deliveries_due_idx
+        ON push_deliveries(next_attempt_at, attempts);
+
+      CREATE TABLE IF NOT EXISTS push_delivery_receipts (
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        turn_id TEXT NOT NULL,
+        subscription_id TEXT NOT NULL REFERENCES push_subscriptions(id) ON DELETE CASCADE,
+        delivered_at TEXT NOT NULL,
+        PRIMARY KEY(thread_id, turn_id, subscription_id)
+      );
     `);
     this.migrateApprovalResolvingState();
     this.migrateIdempotencyState();
@@ -429,6 +492,209 @@ export class SqliteRepository {
 
   close(): void {
     this.database.close();
+  }
+
+  private pushSubscriptionId(endpoint: string): string {
+    return createHash('sha256').update(endpoint).digest('hex');
+  }
+
+  hasPushSubscription(threadId: string, endpoint: string): boolean {
+    const subscriptionId = this.pushSubscriptionId(endpoint);
+    return (
+      this.database
+        .prepare('SELECT 1 FROM thread_push_subscriptions WHERE thread_id=? AND subscription_id=?')
+        .get(threadId, subscriptionId) !== undefined
+    );
+  }
+
+  upsertPushSubscription(threadId: string, subscription: PushSubscriptionInput): string {
+    const id = this.pushSubscriptionId(subscription.endpoint);
+    const now = new Date().toISOString();
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      this.database
+        .prepare(
+          `INSERT INTO push_subscriptions(id,endpoint,expiration_time,p256dh,auth,created_at,updated_at)
+           VALUES(?,?,?,?,?,?,?)
+           ON CONFLICT(id) DO UPDATE SET endpoint=excluded.endpoint,
+             expiration_time=excluded.expiration_time,p256dh=excluded.p256dh,auth=excluded.auth,
+             updated_at=excluded.updated_at`,
+        )
+        .run(
+          id,
+          subscription.endpoint,
+          subscription.expirationTime,
+          subscription.keys.p256dh,
+          subscription.keys.auth,
+          now,
+          now,
+        );
+      this.database
+        .prepare(
+          `INSERT INTO thread_push_subscriptions(thread_id,subscription_id,created_at)
+           VALUES(?,?,?) ON CONFLICT(thread_id,subscription_id) DO NOTHING`,
+        )
+        .run(threadId, id, now);
+      this.database.exec('COMMIT');
+      return id;
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  removeThreadPushSubscription(threadId: string, endpoint: string): string {
+    const id = this.pushSubscriptionId(endpoint);
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      this.database
+        .prepare('DELETE FROM thread_push_subscriptions WHERE thread_id=? AND subscription_id=?')
+        .run(threadId, id);
+      this.database
+        .prepare('DELETE FROM push_deliveries WHERE thread_id=? AND subscription_id=?')
+        .run(threadId, id);
+      this.database
+        .prepare(
+          `DELETE FROM push_subscriptions WHERE id=?
+           AND NOT EXISTS (SELECT 1 FROM thread_push_subscriptions WHERE subscription_id=?)`,
+        )
+        .run(id, id);
+      this.database.exec('COMMIT');
+      return id;
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  enqueuePushDeliveries(
+    threadId: string,
+    turnId: string,
+    payload: PushNotificationPayload,
+  ): number {
+    const now = new Date().toISOString();
+    return Number(
+      this.database
+        .prepare(
+          `INSERT OR IGNORE INTO push_deliveries(
+           id,thread_id,turn_id,subscription_id,payload_json,attempts,next_attempt_at,created_at,updated_at
+         )
+         SELECT lower(hex(randomblob(16))),?,?,mapping.subscription_id,?,0,?,?,?
+         FROM thread_push_subscriptions mapping
+         WHERE mapping.thread_id=? AND NOT EXISTS (
+           SELECT 1 FROM push_delivery_receipts receipt
+           WHERE receipt.thread_id=mapping.thread_id AND receipt.turn_id=?
+             AND receipt.subscription_id=mapping.subscription_id
+         )`,
+        )
+        .run(threadId, turnId, JSON.stringify(payload), Date.now(), now, now, threadId, turnId)
+        .changes,
+    );
+  }
+
+  claimDuePushDeliveries(limit: number): ClaimedPushDelivery[] {
+    const now = Date.now();
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const rows = this.database
+        .prepare(
+          `SELECT d.id,d.subscription_id,s.endpoint,s.expiration_time,s.p256dh,s.auth,
+                  d.payload_json,d.attempts
+           FROM push_deliveries d JOIN push_subscriptions s ON s.id=d.subscription_id
+           WHERE d.attempts < 5 AND d.next_attempt_at <= ?
+           ORDER BY d.next_attempt_at,d.created_at LIMIT ?`,
+        )
+        .all(now, limit) as unknown as PushDeliveryRow[];
+      const updatedAt = new Date().toISOString();
+      for (const row of rows) {
+        const attempt = row.attempts + 1;
+        const backoffMs = Math.min(60_000, 1_000 * 2 ** (attempt - 1));
+        this.database
+          .prepare(
+            'UPDATE push_deliveries SET attempts=?,next_attempt_at=?,updated_at=? WHERE id=?',
+          )
+          .run(attempt, now + backoffMs, updatedAt, row.id);
+      }
+      this.database.exec('COMMIT');
+      return rows.map((row) => ({
+        id: row.id,
+        subscriptionId: row.subscription_id,
+        subscription: {
+          endpoint: row.endpoint,
+          expirationTime: row.expiration_time,
+          keys: { p256dh: row.p256dh, auth: row.auth },
+        },
+        payload: JSON.parse(row.payload_json) as PushNotificationPayload,
+        attempt: row.attempts + 1,
+      }));
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  completePushDelivery(id: string): void {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      this.database
+        .prepare(
+          `INSERT OR IGNORE INTO push_delivery_receipts(thread_id,turn_id,subscription_id,delivered_at)
+           SELECT thread_id,turn_id,subscription_id,? FROM push_deliveries WHERE id=?`,
+        )
+        .run(new Date().toISOString(), id);
+      this.database
+        .prepare(
+          `DELETE FROM push_delivery_receipts WHERE rowid IN (
+             SELECT rowid FROM push_delivery_receipts
+             WHERE thread_id=(SELECT thread_id FROM push_deliveries WHERE id=?)
+             ORDER BY delivered_at DESC,rowid DESC LIMIT -1 OFFSET 1000
+           )`,
+        )
+        .run(id);
+      this.database.prepare('DELETE FROM push_deliveries WHERE id=?').run(id);
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  failPushDelivery(id: string): void {
+    this.database.prepare('DELETE FROM push_deliveries WHERE id=? AND attempts>=5').run(id);
+    this.database
+      .prepare('UPDATE push_deliveries SET updated_at=? WHERE id=? AND attempts<5')
+      .run(new Date().toISOString(), id);
+  }
+
+  isPushDeliveryActive(id: string): boolean {
+    return (
+      this.database
+        .prepare(
+          `SELECT 1 FROM push_deliveries delivery
+           JOIN thread_push_subscriptions mapping
+             ON mapping.thread_id=delivery.thread_id
+            AND mapping.subscription_id=delivery.subscription_id
+           WHERE delivery.id=?`,
+        )
+        .get(id) !== undefined
+    );
+  }
+
+  purgeExhaustedPushDeliveries(): number {
+    return Number(
+      this.database.prepare('DELETE FROM push_deliveries WHERE attempts>=5').run().changes,
+    );
+  }
+
+  removePushSubscriptionGlobally(subscriptionId: string): void {
+    this.database.prepare('DELETE FROM push_subscriptions WHERE id=?').run(subscriptionId);
+  }
+
+  nextPushDeliveryDelayMs(): number | null {
+    const row = this.database
+      .prepare('SELECT MIN(next_attempt_at) AS due FROM push_deliveries WHERE attempts < 5')
+      .get() as { due: number | null };
+    return row.due === null ? null : Math.max(0, Math.min(60_000, row.due - Date.now()));
   }
 
   createSession(tokenHash: string, csrfHash: string, expiresAt: string): string {
