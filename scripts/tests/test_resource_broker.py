@@ -33,6 +33,13 @@ class FakeSystemctl:
         self.commands.append(arguments)
         action = arguments[1]
         if action == "show":
+            if "--property=ControlGroup" in arguments:
+                return subprocess.CompletedProcess(
+                    arguments,
+                    0,
+                    "/codex.slice/codex-web.slice/codex-web-ui.slice/codex-web-ui-workload.slice\n",
+                    "",
+                )
             output = (
                 f"CPUQuotaPerSecUSec={'infinity' if self.cpu is None else self.cpu * 10_000}\n"
                 f"MemoryMax={'infinity' if self.memory is None else self.memory}\n"
@@ -67,8 +74,11 @@ class ResourceBrokerTest(unittest.TestCase):
         (self.proc / "self").mkdir(parents=True)
         (self.proc / "sys/kernel").mkdir(parents=True)
         (self.cgroup / "system.slice/broker.service").mkdir(parents=True)
-        (self.cgroup / "codex-web-ui-workload.slice").mkdir(parents=True)
-        (self.cgroup / "codex-web-ui-workload.slice/cpuset.cpus.effective").write_text(
+        workload = self.cgroup / (
+            "codex.slice/codex-web.slice/codex-web-ui.slice/codex-web-ui-workload.slice"
+        )
+        workload.mkdir(parents=True)
+        (workload / "cpuset.cpus.effective").write_text(
             "0-7\n", encoding="ascii"
         )
         (self.proc / "self/cgroup").write_text("0::/system.slice/broker.service\n", encoding="ascii")

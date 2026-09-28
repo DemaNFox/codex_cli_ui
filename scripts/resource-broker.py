@@ -139,8 +139,14 @@ def _self_cgroup(proc_root: Path, cgroup_root: Path) -> Path:
     return candidate
 
 
-def _capacity_ancestors(proc_root: Path, cgroup_root: Path) -> tuple[Path, list[Path]]:
-    target = cgroup_root / TARGET_SLICE
+def _capacity_ancestors(
+    proc_root: Path, cgroup_root: Path, target: Path | None = None
+) -> tuple[Path, list[Path]]:
+    target = target or cgroup_root / TARGET_SLICE
+    try:
+        target.relative_to(cgroup_root)
+    except ValueError as error:
+        raise BrokerError("CAPACITY_UNAVAILABLE", "workload cgroup escapes its root") from error
     if not target.is_dir():
         raise BrokerError("CAPACITY_UNAVAILABLE", "workload slice cgroup is unavailable")
     # Exclude the target leaf: its current policy is not host capacity.
@@ -172,8 +178,12 @@ def _cpu_set_size(value: str) -> int:
     return len(cpus)
 
 
-def detect_capacity(proc_root: Path = PROC_ROOT, cgroup_root: Path = CGROUP_ROOT) -> Capacity:
-    target, ancestors = _capacity_ancestors(proc_root, cgroup_root)
+def detect_capacity(
+    proc_root: Path = PROC_ROOT,
+    cgroup_root: Path = CGROUP_ROOT,
+    target_cgroup: Path | None = None,
+) -> Capacity:
+    target, ancestors = _capacity_ancestors(proc_root, cgroup_root, target_cgroup)
     try:
         cpu_count = _cpu_set_size((target / "cpuset.cpus.effective").read_text(encoding="ascii"))
     except FileNotFoundError:
@@ -312,6 +322,19 @@ class ResourceBroker:
             raise BrokerError("SYSTEMD_OPERATION_FAILED", "systemd rejected the resource operation")
         return result.stdout
 
+    def _target_cgroup(self) -> Path:
+        control_group = self._command(
+            "show", TARGET_SLICE, "--property=ControlGroup", "--value"
+        ).strip()
+        if not control_group.startswith("/") or ".." in Path(control_group).parts:
+            raise BrokerError("CAPACITY_UNAVAILABLE", "workload control group is invalid")
+        target = self.cgroup_root / control_group.lstrip("/")
+        try:
+            target.relative_to(self.cgroup_root)
+        except ValueError as error:
+            raise BrokerError("CAPACITY_UNAVAILABLE", "workload cgroup escapes its root") from error
+        return target
+
     def current(self) -> Current:
         output = self._command(
             "show",
@@ -341,7 +364,7 @@ class ResourceBroker:
         return value
 
     def snapshot(self) -> dict[str, Any]:
-        capacity = detect_capacity(self.proc_root, self.cgroup_root)
+        capacity = detect_capacity(self.proc_root, self.cgroup_root, self._target_cgroup())
         policy = self._load_policy()
         current = self.current()
         generation = 0 if policy is None else int(policy.get("generation", 0))
@@ -501,7 +524,7 @@ class ResourceBroker:
             if old_policy.get("mode") != mode or previous_requested != expected_requested:
                 raise BrokerError("IDEMPOTENCY_CONFLICT", "requestId was used for another policy")
             return self.snapshot()
-        capacity = detect_capacity(self.proc_root, self.cgroup_root)
+        capacity = detect_capacity(self.proc_root, self.cgroup_root, self._target_cgroup())
         current = self.current()
         effective = self._effective(mode, requested, capacity)
         self._validate_current(effective, current)
