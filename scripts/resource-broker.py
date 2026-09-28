@@ -79,7 +79,7 @@ class Capacity:
             "memoryBytes": self.memory_max_bytes,
             "memoryAvailableBytes": self.memory_available_bytes,
             "tasks": self.tasks_max,
-            "measuredAt": datetime.now(timezone.utc).isoformat(),
+            "measuredAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
 
 
@@ -537,7 +537,7 @@ class ResourceBroker:
             "effective": effective.json(),
             "capacityAtApply": capacity.json(),
             "requestId": request_id,
-            "updatedAt": datetime.now(timezone.utc).isoformat(),
+            "updatedAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
         }
         policy_bytes = (json.dumps(policy, separators=(",", ":"), sort_keys=True) + "\n").encode()
         previous_policy = self.policy_path.read_bytes() if self.policy_path.exists() else None

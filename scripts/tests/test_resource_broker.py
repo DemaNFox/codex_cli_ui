@@ -123,6 +123,7 @@ class ResourceBrokerTest(unittest.TestCase):
         self.assertEqual(snapshot["policy"]["mode"], "auto")
         self.assertIsNone(snapshot["policy"]["memoryMaxBytes"])
         self.assertEqual(snapshot["capacity"]["memoryAvailableBytes"], 12 * BROKER.ONE_GIB)
+        self.assertTrue(snapshot["capacity"]["measuredAt"].endswith("Z"))
         self.assertTrue(self.policy.is_file())
         self.assertIn("CPUQuota=700%", self.drop_in.read_text(encoding="ascii"))
 
