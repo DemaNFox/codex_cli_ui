@@ -296,7 +296,18 @@ cleanup_resource_snapshot() {
   trap - EXIT INT TERM
   remove_activation_backup "$resource_rollback_dir" || \
     printf 'Incomplete resource snapshot could not be removed: %s\n' "$resource_rollback_dir" >&2
-  if [[ $mode == upgrade ]]; then clear_pre_activation_drain "$status"; fi
+  if [[ $mode == upgrade ]]; then
+    clear_pre_activation_drain "$status"
+  else
+    case "$release_dir" in
+      /opt/codex-web-ui/releases/*)
+        if [[ -e $release_dir ]] && ! rm -rf --one-file-system -- "$release_dir"; then
+          printf 'Pre-activation cleanup retained incomplete release: %s\n' "$release_dir" >&2
+        fi
+        ;;
+      *) printf 'Refusing unsafe incomplete release cleanup: %s\n' "$release_dir" >&2 ;;
+    esac
+  fi
   exit "$status"
 }
 resource_rollback_dir=$(mktemp -d /var/lib/codex-web-ui/.activation-rollback.XXXXXX)

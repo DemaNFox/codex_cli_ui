@@ -271,6 +271,10 @@ class InfraStaticTest(unittest.TestCase):
                 provisional_handler_start:snapshot_dir
             ]
             self.assertIn('remove_activation_backup "$resource_rollback_dir"', provisional_handler)
+            if script == installer:
+                self.assertIn('case "$release_dir" in', provisional_handler)
+                self.assertIn('/opt/codex-web-ui/releases/*)', provisional_handler)
+                self.assertIn('rm -rf --one-file-system -- "$release_dir"', provisional_handler)
             rollback = script.index("if ! restore_resource_boundary; then")
             restart = script.index("systemctl restart", rollback)
             self.assertLess(rollback, restart)
