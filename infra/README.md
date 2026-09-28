@@ -193,6 +193,10 @@ alternative installation path:
    `CODEX_WEB_TRANSCRIPTION_MODEL=gpt-transcribe`. The key is used only by the
    Web API for bounded ephemeral transcription and is not shared with the browser
    or the isolated Codex runner. Leave the key empty to disable the feature.
+   The supported installer also runs `setup-push.mjs` once to add a VAPID keypair
+   and HTTPS subject to this file. It preserves existing keys on upgrades so active
+   browser subscriptions remain valid and never prints either key. Removing or
+   rotating the pair invalidates existing device subscriptions.
 4. Install the bounded storage boundary described above before exposing the
    service. Do not remove its timestamped source backups until health and
    remount recovery have been verified.

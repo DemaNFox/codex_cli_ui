@@ -4,6 +4,7 @@ import {
   createProjectRequestSchema,
   attachmentSchema,
   capabilitySchema,
+  pushSubscriptionSchema,
   resolvePermissionRequestSchema,
   resolveUserInputRequestSchema,
   resourceLimitPolicySchema,
@@ -141,6 +142,26 @@ describe('contracts', () => {
     ).toBe(false);
   });
 
+  it('accepts only bounded Web Push subscription material', () => {
+    expect(
+      pushSubscriptionSchema.safeParse({
+        endpoint: 'https://push.example.test/send/device-token',
+        expirationTime: null,
+        keys: {
+          p256dh: 'A'.repeat(87),
+          auth: 'B'.repeat(22),
+        },
+      }).success,
+    ).toBe(true);
+    expect(
+      pushSubscriptionSchema.safeParse({
+        endpoint: 'javascript:alert(1)',
+        expirationTime: null,
+        keys: { p256dh: 'short', auth: 'short' },
+      }).success,
+    ).toBe(false);
+  });
+
   it('accepts only bounded safe account status aggregates', () => {
     const parsed = capabilitySchema.parse({
       codexVersion: 'codex-cli 0.153.4',
@@ -175,6 +196,10 @@ describe('contracts', () => {
         maxBytes: 10 * 1_024 * 1_024,
         maxDurationSeconds: 120,
       },
+      notifications: {
+        available: true,
+        vapidPublicKey: 'A'.repeat(87),
+      },
       warnings: [],
     });
     expect(parsed.rateLimits?.[0]).not.toHaveProperty('accountId');
@@ -184,6 +209,10 @@ describe('contracts', () => {
       model: 'gpt-transcribe',
       maxBytes: 10 * 1_024 * 1_024,
       maxDurationSeconds: 120,
+    });
+    expect(parsed.notifications).toEqual({
+      available: true,
+      vapidPublicKey: 'A'.repeat(87),
     });
     expect(capabilitySchema.safeParse({ ...parsed, transcription: undefined }).success).toBe(true);
     expect(

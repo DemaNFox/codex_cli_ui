@@ -304,6 +304,26 @@ export const resolveApprovalRequestSchema = z.object({
   decision: z.enum(['accept', 'acceptForSession', 'decline', 'cancel']),
 });
 
+const pushKeySchema = z
+  .string()
+  .regex(/^[A-Za-z0-9_-]+$/)
+  .min(16)
+  .max(512);
+
+export const pushSubscriptionSchema = z.object({
+  endpoint: z.string().url().startsWith('https://').max(2_048),
+  expirationTime: z.number().int().nonnegative().nullable(),
+  keys: z.object({
+    p256dh: pushKeySchema,
+    auth: pushKeySchema,
+  }),
+});
+export type PushSubscriptionInput = z.infer<typeof pushSubscriptionSchema>;
+
+export const pushSubscriptionStatusRequestSchema = z.object({
+  endpoint: z.string().url().startsWith('https://').max(2_048),
+});
+
 export const rateLimitWindowSchema = z.object({
   usedPercent: z.number().int().min(0).max(100),
   windowDurationMins: z.number().int().positive().nullable(),
@@ -351,6 +371,17 @@ export const capabilitySchema = z.object({
       model: z.string().min(1).max(120),
       maxBytes: z.number().int().positive(),
       maxDurationSeconds: z.number().int().positive(),
+    })
+    .optional(),
+  notifications: z
+    .object({
+      available: z.boolean(),
+      vapidPublicKey: z
+        .string()
+        .regex(/^[A-Za-z0-9_-]+$/)
+        .min(32)
+        .max(512)
+        .nullable(),
     })
     .optional(),
   warnings: z.array(z.string()),

@@ -135,7 +135,7 @@ test('rejects weak passwords, malformed usernames, symlinks, and permissive file
 
 function runHashValidator(value) {
   const validator = fs.readFileSync(path.join(ROOT, 'scripts/validate-config.sh'), 'utf8');
-  const python = validator.split("<<'PY'\n", 2)[1].replace(/\nPY\s*$/, '\n');
+  const python = validator.split(/<<'PY'\r?\n/, 2)[1].replace(/\r?\nPY\s*$/, '\n');
   return spawnSync('python', ['-c', python, '--check-admin-hash', value], {
     encoding: 'utf8',
   });

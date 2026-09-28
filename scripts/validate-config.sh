@@ -132,6 +132,22 @@ validate_admin_hash(values["CODEX_WEB_ADMIN_PASSWORD_HASH"])
 if not re.fullmatch(r"[A-Za-z0-9_-]{43,256}", values["CODEX_WEB_SESSION_SECRET"]):
     fail("session secret must be 43-256 base64url characters")
 
+push_names = (
+    "CODEX_WEB_VAPID_PUBLIC_KEY",
+    "CODEX_WEB_VAPID_PRIVATE_KEY",
+    "CODEX_WEB_VAPID_SUBJECT",
+)
+push_values = [values.get(name, "") for name in push_names]
+if any(push_values) and not all(push_values):
+    fail("VAPID settings must be either complete or empty")
+if all(push_values):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{80,120}", push_values[0]):
+        fail("invalid VAPID public key")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,80}", push_values[1]):
+        fail("invalid VAPID private key")
+    if not re.fullmatch(r"(?:mailto:.+@.+|https://[^\s]+)", push_values[2]):
+        fail("invalid VAPID subject")
+
 for name in ("CODEX_WEB_DATABASE_PATH", "CODEX_WEB_ATTACHMENT_STORAGE_PATH", "CODEX_WEB_APP_SERVER_SOCKET"):
     if not pathlib.Path(values[name]).is_absolute():
         fail(f"{name} must be absolute")

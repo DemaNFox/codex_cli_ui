@@ -32,7 +32,14 @@ import path from 'node:path';
 const root = process.env.SERVER_ROOT;
 if (!root) throw new Error('SERVER_ROOT is required');
 const require = createRequire(path.join(root, 'package.json'));
-for (const dependency of ['@codex-web/contracts', '@fastify/cookie', 'argon2', 'fastify', 'zod']) {
+for (const dependency of [
+  '@codex-web/contracts',
+  '@fastify/cookie',
+  'argon2',
+  'fastify',
+  'web-push',
+  'zod',
+]) {
   require(dependency);
 }
 JS
