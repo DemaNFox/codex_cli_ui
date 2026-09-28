@@ -83,6 +83,7 @@ if [[ -e $config ]]; then
 fi
 copy_release "$source_dir" "$release_dir"
 atomic_symlink "$release_dir" /opt/codex-web-ui/current
+atomic_symlink "$release_dir/apps/web/dist" /opt/codex-web-ui/web-current
 
 install -m 0644 "$REPO_ROOT/infra/systemd/codex-web-ui@.service" /etc/systemd/system/codex-web-ui@.service
 install -m 0644 "$REPO_ROOT/infra/systemd/codex-web-ui-storage-guard@.service" /etc/systemd/system/codex-web-ui-storage-guard@.service

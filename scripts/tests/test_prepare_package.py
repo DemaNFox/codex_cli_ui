@@ -48,6 +48,8 @@ class PreparePackageTest(unittest.TestCase):
         files = {
             "install.sh": "#!/usr/bin/env bash\n",
             "scripts/install-package.sh": "#!/usr/bin/env bash\n",
+            "scripts/update-web-ubuntu.sh": "#!/usr/bin/env bash\n",
+            "scripts/rollback-web-ubuntu.sh": "#!/usr/bin/env bash\n",
             "scripts/graceful-drain.sh": "#!/usr/bin/env bash\n",
             "scripts/resource-broker.py": "#!/usr/bin/env python3\n",
             "scripts/bootstrap-ubuntu.sh": "#!/usr/bin/env bash\n",
@@ -85,6 +87,7 @@ class PreparePackageTest(unittest.TestCase):
             "name": "codex-web-ui",
             "version": "0.1.0",
             "gitRevision": "a" * 40,
+            "apiCompatibility": 1,
             "target": {"platform": "linux", "architecture": arch},
             "runtime": {
                 "node": {"major": 22, "range": ">=22 <23"},
@@ -160,6 +163,20 @@ class PreparePackageTest(unittest.TestCase):
         result = self._verify()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("manifest and toolchain pins differ", result.stderr)
+
+    def test_unknown_api_compatibility_is_rejected(self) -> None:
+        manifest_path = self.root / "release.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["apiCompatibility"] = 2
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        self._write_checksums()
+        result = self._verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unsupported release or config schema version", result.stderr)
 
     def test_forbidden_runtime_file_is_rejected_even_if_inventoried(self) -> None:
         (self.root / ".env").write_text("SECRET=value\n", encoding="utf-8")

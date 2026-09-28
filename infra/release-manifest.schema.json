@@ -9,6 +9,7 @@
     "name",
     "version",
     "gitRevision",
+    "apiCompatibility",
     "target",
     "runtime",
     "configSchemaVersion",
@@ -19,6 +20,7 @@
     "name": { "const": "codex-web-ui" },
     "version": { "type": "string", "minLength": 1, "maxLength": 128 },
     "gitRevision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "apiCompatibility": { "const": 1 },
     "target": {
       "type": "object",
       "additionalProperties": false,

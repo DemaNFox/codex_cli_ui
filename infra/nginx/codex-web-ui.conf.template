@@ -83,7 +83,7 @@ server {
     }
 
     location / {
-        root /opt/codex-web-ui/current/apps/web/dist;
+        root /opt/codex-web-ui/web-current;
         try_files $uri $uri/ /index.html;
     }
 }

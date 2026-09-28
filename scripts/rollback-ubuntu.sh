@@ -44,6 +44,14 @@ printf '%s\n' "$current" >/var/lib/codex-web-ui/previous-release
 chown root:"$service_group" /var/lib/codex-web-ui/previous-release
 chmod 0640 /var/lib/codex-web-ui/previous-release
 atomic_symlink "$target" /opt/codex-web-ui/current
+current_web=$(readlink -f /opt/codex-web-ui/web-current 2>/dev/null || true)
+if [[ -n $current_web ]]; then
+  case "$current_web" in /opt/codex-web-ui/releases/*/apps/web/dist) ;; *) die 'current web release escapes release directory' ;; esac
+  printf '%s\n' "$current_web" >/var/lib/codex-web-ui/previous-web-release
+  chown root:root /var/lib/codex-web-ui/previous-web-release
+  chmod 0600 /var/lib/codex-web-ui/previous-web-release
+fi
+atomic_symlink "$target/apps/web/dist" /opt/codex-web-ui/web-current
 systemctl restart "codex-web-ui@${service_user}.service"
 "$SCRIPT_DIR/health-check.sh" --timeout "$health_timeout" --service-user "$service_user" || \
   die 'rollback target failed health check; inspect the service before another transition'

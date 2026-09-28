@@ -88,13 +88,13 @@ class InfraStaticTest(unittest.TestCase):
             "Content-Security-Policy",
             "img-src 'self' data: blob:;",
             "X-Content-Type-Options",
-            "root /opt/codex-web-ui/current/apps/web/dist;",
+            "root /opt/codex-web-ui/web-current;",
             "try_files $uri $uri/ /index.html;",
         ):
             self.assertIn(expected, nginx)
         self.assertEqual(nginx.count("proxy_pass http://codex_web_backend;"), 3)
         static_route = nginx.split("location / {", 1)[1].split("}", 1)[0]
-        self.assertIn("root /opt/codex-web-ui/current/apps/web/dist;", static_route)
+        self.assertIn("root /opt/codex-web-ui/web-current;", static_route)
         self.assertIn("try_files $uri $uri/ /index.html;", static_route)
         self.assertNotIn("proxy_pass", static_route)
 
@@ -399,6 +399,7 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("release source contains forbidden sensitive/runtime file", common)
         self.assertIn('apps/web/dist/index.html', common)
         self.assertIn("atomic_symlink", install_script)
+        self.assertIn("/opt/codex-web-ui/web-current", install_script)
         self.assertIn('chown root:root "$config"', install_script)
         self.assertIn('chmod 0600 "$config"', install_script)
         self.assertIn('/usr/local/libexec', install_script)
@@ -406,14 +407,40 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("--check-releases --additional-releases 1", install_script)
         self.assertIn("--check-releases --additional-releases 1", update_script)
         self.assertIn("previous-release", update_script)
+        self.assertIn("previous-web-release", update_script)
+        self.assertIn("/opt/codex-web-ui/web-current", update_script)
         self.assertIn("restoring", update_script)
         self.assertIn("/opt/codex-web-ui/releases/*", rollback_script)
+        self.assertIn("/opt/codex-web-ui/web-current", rollback_script)
         self.assertNotIn("rm -rf", install_script + update_script + rollback_script)
         self.assertIn('@codex-web/server', release_script)
         self.assertIn('--config.inject-workspace-packages=true deploy --prod', release_script)
         self.assertIn("'@codex-web/contracts', '@fastify/cookie', 'argon2', 'fastify', 'zod'", release_script)
         self.assertNotIn('deploy --prod --legacy', release_script)
         self.assertIn('SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"', health_script)
+
+    def test_web_only_update_is_atomic_compatible_and_never_restarts_codex(self) -> None:
+        updater = (ROOT / "scripts/update-web-ubuntu.sh").read_text(encoding="utf-8")
+        rollback = (ROOT / "scripts/rollback-web-ubuntu.sh").read_text(encoding="utf-8")
+        installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        manifest = (ROOT / "infra/release-manifest.schema.json").read_text(encoding="utf-8")
+
+        for expected in (
+            '"apiCompatibility"',
+            'web/API compatibility mismatch',
+            'prepare-package.sh" --verify',
+            '--check-releases --additional-releases 1',
+            'copy_release "$source_dir" "$release_dir"',
+            'atomic_symlink "$release_dir/apps/web/dist" /opt/codex-web-ui/web-current',
+            "web-only update changed the backend release",
+            "previous-web-release",
+        ):
+            self.assertIn(expected, updater if expected != '"apiCompatibility"' else manifest)
+        self.assertNotIn("graceful-drain", updater)
+        self.assertNotIn("systemctl", updater)
+        self.assertIn("Backend was not restarted", rollback)
+        self.assertNotIn("systemctl", rollback)
+        self.assertIn("/opt/codex-web-ui/web-current", installer)
 
     def test_runner_helper_requires_owned_pinned_codex_identity(self) -> None:
         helper = (ROOT / "scripts/run-app-server.sh").read_text(encoding="utf-8")

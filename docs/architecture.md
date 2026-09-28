@@ -148,3 +148,16 @@ This drain prevents planned upgrades from destroying work; it is not crash recov
 runner process failure can still terminate an in-flight Codex turn because the private app-server process is
 bound to that connection. Preserving computation across such a crash would require a durable broker outside
 the API lifecycle.
+
+## Independent Web UI releases
+
+Nginx serves static assets through the root-owned atomic `web-current` symlink, while the API and app-server
+continue to execute from `current`. A web-only update verifies the complete package inventory using the
+already-installed verifier, requires the package and active backend manifests to share the same integer
+`apiCompatibility`, copies the immutable package into the existing bounded release store, then switches only
+`web-current`. It does not request a drain, reload systemd, restart the API or reconnect app-server.
+
+Full updates remain authoritative for backend and UI together: they drain active root turns and subagents,
+switch both pointers and restart the service. Any API compatibility change, server/config/systemd change or
+package lacking compatibility metadata must use that full path. Both update modes record independent previous
+targets, so a static rollback cannot roll back the backend and a full rollback restores both components.

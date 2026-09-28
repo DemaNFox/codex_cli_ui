@@ -99,3 +99,17 @@ through each registered project path.
 `SHA256SUMS` detects corruption and incomplete package trees; it is not a
 publisher signature. Trust comes from cloning the intended GitHub repository
 and reviewing/pinning the Git revision before invoking `sudo`.
+
+After one full drained upgrade installs the split static pointer, frontend-only releases can be activated
+without restarting the API or Codex app-server:
+
+```bash
+sudo /opt/codex-web-ui/current/scripts/update-web-ubuntu.sh \
+  --source /absolute/path/to/verified/package \
+  --release-id 20260928-web-a1b2c3d
+```
+
+The command verifies the checksummed package with the currently installed verifier, rejects a mismatched
+`apiCompatibility`, copies an immutable release into the bounded release store, and atomically switches only
+`web-current`. Use `rollback-web-ubuntu.sh` to reverse only that static switch. Backend, protocol, migration,
+systemd or resource-control changes still require the normal drained full upgrade.

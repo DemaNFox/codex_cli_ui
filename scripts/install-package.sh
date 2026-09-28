@@ -259,8 +259,12 @@ if [[ $mode == upgrade ]]; then
 fi
 copy_release "$package" "$release_dir"
 previous=$(readlink -f /opt/codex-web-ui/current 2>/dev/null || true)
+previous_web=$(readlink -f /opt/codex-web-ui/web-current 2>/dev/null || true)
 if [[ -n $previous ]]; then
   case "$previous" in /opt/codex-web-ui/releases/*) ;; *) die 'current release escapes the managed release directory' ;; esac
+  if [[ -z $previous_web ]]; then previous_web="$previous/apps/web/dist"; fi
+  case "$previous_web" in /opt/codex-web-ui/releases/*/apps/web/dist) ;; *) die 'current web release escapes the managed release directory' ;; esac
+  [[ -f $previous_web/index.html ]] || die 'current web release is incomplete'
   printf '%s\n' "$previous" >/var/lib/codex-web-ui/previous-release
   chown root:codex-web-ui /var/lib/codex-web-ui/previous-release
   chmod 0640 /var/lib/codex-web-ui/previous-release
@@ -351,11 +355,19 @@ restore_resource_boundary() {
   fi
 }
 activation_complete=false
+web_switched=false
 rollback_activation() {
   local status=$?
   trap - EXIT INT TERM
   if ! $activation_complete; then
     printf 'Activation failed; restoring the previous release.\n' >&2
+    if $web_switched; then
+      if [[ -n $previous_web ]]; then
+        atomic_symlink "$previous_web" /opt/codex-web-ui/web-current
+      else
+        rm -f -- /opt/codex-web-ui/web-current
+      fi
+    fi
     if [[ -n $previous ]]; then
       atomic_symlink "$previous" /opt/codex-web-ui/current
     else
@@ -392,6 +404,13 @@ rollback_activation() {
 }
 trap rollback_activation EXIT
 atomic_symlink "$release_dir" /opt/codex-web-ui/current
+if [[ -n $previous_web ]]; then
+  printf '%s\n' "$previous_web" >/var/lib/codex-web-ui/previous-web-release
+  chown root:root /var/lib/codex-web-ui/previous-web-release
+  chmod 0600 /var/lib/codex-web-ui/previous-web-release
+fi
+atomic_symlink "$release_dir/apps/web/dist" /opt/codex-web-ui/web-current
+web_switched=true
 
 for unit in codex-web-ui@.service codex-web-ui-app-server.socket codex-web-ui-app-server@.service codex-web-ui-resource-broker.socket codex-web-ui-resource-broker@.service codex-web-ui-workload.slice codex-web-ui-storage-guard@.service codex-web-ui-storage-guard@.timer; do
   install -m 0644 "$package/infra/systemd/$unit" "/etc/systemd/system/$unit"

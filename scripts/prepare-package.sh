@@ -61,6 +61,8 @@ expected = os.environ.get("EXPECTED_ARCH", "")
 required = (
     "install.sh",
     "scripts/install-package.sh",
+    "scripts/update-web-ubuntu.sh",
+    "scripts/rollback-web-ubuntu.sh",
     "scripts/graceful-drain.sh",
     "scripts/resource-broker.py",
     "scripts/bootstrap-ubuntu.sh",
@@ -106,7 +108,7 @@ except (OSError, json.JSONDecodeError) as error:
     raise SystemExit(f"prepare-package: invalid release.json: {error}")
 
 top_keys = {
-    "schemaVersion", "name", "version", "gitRevision", "target", "runtime",
+    "schemaVersion", "name", "version", "gitRevision", "apiCompatibility", "target", "runtime",
     "configSchemaVersion", "checksumAlgorithm",
 }
 if not isinstance(manifest, dict) or set(manifest) != top_keys:
@@ -119,7 +121,7 @@ if manifest.get("target") != {"platform": "linux", "architecture": arch} or arch
     raise SystemExit("prepare-package: release.json has an unsupported target")
 if expected and expected != f"linux-{arch}":
     raise SystemExit(f"prepare-package: package architecture linux-{arch} does not match requested {expected}")
-if manifest.get("schemaVersion") != 1 or manifest.get("configSchemaVersion") != 1:
+if manifest.get("schemaVersion") != 1 or manifest.get("configSchemaVersion") != 1 or manifest.get("apiCompatibility") != 1:
     raise SystemExit("prepare-package: unsupported release or config schema version")
 if manifest.get("checksumAlgorithm") != "sha256":
     raise SystemExit("prepare-package: unsupported checksum algorithm")
@@ -275,6 +277,7 @@ manifest = {
     "name": "codex-web-ui",
     "version": os.environ["PACKAGE_VERSION"],
     "gitRevision": os.environ["GIT_REVISION"],
+    "apiCompatibility": 1,
     "target": {"platform": "linux", "architecture": arch},
     "runtime": {
         "node": {"major": 22, "range": ">=22 <23"},

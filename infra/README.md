@@ -62,7 +62,8 @@ activation.
 - A prepared release contains `apps/server/dist/index.js` and
   `apps/web/dist/index.html`. Nginx serves the web build directly and proxies
   only `/api/` to the loopback backend. Release directories are immutable and
-  retained under `/opt/codex-web-ui/releases`; `current` is an atomic symlink.
+  retained under `/opt/codex-web-ui/releases`; `current` selects the backend and
+  `web-current` independently selects the static build through atomic symlinks.
 - Each allowed project root and `CODEX_HOME` is an existing canonical directory.
   They cannot overlap. The generated systemd drop-in grants write access only to
   those paths and application state.

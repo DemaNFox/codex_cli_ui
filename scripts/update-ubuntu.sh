@@ -63,6 +63,10 @@ python3 "$SCRIPT_DIR/storage-guard.py" --config "$config" --check-releases --add
 copy_release "$source_dir" "$release_dir"
 previous=$(readlink -f /opt/codex-web-ui/current) || die 'current release link is missing'
 case "$previous" in /opt/codex-web-ui/releases/*) ;; *) die 'current release escapes release directory' ;; esac
+previous_web=$(readlink -f /opt/codex-web-ui/web-current 2>/dev/null || true)
+if [[ -z $previous_web ]]; then previous_web="$previous/apps/web/dist"; fi
+case "$previous_web" in /opt/codex-web-ui/releases/*/apps/web/dist) ;; *) die 'current web release escapes release directory' ;; esac
+[[ -f $previous_web/index.html ]] || die 'current web release is incomplete'
 printf '%s\n' "$previous" >/var/lib/codex-web-ui/previous-release
 chown root:"$service_group" /var/lib/codex-web-ui/previous-release
 chmod 0640 /var/lib/codex-web-ui/previous-release
@@ -78,6 +82,7 @@ resource_rollback_keys=(
   resource-policy
   resource-drop-in
   legacy-resource-drop-in
+  nginx-edge
 )
 legacy_resource_drop_in="/etc/systemd/system/codex-web-ui@${service_user}.service.d/50-resource-boundary.conf"
 legacy_resource_drop_in_dir=${legacy_resource_drop_in%/*}
@@ -93,6 +98,7 @@ resource_rollback_paths=(
   /etc/codex-web-ui/resource-limits.json
   /etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf
   "$legacy_resource_drop_in"
+  /etc/nginx/sites-available/codex-web-ui.conf
 )
 resource_rollback_dir=
 cleanup_resource_snapshot() {
@@ -139,6 +145,11 @@ restore_resource_boundary() {
     rmdir -- "$legacy_resource_drop_in_dir" || return 1
   fi
   systemctl daemon-reload || return 1
+  if [[ -f /etc/nginx/sites-available/codex-web-ui.conf ]]; then
+    require_command nginx
+    nginx -t || return 1
+    systemctl reload nginx || return 1
+  fi
   if $workload_slice_was_active; then systemctl start codex-web-ui-workload.slice || return 1; fi
   if $broker_socket_was_enabled; then systemctl enable codex-web-ui-resource-broker.socket || return 1; fi
   if $broker_socket_was_active; then
@@ -149,11 +160,13 @@ restore_resource_boundary() {
 }
 
 activation_complete=false
+web_switched=false
 rollback_activation() {
   local status=$?
   trap - EXIT INT TERM
   if ! $activation_complete; then
     printf 'Activation failed; restoring the previous release.\n' >&2
+    if $web_switched; then atomic_symlink "$previous_web" /opt/codex-web-ui/web-current; fi
     atomic_symlink "$previous" /opt/codex-web-ui/current
     resource_boundary_restored=true
     if ! restore_resource_boundary; then
@@ -184,6 +197,34 @@ rollback_activation() {
 }
 trap rollback_activation EXIT
 atomic_symlink "$release_dir" /opt/codex-web-ui/current
+printf '%s\n' "$previous_web" >/var/lib/codex-web-ui/previous-web-release
+chown root:root /var/lib/codex-web-ui/previous-web-release
+chmod 0600 /var/lib/codex-web-ui/previous-web-release
+atomic_symlink "$release_dir/apps/web/dist" /opt/codex-web-ui/web-current
+web_switched=true
+nginx_config=/etc/nginx/sites-available/codex-web-ui.conf
+if [[ -e $nginx_config ]]; then
+  require_command nginx
+  [[ -f $nginx_config && ! -L $nginx_config ]] || die 'Nginx configuration is not a regular file'
+  nginx_temporary=$(mktemp /etc/nginx/sites-available/codex-web-ui.conf.XXXXXX)
+  NGINX_CONFIG="$nginx_config" NGINX_TEMPORARY="$nginx_temporary" python3 - <<'PY'
+import os
+from pathlib import Path
+
+source = Path(os.environ["NGINX_CONFIG"]).read_text(encoding="utf-8")
+old = "root /opt/codex-web-ui/current/apps/web/dist;"
+new = "root /opt/codex-web-ui/web-current;"
+if new not in source:
+    if source.count(old) != 1:
+        raise SystemExit("Nginx static root is neither the supported legacy nor split path")
+    source = source.replace(old, new)
+Path(os.environ["NGINX_TEMPORARY"]).write_text(source, encoding="utf-8")
+PY
+  chmod 0644 "$nginx_temporary"
+  mv -f -- "$nginx_temporary" "$nginx_config"
+  nginx -t
+  systemctl reload nginx
+fi
 systemctl stop codex-web-ui-resource-broker.socket 'codex-web-ui-resource-broker@*.service' >/dev/null 2>&1 || true
 for unit in "${resource_units[@]}"; do
   install -m 0644 "$release_dir/infra/systemd/$unit" "/etc/systemd/system/$unit"
