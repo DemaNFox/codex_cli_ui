@@ -1029,6 +1029,117 @@ describe('App', () => {
     expect(screen.getByText('Новый терминальный снимок')).not.toBeNull();
   });
 
+  it('keeps live tree work active until the last subagent becomes terminal', async () => {
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [], subagents: [] });
+      if (url === '/api/threads/thread-1/subagents') return jsonResponse({ data: [] });
+      return undefined;
+    });
+    render(<App />);
+    expect(await screen.findByText('Готов')).not.toBeNull();
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+    const runningChild = {
+      ...subagents[0]!,
+      id: 'tree-child',
+      status: 'running' as const,
+      lastActivityAt: '2026-09-29T00:00:00.000Z',
+      completedAt: null,
+    };
+
+    act(() =>
+      FakeEventSource.instances.at(-1)?.emit({
+        id: 300,
+        threadId: 'thread-1',
+        turnId: null,
+        kind: 'subagent',
+        phase: 'state',
+        payload: {
+          subagent: runningChild,
+          threadRuntime: { status: 'active', activeTurnId: null },
+        },
+        createdAt: '2026-09-29T00:00:00.000Z',
+      }),
+    );
+    expect(await screen.findByText(/Codex работает/)).not.toBeNull();
+
+    act(() =>
+      FakeEventSource.instances.at(-1)?.emit({
+        id: 301,
+        threadId: 'thread-1',
+        turnId: 'turn-root',
+        kind: 'turn',
+        phase: 'completed',
+        payload: {
+          runtime: true,
+          status: 'completed',
+          threadRuntime: { status: 'active', activeTurnId: null },
+        },
+        createdAt: '2026-09-29T00:00:01.000Z',
+      }),
+    );
+    expect(screen.getByText(/Codex работает/)).not.toBeNull();
+
+    act(() =>
+      FakeEventSource.instances.at(-1)?.emit({
+        id: 302,
+        threadId: 'thread-1',
+        turnId: null,
+        kind: 'subagent',
+        phase: 'state',
+        payload: {
+          subagent: {
+            ...runningChild,
+            status: 'completed',
+            lastActivityAt: '2026-09-29T00:00:02.000Z',
+            completedAt: '2026-09-29T00:00:02.000Z',
+          },
+          threadRuntime: { status: 'idle', activeTurnId: null },
+        },
+        createdAt: '2026-09-29T00:00:02.000Z',
+      }),
+    );
+    expect(await screen.findByText('Готов')).not.toBeNull();
+  });
+
+  it('applies native root status changes without requiring a REST refresh', async () => {
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [], subagents: [] });
+      if (url === '/api/threads/thread-1/subagents') return jsonResponse({ data: [] });
+      return undefined;
+    });
+    render(<App />);
+    expect(await screen.findByText('Готов')).not.toBeNull();
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+
+    act(() =>
+      FakeEventSource.instances.at(-1)?.emit({
+        id: 310,
+        threadId: 'thread-1',
+        turnId: null,
+        kind: 'thread',
+        phase: 'state',
+        payload: { threadRuntime: { status: 'active', activeTurnId: null } },
+        createdAt: '2026-09-29T00:01:00.000Z',
+      }),
+    );
+    expect(await screen.findByText(/Codex работает/)).not.toBeNull();
+
+    act(() =>
+      FakeEventSource.instances.at(-1)?.emit({
+        id: 311,
+        threadId: 'thread-1',
+        turnId: null,
+        kind: 'thread',
+        phase: 'state',
+        payload: { threadRuntime: { status: 'idle', activeTurnId: null } },
+        createdAt: '2026-09-29T00:01:01.000Z',
+      }),
+    );
+    expect(await screen.findByText('Готов')).not.toBeNull();
+  });
+
   it('keeps execution history compact and removes redundant lifecycle noise', async () => {
     const events = [
       {

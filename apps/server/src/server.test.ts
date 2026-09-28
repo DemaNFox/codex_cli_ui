@@ -1,4 +1,4 @@
-import type { Attachment, SafeEvent } from '@codex-web/contracts';
+import type { Attachment, SafeEvent, Thread } from '@codex-web/contracts';
 import { hash } from 'argon2';
 import { EventEmitter } from 'node:events';
 import { mkdtemp, mkdir, rename, symlink, unlink, writeFile } from 'node:fs/promises';
@@ -45,6 +45,8 @@ class FakeAppServer implements AppServerClient {
   private listPageSize = Number.POSITIVE_INFINITY;
   private turnStartGate: Promise<void> | null = null;
   private signalTurnStart: (() => void) | null = null;
+  private threadReadGate: Promise<void> | null = null;
+  private signalThreadRead: (() => void) | null = null;
   failNextRequestWith: Error | null = null;
   failTurnStartWith: Error | null = null;
   failNextResponseWith: Error | null = null;
@@ -60,6 +62,19 @@ class FakeAppServer implements AppServerClient {
       signalEntered = resolve;
     });
     this.signalTurnStart = signalEntered;
+    return { entered, release: releaseGate };
+  }
+
+  blockThreadReads(): { entered: Promise<void>; release: () => void } {
+    let releaseGate!: () => void;
+    let signalEntered!: () => void;
+    this.threadReadGate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve;
+    });
+    this.signalThreadRead = signalEntered;
     return { entered, release: releaseGate };
   }
 
@@ -97,6 +112,25 @@ class FakeAppServer implements AppServerClient {
       turns: [],
     });
     return id;
+  }
+
+  addSubagentThread(
+    id: string,
+    cwd: string,
+    status: 'notLoaded' | 'idle' | 'active' | 'systemError',
+  ): void {
+    const now = Math.floor(Date.now() / 1_000);
+    this.threads.set(id, {
+      id,
+      name: null,
+      preview: '',
+      model: 'gpt-test',
+      status: { type: status },
+      createdAt: now,
+      updatedAt: now,
+      cwd,
+      turns: [],
+    });
   }
 
   async start(): Promise<void> {
@@ -163,7 +197,15 @@ class FakeAppServer implements AppServerClient {
         nextCursor: end < threads.length ? String(end) : null,
       };
     }
-    if (method === 'thread/read' || method === 'thread/resume') {
+    if (method === 'thread/read') {
+      this.signalThreadRead?.();
+      this.signalThreadRead = null;
+      if (this.threadReadGate) await this.threadReadGate;
+      this.threadReadGate = null;
+      const thread = this.threads.get(String(values.threadId));
+      return { thread, model: thread?.model ?? 'gpt-test', instructionSources: [] };
+    }
+    if (method === 'thread/resume') {
       const thread = this.threads.get(String(values.threadId));
       return { thread, model: thread?.model ?? 'gpt-test', instructionSources: [] };
     }
@@ -184,6 +226,7 @@ class FakeAppServer implements AppServerClient {
         this.failTurnStartWith = null;
         throw error;
       }
+      this.setThreadStatus(String(values.threadId), 'active');
       return { turn: { id: `turn-${++this.turnCounter}` } };
     }
     if (method === 'turn/steer') return { turnId: values.expectedTurnId };
@@ -1882,6 +1925,182 @@ describe('Codex routes', () => {
     });
   });
 
+  it('keeps a confirmed live turn active across stale list and thread-status snapshots', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-live', status: 'inProgress', items: [] } },
+    });
+
+    appServer.setThreadStatus(threadId, 'notLoaded');
+    const listed = await app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json<{ data: Thread[] }>().data).toEqual([
+      expect.objectContaining({ id: threadId, status: 'active', activeTurnId: 'turn-live' }),
+    ]);
+
+    appServer.emit({
+      method: 'thread/status/changed',
+      params: { threadId, status: { type: 'idle' } },
+    });
+    expect(repository.getThread(threadId)).toMatchObject({
+      status: 'active',
+      activeTurnId: 'turn-live',
+    });
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      upgradeDrain: { activeTurns: 1 },
+    });
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: 'turn-live', status: 'completed', items: [] } },
+    });
+    expect(repository.getThread(threadId)).toMatchObject({ status: 'idle', activeTurnId: null });
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      upgradeDrain: { activeTurns: 0 },
+    });
+  });
+
+  it('does not demote a native active root when its last observed child finishes', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'thread/status/changed',
+      params: { threadId, status: { type: 'active' } },
+    });
+    appServer.emit({
+      method: 'item/started',
+      params: {
+        threadId,
+        turnId: 'turn-native',
+        startedAtMs: Date.parse('2026-09-29T00:00:00.000Z'),
+        item: {
+          type: 'subAgentActivity',
+          id: 'activity-native-child',
+          agentThreadId: 'native-child',
+          agentPath: '/root/native-child',
+          kind: 'started',
+        },
+      },
+    });
+    appServer.emit({
+      method: 'item/completed',
+      params: {
+        threadId,
+        turnId: 'turn-native',
+        completedAtMs: Date.parse('2026-09-29T00:00:01.000Z'),
+        item: {
+          type: 'subAgentActivity',
+          id: 'activity-native-child',
+          agentThreadId: 'native-child',
+          agentPath: '/root/native-child',
+          kind: 'completed',
+        },
+      },
+    });
+
+    expect(repository.getThread(threadId)).toMatchObject({ status: 'active', activeTurnId: null });
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      upgradeDrain: { activeTurns: 1, activeExecutionUnits: 1 },
+    });
+    expect(
+      repository
+        .listEvents(threadId, 0)
+        .filter((event) => event.kind === 'thread')
+        .at(-1),
+    ).toMatchObject({
+      payload: { threadRuntime: { status: 'active', activeTurnId: null } },
+    });
+  });
+
+  it('does not let a stale turn completion finish a newer active turn', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-old', status: 'inProgress', items: [] } },
+    });
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-current', status: 'inProgress', items: [] } },
+    });
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: 'turn-old', status: 'completed', items: [] } },
+    });
+    expect(repository.getThread(threadId)).toMatchObject({
+      status: 'active',
+      activeTurnId: 'turn-current',
+    });
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      upgradeDrain: { activeTurns: 1 },
+    });
+    expect(repository.listEvents(threadId, 0).at(-1)).toMatchObject({
+      turnId: 'turn-old',
+      kind: 'turn',
+      phase: 'completed',
+      payload: { runtime: false },
+    });
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: 'turn-current', status: 'completed', items: [] } },
+    });
+    expect(repository.getThread(threadId)).toMatchObject({ status: 'idle', activeTurnId: null });
+  });
+
+  it('does not clear a newer turn while reconciling a failed command for the previous turn', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-old', status: 'inProgress', items: [] } },
+    });
+    appServer.setThreadStatus(threadId, 'idle');
+    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_FAILED');
+    const gate = appServer.blockThreadReads();
+
+    const steer = app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/steer`,
+      headers: session.headers,
+      payload: { text: 'continue', expectedTurnId: 'turn-old' },
+    });
+    await gate.entered;
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-current', status: 'inProgress', items: [] } },
+    });
+    gate.release();
+
+    const response = await steer;
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({
+      error: { code: 'TURN_COMMAND_OUTCOME_UNKNOWN' },
+    });
+    expect(repository.getThread(threadId)).toMatchObject({
+      status: 'active',
+      activeTurnId: 'turn-current',
+    });
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      upgradeDrain: { activeTurns: 1 },
+    });
+  });
+
   it('persists and broadcasts one sanitized steer message to two sessions', async () => {
     const { app, appServer, repository, projectPath } = await fixture();
     const firstSession = await login(app);
@@ -2270,6 +2489,153 @@ describe('Codex routes', () => {
     expect(afterCompletion.statusCode).toBe(202);
   });
 
+  it('reconciles a missed root terminal before the no-broker capacity fallback rejects', async () => {
+    const { app, appServer, projectPath } = await fixture(1);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const firstThreadId = await createThread(app, project.id, session.headers);
+    const secondThreadId = await createThread(app, project.id, session.headers);
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: `/api/threads/${firstThreadId}/turns`,
+          headers: session.headers,
+          payload: {
+            text: 'first',
+            idempotencyKey: '00000000-0000-4000-8000-000000000290',
+          },
+        })
+      ).statusCode,
+    ).toBe(202);
+
+    appServer.setThreadStatus(firstThreadId, 'idle');
+    const reconciled = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${secondThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'second',
+        idempotencyKey: '00000000-0000-4000-8000-000000000291',
+      },
+    });
+
+    expect(reconciled.statusCode).toBe(202);
+    expect(
+      appServer.requests.some(
+        (request) =>
+          request.method === 'thread/read' &&
+          (request.params as { threadId?: string }).threadId === firstThreadId,
+      ),
+    ).toBe(true);
+  });
+
+  it('counts and reconciles an unknown-id native active root before no-broker admission', async () => {
+    const { app, appServer, projectPath } = await fixture(1);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const firstThreadId = await createThread(app, project.id, session.headers);
+    const secondThreadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'thread/status/changed',
+      params: { threadId: firstThreadId, status: { type: 'active' } },
+    });
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      upgradeDrain: { activeTurns: 1, activeExecutionUnits: 1 },
+    });
+
+    appServer.setThreadStatus(firstThreadId, 'idle');
+    const admitted = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${secondThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'start after native root stopped',
+        idempotencyKey: '00000000-0000-4000-8000-000000000292',
+      },
+    });
+
+    expect(admitted.statusCode).toBe(202);
+    expect(
+      appServer.requests.some(
+        (request) =>
+          request.method === 'thread/read' &&
+          (request.params as { threadId?: string }).threadId === firstThreadId,
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps a reconfirmed native root active while an idle capacity reread is in flight', async () => {
+    const { app, appServer, repository, projectPath } = await fixture(1);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const firstThreadId = await createThread(app, project.id, session.headers);
+    const secondThreadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'thread/status/changed',
+      params: { threadId: firstThreadId, status: { type: 'active' } },
+    });
+    appServer.setThreadStatus(firstThreadId, 'idle');
+    const gate = appServer.blockThreadReads();
+    const attemptedStart = app.inject({
+      method: 'POST',
+      url: `/api/threads/${secondThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'must remain blocked',
+        idempotencyKey: '00000000-0000-4000-8000-000000000293',
+      },
+    });
+    await gate.entered;
+    appServer.emit({
+      method: 'thread/status/changed',
+      params: { threadId: firstThreadId, status: { type: 'active' } },
+    });
+    gate.release();
+
+    expect((await attemptedStart).statusCode).toBe(429);
+    expect(repository.getThread(firstThreadId)).toMatchObject({
+      status: 'active',
+      activeTurnId: null,
+    });
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      upgradeDrain: { activeTurns: 1, activeExecutionUnits: 1 },
+    });
+  });
+
+  it('does not resurrect a native root from an active reread older than a fresh idle event', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'thread/status/changed',
+      params: { threadId, status: { type: 'active' } },
+    });
+    appServer.setThreadStatus(threadId, 'active');
+    appServer.restart();
+    const gate = appServer.blockThreadReads();
+    const read = app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    await gate.entered;
+    appServer.emit({
+      method: 'thread/status/changed',
+      params: { threadId, status: { type: 'idle' } },
+    });
+    gate.release();
+
+    expect((await read).json()).toMatchObject({
+      data: { id: threadId, status: 'idle', activeTurnId: null },
+    });
+    expect(repository.getThread(threadId)).toMatchObject({ status: 'idle', activeTurnId: null });
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      upgradeDrain: { activeTurns: 0, activeExecutionUnits: 0 },
+    });
+  });
+
   it('uses the broker execution ceiling instead of the static fallback turn limit', async () => {
     const broker = new FakeResourceBroker();
     const { app, appServer, projectPath } = await fixture(
@@ -2326,6 +2692,192 @@ describe('Codex routes', () => {
     });
     expect(retried.statusCode).toBe(202);
     expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(7);
+  });
+
+  it('keeps descendant work visible and reconciles missed child terminals before rejecting capacity', async () => {
+    const broker = new FakeResourceBroker();
+    const { app, appServer, repository, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      broker,
+    );
+    const session = await login(app);
+    await new Promise((resolve) => setImmediate(resolve));
+    const project = await createProject(app, projectPath, session.headers);
+    const rootThreadId = await createThread(app, project.id, session.headers);
+    const nextThreadId = await createThread(app, project.id, session.headers);
+    const started = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${rootThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'root task',
+        idempotencyKey: '00000000-0000-4000-8000-000000000301',
+      },
+    });
+    expect(started.statusCode).toBe(202);
+
+    const baseTime = Date.parse('2026-09-29T00:00:00.000Z');
+    for (let index = 0; index < 6; index += 1) {
+      const observedAt = new Date(baseTime + index * 1_000).toISOString();
+      appServer.addSubagentThread(`child-${index}`, projectPath, 'idle');
+      repository.upsertSubagent({
+        id: `child-${index}`,
+        rootThreadId,
+        parentThreadId: rootThreadId,
+        agentPath: `/root/child-${index}`,
+        nickname: null,
+        role: null,
+        model: null,
+        reasoningEffort: null,
+        status: 'running',
+        message: null,
+        startedAt: observedAt,
+        lastActivityAt: observedAt,
+        completedAt: null,
+      });
+    }
+    repository.upsertSubagent({
+      id: rootThreadId,
+      rootThreadId,
+      parentThreadId: rootThreadId,
+      agentPath: '/root',
+      nickname: null,
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'running',
+      message: null,
+      startedAt: new Date(baseTime).toISOString(),
+      lastActivityAt: new Date(baseTime).toISOString(),
+      completedAt: null,
+    });
+    expect(repository.countActiveSubagents()).toBe(6);
+    expect(repository.listSubagents(rootThreadId)).toHaveLength(6);
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: rootThreadId, turn: { id: 'turn-1', status: 'completed', items: [] } },
+    });
+    expect(repository.getThread(rootThreadId)).toMatchObject({
+      status: 'active',
+      activeTurnId: null,
+    });
+    expect(
+      repository
+        .listEvents(rootThreadId, 0)
+        .filter((event) => event.kind === 'turn')
+        .at(-1),
+    ).toMatchObject({
+      phase: 'completed',
+      payload: {
+        runtime: true,
+        threadRuntime: { status: 'active', activeTurnId: null },
+      },
+    });
+    const retried = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${nextThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'new task after missed terminal',
+        idempotencyKey: '00000000-0000-4000-8000-000000000302',
+      },
+    });
+
+    expect(retried.statusCode).toBe(202);
+    expect(repository.countActiveSubagents()).toBe(0);
+    expect(repository.listSubagents(rootThreadId).map((subagent) => subagent.status)).toEqual([
+      'interrupted',
+      'interrupted',
+      'interrupted',
+      'interrupted',
+      'interrupted',
+      'interrupted',
+    ]);
+    expect(
+      appServer.requests.some(
+        (request) =>
+          request.method === 'thread/read' &&
+          (request.params as { threadId?: string }).threadId === 'child-0',
+      ),
+    ).toBe(true);
+  });
+
+  it('does not regress terminal subagents from older or equal-time activity', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const rootThreadId = await createThread(app, project.id, session.headers);
+    const completedAt = '2026-09-29T00:00:02.000Z';
+    repository.upsertSubagent({
+      id: 'child-terminal',
+      rootThreadId,
+      parentThreadId: rootThreadId,
+      agentPath: null,
+      nickname: null,
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'completed',
+      message: 'done',
+      startedAt: '2026-09-29T00:00:00.000Z',
+      lastActivityAt: completedAt,
+      completedAt,
+    });
+    for (const lastActivityAt of ['2026-09-29T00:00:01.000Z', completedAt]) {
+      repository.upsertSubagent({
+        id: 'child-terminal',
+        rootThreadId,
+        parentThreadId: rootThreadId,
+        agentPath: null,
+        nickname: null,
+        role: null,
+        model: null,
+        reasoningEffort: null,
+        status: 'running',
+        message: 'stale',
+        startedAt: '2026-09-29T00:00:00.000Z',
+        lastActivityAt,
+        completedAt: null,
+      });
+    }
+    expect(repository.getSubagent('child-terminal')).toMatchObject({
+      status: 'completed',
+      message: 'done',
+      lastActivityAt: completedAt,
+      completedAt,
+    });
+    const futureActivity = '2026-09-29T01:00:00.000Z';
+    repository.upsertSubagent({
+      id: 'child-clock-skew',
+      rootThreadId,
+      parentThreadId: rootThreadId,
+      agentPath: null,
+      nickname: null,
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'running',
+      message: null,
+      startedAt: futureActivity,
+      lastActivityAt: futureActivity,
+      completedAt: null,
+    });
+    expect(
+      repository.reconcileActiveSubagent(
+        'child-clock-skew',
+        'running',
+        futureActivity,
+        '2026-09-29T00:59:59.000Z',
+      ),
+    ).toBe(true);
+    expect(repository.getSubagent('child-clock-skew')).toMatchObject({
+      status: 'interrupted',
+      lastActivityAt: futureActivity,
+      completedAt: futureActivity,
+    });
   });
 
   it('atomically reserves a turn idempotency key across concurrent duplicates', async () => {

@@ -402,8 +402,10 @@ function mapThread(
   instructionSources: readonly string[] = [],
   responseModel?: string,
   existing?: Thread,
+  liveActiveTurnId?: string | null,
+  treeBusy = false,
 ): Thread {
-  const status = statusType(rpcThread.status);
+  const status = liveActiveTurnId || treeBusy ? 'active' : statusType(rpcThread.status);
   return {
     id: rpcThread.id,
     projectId,
@@ -411,7 +413,7 @@ function mapThread(
     preview: rpcThread.preview,
     model: responseModel ?? rpcThread.model ?? null,
     status,
-    activeTurnId: status === 'active' ? (existing?.activeTurnId ?? null) : null,
+    activeTurnId: status === 'active' ? (liveActiveTurnId ?? existing?.activeTurnId ?? null) : null,
     archived,
     instructionSources: [...instructionSources],
     createdAt: dateFromSeconds(rpcThread.createdAt),
@@ -474,6 +476,69 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     : undefined;
   const sseListeners = new Map<string, Set<SseListener>>();
   const activeTurns = new Set<string>();
+  const treeBusyThreads = new Set<string>();
+  const nativeActiveThreads = new Set<string>();
+  const nativeActivityVersions = new Map<string, number>();
+  let nativeActivityVersion = 0;
+  const markNativeActive = (threadId: string): void => {
+    nativeActiveThreads.add(threadId);
+    nativeActivityVersions.set(threadId, ++nativeActivityVersion);
+  };
+  const clearNativeActive = (threadId: string): void => {
+    nativeActiveThreads.delete(threadId);
+    nativeActivityVersions.set(threadId, ++nativeActivityVersion);
+  };
+  const activeTurnIdForThread = (threadId: string): string | null => {
+    const prefix = `${threadId}:`;
+    for (const activeTurn of activeTurns) {
+      if (activeTurn.startsWith(prefix)) return activeTurn.slice(prefix.length);
+    }
+    return null;
+  };
+  const setActiveTurn = (threadId: string, turnId: string): void => {
+    const prefix = `${threadId}:`;
+    for (const activeTurn of activeTurns) {
+      if (activeTurn.startsWith(prefix)) activeTurns.delete(activeTurn);
+    }
+    activeTurns.add(`${threadId}:${turnId}`);
+  };
+  const clearActiveTurns = (threadId: string): void => {
+    const prefix = `${threadId}:`;
+    for (const activeTurn of activeTurns) {
+      if (activeTurn.startsWith(prefix)) activeTurns.delete(activeTurn);
+    }
+  };
+  const activeTurnEntries = (): { threadId: string; turnId: string }[] =>
+    [...activeTurns].map((entry) => {
+      const separator = entry.indexOf(':');
+      return { threadId: entry.slice(0, separator), turnId: entry.slice(separator + 1) };
+    });
+  const activeRootCount = (): number => {
+    const roots = new Set(activeTurnEntries().map((entry) => entry.threadId));
+    for (const threadId of nativeActiveThreads) roots.add(threadId);
+    return roots.size;
+  };
+  const syncThreadExecutionStatus = (threadId: string): void => {
+    const liveActiveTurnId = activeTurnIdForThread(threadId);
+    const treeBusy = repository.countActiveSubagentsForRoot(threadId) > 0;
+    if (liveActiveTurnId || treeBusy) {
+      if (liveActiveTurnId) treeBusyThreads.delete(threadId);
+      else if (!nativeActiveThreads.has(threadId)) treeBusyThreads.add(threadId);
+      repository.updateThreadRuntime(threadId, {
+        status: 'active',
+        activeTurnId: liveActiveTurnId,
+      });
+      return;
+    }
+    if (treeBusyThreads.delete(threadId) && repository.getThread(threadId)?.status === 'active')
+      repository.updateThreadRuntime(threadId, { status: 'idle', activeTurnId: null });
+  };
+  const threadRuntimePayload = (
+    threadId: string,
+  ): { status: Thread['status']; activeTurnId: string | null } | null => {
+    const thread = repository.getThread(threadId);
+    return thread ? { status: thread.status, activeTurnId: thread.activeTurnId } : null;
+  };
   const approvalGenerations = new Map<string, number>();
   const loadedThreadGenerations = new Map<string, number>();
   const historyHydrations = new Map<string, Promise<Thread>>();
@@ -548,7 +613,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   };
 
   const resourceWorkActive = (): boolean =>
-    activeTurns.size > 0 || pendingTurnStarts > 0 || repository.countActiveSubagents() > 0;
+    activeRootCount() > 0 || pendingTurnStarts > 0 || repository.countActiveSubagents() > 0;
 
   const applyPendingResources = async (): Promise<ResourceLimitSnapshot> => {
     if (resourceApplyPromise) {
@@ -673,25 +738,177 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const readThreadFromAppServer = async (
     existing: Thread,
     includeTurns: boolean,
+    reconcileTurnId?: string,
   ): Promise<{ thread: Thread; turns: unknown }> => {
     const project = repository.getProject(existing.projectId);
     if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
     const cwd = await canonicalProjectPath(pathPolicy, project);
+    const nativeVersionBeforeRead = nativeActivityVersions.get(existing.id) ?? null;
     const result = threadResponseSchema.parse(
       await appServer.request('thread/read', { threadId: existing.id, includeTurns }),
     );
     if (result.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
-    const thread = repository.upsertThread(
-      mapThread(
-        result.thread,
-        project.id,
-        existing.archived,
-        existing.instructionSources,
-        result.model,
-        existing,
-      ),
+    const liveActiveTurnId = activeTurnIdForThread(existing.id);
+    const authoritativeStatus = statusType(result.thread.status);
+    const nativeObservationUnchanged =
+      (nativeActivityVersions.get(existing.id) ?? null) === nativeVersionBeforeRead;
+    if (nativeObservationUnchanged) {
+      if (authoritativeStatus === 'active' && liveActiveTurnId === null)
+        markNativeActive(existing.id);
+      else if (authoritativeStatus !== 'active') clearNativeActive(existing.id);
+    }
+    const preserveLiveRuntime =
+      reconcileTurnId === undefined ||
+      (liveActiveTurnId !== null && liveActiveTurnId !== reconcileTurnId);
+    const preserveTreeRuntime =
+      reconcileTurnId === undefined && repository.countActiveSubagentsForRoot(existing.id) > 0;
+    const preserveNativeRuntime = nativeActiveThreads.has(existing.id);
+    let mappedThread = mapThread(
+      result.thread,
+      project.id,
+      existing.archived,
+      existing.instructionSources,
+      result.model,
+      existing,
+      preserveLiveRuntime ? liveActiveTurnId : null,
+      preserveTreeRuntime || preserveNativeRuntime,
     );
+    if (!nativeObservationUnchanged) {
+      const current = repository.getThread(existing.id) ?? existing;
+      mappedThread = {
+        ...mappedThread,
+        status: current.status,
+        activeTurnId: current.activeTurnId,
+      };
+    }
+    const thread = repository.upsertThread(mappedThread);
     return { thread, turns: result.thread.turns };
+  };
+
+  const reconcileStaleExecutionCapacity = async (): Promise<void> => {
+    const affectedRoots = new Set<string>();
+    const reconciledSubagents = new Set<string>();
+    for (const snapshot of activeTurnEntries()) {
+      const existing = repository.getThread(snapshot.threadId);
+      if (!existing || activeTurnIdForThread(snapshot.threadId) !== snapshot.turnId) continue;
+      try {
+        const reconciled = await readThreadFromAppServer(existing, false, snapshot.turnId);
+        if (
+          reconciled.thread.status === 'active' ||
+          activeTurnIdForThread(snapshot.threadId) !== snapshot.turnId
+        )
+          continue;
+        clearActiveTurns(snapshot.threadId);
+        affectedRoots.add(snapshot.threadId);
+        repository.audit('turn.capacity_reconcile', 'succeeded', {
+          threadId: snapshot.threadId,
+          turnId: snapshot.turnId,
+        });
+      } catch {
+        repository.audit('turn.capacity_reconcile', 'failed', {
+          threadId: snapshot.threadId,
+          turnId: snapshot.turnId,
+        });
+      }
+    }
+    for (const [threadId, expectedVersion] of [...nativeActivityVersions]) {
+      if (!nativeActiveThreads.has(threadId)) continue;
+      const existing = repository.getThread(threadId);
+      const project = existing && repository.getProject(existing.projectId);
+      if (!existing || !project) continue;
+      try {
+        const cwd = await canonicalProjectPath(pathPolicy, project);
+        const result = threadResponseSchema.parse(
+          await appServer.request('thread/read', { threadId, includeTurns: false }),
+        );
+        if (result.thread.id !== threadId || result.thread.cwd !== cwd)
+          throw new Error('NATIVE_THREAD_MISMATCH');
+        if (statusType(result.thread.status) === 'active') continue;
+        if (
+          nativeActiveThreads.has(threadId) &&
+          nativeActivityVersions.get(threadId) === expectedVersion
+        ) {
+          clearNativeActive(threadId);
+          repository.upsertThread(
+            mapThread(
+              result.thread,
+              project.id,
+              existing.archived,
+              existing.instructionSources,
+              result.model,
+              existing,
+              null,
+              repository.countActiveSubagentsForRoot(threadId) > 0,
+            ),
+          );
+          affectedRoots.add(threadId);
+        }
+      } catch {
+        repository.audit('turn.native_capacity_reconcile', 'failed', { threadId });
+      }
+    }
+    for (const snapshot of repository.listActiveSubagents()) {
+      if (snapshot.status !== 'pendingInit' && snapshot.status !== 'running') continue;
+      const rootThread = repository.getThread(snapshot.rootThreadId);
+      const project = rootThread && repository.getProject(rootThread.projectId);
+      if (!rootThread || !project) continue;
+      try {
+        const cwd = await canonicalProjectPath(pathPolicy, project);
+        const result = threadResponseSchema.parse(
+          await appServer.request('thread/read', {
+            threadId: snapshot.id,
+            includeTurns: false,
+          }),
+        );
+        if (result.thread.id !== snapshot.id || result.thread.cwd !== cwd)
+          throw new Error('SUBAGENT_THREAD_MISMATCH');
+        if (statusType(result.thread.status) === 'active') continue;
+        if (
+          repository.reconcileActiveSubagent(
+            snapshot.id,
+            snapshot.status,
+            snapshot.lastActivityAt,
+            new Date().toISOString(),
+          )
+        ) {
+          affectedRoots.add(snapshot.rootThreadId);
+          reconciledSubagents.add(snapshot.id);
+        }
+      } catch {
+        repository.audit('subagent.capacity_reconcile', 'failed', {
+          rootThreadId: snapshot.rootThreadId,
+          subagentId: snapshot.id,
+        });
+      }
+    }
+    for (const rootThreadId of affectedRoots) {
+      syncThreadExecutionStatus(rootThreadId);
+      const threadRuntime = threadRuntimePayload(rootThreadId);
+      if (threadRuntime)
+        publish(
+          repository.appendEvent({
+            threadId: rootThreadId,
+            turnId: null,
+            kind: 'thread',
+            phase: 'state',
+            payload: { threadRuntime, capacityReconciled: true },
+          }),
+        );
+    }
+    for (const subagentId of reconciledSubagents) {
+      const subagent = repository.getSubagent(subagentId);
+      if (!subagent) continue;
+      const threadRuntime = threadRuntimePayload(subagent.rootThreadId);
+      publish(
+        repository.appendEvent({
+          threadId: subagent.rootThreadId,
+          turnId: null,
+          kind: 'subagent',
+          phase: 'state',
+          payload: { subagent, ...(threadRuntime ? { threadRuntime } : {}) },
+        }),
+      );
+    }
   };
 
   const hydrateThreadHistory = async (existing: Thread): Promise<Thread> => {
@@ -720,17 +937,16 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const throwTurnCommandFailure = async (
     thread: Thread,
     error: unknown,
+    expectedTurnId: string,
     onOutcomeUnknown?: () => void,
   ): Promise<never> => {
     if (error instanceof Error && error.message === 'APP_SERVER_UNAVAILABLE') throw error;
     let confirmedInactive = false;
     try {
-      const reconciled = await readThreadFromAppServer(thread, false);
+      const reconciled = await readThreadFromAppServer(thread, false, expectedTurnId);
       if (reconciled.thread.status !== 'active') {
         confirmedInactive = true;
-        for (const activeTurn of activeTurns) {
-          if (activeTurn.startsWith(`${thread.id}:`)) activeTurns.delete(activeTurn);
-        }
+        clearActiveTurns(thread.id);
       }
     } catch {
       // An unavailable reread cannot safely classify the command as rejected.
@@ -948,13 +1164,18 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
             : (existing?.completedAt ?? null)),
       };
       const persisted = repository.upsertSubagent(subagent);
+      syncThreadExecutionStatus(persisted.rootThreadId);
+      const threadRuntime = threadRuntimePayload(persisted.rootThreadId);
       publish(
         repository.appendEvent({
           threadId: persisted.rootThreadId,
           turnId: null,
           kind: 'subagent',
           phase: 'state',
-          payload: { subagent: persisted },
+          payload: {
+            subagent: persisted,
+            ...(threadRuntime ? { threadRuntime } : {}),
+          },
         }),
       );
       void applyPendingResourcesWhenIdle();
@@ -964,35 +1185,67 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       normalizeNotification(redactedMessage, config.maxEventBytes);
     if (!normalized || !repository.getThread(normalized.threadId)) return;
     if (normalized.phase === 'delta') return;
+    let runtimeTurnEvent = true;
     if (message.method === 'turn/started' && normalized.turnId) {
-      activeTurns.add(`${normalized.threadId}:${normalized.turnId}`);
+      setActiveTurn(normalized.threadId, normalized.turnId);
+      treeBusyThreads.delete(normalized.threadId);
+      clearNativeActive(normalized.threadId);
       repository.updateThreadRuntime(normalized.threadId, {
         status: 'active',
         activeTurnId: normalized.turnId,
       });
     }
     if (message.method === 'turn/completed' && normalized.turnId) {
+      const currentTurnId =
+        repository.getThread(normalized.threadId)?.activeTurnId ??
+        activeTurnIdForThread(normalized.threadId);
       activeTurns.delete(`${normalized.threadId}:${normalized.turnId}`);
-      const thread = repository.updateThreadRuntime(normalized.threadId, {
-        status: 'idle',
-        activeTurnId: null,
-      });
+      runtimeTurnEvent = currentTurnId === null || currentTurnId === normalized.turnId;
+      const treeBusy = repository.countActiveSubagentsForRoot(normalized.threadId) > 0;
+      if (runtimeTurnEvent) clearNativeActive(normalized.threadId);
+      if (runtimeTurnEvent && treeBusy) treeBusyThreads.add(normalized.threadId);
+      if (runtimeTurnEvent && !treeBusy) treeBusyThreads.delete(normalized.threadId);
+      const thread = runtimeTurnEvent
+        ? repository.updateThreadRuntime(
+            normalized.threadId,
+            treeBusy
+              ? { status: 'active', activeTurnId: null }
+              : { status: 'idle', activeTurnId: null },
+          )
+        : repository.getThread(normalized.threadId);
       if (thread)
-        pushDispatcher?.enqueue(thread.id, normalized.turnId, terminalPushStatus(message));
+        if (runtimeTurnEvent)
+          pushDispatcher?.enqueue(thread.id, normalized.turnId, terminalPushStatus(message));
       void applyPendingResourcesWhenIdle();
     }
     if (message.method === 'thread/status/changed') {
       const status = threadStatusChangedSchema.safeParse(message.params);
       if (status.success) {
         const nextStatus = statusType(status.data.status);
-        repository.updateThreadRuntime(normalized.threadId, {
-          status: nextStatus,
-          ...(nextStatus === 'active' ? {} : { activeTurnId: null }),
-        });
-        if (nextStatus !== 'active') {
-          for (const activeTurn of activeTurns) {
-            if (activeTurn.startsWith(`${normalized.threadId}:`)) activeTurns.delete(activeTurn);
-          }
+        const liveActiveTurnId = activeTurnIdForThread(normalized.threadId);
+        const treeBusy = repository.countActiveSubagentsForRoot(normalized.threadId) > 0;
+        if (nextStatus === 'active') {
+          treeBusyThreads.delete(normalized.threadId);
+          if (liveActiveTurnId === null) markNativeActive(normalized.threadId);
+        } else {
+          clearNativeActive(normalized.threadId);
+        }
+        if (nextStatus !== 'active' && treeBusy && liveActiveTurnId === null)
+          treeBusyThreads.add(normalized.threadId);
+        const preserveActive =
+          (liveActiveTurnId !== null || treeBusy) &&
+          (nextStatus === 'idle' || nextStatus === 'notLoaded');
+        repository.updateThreadRuntime(
+          normalized.threadId,
+          preserveActive
+            ? { status: 'active', activeTurnId: liveActiveTurnId }
+            : {
+                status: nextStatus,
+                ...(nextStatus === 'active' ? {} : { activeTurnId: null }),
+              },
+        );
+        if (nextStatus !== 'active' && !preserveActive) {
+          clearActiveTurns(normalized.threadId);
           void applyPendingResourcesWhenIdle();
         }
       }
@@ -1007,8 +1260,17 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (message.method === 'thread/unarchived')
       repository.setThreadArchived(normalized.threadId, false);
     const persistedNotification =
-      message.method === 'turn/started' || message.method === 'turn/completed'
-        ? { ...normalized, payload: { ...normalized.payload, runtime: true } }
+      message.method === 'turn/started' ||
+      message.method === 'turn/completed' ||
+      message.method === 'thread/status/changed'
+        ? {
+            ...normalized,
+            payload: {
+              ...normalized.payload,
+              runtime: runtimeTurnEvent,
+              threadRuntime: threadRuntimePayload(normalized.threadId),
+            },
+          }
         : normalized;
     publish(repository.appendEvent(persistedNotification));
   };
@@ -1067,7 +1329,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   app.get('/api/health', (_request, reply) => {
     const ready = appServer.ready;
     const requested = upgradeDrainRequested();
-    const activeTurnCount = activeTurns.size;
+    const activeTurnCount = activeRootCount();
     const activeSubagents = repository.countActiveSubagents();
     return reply.code(ready ? 200 : 503).send({
       status: ready ? 'ready' : 'degraded',
@@ -1399,6 +1661,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
             existing?.instructionSources ?? [],
             undefined,
             existing,
+            activeTurnIdForThread(rpcThread.id),
+            repository.countActiveSubagentsForRoot(rpcThread.id) > 0,
           ),
         );
       }
@@ -1734,7 +1998,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
     if (
       !dependencies.resourceBroker &&
-      activeTurns.size + pendingTurnStarts >= config.maxConcurrentTurns
+      activeRootCount() + pendingTurnStarts >= config.maxConcurrentTurns
+    ) {
+      await reconcileStaleExecutionCapacity();
+    }
+    if (
+      !dependencies.resourceBroker &&
+      activeRootCount() + pendingTurnStarts >= config.maxConcurrentTurns
     ) {
       repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
       throw new HttpError(429, 'TURN_CAPACITY_EXHAUSTED');
@@ -1758,8 +2028,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         const maximumExecutionUnits =
           repository.getResourceLimits().desired.maxParallelAgents ?? autoParallelAgents(capacity);
         executionAgentLimit = maximumExecutionUnits;
-        const activeExecutionUnits =
-          activeTurns.size + pendingTurnStarts + repository.countActiveSubagents();
+        let activeExecutionUnits =
+          activeRootCount() + pendingTurnStarts + repository.countActiveSubagents();
+        if (activeExecutionUnits > maximumExecutionUnits) {
+          await reconcileStaleExecutionCapacity();
+          activeExecutionUnits =
+            activeRootCount() + pendingTurnStarts + repository.countActiveSubagents();
+        }
         if (activeExecutionUnits > maximumExecutionUnits)
           throw new HttpError(
             429,
@@ -1854,7 +2129,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           sandboxPolicy: sandboxPolicy(preset, turnCwd),
         }),
       );
-      activeTurns.add(`${id}:${result.turn.id}`);
+      setActiveTurn(id, result.turn.id);
       repository.updateThreadRuntime(id, { status: 'active', activeTurnId: result.turn.id });
     } catch (error) {
       if (turnStartIssued) repository.markIdempotentUnknown(operation, input.idempotencyKey, hash);
@@ -1906,7 +2181,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         }),
       );
     } catch (error) {
-      return throwTurnCommandFailure(thread, error, () => {
+      return throwTurnCommandFailure(thread, error, input.expectedTurnId, () => {
         publish(
           repository.appendEvent({
             threadId: id,
@@ -1942,7 +2217,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     try {
       await appServer.request('turn/interrupt', { threadId: id, turnId: input.turnId });
     } catch (error) {
-      return throwTurnCommandFailure(thread, error);
+      return throwTurnCommandFailure(thread, error, input.turnId);
     }
     const event = repository.appendEvent({
       threadId: id,

@@ -1160,7 +1160,11 @@ export class SqliteRepository {
          agent_path=COALESCE(excluded.agent_path,subagents.agent_path),nickname=COALESCE(excluded.nickname,subagents.nickname),
          role=COALESCE(excluded.role,subagents.role),model=COALESCE(excluded.model,subagents.model),
          reasoning_effort=COALESCE(excluded.reasoning_effort,subagents.reasoning_effort),status=excluded.status,
-         message=excluded.message,last_activity_at=excluded.last_activity_at,completed_at=excluded.completed_at`,
+         message=excluded.message,last_activity_at=excluded.last_activity_at,completed_at=excluded.completed_at
+         WHERE excluded.last_activity_at > subagents.last_activity_at
+            OR (excluded.last_activity_at = subagents.last_activity_at
+                AND NOT (subagents.status IN ('interrupted','completed','errored','shutdown','notFound')
+                         AND excluded.status IN ('pendingInit','running')))`,
       )
       .run(
         subagent.id,
@@ -1189,16 +1193,64 @@ export class SqliteRepository {
   listSubagents(rootThreadId: string): Subagent[] {
     return (
       this.database
-        .prepare('SELECT * FROM subagents WHERE root_thread_id=? ORDER BY started_at,id')
+        .prepare(
+          'SELECT * FROM subagents WHERE root_thread_id=? AND id<>root_thread_id ORDER BY started_at,id',
+        )
         .all(rootThreadId) as unknown as SubagentRow[]
     ).map(subagentFromRow);
   }
 
   countActiveSubagents(): number {
     const row = this.database
-      .prepare("SELECT count(*) AS count FROM subagents WHERE status IN ('pendingInit','running')")
+      .prepare(
+        "SELECT count(*) AS count FROM subagents WHERE id<>root_thread_id AND status IN ('pendingInit','running')",
+      )
       .get() as { count: number };
     return row.count;
+  }
+
+  countActiveSubagentsForRoot(rootThreadId: string): number {
+    const row = this.database
+      .prepare(
+        "SELECT count(*) AS count FROM subagents WHERE root_thread_id=? AND id<>root_thread_id AND status IN ('pendingInit','running')",
+      )
+      .get(rootThreadId) as { count: number };
+    return row.count;
+  }
+
+  listActiveSubagents(): Subagent[] {
+    return (
+      this.database
+        .prepare(
+          "SELECT * FROM subagents WHERE id<>root_thread_id AND status IN ('pendingInit','running') ORDER BY last_activity_at,id",
+        )
+        .all() as unknown as SubagentRow[]
+    ).map(subagentFromRow);
+  }
+
+  reconcileActiveSubagent(
+    id: string,
+    expectedStatus: 'pendingInit' | 'running',
+    expectedLastActivityAt: string,
+    observedAt: string,
+  ): boolean {
+    const terminalAt = new Date(
+      Math.max(Date.parse(expectedLastActivityAt), Date.parse(observedAt)),
+    ).toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE subagents SET status='interrupted',message=?,last_activity_at=?,completed_at=?
+         WHERE id=? AND status=? AND last_activity_at=?`,
+      )
+      .run(
+        'Subagent is no longer active',
+        terminalAt,
+        terminalAt,
+        id,
+        expectedStatus,
+        expectedLastActivityAt,
+      );
+    return result.changes === 1;
   }
 
   resetActiveSubagentRuntime(): number {

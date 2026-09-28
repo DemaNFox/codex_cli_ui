@@ -270,4 +270,73 @@ describe('subagent protocol normalization', () => {
       }),
     ).toEqual([]);
   });
+
+  it('does not project the root thread as its own subagent', () => {
+    expect(
+      normalizeSubagentNotification({
+        method: 'item/completed',
+        params: {
+          threadId: 'root-thread',
+          turnId: 'turn-1',
+          completedAtMs: startedAtMs,
+          item: {
+            type: 'collabAgentToolCall',
+            id: 'call-self',
+            tool: 'listAgents',
+            status: 'completed',
+            senderThreadId: 'root-thread',
+            receiverThreadIds: ['root-thread', 'child-1'],
+            agentsStates: {
+              'root-thread': { status: 'running' },
+              'child-1': { status: 'running' },
+            },
+          },
+        },
+      }),
+    ).toEqual([expect.objectContaining({ agentThreadId: 'child-1', rootThreadId: 'root-thread' })]);
+
+    expect(
+      normalizeSubagentNotification({
+        method: 'item/started',
+        params: {
+          threadId: 'root-thread',
+          turnId: 'turn-1',
+          startedAtMs,
+          item: {
+            type: 'subAgentActivity',
+            id: 'activity-self',
+            agentThreadId: 'root-thread',
+            agentPath: '/root',
+            kind: 'started',
+          },
+        },
+      }),
+    ).toEqual([]);
+
+    expect(
+      normalizeSubagentNotification(
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'child-1',
+            turnId: 'turn-child',
+            completedAtMs: startedAtMs,
+            item: {
+              type: 'collabAgentToolCall',
+              id: 'call-nested-self',
+              tool: 'listAgents',
+              status: 'completed',
+              senderThreadId: 'child-1',
+              receiverThreadIds: ['root-thread'],
+              agentsStates: { 'root-thread': { status: 'running' } },
+            },
+          },
+        },
+        {
+          findAgent: (id) =>
+            id === 'child-1' ? { agentThreadId: id, rootThreadId: 'root-thread' } : null,
+        },
+      ),
+    ).toEqual([]);
+  });
 });

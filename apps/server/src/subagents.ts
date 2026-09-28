@@ -247,13 +247,15 @@ export function normalizeSubagentNotification(
         : lifecycle.data.params.completedAtMs,
     );
     const { item, threadId } = lifecycle.data.params;
+    const rootThreadId = rootFor(threadId, options);
     if (item.type === 'subAgentActivity') {
+      if (item.agentThreadId === threadId || item.agentThreadId === rootThreadId) return [];
       const status = activityStatus(item.kind);
       return [
         {
           agentThreadId: item.agentThreadId,
           parentThreadId: threadId,
-          rootThreadId: rootFor(threadId, options),
+          rootThreadId,
           agentPath: item.agentPath,
           status,
           ...(item.kind === 'started' ? { startedAt: observedAt } : {}),
@@ -264,14 +266,18 @@ export function normalizeSubagentNotification(
     }
     if (item.senderThreadId !== threadId) return [];
 
-    const agentIds = [...new Set([...item.receiverThreadIds, ...Object.keys(item.agentsStates)])];
+    const agentIds = [
+      ...new Set([...item.receiverThreadIds, ...Object.keys(item.agentsStates)]),
+    ].filter(
+      (agentThreadId) => agentThreadId !== item.senderThreadId && agentThreadId !== rootThreadId,
+    );
     return agentIds.map((agentThreadId) => {
       const state = item.agentsStates[agentThreadId];
       const status = state?.status ?? (item.tool === 'spawnAgent' ? 'pendingInit' : undefined);
       return {
         agentThreadId,
         parentThreadId: item.senderThreadId,
-        rootThreadId: rootFor(item.senderThreadId, options),
+        rootThreadId,
         ...(item.model ? { model: item.model } : {}),
         ...(item.reasoningEffort ? { reasoningEffort: item.reasoningEffort } : {}),
         ...(status ? { status } : {}),

@@ -266,6 +266,36 @@ function subagentFrom(event: SafeEvent): Subagent | null {
   return record as unknown as Subagent;
 }
 
+function threadRuntimeFrom(
+  event: SafeEvent,
+): { status: Thread['status']; activeTurnId: string | null } | null {
+  const value = event.payload.threadRuntime;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    if (event.kind !== 'turn' || event.payload.runtime !== true) return null;
+    const status: Thread['status'] =
+      event.phase === 'started' ||
+      event.payload.status === 'inProgress' ||
+      event.payload.status === 'interruptRequested'
+        ? 'active'
+        : event.phase === 'failed'
+          ? 'systemError'
+          : 'idle';
+    return { status, activeTurnId: status === 'active' ? event.turnId : null };
+  }
+  const runtime = value as Record<string, unknown>;
+  if (
+    !['notLoaded', 'idle', 'active', 'systemError', 'unknown'].includes(
+      typeof runtime.status === 'string' ? runtime.status : '',
+    )
+  )
+    return null;
+  if (runtime.activeTurnId !== null && typeof runtime.activeTurnId !== 'string') return null;
+  return {
+    status: runtime.status as Thread['status'],
+    activeTurnId: runtime.activeTurnId,
+  };
+}
+
 function safeAttachmentUrl(value: string): string | null {
   return value.startsWith('/api/threads/') ? value : null;
 }
@@ -1947,8 +1977,7 @@ function Workspace({
 
   const selectedThread = threads.find((item) => item.id === threadId) ?? null;
   const modelOption = models.find((item) => item.id === model) ?? null;
-  const turnEvents = events.filter((event) => event.kind === 'turn');
-  const lastTurnEvent = turnEvents.at(-1);
+  const lastRuntimeEvent = [...events].reverse().find((event) => threadRuntimeFrom(event) !== null);
   const active = selectedThread?.status === 'active';
   const activeTurnId = active ? selectedThread.activeTurnId : null;
   const activeTurnDuration = useActiveTurnDuration(events, activeTurnId, active);
@@ -2168,28 +2197,22 @@ function Workspace({
   }, [events]);
 
   useEffect(() => {
-    if (!lastTurnEvent || lastTurnEvent.payload.runtime !== true) return;
-    const status: Thread['status'] =
-      lastTurnEvent.phase === 'started' ||
-      lastTurnEvent.payload.status === 'inProgress' ||
-      lastTurnEvent.payload.status === 'interruptRequested'
-        ? 'active'
-        : lastTurnEvent.phase === 'failed'
-          ? 'systemError'
-          : 'idle';
+    if (!lastRuntimeEvent) return;
+    const runtime = threadRuntimeFrom(lastRuntimeEvent);
+    if (!runtime) return;
     const update = (item: Thread) =>
-      item.id === lastTurnEvent.threadId &&
-      Date.parse(lastTurnEvent.createdAt) >= Date.parse(item.updatedAt)
+      item.id === lastRuntimeEvent.threadId &&
+      Date.parse(lastRuntimeEvent.createdAt) >= Date.parse(item.updatedAt)
         ? {
             ...item,
-            status,
-            activeTurnId: status === 'active' ? lastTurnEvent.turnId : null,
-            updatedAt: lastTurnEvent.createdAt,
+            status: runtime.status,
+            activeTurnId: runtime.activeTurnId,
+            updatedAt: lastRuntimeEvent.createdAt,
           }
         : item;
     setThreads((current) => current.map(update));
     setRecentThreads((current) => current.map(update));
-  }, [lastTurnEvent]);
+  }, [lastRuntimeEvent]);
 
   useEffect(() => {
     const updates = events.map(subagentFrom).filter((item): item is Subagent => item !== null);
