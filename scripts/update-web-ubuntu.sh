@@ -63,7 +63,12 @@ python3 "$SCRIPT_DIR/storage-guard.py" --config "$config" --check-releases --add
 
 release_dir="/opt/codex-web-ui/releases/$release_id"
 [[ ! -e $release_dir ]] || die "release already exists: $release_dir"
-previous_web=$(readlink -f /opt/codex-web-ui/web-current 2>/dev/null || true)
+previous_web=
+if [[ -L /opt/codex-web-ui/web-current ]]; then
+  previous_web=$(readlink -f /opt/codex-web-ui/web-current) || die 'current web release link is broken'
+elif [[ -e /opt/codex-web-ui/web-current ]]; then
+  die 'current web release path is not a symlink'
+fi
 if [[ -z $previous_web ]]; then previous_web="$backend_release/apps/web/dist"; fi
 case "$previous_web" in /opt/codex-web-ui/releases/*/apps/web/dist) ;; *) die 'current web release escapes release directory' ;; esac
 [[ -f $previous_web/index.html ]] || die 'current web release is incomplete'

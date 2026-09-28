@@ -259,7 +259,12 @@ if [[ $mode == upgrade ]]; then
 fi
 copy_release "$package" "$release_dir"
 previous=$(readlink -f /opt/codex-web-ui/current 2>/dev/null || true)
-previous_web=$(readlink -f /opt/codex-web-ui/web-current 2>/dev/null || true)
+previous_web=
+if [[ -L /opt/codex-web-ui/web-current ]]; then
+  previous_web=$(readlink -f /opt/codex-web-ui/web-current) || die 'current web release link is broken'
+elif [[ -e /opt/codex-web-ui/web-current ]]; then
+  die 'current web release path is not a symlink'
+fi
 if [[ -n $previous ]]; then
   case "$previous" in /opt/codex-web-ui/releases/*) ;; *) die 'current release escapes the managed release directory' ;; esac
   if [[ -z $previous_web ]]; then previous_web="$previous/apps/web/dist"; fi

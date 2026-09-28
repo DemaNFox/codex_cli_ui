@@ -409,6 +409,7 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("previous-release", update_script)
         self.assertIn("previous-web-release", update_script)
         self.assertIn("/opt/codex-web-ui/web-current", update_script)
+        self.assertIn("[[ -L /opt/codex-web-ui/web-current ]]", update_script)
         self.assertIn("CPUQuota=\nMemoryHigh=infinity", update_script)
         self.assertIn("MemoryMax=infinity", update_script)
         self.assertIn("TasksMax=infinity", update_script)
@@ -443,6 +444,7 @@ class InfraStaticTest(unittest.TestCase):
         self.assertNotIn("systemctl", updater)
         self.assertIn("Backend was not restarted", rollback)
         self.assertNotIn("systemctl", rollback)
+        self.assertIn("[[ -L /opt/codex-web-ui/web-current ]]", updater)
         self.assertIn("/opt/codex-web-ui/web-current", installer)
 
     def test_runner_helper_requires_owned_pinned_codex_identity(self) -> None:
