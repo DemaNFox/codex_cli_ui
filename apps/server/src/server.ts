@@ -51,7 +51,7 @@ import {
 } from './attachment-store.js';
 import { AuthService, HttpError, type AuthContext } from './auth.js';
 import type { ServerConfig } from './config.js';
-import type { AttachmentRecord, SqliteRepository } from './database.js';
+import { PushStorageLimitError, type AttachmentRecord, type SqliteRepository } from './database.js';
 import {
   normalizeApproval,
   normalizeNotification,
@@ -67,6 +67,7 @@ import {
 import type { ProjectPathPolicy } from './path-policy.js';
 import {
   PushNotificationDispatcher,
+  isAllowedPushEndpoint,
   type PushNotificationPayload,
   type PushSender,
 } from './push-notifications.js';
@@ -977,12 +978,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         activeTurnId: null,
       });
       if (thread)
-        pushDispatcher?.enqueue(
-          thread.id,
-          normalized.turnId,
-          thread.name,
-          terminalPushStatus(message),
-        );
+        pushDispatcher?.enqueue(thread.id, normalized.turnId, terminalPushStatus(message));
       void applyPendingResourcesWhenIdle();
     }
     if (message.method === 'thread/status/changed') {
@@ -1621,7 +1617,16 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   app.put('/api/threads/:id/push-subscriptions', (request) => {
     const threadId = requirePushThread(request);
     const input: PushSubscriptionInput = pushSubscriptionSchema.parse(request.body);
-    const subscriptionId = repository.upsertPushSubscription(threadId, input);
+    if (!isAllowedPushEndpoint(input.endpoint))
+      throw new HttpError(400, 'PUSH_ENDPOINT_NOT_ALLOWED', 'Push endpoint is not allowed');
+    let subscriptionId: string;
+    try {
+      subscriptionId = repository.upsertPushSubscription(threadId, input);
+    } catch (error) {
+      if (error instanceof PushStorageLimitError)
+        throw new HttpError(429, 'PUSH_SUBSCRIPTION_LIMIT_REACHED');
+      throw error;
+    }
     repository.audit('push.subscription', 'subscribed', { threadId, subscriptionId });
     return { subscribed: true };
   });
@@ -1630,6 +1635,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const threadId = requirePushThread(request);
     const input = pushSubscriptionStatusRequestSchema.parse(request.body);
     const subscriptionId = repository.removeThreadPushSubscription(threadId, input.endpoint);
+    pushDispatcher?.cancel(threadId, subscriptionId);
     repository.audit('push.subscription', 'unsubscribed', { threadId, subscriptionId });
     return { subscribed: false };
   });

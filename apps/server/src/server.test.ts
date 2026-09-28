@@ -806,6 +806,7 @@ describe('Codex routes', () => {
       payload: audio.body,
     });
     expect(missingCsrf.statusCode).toBe(403);
+
     expect(missingCsrf.json()).toMatchObject({ error: { code: 'CSRF_REQUIRED' } });
 
     const missingIdempotency = await app.inject({
@@ -3276,7 +3277,7 @@ describe('Codex routes', () => {
     const firstThread = await createThread(app, project.id, session.headers);
     const secondThread = await createThread(app, project.id, session.headers);
     const subscription = {
-      endpoint: 'https://push.example.test/device-one',
+      endpoint: 'https://fcm.googleapis.com/device-one',
       expirationTime: null,
       keys: { p256dh: 'p'.repeat(65), auth: 'a'.repeat(24) },
     };
@@ -3295,6 +3296,23 @@ describe('Codex routes', () => {
       payload: subscription,
     });
     expect(missingCsrf.statusCode).toBe(403);
+
+    for (const endpoint of [
+      'https://127.0.0.1/push',
+      'https://[::1]/push',
+      'https://localhost/push',
+      'https://example.com/push',
+    ]) {
+      const rejected = await app.inject({
+        method: 'PUT',
+        url: `/api/threads/${firstThread}/push-subscriptions`,
+        headers: session.headers,
+        payload: { ...subscription, endpoint },
+      });
+      expect(rejected.statusCode).toBe(400);
+      expect(rejected.json()).toMatchObject({ error: { code: 'PUSH_ENDPOINT_NOT_ALLOWED' } });
+      expect(rejected.body).not.toContain(endpoint);
+    }
 
     const subscribed = await app.inject({
       method: 'PUT',
@@ -3337,6 +3355,28 @@ describe('Codex routes', () => {
       ).json(),
     ).toEqual({ subscribed: false });
 
+    for (let index = 0; index < 16; index += 1) {
+      const withinLimit = await app.inject({
+        method: 'PUT',
+        url: `/api/threads/${firstThread}/push-subscriptions`,
+        headers: session.headers,
+        payload: { ...subscription, endpoint: `https://fcm.googleapis.com/cap-${index}` },
+      });
+      expect(withinLimit.statusCode).toBe(200);
+    }
+    const limitedEndpoint = 'https://fcm.googleapis.com/cap-overflow';
+    const limited = await app.inject({
+      method: 'PUT',
+      url: `/api/threads/${firstThread}/push-subscriptions`,
+      headers: session.headers,
+      payload: { ...subscription, endpoint: limitedEndpoint },
+    });
+    expect(limited.statusCode).toBe(429);
+    expect(limited.json()).toMatchObject({
+      error: { code: 'PUSH_SUBSCRIPTION_LIMIT_REACHED' },
+    });
+    expect(limited.body).not.toContain(limitedEndpoint);
+
     const capabilities = await app.inject({
       method: 'GET',
       url: '/api/system/capabilities',
@@ -3356,7 +3396,7 @@ describe('Codex routes', () => {
       method: 'POST',
       url: `/api/threads/${threadId}/push-subscriptions/status`,
       headers: session.headers,
-      payload: { endpoint: 'https://push.example.test/unavailable' },
+      payload: { endpoint: 'https://fcm.googleapis.com/unavailable' },
     });
     expect(response.statusCode).toBe(503);
     const capabilities = await app.inject({
@@ -3385,7 +3425,7 @@ describe('Codex routes', () => {
     const threadId = await createThread(app, project.id, session.headers);
     repository.updateThreadRuntime(threadId, { name: 'Build chat' });
     const subscription = {
-      endpoint: 'https://push.example.test/retry-device',
+      endpoint: 'https://fcm.googleapis.com/retry-device',
       expirationTime: null,
       keys: { p256dh: 'p'.repeat(65), auth: 'a'.repeat(24) },
     };
@@ -3406,14 +3446,9 @@ describe('Codex routes', () => {
     expect(sender.calls).toHaveLength(2);
     expect(sender.deliveries[0]?.payload).toEqual({
       threadId,
-      threadName: 'Build chat',
       status: 'completed',
     });
-    expect(Object.keys(sender.deliveries[0]!.payload).sort()).toEqual([
-      'status',
-      'threadId',
-      'threadName',
-    ]);
+    expect(Object.keys(sender.deliveries[0]!.payload).sort()).toEqual(['status', 'threadId']);
 
     appServer.emit({
       method: 'turn/completed',
@@ -3431,6 +3466,73 @@ describe('Codex routes', () => {
       () => expect(repository.hasPushSubscription(threadId, subscription.endpoint)).toBe(false),
       { timeout: 2_000 },
     );
+  });
+
+  it('aborts only the exact active thread delivery when that mapping is removed', async () => {
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    let aborted = false;
+    const sender: PushSender = {
+      send(_subscription, _payload, signal) {
+        entered();
+        return new Promise<void>((_resolve, reject) => {
+          signal.addEventListener(
+            'abort',
+            () => {
+              aborted = true;
+              reject(new Error('unsubscribed'));
+            },
+            { once: true },
+          );
+        });
+      },
+    };
+    const { app, appServer, repository, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      sender,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const firstThread = await createThread(app, project.id, session.headers);
+    const secondThread = await createThread(app, project.id, session.headers);
+    const subscription = {
+      endpoint: 'https://fcm.googleapis.com/active-unsubscribe',
+      expirationTime: null,
+      keys: { p256dh: 'p'.repeat(65), auth: 'a'.repeat(24) },
+    };
+    for (const threadId of [firstThread, secondThread]) {
+      const response = await app.inject({
+        method: 'PUT',
+        url: `/api/threads/${threadId}/push-subscriptions`,
+        headers: session.headers,
+        payload: subscription,
+      });
+      expect(response.statusCode).toBe(200);
+    }
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: firstThread, turn: { id: 'turn-active-send', status: 'completed' } },
+    });
+    await started;
+    const removed = await app.inject({
+      method: 'DELETE',
+      url: `/api/threads/${firstThread}/push-subscriptions`,
+      headers: session.headers,
+      payload: { endpoint: subscription.endpoint },
+    });
+    expect(removed.statusCode).toBe(200);
+    await vi.waitFor(() => expect(aborted).toBe(true));
+    expect(repository.hasPushSubscription(firstThread, subscription.endpoint)).toBe(false);
+    expect(repository.hasPushSubscription(secondThread, subscription.endpoint)).toBe(true);
+    expect(
+      repository.database.prepare('SELECT COUNT(*) AS count FROM push_deliveries').get(),
+    ).toEqual({ count: 0 });
   });
 });
 

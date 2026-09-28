@@ -14,6 +14,7 @@ import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import type { PushNotificationPayload } from './push-notifications.js';
+import { isAllowedPushEndpoint } from './push-notifications-policy.js';
 
 interface SessionRow {
   id: string;
@@ -87,6 +88,7 @@ interface SubagentRow {
 
 interface PushDeliveryRow {
   id: string;
+  thread_id: string;
   subscription_id: string;
   endpoint: string;
   expiration_time: number | null;
@@ -96,8 +98,24 @@ interface PushDeliveryRow {
   attempts: number;
 }
 
+export const PUSH_STORAGE_LIMITS = {
+  globalSubscriptions: 64,
+  mappingsPerThread: 16,
+  pendingGlobal: 1_024,
+  pendingPerThread: 64,
+  receiptsGlobal: 4_096,
+  receiptsPerThread: 128,
+} as const;
+
+export class PushStorageLimitError extends Error {
+  constructor(readonly scope: 'global-subscriptions' | 'thread-mappings') {
+    super('Push subscription limit reached');
+  }
+}
+
 export interface ClaimedPushDelivery {
   readonly id: string;
+  readonly threadId: string;
   readonly subscriptionId: string;
   readonly subscription: PushSubscriptionInput;
   readonly payload: PushNotificationPayload;
@@ -424,6 +442,64 @@ export class SqliteRepository {
     this.migrateApprovalResolvingState();
     this.migrateIdempotencyState();
     this.migrateThreadActiveTurn();
+    this.enforcePushStorageBounds();
+  }
+
+  private enforcePushStorageBounds(): void {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const subscriptions = this.database
+        .prepare('SELECT id,endpoint FROM push_subscriptions')
+        .all() as unknown as { id: string; endpoint: string }[];
+      const deleteSubscription = this.database.prepare('DELETE FROM push_subscriptions WHERE id=?');
+      for (const subscription of subscriptions) {
+        if (!isAllowedPushEndpoint(subscription.endpoint)) deleteSubscription.run(subscription.id);
+      }
+      this.database.exec(`
+      UPDATE push_deliveries SET payload_json=CASE
+        WHEN payload_json LIKE '%"status":"interrupted"%' THEN '{"status":"interrupted"}'
+        WHEN payload_json LIKE '%"status":"failed"%' THEN '{"status":"failed"}'
+        ELSE '{"status":"completed"}'
+      END;
+      DELETE FROM thread_push_subscriptions WHERE rowid IN (
+        SELECT rowid FROM (
+          SELECT rowid,ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY created_at DESC,rowid DESC) AS position
+          FROM thread_push_subscriptions
+        ) WHERE position > ${PUSH_STORAGE_LIMITS.mappingsPerThread}
+      );
+      DELETE FROM push_subscriptions WHERE id NOT IN (
+        SELECT DISTINCT subscription_id FROM thread_push_subscriptions
+      );
+      DELETE FROM push_subscriptions WHERE rowid IN (
+        SELECT rowid FROM push_subscriptions ORDER BY updated_at DESC,rowid DESC
+        LIMIT -1 OFFSET ${PUSH_STORAGE_LIMITS.globalSubscriptions}
+      );
+      DELETE FROM push_deliveries WHERE rowid IN (
+        SELECT rowid FROM (
+          SELECT rowid,ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY created_at,rowid) AS position
+          FROM push_deliveries
+        ) WHERE position > ${PUSH_STORAGE_LIMITS.pendingPerThread}
+      );
+      DELETE FROM push_deliveries WHERE rowid IN (
+        SELECT rowid FROM push_deliveries ORDER BY created_at,rowid
+        LIMIT -1 OFFSET ${PUSH_STORAGE_LIMITS.pendingGlobal}
+      );
+      DELETE FROM push_delivery_receipts WHERE rowid IN (
+        SELECT rowid FROM (
+          SELECT rowid,ROW_NUMBER() OVER (PARTITION BY thread_id ORDER BY delivered_at DESC,rowid DESC) AS position
+          FROM push_delivery_receipts
+        ) WHERE position > ${PUSH_STORAGE_LIMITS.receiptsPerThread}
+      );
+      DELETE FROM push_delivery_receipts WHERE rowid IN (
+        SELECT rowid FROM push_delivery_receipts ORDER BY delivered_at DESC,rowid DESC
+        LIMIT -1 OFFSET ${PUSH_STORAGE_LIMITS.receiptsGlobal}
+      );
+      `);
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   private migrateThreadActiveTurn(): void {
@@ -512,6 +588,26 @@ export class SqliteRepository {
     const now = new Date().toISOString();
     this.database.exec('BEGIN IMMEDIATE');
     try {
+      const existingSubscription = this.database
+        .prepare('SELECT 1 FROM push_subscriptions WHERE id=?')
+        .get(id);
+      const existingMapping = this.database
+        .prepare('SELECT 1 FROM thread_push_subscriptions WHERE thread_id=? AND subscription_id=?')
+        .get(threadId, id);
+      if (!existingSubscription) {
+        const globalCount = this.database
+          .prepare('SELECT COUNT(*) AS count FROM push_subscriptions')
+          .get() as { count: number };
+        if (globalCount.count >= PUSH_STORAGE_LIMITS.globalSubscriptions)
+          throw new PushStorageLimitError('global-subscriptions');
+      }
+      if (!existingMapping) {
+        const mappingCount = this.database
+          .prepare('SELECT COUNT(*) AS count FROM thread_push_subscriptions WHERE thread_id=?')
+          .get(threadId) as { count: number };
+        if (mappingCount.count >= PUSH_STORAGE_LIMITS.mappingsPerThread)
+          throw new PushStorageLimitError('thread-mappings');
+      }
       this.database
         .prepare(
           `INSERT INTO push_subscriptions(id,endpoint,expiration_time,p256dh,auth,created_at,updated_at)
@@ -571,12 +667,41 @@ export class SqliteRepository {
     threadId: string,
     turnId: string,
     payload: PushNotificationPayload,
-  ): number {
+  ): { enqueued: number; dropped: number } {
     const now = new Date().toISOString();
-    return Number(
-      this.database
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const eligible = this.database
         .prepare(
-          `INSERT OR IGNORE INTO push_deliveries(
+          `SELECT COUNT(*) AS count FROM thread_push_subscriptions mapping
+           WHERE mapping.thread_id=? AND NOT EXISTS (
+             SELECT 1 FROM push_delivery_receipts receipt
+             WHERE receipt.thread_id=mapping.thread_id AND receipt.turn_id=?
+               AND receipt.subscription_id=mapping.subscription_id
+           ) AND NOT EXISTS (
+             SELECT 1 FROM push_deliveries delivery
+             WHERE delivery.thread_id=mapping.thread_id AND delivery.turn_id=?
+               AND delivery.subscription_id=mapping.subscription_id
+           )`,
+        )
+        .get(threadId, turnId, turnId) as { count: number };
+      const globalPending = this.database
+        .prepare('SELECT COUNT(*) AS count FROM push_deliveries')
+        .get() as { count: number };
+      const threadPending = this.database
+        .prepare('SELECT COUNT(*) AS count FROM push_deliveries WHERE thread_id=?')
+        .get(threadId) as { count: number };
+      const capacity = Math.max(
+        0,
+        Math.min(
+          PUSH_STORAGE_LIMITS.pendingGlobal - globalPending.count,
+          PUSH_STORAGE_LIMITS.pendingPerThread - threadPending.count,
+        ),
+      );
+      const enqueued = Number(
+        this.database
+          .prepare(
+            `INSERT OR IGNORE INTO push_deliveries(
            id,thread_id,turn_id,subscription_id,payload_json,attempts,next_attempt_at,created_at,updated_at
          )
          SELECT lower(hex(randomblob(16))),?,?,mapping.subscription_id,?,0,?,?,?
@@ -585,11 +710,26 @@ export class SqliteRepository {
            SELECT 1 FROM push_delivery_receipts receipt
            WHERE receipt.thread_id=mapping.thread_id AND receipt.turn_id=?
              AND receipt.subscription_id=mapping.subscription_id
-         )`,
-        )
-        .run(threadId, turnId, JSON.stringify(payload), Date.now(), now, now, threadId, turnId)
-        .changes,
-    );
+         ) LIMIT ?`,
+          )
+          .run(
+            threadId,
+            turnId,
+            JSON.stringify({ status: payload.status }),
+            Date.now(),
+            now,
+            now,
+            threadId,
+            turnId,
+            capacity,
+          ).changes,
+      );
+      this.database.exec('COMMIT');
+      return { enqueued, dropped: Math.max(0, eligible.count - enqueued) };
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   claimDuePushDeliveries(limit: number): ClaimedPushDelivery[] {
@@ -598,7 +738,7 @@ export class SqliteRepository {
     try {
       const rows = this.database
         .prepare(
-          `SELECT d.id,d.subscription_id,s.endpoint,s.expiration_time,s.p256dh,s.auth,
+          `SELECT d.id,d.thread_id,d.subscription_id,s.endpoint,s.expiration_time,s.p256dh,s.auth,
                   d.payload_json,d.attempts
            FROM push_deliveries d JOIN push_subscriptions s ON s.id=d.subscription_id
            WHERE d.attempts < 5 AND d.next_attempt_at <= ?
@@ -616,17 +756,25 @@ export class SqliteRepository {
           .run(attempt, now + backoffMs, updatedAt, row.id);
       }
       this.database.exec('COMMIT');
-      return rows.map((row) => ({
-        id: row.id,
-        subscriptionId: row.subscription_id,
-        subscription: {
-          endpoint: row.endpoint,
-          expirationTime: row.expiration_time,
-          keys: { p256dh: row.p256dh, auth: row.auth },
-        },
-        payload: JSON.parse(row.payload_json) as PushNotificationPayload,
-        attempt: row.attempts + 1,
-      }));
+      return rows.map((row) => {
+        const stored = JSON.parse(row.payload_json) as { status?: unknown };
+        const status =
+          stored.status === 'interrupted' || stored.status === 'failed'
+            ? stored.status
+            : 'completed';
+        return {
+          id: row.id,
+          threadId: row.thread_id,
+          subscriptionId: row.subscription_id,
+          subscription: {
+            endpoint: row.endpoint,
+            expirationTime: row.expiration_time,
+            keys: { p256dh: row.p256dh, auth: row.auth },
+          },
+          payload: { threadId: row.thread_id, status },
+          attempt: row.attempts + 1,
+        };
+      });
     } catch (error) {
       this.database.exec('ROLLBACK');
       throw error;
@@ -647,10 +795,16 @@ export class SqliteRepository {
           `DELETE FROM push_delivery_receipts WHERE rowid IN (
              SELECT rowid FROM push_delivery_receipts
              WHERE thread_id=(SELECT thread_id FROM push_deliveries WHERE id=?)
-             ORDER BY delivered_at DESC,rowid DESC LIMIT -1 OFFSET 1000
+             ORDER BY delivered_at DESC,rowid DESC LIMIT -1 OFFSET ${PUSH_STORAGE_LIMITS.receiptsPerThread}
            )`,
         )
         .run(id);
+      this.database.exec(`
+        DELETE FROM push_delivery_receipts WHERE rowid IN (
+          SELECT rowid FROM push_delivery_receipts ORDER BY delivered_at DESC,rowid DESC
+          LIMIT -1 OFFSET ${PUSH_STORAGE_LIMITS.receiptsGlobal}
+        )
+      `);
       this.database.prepare('DELETE FROM push_deliveries WHERE id=?').run(id);
       this.database.exec('COMMIT');
     } catch (error) {
@@ -688,6 +842,27 @@ export class SqliteRepository {
 
   removePushSubscriptionGlobally(subscriptionId: string): void {
     this.database.prepare('DELETE FROM push_subscriptions WHERE id=?').run(subscriptionId);
+  }
+
+  removePushSubscriptionsWhere(predicate: (endpoint: string) => boolean): number {
+    const rows = this.database
+      .prepare('SELECT id,endpoint FROM push_subscriptions')
+      .all() as unknown as {
+      id: string;
+      endpoint: string;
+    }[];
+    const ids = rows.filter((row) => predicate(row.endpoint)).map((row) => row.id);
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const statement = this.database.prepare('DELETE FROM push_subscriptions WHERE id=?');
+      let removed = 0;
+      for (const id of ids) removed += Number(statement.run(id).changes);
+      this.database.exec('COMMIT');
+      return removed;
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   nextPushDeliveryDelayMs(): number | null {

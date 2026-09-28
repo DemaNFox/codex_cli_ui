@@ -3,10 +3,11 @@ import webPush from 'web-push';
 import { request } from 'node:https';
 
 import type { SqliteRepository } from './database.js';
+import { isAllowedPushEndpoint } from './push-notifications-policy.js';
+export { isAllowedPushEndpoint } from './push-notifications-policy.js';
 
 export interface PushNotificationPayload {
   readonly threadId: string;
-  readonly threadName: string;
   readonly status: 'completed' | 'interrupted' | 'failed';
 }
 
@@ -70,7 +71,13 @@ export class PushNotificationDispatcher {
   private running = false;
   private closed = false;
   private activeDrain: Promise<void> | null = null;
-  private activeAbort: AbortController | null = null;
+  private activeDelivery:
+    | {
+        readonly threadId: string;
+        readonly subscriptionId: string;
+        readonly abort: AbortController;
+      }
+    | undefined;
 
   constructor(
     private readonly repository: SqliteRepository,
@@ -78,30 +85,39 @@ export class PushNotificationDispatcher {
   ) {}
 
   start(): void {
+    const unsafeSubscriptions = this.repository.removePushSubscriptionsWhere(
+      (endpoint) => !isAllowedPushEndpoint(endpoint),
+    );
+    if (unsafeSubscriptions > 0)
+      this.repository.audit('push.subscription', 'unsafe-purged', { count: unsafeSubscriptions });
     const purged = this.repository.purgeExhaustedPushDeliveries();
     if (purged > 0) this.repository.audit('push.delivery', 'exhausted-purged', { count: purged });
     this.schedule(0);
   }
 
-  enqueue(
-    threadId: string,
-    turnId: string,
-    threadName: string | null,
-    status: PushNotificationPayload['status'],
-  ): void {
-    this.repository.enqueuePushDeliveries(threadId, turnId, {
-      threadId,
-      threadName: threadName?.trim() || 'Codex chat',
-      status,
-    });
+  enqueue(threadId: string, turnId: string, status: PushNotificationPayload['status']): void {
+    const result = this.repository.enqueuePushDeliveries(threadId, turnId, { threadId, status });
+    if (result.dropped > 0)
+      this.repository.audit('push.delivery', 'queue-limit', {
+        threadId,
+        dropped: result.dropped,
+      });
     this.schedule(0);
+  }
+
+  cancel(threadId: string, subscriptionId: string): void {
+    if (
+      this.activeDelivery?.threadId === threadId &&
+      this.activeDelivery.subscriptionId === subscriptionId
+    )
+      this.activeDelivery.abort.abort();
   }
 
   async close(): Promise<void> {
     this.closed = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
-    this.activeAbort?.abort();
+    this.activeDelivery?.abort.abort();
     await this.activeDrain;
   }
 
@@ -124,7 +140,11 @@ export class PushNotificationDispatcher {
         if (this.closed) break;
         if (!this.repository.isPushDeliveryActive(delivery.id)) continue;
         const abort = new AbortController();
-        this.activeAbort = abort;
+        this.activeDelivery = {
+          threadId: delivery.threadId,
+          subscriptionId: delivery.subscriptionId,
+          abort,
+        };
         try {
           await this.sender.send(
             delivery.subscription,
@@ -133,6 +153,7 @@ export class PushNotificationDispatcher {
           );
           this.repository.completePushDelivery(delivery.id);
         } catch (error) {
+          if (!this.repository.isPushDeliveryActive(delivery.id)) continue;
           const code = statusCode(error);
           if (code === 404 || code === 410) {
             this.repository.removePushSubscriptionGlobally(delivery.subscriptionId);
@@ -149,7 +170,7 @@ export class PushNotificationDispatcher {
             });
           }
         } finally {
-          if (this.activeAbort === abort) this.activeAbort = null;
+          if (this.activeDelivery?.abort === abort) this.activeDelivery = undefined;
         }
       }
     } finally {
