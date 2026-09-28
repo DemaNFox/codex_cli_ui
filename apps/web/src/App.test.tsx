@@ -363,6 +363,53 @@ describe('App', () => {
     expect(source?.close).toHaveBeenCalledOnce();
   });
 
+  it('offers a scroll-to-latest control when new events arrive below the viewport', async () => {
+    const initialEvent = {
+      id: 1,
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Начальное сообщение' },
+      createdAt: '2026-09-27T10:01:00.000Z',
+    };
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [initialEvent] });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByText('Начальное сообщение');
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+    const scroll = document.querySelector<HTMLDivElement>('.conversation-scroll');
+    if (!scroll) throw new Error('conversation scroll was not rendered');
+    Object.defineProperties(scroll, {
+      scrollHeight: { configurable: true, value: 1_000 },
+      clientHeight: { configurable: true, value: 300 },
+      scrollTop: { configurable: true, writable: true, value: 100 },
+    });
+    const scrollTo = vi.fn();
+    Object.defineProperty(scroll, 'scrollTo', { configurable: true, value: scrollTo });
+    fireEvent.scroll(scroll);
+
+    act(() => {
+      FakeEventSource.instances.at(-1)?.emit({
+        ...initialEvent,
+        id: 2,
+        payload: { text: 'Новое сообщение ниже' },
+        createdAt: '2026-09-27T10:02:00.000Z',
+      });
+    });
+
+    const jump = await screen.findByRole('button', { name: 'Перейти к новым сообщениям' });
+    expect(scrollTo).not.toHaveBeenCalled();
+    await user.click(jump);
+    expect(scrollTo).toHaveBeenCalledWith({ top: 1_000, behavior: 'smooth' });
+    expect(screen.queryByRole('button', { name: 'Перейти к новым сообщениям' })).toBeNull();
+  });
+
   it('keeps primary controls available and opens compact project/thread menus', async () => {
     installAuthenticatedApi();
     const user = userEvent.setup();

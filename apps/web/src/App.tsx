@@ -1830,7 +1830,11 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
+  const [showScrollToLatest, setShowScrollToLatest] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const conversationScrollRef = useRef<HTMLDivElement>(null);
+  const followingLatestRef = useRef(true);
+  const lastEventIdRef = useRef<number | null>(null);
   const mobileNavigationToggleRef = useRef<HTMLButtonElement>(null);
   const statusToggleRef = useRef<HTMLButtonElement>(null);
   const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
@@ -1841,6 +1845,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     () => new Set(),
   );
   const { events, streamState, mergeEvents } = useThreadEvents(threadId);
+  const latestEventId = events.at(-1)?.id ?? null;
 
   const selectedThread = threads.find((item) => item.id === threadId) ?? null;
   const modelOption = models.find((item) => item.id === model) ?? null;
@@ -1892,7 +1897,41 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   useEffect(() => {
     setLocallyResolvedRequests(new Set());
     setActionNotice(null);
+    setShowScrollToLatest(false);
+    followingLatestRef.current = true;
+    lastEventIdRef.current = null;
   }, [threadId]);
+
+  useEffect(() => {
+    if (latestEventId === null || latestEventId === lastEventIdRef.current) return;
+    const previousEventId = lastEventIdRef.current;
+    lastEventIdRef.current = latestEventId;
+    const scroll = conversationScrollRef.current;
+    if (!scroll) return;
+    if (previousEventId === null || followingLatestRef.current) {
+      scroll.scrollTo?.({ top: scroll.scrollHeight, behavior: 'smooth' });
+      setShowScrollToLatest(false);
+      return;
+    }
+    setShowScrollToLatest(true);
+  }, [latestEventId]);
+
+  function trackConversationScroll(): void {
+    const scroll = conversationScrollRef.current;
+    if (!scroll) return;
+    const nearLatest = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight <= 80;
+    followingLatestRef.current = nearLatest;
+    setShowScrollToLatest(!nearLatest);
+  }
+
+  function scrollToLatest(): void {
+    const scroll = conversationScrollRef.current;
+    if (!scroll) return;
+    followingLatestRef.current = true;
+    setShowScrollToLatest(false);
+    if (scroll.scrollTo) scroll.scrollTo({ top: scroll.scrollHeight, behavior: 'smooth' });
+    else scroll.scrollTop = scroll.scrollHeight;
+  }
 
   useEffect(() => {
     const nameEvent = [...events]
@@ -2663,7 +2702,11 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
             <span>{actionNotice}</span>
           </div>
         )}
-        <div className="conversation-scroll">
+        <div
+          className="conversation-scroll"
+          ref={conversationScrollRef}
+          onScroll={trackConversationScroll}
+        >
           <SubagentPanel subagents={subagents} />
           <Transcript events={events} />
           {approvals.map((approval) => (
@@ -2689,6 +2732,17 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
           ))}
         </div>
         <div className="composer-wrap">
+          {showScrollToLatest && (
+            <button
+              className="scroll-to-latest"
+              type="button"
+              onClick={scrollToLatest}
+              aria-label="Перейти к новым сообщениям"
+              title="Новые сообщения ниже"
+            >
+              ↓
+            </button>
+          )}
           {composer.startsWith('/') && !composer.includes(' ') && (
             <div className="slash-palette" role="listbox" aria-label="Команды Codex">
               {SLASH_COMMANDS.filter(({ command }) => command.startsWith(composer)).map(

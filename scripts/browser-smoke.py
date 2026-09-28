@@ -495,6 +495,23 @@ def main() -> int:
         )
         if transcript_metrics["scrollHeight"] <= transcript_metrics["clientHeight"]:
             raise AssertionError("long transcript is not isolated in its own scroll container")
+        page.locator(".conversation-scroll").evaluate(
+            """element => {
+                element.scrollTop = 0;
+                element.dispatchEvent(new Event('scroll'));
+            }"""
+        )
+        jump_to_latest = page.get_by_role("button", name="Перейти к новым сообщениям")
+        jump_to_latest.wait_for()
+        jump_to_latest.click()
+        page.wait_for_function(
+            """() => {
+                const element = document.querySelector('.conversation-scroll');
+                return element && element.scrollHeight - element.scrollTop - element.clientHeight <= 80;
+            }"""
+        )
+        if jump_to_latest.count():
+            raise AssertionError("scroll-to-latest control remains visible at the bottom")
         first_time = page.locator(".message time").first
         first_time.wait_for()
         if first_time.get_attribute("datetime") != "2026-09-27T11:58:00.000Z":

@@ -128,6 +128,9 @@ Thread menus allow a server-persisted manual rename. Until the operator renames 
 apply that notification immediately; background and visibility refreshes reconcile project/thread navigation
 changed from another device.
 Messages and visible execution stages render their persisted ISO event time in the browser's local timezone.
+The transcript follows new events only while the reader remains near its bottom. Scrolling upward exposes a
+floating jump control; newly streamed events keep that control visible instead of moving the reader, and the
+control returns to the latest event on demand.
 For live work this is the server receipt time. Older history first imported from Codex may only have the import
 time when the protocol item did not expose a trustworthy occurrence timestamp.
 At `820px` and below, the navigation is an off-canvas drawer with focus containment, Escape close and focus
