@@ -97,6 +97,11 @@ function pushNotificationLabel(state: PushNotificationState): string {
   }
 }
 
+function fitComposerInput(input: HTMLTextAreaElement): void {
+  input.style.height = 'auto';
+  if (input.value) input.style.height = `${input.scrollHeight}px`;
+}
+
 interface QueuedAttachment {
   localId: string;
   file: File;
@@ -1947,6 +1952,10 @@ function Workspace({
   const active = selectedThread?.status === 'active';
   const activeTurnId = active ? selectedThread.activeTurnId : null;
   const activeTurnDuration = useActiveTurnDuration(events, activeTurnId, active);
+
+  useLayoutEffect(() => {
+    if (composerInputRef.current) fitComposerInput(composerInputRef.current);
+  }, [composer]);
   const approvals = useMemo(() => {
     const pending = new Map<string, PendingApproval>();
     for (const event of events) {
@@ -3277,7 +3286,10 @@ function Workspace({
                   : 'Создайте чат, чтобы начать'
               }
               value={composer}
-              onChange={(event) => setComposer(event.target.value)}
+              onChange={(event) => {
+                setComposer(event.target.value);
+                fitComposerInput(event.currentTarget);
+              }}
               onPaste={(event: ClipboardEvent<HTMLTextAreaElement>) => {
                 const files = Array.from(event.clipboardData.files);
                 if (files.length) {
@@ -3292,44 +3304,46 @@ function Workspace({
                 }
               }}
               disabled={!threadId || archiveView}
-              rows={3}
+              rows={1}
             />
-            <button
-              type="button"
-              className="attach-button"
-              onClick={() => fileInputRef.current?.click()}
-              disabled={!threadId || archiveView || active || busy}
-              aria-label="Прикрепить файлы"
-              title={active ? 'Вложения недоступны во время активной задачи' : 'Прикрепить файлы'}
-            >
-              ＋
-            </button>
-            <VoiceInputButton
-              available={capability?.transcription?.available ?? false}
-              csrfToken={session.csrfToken}
-              disabled={!threadId || archiveView || busy}
-              maxBytes={capability?.transcription?.maxBytes ?? 10 * 1024 * 1024}
-              maxDurationSeconds={capability?.transcription?.maxDurationSeconds ?? 120}
-              onError={setError}
-              onTranscript={(text) => {
-                setComposer((current) => `${current}${current.trim() ? '\n' : ''}${text}`);
-                window.requestAnimationFrame(() => composerInputRef.current?.focus());
-              }}
-            />
-            <button
-              className="send-button"
-              onClick={() => void send()}
-              disabled={
-                !threadId ||
-                archiveView ||
-                (!composer.trim() && !queuedAttachments.length) ||
-                (active && queuedAttachments.length > 0) ||
-                busy
-              }
-              aria-label={active ? 'Направить задачу' : 'Отправить сообщение'}
-            >
-              {active ? '↗' : '↑'}
-            </button>
+            <div className="composer-controls">
+              <button
+                type="button"
+                className="attach-button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={!threadId || archiveView || active || busy}
+                aria-label="Прикрепить файлы"
+                title={active ? 'Вложения недоступны во время активной задачи' : 'Прикрепить файлы'}
+              >
+                ＋
+              </button>
+              <VoiceInputButton
+                available={capability?.transcription?.available ?? false}
+                csrfToken={session.csrfToken}
+                disabled={!threadId || archiveView || busy}
+                maxBytes={capability?.transcription?.maxBytes ?? 10 * 1024 * 1024}
+                maxDurationSeconds={capability?.transcription?.maxDurationSeconds ?? 120}
+                onError={setError}
+                onTranscript={(text) => {
+                  setComposer((current) => `${current}${current.trim() ? '\n' : ''}${text}`);
+                  window.requestAnimationFrame(() => composerInputRef.current?.focus());
+                }}
+              />
+              <button
+                className="send-button"
+                onClick={() => void send()}
+                disabled={
+                  !threadId ||
+                  archiveView ||
+                  (!composer.trim() && !queuedAttachments.length) ||
+                  (active && queuedAttachments.length > 0) ||
+                  busy
+                }
+                aria-label={active ? 'Направить задачу' : 'Отправить сообщение'}
+              >
+                {active ? '↗' : '↑'}
+              </button>
+            </div>
           </div>
           {(attachmentNotice || (active && queuedAttachments.length > 0)) && (
             <p className="attachment-notice" role="status">

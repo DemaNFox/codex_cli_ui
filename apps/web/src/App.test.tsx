@@ -1444,6 +1444,22 @@ describe('App', () => {
     );
   });
 
+  it('keeps the composer compact and grows it with multiline input', async () => {
+    installAuthenticatedApi();
+    render(<App />);
+
+    const textarea = await screen.findByLabelText<HTMLTextAreaElement>('Сообщение Codex');
+    expect(textarea.rows).toBe(1);
+    expect(textarea.closest('.composer')?.querySelector('.composer-controls')).not.toBeNull();
+    Object.defineProperty(textarea, 'scrollHeight', { configurable: true, value: 144 });
+
+    fireEvent.change(textarea, { target: { value: 'Первая строка\nВторая строка' } });
+    expect(textarea.style.height).toBe('144px');
+
+    fireEvent.change(textarea, { target: { value: '' } });
+    expect(textarea.style.height).toBe('auto');
+  });
+
   it('queues files from picker, clipboard and drop, then removes them before upload', async () => {
     installAuthenticatedApi();
     const user = userEvent.setup();

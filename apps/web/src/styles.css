@@ -1214,14 +1214,22 @@ button:disabled {
 .composer textarea {
   display: block;
   width: 100%;
-  min-height: 4.6rem;
+  min-height: 2.9rem;
   max-height: 12rem;
-  padding: 0.85rem 3.4rem 0.85rem 5.85rem;
-  resize: vertical;
+  padding: 0.8rem 0.85rem 0.35rem;
+  resize: none;
+  overflow-y: auto;
   border: 0;
   outline: 0;
   background: transparent;
   line-height: 1.5;
+}
+.composer-controls {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.2rem;
+  padding: 0 0.55rem 0.55rem;
 }
 .visually-hidden {
   position: absolute !important;
@@ -1305,9 +1313,7 @@ button:disabled {
   background: #2d343a;
 }
 .attach-button {
-  position: absolute;
-  left: 0.7rem;
-  bottom: 0.7rem;
+  flex: 0 0 auto;
   width: 2.15rem;
   height: 2.15rem;
   border-radius: 0.6rem;
@@ -1318,10 +1324,8 @@ button:disabled {
   background: #252c31;
 }
 .voice-input {
-  position: absolute;
-  left: 3.05rem;
-  bottom: 0.7rem;
   display: flex;
+  min-width: 0;
   align-items: center;
   gap: 0.25rem;
 }
@@ -1361,11 +1365,10 @@ button:disabled {
   font-size: 1rem;
 }
 .send-button {
-  position: absolute;
-  right: 0.7rem;
-  bottom: 0.7rem;
   display: grid;
+  flex: 0 0 auto;
   place-items: center;
+  margin-left: auto;
   width: 2.15rem;
   height: 2.15rem;
   border-radius: 0.6rem;
@@ -1887,26 +1890,12 @@ button:disabled {
     padding-right: 1.1rem;
   }
   .composer textarea {
-    min-height: 3.5rem;
+    min-height: 2.75rem;
     max-height: 7rem;
     padding-top: 0.65rem;
-    padding-bottom: 0.65rem;
-    padding-right: 3.1rem;
-    padding-left: 5.55rem;
-  }
-  .send-button,
-  .attach-button,
-  .voice-input {
-    bottom: 0.55rem;
-  }
-  .send-button {
-    right: 0.55rem;
-  }
-  .attach-button {
-    left: 0.55rem;
-  }
-  .voice-input {
-    left: 2.9rem;
+    padding-right: 0.75rem;
+    padding-bottom: 0.25rem;
+    padding-left: 0.75rem;
   }
   .composer-hint {
     display: none;

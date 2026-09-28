@@ -726,6 +726,26 @@ def main() -> int:
             raise AssertionError("composer is pushed below the desktop viewport")
 
         composer = page.get_by_label("Сообщение Codex")
+        textarea_box = composer.bounding_box()
+        controls_box = page.locator(".composer-controls").bounding_box()
+        textarea_padding = composer.evaluate(
+            "element => ({left: parseFloat(getComputedStyle(element).paddingLeft), resize: getComputedStyle(element).resize})"
+        )
+        if not textarea_box or textarea_box["height"] > 60:
+            raise AssertionError(f"empty composer is not compact: {textarea_box}")
+        if not controls_box or controls_box["y"] < textarea_box["y"] + textarea_box["height"] - 1:
+            raise AssertionError("composer controls overlap the text entry area")
+        if textarea_padding["left"] > 20 or textarea_padding["resize"] != "none":
+            raise AssertionError(f"composer text is offset or manually resizable: {textarea_padding}")
+        composer.fill("one\ntwo\nthree\nfour")
+        grown_box = composer.bounding_box()
+        if not grown_box or grown_box["height"] <= textarea_box["height"]:
+            raise AssertionError("composer did not grow with multiline text")
+        composer.fill("")
+        compact_box = composer.bounding_box()
+        if not compact_box or compact_box["height"] > textarea_box["height"] + 1:
+            raise AssertionError("composer did not return to compact height after clearing")
+
         composer.fill("/sta")
         page.get_by_role("listbox", name="Команды Codex").wait_for()
         page.get_by_role("option", name="/status Статус, лимиты и использование").click()
