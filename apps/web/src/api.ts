@@ -93,6 +93,10 @@ export interface AttachmentUpload {
   abort: () => void;
 }
 
+export interface PushSubscriptionStatus {
+  subscribed: boolean;
+}
+
 function uploadAttachment(
   csrfToken: string,
   threadId: string,
@@ -353,6 +357,38 @@ export const api = {
         },
       ),
     ),
+  pushSubscriptionStatus: async (csrfToken: string, threadId: string, endpoint: string) =>
+    unwrapData(
+      await request<PushSubscriptionStatus | { data: PushSubscriptionStatus }>(
+        `/api/threads/${encodeURIComponent(threadId)}/push-subscriptions/status`,
+        {
+          method: 'POST',
+          csrfToken,
+          body: { endpoint },
+        },
+      ),
+    ),
+  savePushSubscription: async (
+    csrfToken: string,
+    threadId: string,
+    subscription: PushSubscriptionJSON,
+  ) =>
+    unwrapData(
+      await request<PushSubscriptionStatus | { data: PushSubscriptionStatus }>(
+        `/api/threads/${encodeURIComponent(threadId)}/push-subscriptions`,
+        {
+          method: 'PUT',
+          csrfToken,
+          body: subscription,
+        },
+      ),
+    ),
+  deletePushSubscription: (csrfToken: string, threadId: string, endpoint: string) =>
+    request<void>(`/api/threads/${encodeURIComponent(threadId)}/push-subscriptions`, {
+      method: 'DELETE',
+      csrfToken,
+      body: { endpoint },
+    }),
   resolveApproval: (
     csrfToken: string,
     approvalId: string,

@@ -60,6 +60,10 @@ const capabilities = {
     maxBytes: 10 * 1024 * 1024,
     maxDurationSeconds: 300,
   },
+  notifications: {
+    available: true,
+    vapidPublicKey: 'BEl62iUYgUivxIkv69yViEuiBIa40HI4o2TjDqFr6BkDHRMYitVCCfZwzVQHBGEY',
+  },
   projectRoots: ['/srv/projects'],
   skills: [
     { name: 'multi-agent-orchestrator', path: '/etc/codex/skills/orchestrator', enabled: true },
@@ -283,6 +287,10 @@ beforeEach(() => {
   FakeXMLHttpRequest.autoRespond = true;
   vi.stubGlobal('EventSource', FakeEventSource);
   vi.stubGlobal('XMLHttpRequest', FakeXMLHttpRequest);
+  Object.defineProperty(window, 'isSecureContext', {
+    configurable: true,
+    value: true,
+  });
   Object.defineProperty(URL, 'createObjectURL', {
     configurable: true,
     value: vi.fn(() => 'blob:preview'),
@@ -293,7 +301,163 @@ beforeEach(() => {
   });
 });
 
+function installPushApi() {
+  const unsubscribe = vi.fn(() => Promise.resolve(true));
+  const subscription = {
+    endpoint: 'https://push.example/device-1',
+    expirationTime: null,
+    options: { userVisibleOnly: true, applicationServerKey: null },
+    getKey: vi.fn(() => null),
+    unsubscribe,
+    toJSON: vi.fn(() => ({
+      endpoint: 'https://push.example/device-1',
+      expirationTime: null,
+      keys: { p256dh: 'public-key', auth: 'auth-key' },
+    })),
+  } as unknown as PushSubscription;
+  const pushManager = {
+    getSubscription: vi.fn<() => Promise<PushSubscription | null>>(),
+    permissionState: vi.fn(),
+    subscribe: vi.fn(() => Promise.resolve(subscription)),
+  };
+  const registration = { pushManager } as unknown as ServiceWorkerRegistration;
+  let installedRegistration: ServiceWorkerRegistration | undefined;
+  const serviceWorker: Pick<ServiceWorkerContainer, 'getRegistration' | 'ready' | 'register'> = {
+    getRegistration: vi.fn(() => Promise.resolve(installedRegistration)),
+    ready: Promise.resolve(registration),
+    register: vi.fn((_scriptURL: string | URL, _options?: RegistrationOptions) => {
+      void _scriptURL;
+      void _options;
+      installedRegistration = registration;
+      return Promise.resolve(registration);
+    }),
+  };
+  pushManager.getSubscription.mockImplementation(() =>
+    Promise.resolve(installedRegistration ? subscription : null),
+  );
+  Object.defineProperty(navigator, 'serviceWorker', {
+    configurable: true,
+    value: serviceWorker,
+  });
+  class TestNotification {
+    static permission: NotificationPermission = 'default';
+    static requestPermission = vi.fn(() => {
+      TestNotification.permission = 'granted';
+      return Promise.resolve<NotificationPermission>('granted');
+    });
+  }
+  vi.stubGlobal('Notification', TestNotification);
+  vi.stubGlobal('PushManager', class PushManager {});
+  return {
+    registration,
+    serviceWorker,
+    subscription,
+    unsubscribe,
+    pushManager,
+    TestNotification,
+  };
+}
+
 describe('App', () => {
+  it('shows a clear unavailable state when server push is not configured', async () => {
+    installAuthenticatedApi((url) => {
+      if (url !== '/api/system/capabilities') return undefined;
+      return jsonResponse({ ...capabilities, notifications: undefined });
+    });
+
+    render(<App />);
+
+    const button = await screen.findByRole('button', {
+      name: 'Уведомления не настроены на сервере',
+    });
+    expect(button.hasAttribute('disabled')).toBe(true);
+  });
+
+  it('explains that push requires a secure browser context', async () => {
+    Object.defineProperty(window, 'isSecureContext', {
+      configurable: true,
+      value: false,
+    });
+    installAuthenticatedApi();
+
+    render(<App />);
+
+    const button = await screen.findByRole('button', {
+      name: 'Уведомления доступны только по HTTPS или на localhost',
+    });
+    expect(button.hasAttribute('disabled')).toBe(true);
+  });
+
+  it('enables and disables only the selected chat push mapping', async () => {
+    const { serviceWorker, subscription, unsubscribe, TestNotification } = installPushApi();
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url.endsWith('/push-subscriptions') && init?.method === 'PUT') {
+        return jsonResponse({ data: { subscribed: true } });
+      }
+      if (url.endsWith('/push-subscriptions') && init?.method === 'DELETE') {
+        return new Response(null, { status: 204 });
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const enable = await screen.findByRole('button', {
+      name: 'Включить уведомления для этого чата',
+    });
+    await user.click(enable);
+
+    expect(TestNotification.requestPermission).toHaveBeenCalledOnce();
+    expect(serviceWorker.register).toHaveBeenCalledWith('/push-service-worker.js', { scope: '/' });
+    await expect(serviceWorker.ready).resolves.toBeDefined();
+    await screen.findByRole('button', { name: 'Отключить уведомления для этого чата' });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/threads/thread-1/push-subscriptions',
+      expect.objectContaining({ method: 'PUT' }),
+    );
+
+    await user.click(screen.getByRole('button', { name: 'Отключить уведомления для этого чата' }));
+    await screen.findByRole('button', { name: 'Включить уведомления для этого чата' });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/threads/thread-1/push-subscriptions',
+      expect.objectContaining({
+        method: 'DELETE',
+        body: JSON.stringify({ endpoint: subscription.endpoint }),
+      }),
+    );
+    expect(unsubscribe).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the current browser endpoint when switching chats', async () => {
+    const { serviceWorker, registration } = installPushApi();
+    const secondThread = { ...thread, id: 'thread-2', name: 'Second task' };
+    await serviceWorker.register('/push-service-worker.js', { scope: '/' });
+    expect(registration).toBeDefined();
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url.includes('/api/threads?')) return jsonResponse([thread, secondThread]);
+      if (url === '/api/threads/thread-2') {
+        return jsonResponse({ data: secondThread, events: [] });
+      }
+      if (url.endsWith('/push-subscriptions/status') && init?.method === 'POST') {
+        return jsonResponse({ data: { subscribed: url.includes('thread-2') } });
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByRole('button', { name: 'Включить уведомления для этого чата' });
+    await user.click(screen.getByRole('button', { name: 'Открыть чат проекта Second task' }));
+    await screen.findByRole('button', { name: 'Отключить уведомления для этого чата' });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/threads/thread-2/push-subscriptions/status',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ endpoint: 'https://push.example/device-1' }),
+      }),
+    );
+  });
+
   it('remains compatible with a backend that predates transcription capabilities', async () => {
     installAuthenticatedApi((url) => {
       if (url !== '/api/system/capabilities') return undefined;

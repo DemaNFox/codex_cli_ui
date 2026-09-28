@@ -29,6 +29,8 @@ def main() -> int:
     console_errors: list[str] = []
     resolved_user_input: dict[str, object] | None = None
     resolved_permission: dict[str, object] | None = None
+    push_subscribed = False
+    push_endpoint = "https://push.example/smoke-device"
     resource_snapshot = {
         "capacity": {
             "cpuCores": 8,
@@ -59,6 +61,7 @@ def main() -> int:
 
     def api(route: Route) -> None:
         nonlocal signed_in, archived, thread_name, resolved_user_input, resolved_permission
+        nonlocal push_subscribed
         nonlocal resource_snapshot
         request = route.request
         parsed = urlparse(request.url)
@@ -167,9 +170,23 @@ def main() -> int:
                         "maxBytes": 10485760,
                         "maxDurationSeconds": 120,
                     },
+                    "notifications": {
+                        "available": True,
+                        "vapidPublicKey": "BEl62iUYgUivxIkv69yViEuiBIa40HI4o2TjDqFr6BkDHRMYitVCCfZwzVQHBGEY",
+                    },
                     "warnings": [],
                 },
             )
+        elif path == "/api/threads/t1/push-subscriptions/status":
+            push_subscribed = push_subscribed and request.post_data_json["endpoint"] == push_endpoint
+            payload(route, 200, {"data": {"subscribed": push_subscribed}})
+        elif path == "/api/threads/t1/push-subscriptions" and request.method == "PUT":
+            push_subscribed = request.post_data_json["endpoint"] == push_endpoint
+            payload(route, 200, {"data": {"subscribed": push_subscribed}})
+        elif path == "/api/threads/t1/push-subscriptions" and request.method == "DELETE":
+            if request.post_data_json["endpoint"] == push_endpoint:
+                push_subscribed = False
+            route.fulfill(status=204, body="")
         elif path == "/api/system/resource-limits" and request.method == "GET":
             payload(route, 200, {"data": resource_snapshot})
         elif path == "/api/system/resource-limits" and request.method == "PUT":
@@ -468,8 +485,90 @@ def main() -> int:
             if message.type == "error"
             else None,
         )
+        page.add_init_script(
+            """
+            (() => {
+              const subscription = {
+                endpoint: 'https://push.example/smoke-device',
+                unsubscribe: async () => { throw new Error('global unsubscribe must not be called'); },
+                toJSON: () => ({
+                  endpoint: 'https://push.example/smoke-device',
+                  expirationTime: null,
+                  keys: { p256dh: 'public-key', auth: 'auth-key' },
+                }),
+              };
+              let installed = false;
+              const registration = {
+                pushManager: {
+                  getSubscription: async () => installed ? subscription : null,
+                  subscribe: async () => { installed = true; return subscription; },
+                },
+              };
+              class MockNotification {
+                static permission = 'default';
+                static async requestPermission() { this.permission = 'granted'; return 'granted'; }
+              }
+              Object.defineProperty(window, 'Notification', { configurable: true, value: MockNotification });
+              Object.defineProperty(window, 'PushManager', { configurable: true, value: class PushManager {} });
+              Object.defineProperty(navigator, 'serviceWorker', {
+                configurable: true,
+                value: {
+                  getRegistration: async () => installed ? registration : undefined,
+                  register: async () => { installed = true; return registration; },
+                  ready: Promise.resolve(registration),
+                },
+              });
+            })();
+            """
+        )
         page.route("**/api/**", api)
         page.goto(BASE_URL, wait_until="domcontentloaded")
+        if page.locator('link[rel="manifest"][href="/manifest.webmanifest"]').count() != 1:
+            raise AssertionError("installable web app manifest is not linked")
+        worker_source = page.request.get(f"{BASE_URL}/push-service-worker.js").text()
+        hostile_notification = page.evaluate(
+            """
+            async ({ source }) => {
+              const handlers = {};
+              const shown = [];
+              const scope = {
+                location: { origin: window.location.origin },
+                addEventListener: (type, handler) => { handlers[type] = handler; },
+                registration: {
+                  showNotification: async (title, options) => { shown.push({ title, options }); },
+                },
+                clients: { matchAll: async () => [], openWindow: async () => undefined },
+              };
+              new Function('self', source)(scope);
+              let completion;
+              handlers.push({
+                data: { json: () => ({
+                  threadId: '../unsafe',
+                  threadName: 'Безопасный чат',
+                  status: 'completed',
+                  title: 'INJECTED TITLE',
+                  body: 'PRIVATE TRANSCRIPT',
+                  url: 'https://evil.example/steal',
+                }) },
+                waitUntil: (promise) => { completion = promise; },
+              });
+              await completion;
+              return shown[0];
+            }
+            """,
+            {"source": worker_source},
+        )
+        if hostile_notification != {
+            "title": "Codex · Безопасный чат",
+            "options": {
+                "body": "Работа в чате завершена.",
+                "tag": "codex-chat",
+                "data": {"url": "/"},
+            },
+        }:
+            raise AssertionError(
+                f"push worker trusted unexpected or cross-origin payload fields: {hostile_notification}"
+            )
 
         page.get_by_label("Логин").fill("owner")
         page.get_by_label("Пароль").fill("correct-horse-battery-staple")
@@ -482,6 +581,15 @@ def main() -> int:
         page.get_by_role("table").get_by_role("cell", name="Готово").wait_for()
         if page.get_by_role("button", name="Голосовой ввод").count() != 1:
             raise AssertionError("voice input control is not available in the composer")
+        push_toggle = page.get_by_role("button", name="Включить уведомления для этого чата")
+        push_toggle.click()
+        page.get_by_role("button", name="Отключить уведомления для этого чата").wait_for()
+        if not push_subscribed:
+            raise AssertionError("push subscription was not mapped to the selected chat")
+        page.get_by_role("button", name="Отключить уведомления для этого чата").click()
+        page.get_by_role("button", name="Включить уведомления для этого чата").wait_for()
+        if push_subscribed:
+            raise AssertionError("push subscription mapping was not removed from the selected chat")
         transcript_metrics = page.locator(".conversation-scroll").evaluate(
             "element => ({scrollHeight: element.scrollHeight, clientHeight: element.clientHeight, scrollTop: element.scrollTop})"
         )

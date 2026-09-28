@@ -157,6 +157,51 @@ describe('api response envelopes', () => {
     );
   });
 
+  it('checks, saves and removes the current device push mapping for one thread', async () => {
+    const fetchMock = vi.fn<typeof fetch>(() =>
+      Promise.resolve(response({ data: { subscribed: true } })),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const subscription = {
+      endpoint: 'https://push.example/subscription-1',
+      expirationTime: null,
+      keys: { p256dh: 'public-key', auth: 'auth-key' },
+    } satisfies PushSubscriptionJSON;
+
+    await expect(
+      api.pushSubscriptionStatus('csrf', thread.id, subscription.endpoint),
+    ).resolves.toEqual({ subscribed: true });
+    await expect(api.savePushSubscription('csrf', thread.id, subscription)).resolves.toEqual({
+      subscribed: true,
+    });
+    await api.deletePushSubscription('csrf', thread.id, subscription.endpoint);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/threads/thread-1/push-subscriptions/status',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ endpoint: subscription.endpoint }),
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/threads/thread-1/push-subscriptions',
+      expect.objectContaining({ method: 'PUT', body: JSON.stringify(subscription) }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      '/api/threads/thread-1/push-subscriptions',
+      expect.objectContaining({
+        method: 'DELETE',
+        body: JSON.stringify({ endpoint: subscription.endpoint }),
+      }),
+    );
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(new Headers(init?.headers).get('X-CSRF-Token')).toBe('csrf');
+    }
+  });
+
   it('retries a network-ambiguous transcription with the same idempotency key', async () => {
     vi.spyOn(crypto, 'randomUUID').mockReturnValue('00000000-0000-4000-8000-000000000301');
     const fetchMock = vi

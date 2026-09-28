@@ -37,6 +37,15 @@ import { useThreadEvents } from './useThreadEvents.js';
 import { VoiceInputButton } from './VoiceInputButton.js';
 
 type LoadState = 'loading' | 'ready' | 'signed-out';
+type PushNotificationState =
+  | 'unavailable'
+  | 'insecure'
+  | 'unsupported'
+  | 'checking'
+  | 'subscribed'
+  | 'unsubscribed'
+  | 'denied'
+  | 'error';
 
 const MAX_ATTACHMENTS_PER_TURN = 8;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
@@ -45,6 +54,47 @@ const EVENT_TIME_FORMATTER = new Intl.DateTimeFormat('ru-RU', {
   dateStyle: 'short',
   timeStyle: 'medium',
 });
+
+function pushSupportIssue(): 'insecure' | 'unsupported' | null {
+  if (!window.isSecureContext) return 'insecure';
+  if (
+    typeof Notification === 'undefined' ||
+    !('serviceWorker' in navigator) ||
+    typeof PushManager === 'undefined'
+  ) {
+    return 'unsupported';
+  }
+  return null;
+}
+
+function vapidKeyBuffer(value: string): ArrayBuffer {
+  const padding = '='.repeat((4 - (value.length % 4)) % 4);
+  const binary = window.atob((value + padding).replace(/-/g, '+').replace(/_/g, '/'));
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes.buffer;
+}
+
+function pushNotificationLabel(state: PushNotificationState): string {
+  switch (state) {
+    case 'subscribed':
+      return 'Отключить уведомления для этого чата';
+    case 'checking':
+      return 'Проверяем подписку на уведомления…';
+    case 'insecure':
+      return 'Уведомления доступны только по HTTPS или на localhost';
+    case 'denied':
+      return 'Уведомления запрещены в настройках браузера';
+    case 'unsupported':
+      return 'Этот браузер не поддерживает push-уведомления';
+    case 'unavailable':
+      return 'Уведомления не настроены на сервере';
+    case 'error':
+      return 'Не удалось проверить подписку на уведомления';
+    default:
+      return 'Включить уведомления для этого чата';
+  }
+}
 
 interface QueuedAttachment {
   localId: string;
@@ -1832,6 +1882,9 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const [mobileRuntimeOpen, setMobileRuntimeOpen] = useState(false);
   const [statusRefreshing, setStatusRefreshing] = useState(false);
+  const [pushNotificationState, setPushNotificationState] =
+    useState<PushNotificationState>('unavailable');
+  const [pushNotificationBusy, setPushNotificationBusy] = useState(false);
   const [model, setModel] = useState('');
   const [effort, setEffort] = useState('');
   const [permission, setPermission] = useState<PermissionPreset>('workspace-write');
@@ -1922,6 +1975,55 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     userScrollIntentAtRef.current = 0;
     lastEventIdRef.current = null;
   }, [threadId]);
+
+  useEffect(() => {
+    let cancelled = false;
+    const notificationCapability = capability?.notifications;
+
+    if (!notificationCapability?.available || !notificationCapability.vapidPublicKey) {
+      setPushNotificationState('unavailable');
+      return;
+    }
+    const supportIssue = pushSupportIssue();
+    if (supportIssue) {
+      setPushNotificationState(supportIssue);
+      return;
+    }
+    if (Notification.permission === 'denied') {
+      setPushNotificationState('denied');
+      return;
+    }
+    if (!threadId) {
+      setPushNotificationState('unsubscribed');
+      return;
+    }
+
+    setPushNotificationState('checking');
+    void navigator.serviceWorker
+      .getRegistration('/')
+      .then((registration) => registration?.pushManager.getSubscription() ?? null)
+      .then(async (subscription) => {
+        if (cancelled) return;
+        if (!subscription) {
+          setPushNotificationState('unsubscribed');
+          return;
+        }
+        const status = await api.pushSubscriptionStatus(
+          session.csrfToken,
+          threadId,
+          subscription.endpoint,
+        );
+        if (!cancelled) {
+          setPushNotificationState(status.subscribed ? 'subscribed' : 'unsubscribed');
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setPushNotificationState('error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [capability?.notifications, session.csrfToken, threadId]);
 
   useLayoutEffect(() => {
     if (
@@ -2113,6 +2215,69 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   function closeDiagnostics() {
     setShowDiagnostics(false);
     window.setTimeout(() => statusToggleRef.current?.focus());
+  }
+
+  async function togglePushNotifications(): Promise<void> {
+    if (!threadId || pushNotificationBusy) return;
+    const notificationCapability = capability?.notifications;
+    if (!notificationCapability?.available || !notificationCapability.vapidPublicKey) {
+      setPushNotificationState('unavailable');
+      return;
+    }
+    const supportIssue = pushSupportIssue();
+    if (supportIssue) {
+      setPushNotificationState(supportIssue);
+      return;
+    }
+
+    setPushNotificationBusy(true);
+    try {
+      const registration = await navigator.serviceWorker.getRegistration('/');
+      const currentSubscription = await registration?.pushManager.getSubscription();
+      if (pushNotificationState === 'subscribed') {
+        if (currentSubscription) {
+          await api.deletePushSubscription(
+            session.csrfToken,
+            threadId,
+            currentSubscription.endpoint,
+          );
+        }
+        setPushNotificationState('unsubscribed');
+        setActionNotice('Уведомления для этого чата отключены на этом устройстве.');
+        return;
+      }
+
+      const permission =
+        Notification.permission === 'default'
+          ? await Notification.requestPermission()
+          : Notification.permission;
+      if (permission !== 'granted') {
+        setPushNotificationState('denied');
+        setActionNotice(null);
+        return;
+      }
+
+      let activeRegistration = registration;
+      if (!activeRegistration) {
+        await navigator.serviceWorker.register('/push-service-worker.js', { scope: '/' });
+        activeRegistration = await navigator.serviceWorker.ready;
+      }
+      const subscription =
+        currentSubscription ??
+        (await activeRegistration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: vapidKeyBuffer(notificationCapability.vapidPublicKey),
+        }));
+      await api.savePushSubscription(session.csrfToken, threadId, subscription.toJSON());
+      setPushNotificationState('subscribed');
+      setActionNotice('Уведомления для этого чата включены на этом устройстве.');
+    } catch (cause) {
+      setPushNotificationState('error');
+      setActionNotice(null);
+      setError(`Не удалось изменить уведомления: ${errorMessage(cause)}`);
+    } finally {
+      setPushNotificationBusy(false);
+    }
   }
 
   function persistRuntimePreferences(input: Omit<RuntimePreferences, 'updatedAt'>) {
@@ -2743,6 +2908,31 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
             </span>
           </div>
           <div className="toolbar-actions">
+            <button
+              className={`icon-button push-notification-toggle ${pushNotificationState === 'subscribed' ? 'enabled' : ''}`}
+              type="button"
+              onClick={() => void togglePushNotifications()}
+              disabled={
+                !threadId ||
+                pushNotificationBusy ||
+                pushNotificationState === 'checking' ||
+                pushNotificationState === 'unavailable' ||
+                pushNotificationState === 'insecure' ||
+                pushNotificationState === 'unsupported' ||
+                pushNotificationState === 'denied'
+              }
+              aria-pressed={pushNotificationState === 'subscribed'}
+              aria-label={pushNotificationLabel(pushNotificationState)}
+              title={pushNotificationLabel(pushNotificationState)}
+            >
+              <span aria-hidden="true">
+                {pushNotificationBusy || pushNotificationState === 'checking'
+                  ? '…'
+                  : pushNotificationState === 'subscribed'
+                    ? '🔔'
+                    : '🔕'}
+              </span>
+            </button>
             {active && threadId && (
               <button
                 className="danger"
