@@ -3037,6 +3037,33 @@ describe('event normalization', () => {
     );
     expect(JSON.stringify(event)).not.toContain('abc.def.ghi');
     expect(Buffer.byteLength(JSON.stringify(event?.payload))).toBeLessThan(1_300);
+
+    const completed = normalizeNotification(
+      {
+        method: 'item/completed',
+        params: {
+          threadId: 't',
+          turnId: 'u',
+          item: {
+            id: 'command-1',
+            type: 'commandExecution',
+            command: 'curl -H "Authorization: Bearer abc.def.ghi" https://example.test',
+            aggregatedOutput: 'password=output-secret',
+            status: 'completed',
+          },
+        },
+      },
+      4_096,
+    );
+    expect(completed?.payload).toMatchObject({
+      item: {
+        type: 'commandExecution',
+        command: 'curl -H "Authorization[REDACTED] [REDACTED]" https://example.test',
+        aggregatedOutput: 'password[REDACTED]',
+      },
+    });
+    expect(JSON.stringify(completed)).not.toContain('abc.def.ghi');
+    expect(JSON.stringify(completed)).not.toContain('output-secret');
   });
 
   it('enforces the serialized byte ceiling and removes hostile secret-bearing fields', () => {

@@ -742,6 +742,74 @@ describe('App', () => {
     expect(screen.queryByText('Показаны 3 последних действия')).toBeNull();
   });
 
+  it('shows safe useful previews for live Codex activity items', async () => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-preview',
+        kind: 'tool',
+        phase: 'completed',
+        payload: {
+          item: {
+            id: 'command-1',
+            type: 'commandExecution',
+            command: 'pnpm verify',
+            aggregatedOutput: 'All checks passed',
+          },
+        },
+        createdAt: '2026-09-27T10:01:01.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-preview',
+        kind: 'tool',
+        phase: 'completed',
+        payload: {
+          item: {
+            id: 'files-1',
+            type: 'fileChange',
+            changes: [{ path: 'src/App.tsx' }, { path: 'src/App.test.tsx' }],
+          },
+        },
+        createdAt: '2026-09-27T10:01:02.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-preview',
+        kind: 'tool',
+        phase: 'completed',
+        payload: {
+          item: {
+            id: 'tool-1',
+            type: 'mcpToolCall',
+            server: 'github',
+            tool: 'create_pull_request',
+            arguments: { token: 'must-not-render' },
+          },
+        },
+        createdAt: '2026-09-27T10:01:03.000Z',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText('pnpm verify')).not.toBeNull();
+    expect(screen.getByText('Выполнил команду')).not.toBeNull();
+    expect(screen.getByText('src/App.tsx, src/App.test.tsx')).not.toBeNull();
+    expect(screen.getByText('github · create_pull_request')).not.toBeNull();
+    expect(screen.queryByText('must-not-render')).toBeNull();
+
+    await user.click(screen.getByText('Выполнил команду'));
+    expect(screen.getByText('All checks passed')).not.toBeNull();
+  });
+
   it('shows elapsed time for the active task in the toolbar', async () => {
     const startedAt = new Date(Date.now() - 5_000).toISOString();
     const activeThread = {

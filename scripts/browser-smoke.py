@@ -376,9 +376,16 @@ def main() -> int:
                     "id": 104,
                     "threadId": "t1",
                     "turnId": "turn-1",
-                    "kind": "command",
+                    "kind": "tool",
                     "phase": "completed",
-                    "payload": {"command": "pnpm test", "output": "All tests passed"},
+                    "payload": {
+                        "item": {
+                            "id": "command-1",
+                            "type": "commandExecution",
+                            "command": "pnpm test",
+                            "aggregatedOutput": "All tests passed",
+                        }
+                    },
                     "createdAt": "2026-09-27T12:00:00.300Z",
                 },
                 {
@@ -477,6 +484,7 @@ def main() -> int:
         if activity_group.locator(".activity-row").count() != 6:
             raise AssertionError("expanded activity group does not expose the full action history")
         command_row = page.locator("details.activity-row").filter(has_text="Выполнил команду")
+        command_row.get_by_text("pnpm test").wait_for()
         command_row.get_by_text("Выполнил команду").click()
         command_row.get_by_text("All tests passed").wait_for()
 

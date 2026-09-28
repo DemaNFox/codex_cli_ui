@@ -264,6 +264,23 @@ function valueText(value: unknown): string | null {
 }
 
 function eventText(event: SafeEvent): string {
+  const item = eventItem(event);
+  if (item?.type === 'commandExecution' && typeof item.aggregatedOutput === 'string')
+    return item.aggregatedOutput;
+  if (item?.type === 'reasoning' && Array.isArray(item.summary)) {
+    const summary = item.summary
+      .filter((part): part is string => typeof part === 'string')
+      .join('\n');
+    if (summary) return summary;
+  }
+  if (item?.type === 'fileChange' && Array.isArray(item.changes)) {
+    const paths = item.changes.flatMap((value) => {
+      if (!value || typeof value !== 'object') return [];
+      const path = (value as Record<string, unknown>).path;
+      return typeof path === 'string' ? [path] : [];
+    });
+    if (paths.length) return paths.join('\n');
+  }
   const text = valueText(event.payload);
   if (text) return text;
   if (
@@ -279,12 +296,12 @@ function eventTitle(event: SafeEvent): string {
   if (event.kind === 'turn' && event.payload.status === 'interruptRequested')
     return 'Остановка запрошена';
   if (event.kind === 'tool') {
-    const preview = eventPreview(event);
-    if (preview === 'команда')
+    const itemType = eventItem(event)?.type;
+    if (itemType === 'commandExecution')
       return event.phase === 'completed' ? 'Выполнил команду' : 'Выполняет команду';
-    if (preview === 'изменение файлов')
+    if (itemType === 'fileChange')
       return event.phase === 'completed' ? 'Изменил файлы' : 'Изменяет файлы';
-    if (preview === 'анализ')
+    if (itemType === 'reasoning')
       return event.phase === 'completed' ? 'Завершил анализ' : 'Анализирует';
   }
   const titles: Partial<Record<SafeEvent['kind'], Partial<Record<SafeEvent['phase'], string>>>> = {
@@ -321,11 +338,36 @@ function eventTitle(event: SafeEvent): string {
   return titles[event.kind]?.[event.phase] ?? fallbacks[event.kind] ?? 'Событие';
 }
 
+function eventItem(event: SafeEvent): Record<string, unknown> | null {
+  const item = event.payload.item;
+  return item && typeof item === 'object' ? (item as Record<string, unknown>) : null;
+}
+
+function fileChangePreview(item: Record<string, unknown>): string | null {
+  if (!Array.isArray(item.changes)) return null;
+  const paths = item.changes.flatMap((value) => {
+    if (!value || typeof value !== 'object') return [];
+    const path = (value as Record<string, unknown>).path;
+    return typeof path === 'string' ? [path] : [];
+  });
+  if (!paths.length) return null;
+  const visible = paths.slice(0, 2).join(', ');
+  return paths.length > 2 ? `${visible} и ещё ${paths.length - 2}` : visible;
+}
+
 function eventPreview(event: SafeEvent): string | null {
   const source = event.payload;
-  const item =
-    source.item && typeof source.item === 'object'
-      ? (source.item as Record<string, unknown>)
+  const item = eventItem(event);
+  const itemType = typeof item?.type === 'string' ? item.type : null;
+  const toolName =
+    typeof item?.tool === 'string'
+      ? [typeof item.server === 'string' ? item.server : item.namespace, item.tool]
+          .filter((part): part is string => typeof part === 'string' && part.length > 0)
+          .join(' · ')
+      : null;
+  const reasoningSummary =
+    itemType === 'reasoning' && Array.isArray(item?.summary)
+      ? item.summary.find((part): part is string => typeof part === 'string' && part.length > 0)
       : null;
   const candidates = [
     source.command,
@@ -336,8 +378,11 @@ function eventPreview(event: SafeEvent): string | null {
     source.method,
     item?.title,
     item?.name,
-    item?.tool,
-    item?.type,
+    item?.command,
+    itemType === 'fileChange' && item ? fileChangePreview(item) : null,
+    reasoningSummary,
+    toolName,
+    itemType,
   ];
   let value = candidates.find((candidate): candidate is string => typeof candidate === 'string');
   if (!value) return null;
