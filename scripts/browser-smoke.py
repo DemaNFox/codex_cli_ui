@@ -208,7 +208,7 @@ def main() -> int:
                 route,
                 200,
                 {
-                    "data": [
+                    "data": ([
                         {
                             "id": "t1",
                             "projectId": "p1",
@@ -225,9 +225,24 @@ def main() -> int:
                             "createdAt": "2026-09-27T12:00:00.000Z",
                             "updatedAt": "2026-09-27T12:00:00.000Z",
                         }
-                    ]
-                    if visible
-                    else []
+                    ] if visible else []) + ([
+                        {
+                            "id": "t2",
+                            "projectId": "p1",
+                            "name": "Фоновая задача",
+                            "preview": "Проверка индикатора",
+                            "archived": False,
+                            "status": "active",
+                            "activeTurnId": "turn-background",
+                            "model": "gpt-6-astra",
+                            "reasoningEffort": "high",
+                            "permissionPreset": "workspace-write",
+                            "approvalPolicy": "on-request",
+                            "instructionSources": ["/srv/projects/demo/AGENTS.md"],
+                            "createdAt": "2026-09-27T12:01:00.000Z",
+                            "updatedAt": "2026-09-27T12:01:00.000Z",
+                        }
+                    ] if visible and not wants_archived else [])
                 },
             )
         elif path == "/api/threads/t1" and request.method == "GET":
@@ -578,6 +593,11 @@ def main() -> int:
         page.get_by_text("GitHub").wait_for()
         if page.get_by_label("Навигация").count() != 1:
             raise AssertionError("workspace must use one unified navigation sidebar")
+        page.get_by_role(
+            "button", name="Открыть чат проекта Фоновая задача — в работе"
+        ).wait_for()
+        if page.locator(".thread-running-badge").count() != 2:
+            raise AssertionError("active chat indicator must appear in project and recent lists")
         page.get_by_role("table").get_by_role("cell", name="Готово").wait_for()
         if page.get_by_role("button", name="Голосовой ввод").count() != 1:
             raise AssertionError("voice input control is not available in the composer")

@@ -359,6 +359,78 @@ function installPushApi() {
 }
 
 describe('App', () => {
+  it('marks active chats in project and recent sidebar lists without marking idle chats', async () => {
+    const runningThread = {
+      ...thread,
+      id: 'thread-running',
+      name: 'Синхронизация лидов',
+      status: 'active' as const,
+      activeTurnId: 'turn-running',
+      updatedAt: '2026-09-27T10:05:00.000Z',
+    };
+    installAuthenticatedApi((url) => {
+      if (url.includes('/api/threads?')) return jsonResponse([thread, runningThread]);
+      return undefined;
+    });
+
+    render(<App />);
+
+    const projectRow = await screen.findByRole('button', {
+      name: 'Открыть чат проекта Синхронизация лидов — в работе',
+    });
+    expect(projectRow.textContent).toContain('В работе');
+    expect(
+      screen.getByRole('button', { name: 'Открыть недавний чат Синхронизация лидов — в работе' })
+        .textContent,
+    ).toContain('В работе');
+    expect(
+      screen.getByRole('button', { name: 'Открыть чат проекта Frontend task' }).textContent,
+    ).not.toContain('В работе');
+  });
+
+  it.each(['TURN_CAPACITY_EXHAUSTED', 'RESOURCE_CAPACITY_EXHAUSTED'] as const)(
+    'explains %s and preserves the unsent draft',
+    async (capacityCode) => {
+      const runningThread = {
+        ...thread,
+        id: 'thread-running',
+        name: 'Занятая задача',
+        status: 'active' as const,
+        activeTurnId: 'turn-running',
+      };
+      installAuthenticatedApi((url, init) => {
+        if (url.includes('/api/threads?')) return jsonResponse([thread, runningThread]);
+        if (url === '/api/threads/thread-1/turns' && init?.method === 'POST') {
+          return jsonResponse(
+            {
+              error: {
+                code: capacityCode,
+                message: capacityCode,
+              },
+            },
+            429,
+          );
+        }
+        return undefined;
+      });
+      const user = userEvent.setup();
+      render(<App />);
+
+      await user.click(
+        await screen.findByRole('button', { name: 'Открыть недавний чат Frontend task' }),
+      );
+      const input = await screen.findByLabelText('Сообщение Codex');
+      await user.type(input, 'Запусти после освобождения слота');
+      await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
+
+      expect((await screen.findByRole('alert')).textContent).toContain(
+        'Сейчас заняты все безопасные слоты задач',
+      );
+      expect((input as HTMLTextAreaElement).value).toBe('Запусти после освобождения слота');
+      expect(screen.getAllByText('В работе')).toHaveLength(2);
+    },
+  );
+
   it('shows a clear unavailable state when server push is not configured', async () => {
     installAuthenticatedApi((url) => {
       if (url !== '/api/system/capabilities') return undefined;

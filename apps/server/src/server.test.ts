@@ -2270,6 +2270,64 @@ describe('Codex routes', () => {
     expect(afterCompletion.statusCode).toBe(202);
   });
 
+  it('uses the broker execution ceiling instead of the static fallback turn limit', async () => {
+    const broker = new FakeResourceBroker();
+    const { app, appServer, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      broker,
+    );
+    const session = await login(app);
+    await new Promise((resolve) => setImmediate(resolve));
+    const project = await createProject(app, projectPath, session.headers);
+    const threadIds = await Promise.all(
+      Array.from({ length: 7 }, () => createThread(app, project.id, session.headers)),
+    );
+
+    for (const [index, threadId] of threadIds.slice(0, 6).entries()) {
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/threads/${threadId}/turns`,
+        headers: session.headers,
+        payload: {
+          text: `accepted ${index}`,
+          idempotencyKey: `00000000-0000-4000-8000-00000000010${index}`,
+        },
+      });
+      expect(response.statusCode).toBe(202);
+    }
+
+    const saturatedKey = '00000000-0000-4000-8000-000000000200';
+    const saturated = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadIds[6]}/turns`,
+      headers: session.headers,
+      payload: { text: 'wait for capacity', idempotencyKey: saturatedKey },
+    });
+    expect(saturated.statusCode).toBe(429);
+    expect(saturated.json()).toMatchObject({
+      error: { code: 'RESOURCE_CAPACITY_EXHAUSTED' },
+    });
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(6);
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      upgradeDrain: { activeTurns: 6, pendingTurnStarts: 0 },
+    });
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: threadIds[0], turn: { id: 'turn-1' } },
+    });
+    const retried = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadIds[6]}/turns`,
+      headers: session.headers,
+      payload: { text: 'wait for capacity', idempotencyKey: saturatedKey },
+    });
+    expect(retried.statusCode).toBe(202);
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(7);
+  });
+
   it('atomically reserves a turn idempotency key across concurrent duplicates', async () => {
     const { app, appServer, projectPath } = await fixture();
     const session = await login(app);

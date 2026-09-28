@@ -517,6 +517,43 @@ button:disabled {
   text-align: left;
   background: transparent;
 }
+.thread-row-title {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.45rem;
+}
+.thread-running-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.28rem;
+  color: var(--accent);
+  font-size: 0.62rem;
+  font-weight: 650;
+  line-height: 1;
+  white-space: nowrap;
+}
+.thread-running-dot {
+  width: 0.42rem;
+  height: 0.42rem;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 42%, transparent);
+  animation: thread-running-pulse 1.8s ease-out infinite;
+}
+@keyframes thread-running-pulse {
+  55%,
+  100% {
+    box-shadow: 0 0 0 0.34rem transparent;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .thread-running-dot {
+    animation: none;
+  }
+}
 .thread-row strong,
 .thread-row small {
   overflow: hidden;
