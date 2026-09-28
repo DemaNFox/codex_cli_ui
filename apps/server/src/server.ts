@@ -443,6 +443,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   repository.resetActiveSubagentRuntime();
   let pendingTurnStarts = 0;
   let resourceApplyPromise: Promise<ResourceLimitSnapshot> | null = null;
+  let resourceApplyVersion: number | null = null;
   const upgradeDrainPath =
     dependencies.upgradeDrainPath ?? '/var/lib/codex-web-ui/data/upgrade-drain';
   const upgradeDrainRequested = (): boolean => {
@@ -506,7 +507,18 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     activeTurns.size > 0 || pendingTurnStarts > 0 || repository.countActiveSubagents() > 0;
 
   const applyPendingResources = async (): Promise<ResourceLimitSnapshot> => {
-    if (resourceApplyPromise) return resourceApplyPromise;
+    if (resourceApplyPromise) {
+      const inFlightVersion = resourceApplyVersion;
+      try {
+        const snapshot = await resourceApplyPromise;
+        if (repository.getResourceLimits().version === inFlightVersion) return snapshot;
+      } catch (error) {
+        if (repository.getResourceLimits().version === inFlightVersion) throw error;
+      }
+      return applyPendingResources();
+    }
+    const applyingVersion = repository.getResourceLimits().version;
+    resourceApplyVersion = applyingVersion;
     resourceApplyPromise = (async () => {
       const stored = repository.getResourceLimits();
       const before = await brokerSnapshot();
@@ -548,8 +560,15 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       }
     })().finally(() => {
       resourceApplyPromise = null;
+      resourceApplyVersion = null;
     });
-    return resourceApplyPromise;
+    try {
+      const snapshot = await resourceApplyPromise;
+      if (repository.getResourceLimits().version === applyingVersion) return snapshot;
+    } catch (error) {
+      if (repository.getResourceLimits().version === applyingVersion) throw error;
+    }
+    return applyPendingResources();
   };
 
   const applyPendingResourcesWhenIdle = (): void => {

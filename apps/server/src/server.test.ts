@@ -249,6 +249,8 @@ type BrokerApplyRequest = Parameters<ResourceBroker['apply']>[0];
 class FakeResourceBroker implements ResourceBroker {
   readonly applyRequests: BrokerApplyRequest[] = [];
   failApply = false;
+  private applyGate: Promise<void> | null = null;
+  private signalApply: (() => void) | null = null;
   current: BrokerResourceSnapshot = {
     capacity: {
       cpuQuotaPercent: 800,
@@ -266,12 +268,31 @@ class FakeResourceBroker implements ResourceBroker {
     generation: 1,
   };
 
+  blockApplies(): { entered: Promise<void>; release: () => void } {
+    let release!: () => void;
+    let entered!: () => void;
+    this.applyGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const enteredPromise = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    this.signalApply = entered;
+    return { entered: enteredPromise, release };
+  }
+
   async snapshot(): Promise<BrokerResourceSnapshot> {
     return this.current;
   }
 
   async apply(request: BrokerApplyRequest): Promise<BrokerResourceSnapshot> {
     this.applyRequests.push(request);
+    this.signalApply?.();
+    this.signalApply = null;
+    if (this.applyGate) {
+      await this.applyGate;
+      this.applyGate = null;
+    }
     if (this.failApply) throw new Error('broker failed');
     this.current = {
       ...this.current,
@@ -2712,6 +2733,67 @@ describe('Codex routes', () => {
     expect(body.data[0]).toMatchObject({ id: 'agent-1', status: 'running' });
     expect(body.data[0]!.message).toContain('[REDACTED]');
     expect(response.body).not.toContain('must never be persisted');
+  });
+
+  it('serializes concurrent resource updates and applies the newest stored version', async () => {
+    const broker = new FakeResourceBroker();
+    const { app, repository } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      broker,
+    );
+    const session = await login(app);
+    await new Promise((resolve) => setImmediate(resolve));
+    const gate = broker.blockApplies();
+    const first = app.inject({
+      method: 'PUT',
+      url: '/api/system/resource-limits',
+      headers: session.headers,
+      payload: {
+        expectedVersion: 0,
+        desired: {
+          mode: 'custom',
+          cpuCores: 4,
+          memoryBytes: 8 * 1_024 * 1_024 * 1_024,
+          tasks: 1_024,
+          maxParallelAgents: 3,
+        },
+      },
+    });
+    await gate.entered;
+    const second = app.inject({
+      method: 'PUT',
+      url: '/api/system/resource-limits',
+      headers: session.headers,
+      payload: {
+        expectedVersion: 1,
+        desired: {
+          mode: 'custom',
+          cpuCores: 2,
+          memoryBytes: 4 * 1_024 * 1_024 * 1_024,
+          tasks: 512,
+          maxParallelAgents: 2,
+        },
+      },
+    });
+    for (let attempt = 0; attempt < 20 && repository.getResourceLimits().version < 2; attempt += 1)
+      await new Promise((resolve) => setImmediate(resolve));
+    expect(repository.getResourceLimits().version).toBe(2);
+    gate.release();
+    const [firstResponse, secondResponse] = await Promise.all([first, second]);
+    expect(firstResponse.statusCode).toBe(200);
+    expect(secondResponse.statusCode).toBe(200);
+    expect(repository.getResourceLimits()).toMatchObject({
+      version: 2,
+      state: 'applied',
+      desired: { cpuCores: 2, memoryBytes: 4 * 1_024 * 1_024 * 1_024 },
+    });
+    expect(broker.applyRequests.at(-1)).toMatchObject({
+      cpuQuotaPercent: 200,
+      memoryMaxBytes: 4 * 1_024 * 1_024 * 1_024,
+      tasksMax: 512,
+    });
   });
 
   it('defers policy changes during work and passes the effective agent ceiling to Codex', async () => {
