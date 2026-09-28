@@ -445,6 +445,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   let resourceApplyPromise: Promise<ResourceLimitSnapshot> | null = null;
   let resourceApplyVersion: number | null = null;
   let resourceStartupRetry: NodeJS.Timeout | null = null;
+  let serverClosing = false;
   const upgradeDrainPath =
     dependencies.upgradeDrainPath ?? '/var/lib/codex-web-ui/data/upgrade-drain';
   const upgradeDrainRequested = (): boolean => {
@@ -572,11 +573,21 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return applyPendingResources();
   };
 
-  const applyPendingResourcesWhenIdle = (): void => {
+  const applyPendingResourcesWhenIdle = async (): Promise<void> => {
     if (repository.getResourceLimits().state === 'applied' || resourceWorkActive()) return;
-    void applyPendingResources().catch(() => {
+    await applyPendingResources().catch(() => {
       // The failure is persisted as degraded state and exposed through the resource endpoint.
     });
+  };
+
+  const reconcileStartupResources = async (): Promise<void> => {
+    await applyPendingResourcesWhenIdle();
+    if (serverClosing || repository.getResourceLimits().state === 'applied') return;
+    resourceStartupRetry = setTimeout(() => {
+      resourceStartupRetry = null;
+      if (!serverClosing) void applyPendingResourcesWhenIdle();
+    }, 1_000);
+    resourceStartupRetry.unref();
   };
 
   await app.register(cookie);
@@ -904,7 +915,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           payload: { subagent: persisted },
         }),
       );
-      applyPendingResourcesWhenIdle();
+      void applyPendingResourcesWhenIdle();
     }
     const normalized =
       completedAgentMessage(redactedMessage, config.maxEventBytes) ??
@@ -921,7 +932,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (message.method === 'turn/completed' && normalized.turnId) {
       activeTurns.delete(`${normalized.threadId}:${normalized.turnId}`);
       repository.updateThreadRuntime(normalized.threadId, { status: 'idle', activeTurnId: null });
-      applyPendingResourcesWhenIdle();
+      void applyPendingResourcesWhenIdle();
     }
     if (message.method === 'thread/status/changed') {
       const status = threadStatusChangedSchema.safeParse(message.params);
@@ -935,7 +946,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           for (const activeTurn of activeTurns) {
             if (activeTurn.startsWith(`${normalized.threadId}:`)) activeTurns.delete(activeTurn);
           }
-          applyPendingResourcesWhenIdle();
+          void applyPendingResourcesWhenIdle();
         }
       }
     }
@@ -993,16 +1004,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
 
   app.addHook('onReady', async () => {
     await appServer.start();
-    if (dependencies.resourceBroker) {
-      applyPendingResourcesWhenIdle();
-      resourceStartupRetry = setTimeout(() => {
-        resourceStartupRetry = null;
-        applyPendingResourcesWhenIdle();
-      }, 1_000);
-      resourceStartupRetry.unref();
-    }
+    if (dependencies.resourceBroker) void reconcileStartupResources();
   });
   app.addHook('onClose', async () => {
+    serverClosing = true;
     if (resourceStartupRetry) clearTimeout(resourceStartupRetry);
     unsubscribe();
     await appServer.stop();
@@ -2017,8 +2022,6 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       warnings,
     });
   });
-
-  if (dependencies.resourceBroker) applyPendingResourcesWhenIdle();
 
   return app;
 }

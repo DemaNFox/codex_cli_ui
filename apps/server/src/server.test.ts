@@ -5,7 +5,7 @@ import { mkdtemp, mkdir, rename, symlink, unlink, writeFile } from 'node:fs/prom
 import { createServer as createNetServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import {
   INITIALIZED_NOTIFICATION,
@@ -2633,6 +2633,42 @@ describe('Codex routes', () => {
       { mode: 'auto', cpuQuotaPercent: null, memoryMaxBytes: null, tasksMax: null },
     ]);
     await app.close();
+  });
+
+  it('schedules the startup retry only after a slow first broker attempt settles', async () => {
+    vi.useFakeTimers();
+    try {
+      let rejectFirst!: (error: Error) => void;
+      const firstSnapshot = new Promise<BrokerResourceSnapshot>((_resolve, reject) => {
+        rejectFirst = reject;
+      });
+      class SlowFirstSnapshotBroker extends FakeResourceBroker {
+        snapshots = 0;
+
+        override async snapshot(): Promise<BrokerResourceSnapshot> {
+          this.snapshots += 1;
+          if (this.snapshots === 1) return firstSnapshot;
+          return super.snapshot();
+        }
+      }
+      const broker = new SlowFirstSnapshotBroker();
+      const { app, repository } = await fixture(
+        2,
+        undefined,
+        (root) => new AttachmentStore(root),
+        broker,
+      );
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(broker.snapshots).toBe(1);
+      rejectFirst(new Error('first snapshot failed'));
+      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(repository.getResourceLimits().state).toBe('applied');
+      expect(broker.snapshots).toBe(2);
+      await app.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('applies bounded resource policies and rejects host-overcommit requests', async () => {
