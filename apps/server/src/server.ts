@@ -1628,16 +1628,32 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       const resumeCwd = await canonicalProjectPath(pathPolicy, project);
       if (loadedThreadGenerations.get(id) !== appServer.generation) {
         if (!repository.isThreadHistoryHydrated(id)) await hydrateThreadHistory(thread);
-        const resumed = threadResponseSchema.parse(
-          await appServer.request('thread/resume', {
-            threadId: id,
-            cwd: resumeCwd,
-            excludeTurns: true,
-            ...(executionAgentLimit === undefined
-              ? {}
-              : { config: { agents: { max_threads: executionAgentLimit } } }),
-          }),
-        );
+        let resumed: z.infer<typeof threadResponseSchema>;
+        try {
+          resumed = threadResponseSchema.parse(
+            await appServer.request('thread/resume', {
+              threadId: id,
+              cwd: resumeCwd,
+              excludeTurns: true,
+              ...(executionAgentLimit === undefined
+                ? {}
+                : { config: { agents: { max_threads: executionAgentLimit } } }),
+            }),
+          );
+        } catch (error) {
+          const emptyLocalThread = repository.listEvents(id, 0, 1).length === 0;
+          if (
+            emptyLocalThread &&
+            error instanceof Error &&
+            error.message === 'APP_SERVER_REQUEST_FAILED'
+          )
+            throw new HttpError(
+              409,
+              'EMPTY_THREAD_NOT_PERSISTED',
+              'Этот пустой чат был создан до перезапуска сервера и недоступен в Codex. Создайте новый чат — вложения в текущем чате можно удалить или оставить.',
+            );
+          throw error;
+        }
         if (resumed.thread.cwd !== resumeCwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
         loadedThreadGenerations.set(id, appServer.generation);
       }

@@ -2072,6 +2072,31 @@ describe('Codex routes', () => {
     ).toMatchObject({ config: { agents: { max_threads: 6 } } });
   });
 
+  it('explains when an empty pre-restart chat was never persisted by Codex', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.restart();
+    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_FAILED');
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'first task after restart',
+        idempotencyKey: '78787878-7878-4787-8787-787878787878',
+      },
+    });
+
+    expect(response.statusCode).toBe(409);
+    const body = response.json<{ error: { code: string; message: string } }>();
+    expect(body.error.code).toBe('EMPTY_THREAD_NOT_PERSISTED');
+    expect(body.error.message).toContain('Создайте новый чат');
+    expect(appServer.requests.filter((item) => item.method === 'turn/start')).toHaveLength(0);
+  });
+
   it('serves hydrated journal history when a post-restart metadata refresh fails', async () => {
     const { app, appServer, repository, projectPath } = await fixture();
     const session = await login(app);
