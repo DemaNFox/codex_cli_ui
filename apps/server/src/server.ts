@@ -1732,7 +1732,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
       throw new HttpError(409, 'ATTACHMENT_ALREADY_SENT');
     }
-    if (activeTurns.size + pendingTurnStarts >= config.maxConcurrentTurns) {
+    if (
+      !dependencies.resourceBroker &&
+      activeTurns.size + pendingTurnStarts >= config.maxConcurrentTurns
+    ) {
       repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
       throw new HttpError(429, 'TURN_CAPACITY_EXHAUSTED');
     }

@@ -110,6 +110,9 @@ subagent is active and applied only after the workload becomes idle. New work fa
 pending/degraded and when live memory or the effective execution-unit ceiling is exhausted. Disk admission and a periodic guard stop work on low space
 or database overflow, while an administrator-enforced filesystem quota or
 dedicated bounded volume remains mandatory for a hard disk limit.
+When the resource broker is configured, its effective root-turn/subagent ceiling is the only application
+concurrency admission limit. `CODEX_WEB_MAX_CONCURRENT_TURNS` remains a fail-safe for local or test deployments
+that run without the broker; it does not silently cap automatic or custom broker policy.
 The effective agent ceiling is also passed to the pinned Codex thread configuration as `agents.max_threads`
 when an idle thread is resumed, so descendants share the same concurrency limit; the cgroup remains the final
 machine-level enforcement boundary. Automatic concurrency allows at most eight threads and budgets at least
