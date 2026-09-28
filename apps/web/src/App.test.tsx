@@ -530,6 +530,78 @@ describe('App', () => {
     expect(screen.getByText('Работает')).not.toBeNull();
   });
 
+  it('merges thread, REST and SSE subagents monotonically without terminal regression', async () => {
+    const completed = {
+      ...subagents[0]!,
+      status: 'completed' as const,
+      message: 'Готово',
+      lastActivityAt: '2026-09-28T10:02:00.000Z',
+      completedAt: '2026-09-28T10:02:00.000Z',
+    };
+    const staleRunning = {
+      ...subagents[0]!,
+      status: 'running' as const,
+      message: 'Старый прогресс',
+      lastActivityAt: '2026-09-28T10:01:00.000Z',
+    };
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') {
+        return jsonResponse({ data: thread, events: [], subagents: [completed] });
+      }
+      if (url === '/api/threads/thread-1/subagents') {
+        return jsonResponse({ data: [staleRunning] });
+      }
+      return undefined;
+    });
+    render(<App />);
+
+    expect(await screen.findByText('Завершён')).not.toBeNull();
+    expect(screen.getByText('Готово')).not.toBeNull();
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+
+    act(() =>
+      FakeEventSource.instances.at(-1)?.emit({
+        id: 200,
+        threadId: 'thread-1',
+        turnId: null,
+        kind: 'subagent',
+        phase: 'state',
+        payload: {
+          subagent: {
+            ...staleRunning,
+            status: 'pendingInit',
+            message: 'Равный, но незавершённый снимок',
+            lastActivityAt: completed.lastActivityAt,
+          },
+        },
+        createdAt: '2026-09-28T10:02:01.000Z',
+      }),
+    );
+    expect(screen.getByText('Завершён')).not.toBeNull();
+    expect(screen.queryByText('Равный, но незавершённый снимок')).toBeNull();
+
+    act(() =>
+      FakeEventSource.instances.at(-1)?.emit({
+        id: 201,
+        threadId: 'thread-1',
+        turnId: null,
+        kind: 'subagent',
+        phase: 'state',
+        payload: {
+          subagent: {
+            ...completed,
+            status: 'errored',
+            message: 'Новый терминальный снимок',
+            lastActivityAt: '2026-09-28T10:03:00.000Z',
+          },
+        },
+        createdAt: '2026-09-28T10:03:01.000Z',
+      }),
+    );
+    expect(await screen.findByText('Ошибка')).not.toBeNull();
+    expect(screen.getByText('Новый терминальный снимок')).not.toBeNull();
+  });
+
   it('keeps execution history compact and removes redundant lifecycle noise', async () => {
     const events = [
       {

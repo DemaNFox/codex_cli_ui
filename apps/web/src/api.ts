@@ -85,6 +85,7 @@ function unwrapData<T>(value: T | { data: T }): T {
 export interface ThreadHistory {
   data: Thread;
   events: SafeEvent[];
+  subagents?: Subagent[];
 }
 
 export interface AttachmentUpload {

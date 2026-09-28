@@ -119,6 +119,35 @@ const SUBAGENT_STATUSES = new Set<Subagent['status']>([
   'shutdown',
   'notFound',
 ]);
+const TERMINAL_SUBAGENT_STATUSES = new Set<Subagent['status']>([
+  'interrupted',
+  'completed',
+  'errored',
+  'shutdown',
+  'notFound',
+]);
+
+function shouldReplaceSubagent(current: Subagent, incoming: Subagent): boolean {
+  const currentTime = Date.parse(current.lastActivityAt);
+  const incomingTime = Date.parse(incoming.lastActivityAt);
+  if (incomingTime > currentTime) return true;
+  if (incomingTime < currentTime || Number.isNaN(incomingTime)) return false;
+  if (Number.isNaN(currentTime)) return true;
+  const currentTerminal = TERMINAL_SUBAGENT_STATUSES.has(current.status);
+  const incomingTerminal = TERMINAL_SUBAGENT_STATUSES.has(incoming.status);
+  if (currentTerminal !== incomingTerminal) return incomingTerminal;
+  return true;
+}
+
+function mergeSubagents(current: Subagent[], incoming: readonly Subagent[]): Subagent[] {
+  if (!incoming.length) return current;
+  const next = new Map(current.map((subagent) => [subagent.id, subagent]));
+  for (const update of incoming) {
+    const existing = next.get(update.id);
+    if (!existing || shouldReplaceSubagent(existing, update)) next.set(update.id, update);
+  }
+  return [...next.values()];
+}
 
 function subagentFrom(event: SafeEvent): Subagent | null {
   if (event.kind !== 'subagent') return null;
@@ -1781,11 +1810,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   useEffect(() => {
     const updates = events.map(subagentFrom).filter((item): item is Subagent => item !== null);
     if (!updates.length) return;
-    setSubagents((current) => {
-      const next = new Map(current.map((subagent) => [subagent.id, subagent]));
-      for (const update of updates) next.set(update.id, update);
-      return [...next.values()];
-    });
+    setSubagents((current) => mergeSubagents(current, updates));
   }, [events]);
 
   useEffect(() => {
@@ -1943,7 +1968,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
         if (cancelled) return;
         setProjects(projectList);
         if (resourceSnapshot) setResourceLimits(resourceSnapshot);
-        if (threadSubagents) setSubagents(threadSubagents);
+        if (threadSubagents) setSubagents((current) => mergeSubagents(current, threadSubagents));
         const selectedIndex = projectList.findIndex((project) => project.id === projectId);
         if (selectedIndex >= 0)
           setThreads(archiveView ? (archivedThreads ?? []) : (activeThreads[selectedIndex] ?? []));
@@ -2009,6 +2034,8 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
           current.map((item) => (item.id === requestedThreadId ? history.data : item)),
         );
         mergeEvents(history.events, requestedThreadId);
+        const historySubagents = history.subagents;
+        if (historySubagents) setSubagents((current) => mergeSubagents(current, historySubagents));
         setThreadAttachmentBytes(
           attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
         );
@@ -2019,7 +2046,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     void api
       .subagents(requestedThreadId)
       .then((threadSubagents) => {
-        if (!cancelled) setSubagents(threadSubagents);
+        if (!cancelled) setSubagents((current) => mergeSubagents(current, threadSubagents));
       })
       .catch(() => {
         // Subagent observability is optional and must not hide the chat history.
