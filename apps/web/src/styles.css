@@ -524,16 +524,6 @@ button:disabled {
   align-items: center;
   gap: 0.45rem;
 }
-.thread-running-badge {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.28rem;
-  color: var(--accent);
-  font-size: 0.62rem;
-  font-weight: 650;
-  line-height: 1;
-  white-space: nowrap;
-}
 .thread-running-dot {
   width: 0.42rem;
   height: 0.42rem;

@@ -378,11 +378,13 @@ describe('App', () => {
     const projectRow = await screen.findByRole('button', {
       name: 'Открыть чат проекта Синхронизация лидов — в работе',
     });
-    expect(projectRow.textContent).toContain('В работе');
-    expect(
-      screen.getByRole('button', { name: 'Открыть недавний чат Синхронизация лидов — в работе' })
-        .textContent,
-    ).toContain('В работе');
+    expect(projectRow.textContent).not.toContain('В работе');
+    expect(projectRow.querySelector('.thread-running-dot')).not.toBeNull();
+    const recentRow = screen.getByRole('button', {
+      name: 'Открыть недавний чат Синхронизация лидов — в работе',
+    });
+    expect(recentRow.textContent).not.toContain('В работе');
+    expect(recentRow.querySelector('.thread-running-dot')).not.toBeNull();
     expect(
       screen.getByRole('button', { name: 'Открыть чат проекта Frontend task' }).textContent,
     ).not.toContain('В работе');
@@ -427,7 +429,7 @@ describe('App', () => {
         'Сейчас заняты все безопасные слоты задач',
       );
       expect((input as HTMLTextAreaElement).value).toBe('Запусти после освобождения слота');
-      expect(screen.getAllByText('В работе')).toHaveLength(2);
+      expect(document.querySelectorAll('.thread-running-dot')).toHaveLength(2);
     },
   );
 

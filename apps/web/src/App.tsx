@@ -833,11 +833,7 @@ function NavigationSidebar({
           >
             <span className="thread-row-title">
               <strong>{displayName}</strong>
-              {running && (
-                <span className="thread-running-badge" aria-hidden="true">
-                  <span className="thread-running-dot" />В работе
-                </span>
-              )}
+              {running && <span className="thread-running-dot" aria-hidden="true" />}
             </span>
             <small>
               {showProject && project ? `${project.name} · ` : ''}
