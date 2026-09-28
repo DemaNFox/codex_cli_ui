@@ -444,6 +444,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   let pendingTurnStarts = 0;
   let resourceApplyPromise: Promise<ResourceLimitSnapshot> | null = null;
   let resourceApplyVersion: number | null = null;
+  let resourceStartupRetry: NodeJS.Timeout | null = null;
   const upgradeDrainPath =
     dependencies.upgradeDrainPath ?? '/var/lib/codex-web-ui/data/upgrade-drain';
   const upgradeDrainRequested = (): boolean => {
@@ -992,9 +993,17 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
 
   app.addHook('onReady', async () => {
     await appServer.start();
-    if (dependencies.resourceBroker) applyPendingResourcesWhenIdle();
+    if (dependencies.resourceBroker) {
+      applyPendingResourcesWhenIdle();
+      resourceStartupRetry = setTimeout(() => {
+        resourceStartupRetry = null;
+        applyPendingResourcesWhenIdle();
+      }, 1_000);
+      resourceStartupRetry.unref();
+    }
   });
   app.addHook('onClose', async () => {
+    if (resourceStartupRetry) clearTimeout(resourceStartupRetry);
     unsubscribe();
     await appServer.stop();
     repository.close();
