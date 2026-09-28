@@ -190,7 +190,7 @@ class InfraStaticTest(unittest.TestCase):
         update_health = updater.index(
             'if ! "$SCRIPT_DIR/health-check.sh" --timeout "$health_timeout" --service-user "$service_user"'
         )
-        update_release = updater.rindex('bash "$SCRIPT_DIR/graceful-drain.sh" \\\n  --release')
+        update_release = updater.rindex('--release --config "$config"')
         self.assertLess(update_begin, update_copy)
         self.assertLess(update_copy, update_switch)
         self.assertLess(update_switch, update_health)
