@@ -477,6 +477,24 @@ def main() -> int:
         page.get_by_role("heading", name="Переносимый чат").wait_for()
 
         page.get_by_text("GitHub").wait_for()
+        if page.get_by_label("Навигация").count() != 1:
+            raise AssertionError("workspace must use one unified navigation sidebar")
+        page.get_by_role("table").get_by_role("cell", name="Готово").wait_for()
+        if page.get_by_role("button", name="Голосовой ввод").count() != 1:
+            raise AssertionError("voice input control is not available in the composer")
+        transcript_metrics = page.locator(".conversation-scroll").evaluate(
+            "element => ({scrollHeight: element.scrollHeight, clientHeight: element.clientHeight, scrollTop: element.scrollTop})"
+        )
+        if transcript_metrics["scrollHeight"] <= transcript_metrics["clientHeight"]:
+            raise AssertionError("long transcript is not isolated in its own scroll container")
+        page.wait_for_timeout(500)
+        initial_metrics = page.locator(".conversation-scroll").evaluate(
+            "element => ({scrollHeight: element.scrollHeight, clientHeight: element.clientHeight, scrollTop: element.scrollTop})"
+        )
+        if initial_metrics["scrollHeight"] - initial_metrics["scrollTop"] - initial_metrics["clientHeight"] > 80:
+            raise AssertionError(
+                f"existing chat did not open at its latest message: metrics={initial_metrics}, jump={page.get_by_role('button', name='Перейти к новым сообщениям').count()}"
+            )
         if page.locator(".activity-card").count():
             raise AssertionError("legacy activity cards are still rendered")
         if page.get_by_text("Состояние чата").count():
@@ -498,20 +516,13 @@ def main() -> int:
         command_row.get_by_text("Выполнил команду").click()
         command_row.get_by_text("All tests passed").wait_for()
 
-        if page.get_by_label("Навигация").count() != 1:
-            raise AssertionError("workspace must use one unified navigation sidebar")
-        page.get_by_role("table").get_by_role("cell", name="Готово").wait_for()
-        if page.get_by_role("button", name="Голосовой ввод").count() != 1:
-            raise AssertionError("voice input control is not available in the composer")
-        transcript_metrics = page.locator(".conversation-scroll").evaluate(
-            "element => ({scrollHeight: element.scrollHeight, clientHeight: element.clientHeight})"
-        )
-        if transcript_metrics["scrollHeight"] <= transcript_metrics["clientHeight"]:
-            raise AssertionError("long transcript is not isolated in its own scroll container")
-        page.locator(".conversation-scroll").evaluate(
-            """element => {
-                element.scrollTop = 0;
-                element.dispatchEvent(new Event('scroll'));
+        conversation_scroll = page.locator(".conversation-scroll")
+        conversation_scroll.hover()
+        page.mouse.wheel(0, -10_000)
+        page.wait_for_function(
+            """() => {
+                const element = document.querySelector('.conversation-scroll');
+                return element && element.scrollTop <= 80;
             }"""
         )
         jump_to_latest = page.get_by_role("button", name="Перейти к новым сообщениям")

@@ -610,6 +610,10 @@ button:disabled {
   padding: 2rem max(1.25rem, calc((100% - 48rem) / 2));
   scroll-behavior: smooth;
 }
+.conversation-content {
+  min-width: 0;
+  min-height: 100%;
+}
 .welcome-state {
   min-height: 100%;
   display: grid;

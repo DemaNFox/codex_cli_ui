@@ -424,8 +424,10 @@ describe('App', () => {
       clientHeight: { configurable: true, value: 300 },
       scrollTop: { configurable: true, writable: true, value: 100 },
     });
-    const scrollTo = vi.fn();
-    Object.defineProperty(scroll, 'scrollTo', { configurable: true, value: scrollTo });
+    scroll.scrollTop = 1_000;
+    fireEvent.scroll(scroll);
+    fireEvent.wheel(scroll, { deltaY: -100 });
+    scroll.scrollTop = 100;
     fireEvent.scroll(scroll);
 
     act(() => {
@@ -438,10 +440,61 @@ describe('App', () => {
     });
 
     const jump = await screen.findByRole('button', { name: 'Перейти к новым сообщениям' });
-    expect(scrollTo).not.toHaveBeenCalled();
+    expect(scroll.scrollTop).toBe(100);
     await user.click(jump);
-    expect(scrollTo).toHaveBeenCalledWith({ top: 1_000, behavior: 'smooth' });
+    expect(scroll.scrollTop).toBe(1_000);
     expect(screen.queryByRole('button', { name: 'Перейти к новым сообщениям' })).toBeNull();
+
+    Object.defineProperty(scroll, 'scrollHeight', { configurable: true, value: 1_200 });
+    act(() => {
+      FakeEventSource.instances.at(-1)?.emit({
+        ...initialEvent,
+        id: 3,
+        payload: { text: 'Ещё одно новое сообщение' },
+        createdAt: '2026-09-27T10:03:00.000Z',
+      });
+    });
+    await screen.findByText('Ещё одно новое сообщение');
+    await waitFor(() => expect(scroll.scrollTop).toBe(1_200));
+    expect(screen.queryByRole('button', { name: 'Перейти к новым сообщениям' })).toBeNull();
+  });
+
+  it('opens an existing chat at the latest message without a scroll animation', async () => {
+    const initialEvent = {
+      id: 1,
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Последнее сообщение' },
+      createdAt: '2026-09-27T10:01:00.000Z',
+    };
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [initialEvent] });
+      return undefined;
+    });
+    const originalScrollHeight = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      'scrollHeight',
+    );
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get: () => 1_000,
+    });
+
+    try {
+      render(<App />);
+      await screen.findByText('Последнее сообщение');
+      const scroll = document.querySelector<HTMLDivElement>('.conversation-scroll');
+      await waitFor(() => expect(scroll?.scrollTop).toBe(1_000));
+      expect(scroll?.style.scrollBehavior).toBe('');
+      expect(screen.queryByRole('button', { name: 'Перейти к новым сообщениям' })).toBeNull();
+    } finally {
+      if (originalScrollHeight)
+        Object.defineProperty(HTMLElement.prototype, 'scrollHeight', originalScrollHeight);
+      else Reflect.deleteProperty(HTMLElement.prototype, 'scrollHeight');
+    }
   });
 
   it('keeps primary controls available and opens compact project/thread menus', async () => {

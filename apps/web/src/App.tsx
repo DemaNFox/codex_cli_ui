@@ -4,6 +4,7 @@ import {
   FormEvent,
   type ReactNode,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -112,6 +113,13 @@ function formatMetric(value: number | null): string {
 function formatEventDateTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : EVENT_TIME_FORMATTER.format(date);
+}
+
+function positionAtLatestImmediately(scroll: HTMLDivElement): void {
+  const previousScrollBehavior = scroll.style.scrollBehavior;
+  scroll.style.scrollBehavior = 'auto';
+  scroll.scrollTop = scroll.scrollHeight;
+  scroll.style.scrollBehavior = previousScrollBehavior;
 }
 
 const SLASH_COMMANDS = [
@@ -1841,8 +1849,11 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const conversationScrollRef = useRef<HTMLDivElement>(null);
+  const conversationContentRef = useRef<HTMLDivElement>(null);
   const followingLatestRef = useRef(true);
+  const userScrollIntentAtRef = useRef(0);
   const lastEventIdRef = useRef<number | null>(null);
+  const positionedThreadRef = useRef<string | null>(null);
   const mobileNavigationToggleRef = useRef<HTMLButtonElement>(null);
   const statusToggleRef = useRef<HTMLButtonElement>(null);
   const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
@@ -1853,7 +1864,8 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     () => new Set(),
   );
   const { events, streamState, mergeEvents } = useThreadEvents(threadId);
-  const latestEventId = events.at(-1)?.id ?? null;
+  const latestEvent = events.at(-1) ?? null;
+  const latestEventId = latestEvent?.id ?? null;
 
   const selectedThread = threads.find((item) => item.id === threadId) ?? null;
   const modelOption = models.find((item) => item.id === model) ?? null;
@@ -1907,29 +1919,85 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     setActionNotice(null);
     setShowScrollToLatest(false);
     followingLatestRef.current = true;
+    userScrollIntentAtRef.current = 0;
     lastEventIdRef.current = null;
   }, [threadId]);
 
-  useEffect(() => {
-    if (latestEventId === null || latestEventId === lastEventIdRef.current) return;
+  useLayoutEffect(() => {
+    if (
+      threadId === null ||
+      latestEvent === null ||
+      latestEvent.threadId !== threadId ||
+      latestEventId === lastEventIdRef.current
+    )
+      return;
     const previousEventId = lastEventIdRef.current;
     lastEventIdRef.current = latestEventId;
     const scroll = conversationScrollRef.current;
     if (!scroll) return;
-    if (previousEventId === null || followingLatestRef.current) {
-      scroll.scrollTo?.({ top: scroll.scrollHeight, behavior: 'smooth' });
+    if (positionedThreadRef.current !== threadId || previousEventId === null) {
+      positionedThreadRef.current = threadId;
+      followingLatestRef.current = true;
+      positionAtLatestImmediately(scroll);
+      setShowScrollToLatest(false);
+      return;
+    }
+    if (followingLatestRef.current) {
+      positionAtLatestImmediately(scroll);
       setShowScrollToLatest(false);
       return;
     }
     setShowScrollToLatest(true);
-  }, [latestEventId]);
+  }, [latestEvent, latestEventId, threadId]);
+
+  useLayoutEffect(() => {
+    const scroll = conversationScrollRef.current;
+    if (
+      !scroll ||
+      threadId === null ||
+      positionedThreadRef.current !== threadId ||
+      !followingLatestRef.current
+    )
+      return;
+    positionAtLatestImmediately(scroll);
+  }, [approvals, events, permissionRequests, subagents, threadId, userInputRequests]);
+
+  useEffect(() => {
+    const scroll = conversationScrollRef.current;
+    const content = conversationContentRef.current;
+    if (!scroll || !content || typeof ResizeObserver === 'undefined') return;
+    let frame = 0;
+    const observer = new ResizeObserver(() => {
+      if (!followingLatestRef.current) return;
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        if (followingLatestRef.current) {
+          positionAtLatestImmediately(scroll);
+        }
+      });
+    });
+    observer.observe(content);
+    return () => {
+      observer.disconnect();
+      window.cancelAnimationFrame(frame);
+    };
+  }, [threadId]);
 
   function trackConversationScroll(): void {
     const scroll = conversationScrollRef.current;
     if (!scroll) return;
     const nearLatest = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight <= 80;
-    followingLatestRef.current = nearLatest;
-    setShowScrollToLatest(!nearLatest);
+    if (nearLatest) followingLatestRef.current = true;
+    else if (
+      userScrollIntentAtRef.current > 0 &&
+      performance.now() - userScrollIntentAtRef.current < 500
+    )
+      followingLatestRef.current = false;
+    setShowScrollToLatest(!followingLatestRef.current);
+  }
+
+  function markConversationScrollIntent(): void {
+    userScrollIntentAtRef.current = performance.now();
   }
 
   function scrollToLatest(): void {
@@ -1937,8 +2005,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     if (!scroll) return;
     followingLatestRef.current = true;
     setShowScrollToLatest(false);
-    if (scroll.scrollTo) scroll.scrollTo({ top: scroll.scrollHeight, behavior: 'smooth' });
-    else scroll.scrollTop = scroll.scrollHeight;
+    positionAtLatestImmediately(scroll);
   }
 
   useEffect(() => {
@@ -2714,30 +2781,35 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
           className="conversation-scroll"
           ref={conversationScrollRef}
           onScroll={trackConversationScroll}
+          onWheel={markConversationScrollIntent}
+          onTouchMove={markConversationScrollIntent}
+          onPointerDown={markConversationScrollIntent}
         >
-          <SubagentPanel subagents={subagents} />
-          <Transcript events={events} />
-          {approvals.map((approval) => (
-            <ApprovalCard
-              key={approval.id}
-              approval={approval}
-              onResolve={(decision) => void resolveApproval(approval.id, decision)}
-            />
-          ))}
-          {userInputRequests.map((request) => (
-            <UserInputCard
-              key={request.id}
-              request={request}
-              onResolve={(answers) => resolveUserInput(request.id, answers)}
-            />
-          ))}
-          {permissionRequests.map((request) => (
-            <PermissionCard
-              key={request.id}
-              request={request}
-              onResolve={(decision) => resolvePermission(request.id, decision)}
-            />
-          ))}
+          <div className="conversation-content" ref={conversationContentRef}>
+            <SubagentPanel subagents={subagents} />
+            <Transcript events={events} />
+            {approvals.map((approval) => (
+              <ApprovalCard
+                key={approval.id}
+                approval={approval}
+                onResolve={(decision) => void resolveApproval(approval.id, decision)}
+              />
+            ))}
+            {userInputRequests.map((request) => (
+              <UserInputCard
+                key={request.id}
+                request={request}
+                onResolve={(answers) => resolveUserInput(request.id, answers)}
+              />
+            ))}
+            {permissionRequests.map((request) => (
+              <PermissionCard
+                key={request.id}
+                request={request}
+                onResolve={(decision) => resolvePermission(request.id, decision)}
+              />
+            ))}
+          </div>
         </div>
         <div className="composer-wrap">
           {showScrollToLatest && (
