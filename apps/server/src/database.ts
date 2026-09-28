@@ -2,8 +2,10 @@ import type {
   Attachment,
   PendingApproval,
   Project,
+  ResourceLimitPolicy,
   RuntimePreferences,
   SafeEvent,
+  Subagent,
   Thread,
 } from '@codex-web/contracts';
 import { DatabaseSync } from 'node:sqlite';
@@ -63,6 +65,31 @@ interface AttachmentRow {
   storage_name: string;
   turn_id: string | null;
   created_at: string;
+}
+
+interface SubagentRow {
+  id: string;
+  root_thread_id: string;
+  parent_thread_id: string;
+  agent_path: string | null;
+  nickname: string | null;
+  role: string | null;
+  model: string | null;
+  reasoning_effort: string | null;
+  status: Subagent['status'];
+  message: string | null;
+  started_at: string;
+  last_activity_at: string;
+  completed_at: string | null;
+}
+
+export interface StoredResourceLimits {
+  desired: ResourceLimitPolicy;
+  state: 'applied' | 'pending-idle' | 'applying' | 'degraded';
+  version: number;
+  updatedAt: string;
+  appliedAt: string | null;
+  warning: string | null;
 }
 
 export interface AttachmentRecord {
@@ -147,6 +174,24 @@ function attachmentFromRow(row: AttachmentRow): AttachmentRecord {
   };
 }
 
+function subagentFromRow(row: SubagentRow): Subagent {
+  return {
+    id: row.id,
+    rootThreadId: row.root_thread_id,
+    parentThreadId: row.parent_thread_id,
+    agentPath: row.agent_path,
+    nickname: row.nickname,
+    role: row.role,
+    model: row.model,
+    reasoningEffort: row.reasoning_effort,
+    status: row.status,
+    message: row.message,
+    startedAt: row.started_at,
+    lastActivityAt: row.last_activity_at,
+    completedAt: row.completed_at,
+  };
+}
+
 export class SqliteRepository {
   readonly database: DatabaseSync;
 
@@ -217,6 +262,37 @@ export class SqliteRepository {
         approval_policy TEXT NOT NULL CHECK(approval_policy IN ('untrusted','on-request','never')),
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS resource_limit_preferences (
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        mode TEXT NOT NULL CHECK(mode IN ('auto','custom')),
+        cpu_cores REAL,
+        memory_bytes INTEGER,
+        tasks INTEGER,
+        max_parallel_agents INTEGER,
+        state TEXT NOT NULL CHECK(state IN ('applied','pending-idle','applying','degraded')),
+        version INTEGER NOT NULL CHECK(version >= 0),
+        updated_at TEXT NOT NULL,
+        applied_at TEXT,
+        warning TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS subagents (
+        id TEXT PRIMARY KEY,
+        root_thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        parent_thread_id TEXT NOT NULL,
+        agent_path TEXT,
+        nickname TEXT,
+        role TEXT,
+        model TEXT,
+        reasoning_effort TEXT,
+        status TEXT NOT NULL CHECK(status IN ('pendingInit','running','interrupted','completed','errored','shutdown','notFound')),
+        message TEXT,
+        started_at TEXT NOT NULL,
+        last_activity_at TEXT NOT NULL,
+        completed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS subagents_root_idx ON subagents(root_thread_id,status,last_activity_at);
 
       CREATE TABLE IF NOT EXISTS attachments (
         id TEXT PRIMARY KEY,
@@ -549,6 +625,150 @@ export class SqliteRepository {
         updatedAt,
       );
     return this.getRuntimePreferences();
+  }
+
+  getResourceLimits(): StoredResourceLimits {
+    this.database
+      .prepare(
+        `INSERT INTO resource_limit_preferences(id,mode,cpu_cores,memory_bytes,tasks,max_parallel_agents,state,version,updated_at,applied_at,warning)
+         VALUES(1,'auto',NULL,NULL,NULL,NULL,'pending-idle',0,?,NULL,NULL) ON CONFLICT(id) DO NOTHING`,
+      )
+      .run(new Date(0).toISOString());
+    const row = this.database
+      .prepare('SELECT * FROM resource_limit_preferences WHERE id=1')
+      .get() as {
+      mode: ResourceLimitPolicy['mode'];
+      cpu_cores: number | null;
+      memory_bytes: number | null;
+      tasks: number | null;
+      max_parallel_agents: number | null;
+      state: StoredResourceLimits['state'];
+      version: number;
+      updated_at: string;
+      applied_at: string | null;
+      warning: string | null;
+    };
+    return {
+      desired: {
+        mode: row.mode,
+        cpuCores: row.cpu_cores,
+        memoryBytes: row.memory_bytes,
+        tasks: row.tasks,
+        maxParallelAgents: row.max_parallel_agents,
+      },
+      state: row.state,
+      version: row.version,
+      updatedAt: row.updated_at,
+      appliedAt: row.applied_at,
+      warning: row.warning,
+    };
+  }
+
+  setResourceLimitDesired(
+    desired: ResourceLimitPolicy,
+    expectedVersion: number,
+    state: StoredResourceLimits['state'],
+  ): StoredResourceLimits | undefined {
+    this.getResourceLimits();
+    const updatedAt = new Date().toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE resource_limit_preferences SET mode=?,cpu_cores=?,memory_bytes=?,tasks=?,max_parallel_agents=?,
+         state=?,version=version+1,updated_at=?,warning=NULL WHERE id=1 AND version=?`,
+      )
+      .run(
+        desired.mode,
+        desired.cpuCores,
+        desired.memoryBytes,
+        desired.tasks,
+        desired.maxParallelAgents,
+        state,
+        updatedAt,
+        expectedVersion,
+      );
+    return result.changes === 1 ? this.getResourceLimits() : undefined;
+  }
+
+  setResourceLimitState(
+    version: number,
+    state: StoredResourceLimits['state'],
+    input: { appliedAt?: string | null; warning?: string | null } = {},
+  ): StoredResourceLimits | undefined {
+    const current = this.getResourceLimits();
+    const result = this.database
+      .prepare(
+        `UPDATE resource_limit_preferences SET state=?,applied_at=?,warning=?,updated_at=?
+         WHERE id=1 AND version=?`,
+      )
+      .run(
+        state,
+        input.appliedAt === undefined ? current.appliedAt : input.appliedAt,
+        input.warning === undefined ? current.warning : input.warning,
+        new Date().toISOString(),
+        version,
+      );
+    return result.changes === 1 ? this.getResourceLimits() : undefined;
+  }
+
+  upsertSubagent(subagent: Subagent): Subagent {
+    this.database
+      .prepare(
+        `INSERT INTO subagents(id,root_thread_id,parent_thread_id,agent_path,nickname,role,model,reasoning_effort,status,message,started_at,last_activity_at,completed_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET
+         root_thread_id=excluded.root_thread_id,parent_thread_id=excluded.parent_thread_id,
+         agent_path=COALESCE(excluded.agent_path,subagents.agent_path),nickname=COALESCE(excluded.nickname,subagents.nickname),
+         role=COALESCE(excluded.role,subagents.role),model=COALESCE(excluded.model,subagents.model),
+         reasoning_effort=COALESCE(excluded.reasoning_effort,subagents.reasoning_effort),status=excluded.status,
+         message=excluded.message,last_activity_at=excluded.last_activity_at,completed_at=excluded.completed_at`,
+      )
+      .run(
+        subagent.id,
+        subagent.rootThreadId,
+        subagent.parentThreadId,
+        subagent.agentPath,
+        subagent.nickname,
+        subagent.role,
+        subagent.model,
+        subagent.reasoningEffort,
+        subagent.status,
+        subagent.message,
+        subagent.startedAt,
+        subagent.lastActivityAt,
+        subagent.completedAt,
+      );
+    return this.getSubagent(subagent.id)!;
+  }
+
+  getSubagent(id: string): Subagent | undefined {
+    const row = this.database.prepare('SELECT * FROM subagents WHERE id=?').get(id) as
+      SubagentRow | undefined;
+    return row && subagentFromRow(row);
+  }
+
+  listSubagents(rootThreadId: string): Subagent[] {
+    return (
+      this.database
+        .prepare('SELECT * FROM subagents WHERE root_thread_id=? ORDER BY started_at,id')
+        .all(rootThreadId) as unknown as SubagentRow[]
+    ).map(subagentFromRow);
+  }
+
+  countActiveSubagents(): number {
+    const row = this.database
+      .prepare("SELECT count(*) AS count FROM subagents WHERE status IN ('pendingInit','running')")
+      .get() as { count: number };
+    return row.count;
+  }
+
+  resetActiveSubagentRuntime(): number {
+    const now = new Date().toISOString();
+    const result = this.database
+      .prepare(
+        `UPDATE subagents SET status='interrupted',message='Runtime restarted',last_activity_at=?,completed_at=?
+         WHERE status IN ('pendingInit','running')`,
+      )
+      .run(now, now);
+    return Number(result.changes);
   }
 
   upsertThread(thread: Thread): Thread {

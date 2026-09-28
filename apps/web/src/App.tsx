@@ -1289,6 +1289,14 @@ function ResourceSettings({
   const dirty = JSON.stringify(normalizedDraft) !== JSON.stringify(snapshot.desired);
   const maxMemoryGiB = snapshot.capacity.memoryBytes / 1024 ** 3;
   const memoryGiB = draft.memoryBytes === null ? '' : draft.memoryBytes / 1024 ** 3;
+  const safeAgentMaximum = Math.max(
+    1,
+    Math.min(
+      8,
+      Math.floor(draft.cpuCores ?? snapshot.effective.cpuCores),
+      Math.floor((draft.memoryBytes ?? snapshot.effective.memoryBytes) / (2 * 1024 ** 3)),
+    ),
+  );
   const fieldsValid =
     !custom ||
     (draft.cpuCores !== null &&
@@ -1301,8 +1309,7 @@ function ResourceSettings({
       draft.tasks >= 64 &&
       draft.tasks <= snapshot.capacity.tasks &&
       (draft.maxParallelAgents === null ||
-        (draft.maxParallelAgents > 0 &&
-          draft.maxParallelAgents <= Math.min(64, snapshot.capacity.tasks))));
+        (draft.maxParallelAgents > 0 && draft.maxParallelAgents <= safeAgentMaximum)));
 
   const setNumber = (key: keyof ResourceLimitPolicy, value: string, multiplier = 1) => {
     const parsed = value === '' ? null : Number(value) * multiplier;
@@ -1426,18 +1433,18 @@ function ResourceSettings({
             <small>Максимум: {snapshot.capacity.tasks.toLocaleString('ru')}</small>
           </label>
           <label>
-            Параллельные агенты
+            Параллельные агенты (включая основной)
             <input
               aria-label="Максимум параллельных агентов"
               type="number"
               min="1"
-              max={Math.min(64, snapshot.capacity.tasks)}
+              max={safeAgentMaximum}
               step="1"
               value={draft.maxParallelAgents ?? ''}
               onChange={(event) => setNumber('maxParallelAgents', event.target.value)}
               disabled={busy}
             />
-            <small>Максимум: {Math.min(64, snapshot.capacity.tasks)}</small>
+            <small>Безопасный максимум для выбранных CPU/RAM: {safeAgentMaximum}</small>
           </label>
         </div>
       )}

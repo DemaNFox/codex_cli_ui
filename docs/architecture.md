@@ -23,6 +23,10 @@ Browser
   environment or SQLite; it receives read-only attachment access and explicit project/Codex-home paths.
 - JSON-RPC requests are correlated by generated numeric IDs. Server-initiated approval and input requests are recorded as pending UI actions.
 - The backend projects safe, normalized events to per-thread SSE streams. Reconnect uses the last event ID and the durable event journal.
+- Subagent lifecycle notifications are projected into a server-owned table keyed by the root chat and are
+  published as safe SSE state snapshots. The projection includes public identity, hierarchy, model, effort,
+  exact lifecycle state and timestamps, but never the delegated prompt or chain-of-thought. Every authenticated
+  device therefore sees the same running and completed subagents after reconnect.
 - Projects, thread metadata, authenticated sessions and the safe event journal are server-owned. Browsers keep
   only transient view/composer state: a second authenticated device loads the same project and chat inventory,
   hydrates the selected transcript from the server and then follows it through SSE. Active-turn steering is
@@ -72,10 +76,20 @@ snapshot.
 
 Deployment secrets are kept in a root-owned `0600` environment file. systemd
 loads it before changing to the unprivileged service identity, so the service
-user does not receive file-read access. CPU, memory and process counts are
-bounded by the unit. Disk admission and a periodic guard stop work on low space
+user does not receive file-read access. CPU, memory and process counts for the API and all runners are
+aggregated in one workload slice. A separate root-owned, socket-activated resource broker accepts only a fixed
+snapshot/apply protocol from the API service identity and can change only that slice. The default automatic
+policy never allocates more than the parent cgroup/host permits and reserves at least one CPU plus 15% of RAM
+(at least 1 GiB) for Ubuntu. Custom ceilings are validated against live capacity, staged while any root task or
+subagent is active and applied only after the workload becomes idle. New work fails closed while a policy is
+pending/degraded and when live memory or the effective execution-unit ceiling is exhausted. Disk admission and a periodic guard stop work on low space
 or database overflow, while an administrator-enforced filesystem quota or
 dedicated bounded volume remains mandatory for a hard disk limit.
+The effective agent ceiling is also passed to the pinned Codex thread configuration as `agents.max_threads`
+when an idle thread is resumed, so descendants share the same concurrency limit; the cgroup remains the final
+machine-level enforcement boundary. Automatic concurrency allows at most eight threads and budgets at least
+one CPU core and 2 GiB of the selected workload memory per concurrent root/subagent slot; a custom value above
+that derived ceiling is rejected.
 
 ## Initial API
 
@@ -89,8 +103,11 @@ dedicated bounded volume remains mandatory for a hard disk limit.
 - `POST /api/user-input-requests/:id/resolve` for typed `request_user_input` answers; secret answers are never persisted or echoed
 - `POST /api/permission-requests/:id/resolve` for an explicit deny or one-turn grant derived from the validated request
 - `GET /api/threads/:id/events` using SSE and `Last-Event-ID`
+- `GET /api/threads/:id/subagents` for the durable root-chat subagent projection
 - `POST/GET /api/threads/:id/attachments`, `GET/DELETE /api/threads/:id/attachments/:attachmentId`; uploads use multipart field `file`
 - `GET /api/system/capabilities` for safe version/auth/instruction/skill, rate-limit and aggregate-usage status
+- `GET/PUT /api/system/resource-limits` and `POST /api/system/resource-limits/apply` for the
+  authenticated, CSRF-protected resource policy workflow
 
 All state-changing routes require an authenticated session, exact Origin and a session-bound CSRF token.
 
@@ -120,7 +137,8 @@ composer. The account/logout row remains reachable inside the drawer.
 Package upgrades are fail-closed around active Codex work. The installer requests a drain before switching the
 `current` release: new turn starts are rejected, while reads, SSE, steering, interruption and pending user
 interactions remain available from desktop or phone. Activation proceeds only after the running API reports
-zero active and pending turn starts. An unavailable or unverifiable drain leaves the old release running.
+zero active root turns, pending turn starts and active subagents. An unavailable or unverifiable drain leaves
+the old release running.
 An active legacy release that lacks this health contract is never upgraded in place: the installer fails
 closed. Its one-time migration requires an external maintenance fence that blocks new turn submissions,
 followed by a verified idle state and a stopped API with no app-server runners. Later drain-aware upgrades

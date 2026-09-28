@@ -3,6 +3,7 @@ import { AttachmentStore } from './attachment-store.js';
 import { loadConfig } from './config.js';
 import { SqliteRepository } from './database.js';
 import { ProjectPathPolicy } from './path-policy.js';
+import { UnixResourceBrokerClient } from './resource-broker.js';
 import { buildServer } from './server.js';
 
 const config = loadConfig();
@@ -16,6 +17,14 @@ const appServer = config.appServerSocket
       expectedVersion: config.codexVersionPin,
     });
 const attachmentStore = new AttachmentStore(config.attachmentStoragePath);
-const server = await buildServer({ config, repository, pathPolicy, appServer, attachmentStore });
+const resourceBroker = new UnixResourceBrokerClient(config.resourceBrokerSocket);
+const server = await buildServer({
+  config,
+  repository,
+  pathPolicy,
+  appServer,
+  attachmentStore,
+  resourceBroker,
+});
 
 await server.listen({ host: config.host, port: config.port });

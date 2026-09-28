@@ -19,6 +19,105 @@ export const updateRuntimePreferencesRequestSchema = runtimePreferencesSchema.om
   updatedAt: true,
 });
 
+const nullableCpuCoresSchema = z.number().finite().min(0.25).max(4_096).nullable();
+const nullableResourceIntegerSchema = z
+  .number()
+  .int()
+  .positive()
+  .max(Number.MAX_SAFE_INTEGER)
+  .nullable();
+
+export const resourceLimitPolicySchema = z
+  .object({
+    mode: z.enum(['auto', 'custom']),
+    cpuCores: nullableCpuCoresSchema,
+    memoryBytes: nullableResourceIntegerSchema,
+    tasks: z.number().int().min(64).max(4_194_304).nullable(),
+    maxParallelAgents: z.number().int().min(1).max(64).nullable(),
+  })
+  .superRefine((value, context) => {
+    if (
+      value.mode === 'auto' &&
+      [value.cpuCores, value.memoryBytes, value.tasks, value.maxParallelAgents].some(
+        (item) => item !== null,
+      )
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Automatic resource policy cannot contain custom ceilings',
+      });
+    if (
+      value.mode === 'custom' &&
+      [value.cpuCores, value.memoryBytes, value.tasks].some((item) => item === null)
+    )
+      context.addIssue({
+        code: 'custom',
+        message: 'Custom resource policy requires CPU, memory and task ceilings',
+      });
+  });
+export type ResourceLimitPolicy = z.infer<typeof resourceLimitPolicySchema>;
+
+export const resourceLimitSnapshotSchema = z.object({
+  capacity: z.object({
+    cpuCores: z.number().finite().positive(),
+    memoryBytes: z.number().int().positive(),
+    memoryAvailableBytes: z.number().int().nonnegative(),
+    tasks: z.number().int().positive(),
+    measuredAt: z.string().datetime(),
+  }),
+  desired: resourceLimitPolicySchema,
+  effective: z.object({
+    cpuCores: z.number().finite().positive(),
+    memoryBytes: z.number().int().positive(),
+    tasks: z.number().int().positive(),
+    maxParallelAgents: z.number().int().min(1).max(64),
+  }),
+  state: z.enum(['applied', 'pending-idle', 'applying', 'degraded']),
+  version: z.number().int().nonnegative(),
+  updatedAt: z.string().datetime(),
+  appliedAt: z.string().datetime().nullable(),
+  warning: z.string().max(2_000).nullable(),
+});
+export type ResourceLimitSnapshot = z.infer<typeof resourceLimitSnapshotSchema>;
+
+export const updateResourceLimitsRequestSchema = z.object({
+  desired: resourceLimitPolicySchema,
+  expectedVersion: z.number().int().nonnegative(),
+});
+
+export const applyResourceLimitsRequestSchema = z.object({
+  idempotencyKey: z.string().uuid(),
+  expectedVersion: z.number().int().nonnegative(),
+});
+
+export const subagentStatusSchema = z.enum([
+  'pendingInit',
+  'running',
+  'interrupted',
+  'completed',
+  'errored',
+  'shutdown',
+  'notFound',
+]);
+export type SubagentStatus = z.infer<typeof subagentStatusSchema>;
+
+export const subagentSchema = z.object({
+  id: z.string().min(1).max(200),
+  rootThreadId: z.string().min(1).max(200),
+  parentThreadId: z.string().min(1).max(200),
+  agentPath: z.string().min(1).max(500).nullable(),
+  nickname: z.string().min(1).max(120).nullable(),
+  role: z.string().min(1).max(120).nullable(),
+  model: z.string().min(1).max(120).nullable(),
+  reasoningEffort: z.string().min(1).max(40).nullable(),
+  status: subagentStatusSchema,
+  message: z.string().max(2_000).nullable(),
+  startedAt: z.string().datetime(),
+  lastActivityAt: z.string().datetime(),
+  completedAt: z.string().datetime().nullable(),
+});
+export type Subagent = z.infer<typeof subagentSchema>;
+
 export const loginRequestSchema = z.object({
   username: z.string().trim().min(1).max(80),
   password: z.string().min(12).max(1024),
@@ -147,6 +246,7 @@ export const eventKindSchema = z.enum([
   'usage',
   'warning',
   'error',
+  'subagent',
 ]);
 
 export const safeEventSchema = z.object({

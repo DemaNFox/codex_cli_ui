@@ -9,17 +9,22 @@ import {
   resolvePermissionRequestSchema,
   resolveApprovalRequestSchema,
   resolveUserInputRequestSchema,
+  resourceLimitSnapshotSchema,
   startThreadRequestSchema,
   startTurnRequestSchema,
   steerTurnRequestSchema,
   threadListQuerySchema,
   updateRuntimePreferencesRequestSchema,
+  updateResourceLimitsRequestSchema,
+  applyResourceLimitsRequestSchema,
   userInputQuestionSchema,
   type PermissionPreset,
   type Attachment,
   type PendingApproval,
   type Project,
+  type ResourceLimitSnapshot,
   type SafeEvent,
+  type Subagent,
   type Thread,
 } from '@codex-web/contracts';
 import cookie from '@fastify/cookie';
@@ -51,7 +56,13 @@ import {
   validateUserInputAnswers,
 } from './interaction-normalizer.js';
 import type { ProjectPathPolicy } from './path-policy.js';
+import {
+  ResourceBrokerError,
+  type BrokerResourceSnapshot,
+  type ResourceBroker,
+} from './resource-broker.js';
 import { createSseDelivery } from './sse.js';
+import { normalizeSubagentNotification } from './subagents.js';
 
 const idParamsSchema = z.object({ id: z.string().min(1).max(200) });
 const attachmentParamsSchema = z.object({
@@ -226,6 +237,7 @@ export interface ServerDependencies {
   readonly pathPolicy: ProjectPathPolicy;
   readonly appServer: AppServerClient;
   readonly attachmentStore: AttachmentStore;
+  readonly resourceBroker?: ResourceBroker;
   readonly upgradeDrainPath?: string;
 }
 
@@ -428,7 +440,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const historyHydrations = new Map<string, Promise<Thread>>();
   repository.markPendingIdempotencyUnknown();
   repository.resetActiveThreadRuntime();
+  repository.resetActiveSubagentRuntime();
   let pendingTurnStarts = 0;
+  let resourceApplyPromise: Promise<ResourceLimitSnapshot> | null = null;
   const upgradeDrainPath =
     dependencies.upgradeDrainPath ?? '/var/lib/codex-web-ui/data/upgrade-drain';
   const upgradeDrainRequested = (): boolean => {
@@ -437,6 +451,112 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     } catch {
       return false;
     }
+  };
+
+  const safeParallelAgents = (cpuQuotaPercent: number, memoryBytes: number): number =>
+    Math.max(
+      1,
+      Math.min(
+        8,
+        Math.floor(cpuQuotaPercent / 100),
+        Math.floor(memoryBytes / (2 * 1_024 * 1_024 * 1_024)),
+      ),
+    );
+
+  const autoParallelAgents = (snapshot: BrokerResourceSnapshot): number =>
+    safeParallelAgents(snapshot.effective.cpuQuotaPercent, snapshot.effective.memoryMaxBytes);
+
+  const publicResourceSnapshot = (broker: BrokerResourceSnapshot): ResourceLimitSnapshot => {
+    const stored = repository.getResourceLimits();
+    return resourceLimitSnapshotSchema.parse({
+      capacity: {
+        cpuCores: broker.capacity.cpuQuotaPercent / 100,
+        memoryBytes: broker.capacity.memoryBytes,
+        memoryAvailableBytes: broker.capacity.memoryAvailableBytes,
+        tasks: broker.capacity.tasks,
+        measuredAt: broker.capacity.measuredAt,
+      },
+      desired: stored.desired,
+      effective: {
+        cpuCores: broker.effective.cpuQuotaPercent / 100,
+        memoryBytes: broker.effective.memoryMaxBytes,
+        tasks: broker.effective.tasksMax,
+        maxParallelAgents: stored.desired.maxParallelAgents ?? autoParallelAgents(broker),
+      },
+      state: stored.state,
+      version: stored.version,
+      updatedAt: stored.updatedAt,
+      appliedAt: stored.appliedAt,
+      warning: stored.warning,
+    });
+  };
+
+  const brokerSnapshot = async (): Promise<BrokerResourceSnapshot> => {
+    if (!dependencies.resourceBroker)
+      throw new HttpError(503, 'RESOURCE_BROKER_UNAVAILABLE', 'Resource broker is unavailable');
+    try {
+      return await dependencies.resourceBroker.snapshot();
+    } catch (error) {
+      if (error instanceof ResourceBrokerError) throw new HttpError(503, error.code, error.message);
+      throw error;
+    }
+  };
+
+  const resourceWorkActive = (): boolean =>
+    activeTurns.size > 0 || pendingTurnStarts > 0 || repository.countActiveSubagents() > 0;
+
+  const applyPendingResources = async (): Promise<ResourceLimitSnapshot> => {
+    if (resourceApplyPromise) return resourceApplyPromise;
+    resourceApplyPromise = (async () => {
+      const stored = repository.getResourceLimits();
+      const before = await brokerSnapshot();
+      if (stored.state === 'applied') return publicResourceSnapshot(before);
+      if (resourceWorkActive()) {
+        repository.setResourceLimitState(stored.version, 'pending-idle', { warning: null });
+        return publicResourceSnapshot(before);
+      }
+      repository.setResourceLimitState(stored.version, 'applying', { warning: null });
+      try {
+        const desired = stored.desired;
+        const applied = await dependencies.resourceBroker!.apply({
+          mode: desired.mode,
+          cpuQuotaPercent:
+            desired.mode === 'custom' && desired.cpuCores !== null
+              ? Math.round(desired.cpuCores * 100)
+              : null,
+          memoryMaxBytes: desired.mode === 'custom' ? desired.memoryBytes : null,
+          tasksMax: desired.mode === 'custom' ? desired.tasks : null,
+        });
+        repository.setResourceLimitState(stored.version, 'applied', {
+          appliedAt: new Date().toISOString(),
+          warning: null,
+        });
+        repository.audit('resource_limits.apply', 'succeeded', {
+          version: stored.version,
+          mode: desired.mode,
+          generation: applied.generation,
+        });
+        return publicResourceSnapshot(applied);
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message.slice(0, 2_000) : 'Resource broker failed';
+        repository.setResourceLimitState(stored.version, 'degraded', { warning: message });
+        repository.audit('resource_limits.apply', 'failed', { version: stored.version });
+        if (error instanceof ResourceBrokerError)
+          throw new HttpError(503, error.code, error.message);
+        throw error;
+      }
+    })().finally(() => {
+      resourceApplyPromise = null;
+    });
+    return resourceApplyPromise;
+  };
+
+  const applyPendingResourcesWhenIdle = (): void => {
+    if (repository.getResourceLimits().state === 'applied' || resourceWorkActive()) return;
+    void applyPendingResources().catch(() => {
+      // The failure is persisted as degraded state and exposed through the resource endpoint.
+    });
   };
 
   await app.register(cookie);
@@ -724,6 +844,48 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       message,
       attachmentStore.root,
     ) as AppServerInbound;
+    for (const projection of normalizeSubagentNotification(redactedMessage, {
+      findAgent: (agentThreadId) => {
+        const existing = repository.getSubagent(agentThreadId);
+        return existing
+          ? { agentThreadId: existing.id, rootThreadId: existing.rootThreadId }
+          : null;
+      },
+      maxMessageLength: 1_024,
+    })) {
+      if (!repository.getThread(projection.rootThreadId)) continue;
+      const existing = repository.getSubagent(projection.agentThreadId);
+      const subagent: Subagent = {
+        id: projection.agentThreadId,
+        rootThreadId: projection.rootThreadId,
+        parentThreadId: projection.parentThreadId,
+        agentPath: projection.agentPath ?? existing?.agentPath ?? null,
+        nickname: projection.nickname ?? existing?.nickname ?? null,
+        role: projection.role ?? existing?.role ?? null,
+        model: projection.model ?? existing?.model ?? null,
+        reasoningEffort: projection.reasoningEffort ?? existing?.reasoningEffort ?? null,
+        status: projection.status ?? existing?.status ?? 'pendingInit',
+        message: projection.statusMessage ?? existing?.message ?? null,
+        startedAt: projection.startedAt ?? existing?.startedAt ?? projection.lastActivityAt,
+        lastActivityAt: projection.lastActivityAt,
+        completedAt:
+          projection.completedAt ??
+          (projection.status && ['pendingInit', 'running'].includes(projection.status)
+            ? null
+            : (existing?.completedAt ?? null)),
+      };
+      const persisted = repository.upsertSubagent(subagent);
+      publish(
+        repository.appendEvent({
+          threadId: persisted.rootThreadId,
+          turnId: null,
+          kind: 'subagent',
+          phase: 'state',
+          payload: { subagent: persisted },
+        }),
+      );
+      applyPendingResourcesWhenIdle();
+    }
     const normalized =
       completedAgentMessage(redactedMessage, config.maxEventBytes) ??
       normalizeNotification(redactedMessage, config.maxEventBytes);
@@ -739,6 +901,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (message.method === 'turn/completed' && normalized.turnId) {
       activeTurns.delete(`${normalized.threadId}:${normalized.turnId}`);
       repository.updateThreadRuntime(normalized.threadId, { status: 'idle', activeTurnId: null });
+      applyPendingResourcesWhenIdle();
     }
     if (message.method === 'thread/status/changed') {
       const status = threadStatusChangedSchema.safeParse(message.params);
@@ -752,6 +915,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           for (const activeTurn of activeTurns) {
             if (activeTurn.startsWith(`${normalized.threadId}:`)) activeTurns.delete(activeTurn);
           }
+          applyPendingResourcesWhenIdle();
         }
       }
     }
@@ -807,7 +971,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     });
   });
 
-  app.addHook('onReady', async () => appServer.start());
+  app.addHook('onReady', async () => {
+    await appServer.start();
+    if (dependencies.resourceBroker) applyPendingResourcesWhenIdle();
+  });
   app.addHook('onClose', async () => {
     unsubscribe();
     await appServer.stop();
@@ -818,6 +985,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const ready = appServer.ready;
     const requested = upgradeDrainRequested();
     const activeTurnCount = activeTurns.size;
+    const activeSubagents = repository.countActiveSubagents();
     return reply.code(ready ? 200 : 503).send({
       status: ready ? 'ready' : 'degraded',
       appServerReady: ready,
@@ -826,9 +994,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         requested,
         acceptingNewTurns: !requested,
         activeTurns: activeTurnCount,
+        activeSubagents,
+        activeExecutionUnits: activeTurnCount + pendingTurnStarts + activeSubagents,
         pendingTurnStarts,
-        idle: requested && activeTurnCount === 0 && pendingTurnStarts === 0,
+        idle:
+          requested && activeTurnCount === 0 && pendingTurnStarts === 0 && activeSubagents === 0,
       },
+      resources: { state: repository.getResourceLimits().state },
       codexVersion: config.codexVersionPin,
     });
   });
@@ -878,6 +1050,87 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const preferences = repository.setRuntimePreferences(input);
     repository.audit('runtime_preferences.update', 'succeeded');
     return { data: preferences };
+  });
+
+  app.get('/api/system/resource-limits', async (request) => {
+    auth.authenticate(request);
+    const snapshot = await brokerSnapshot();
+    return { data: publicResourceSnapshot(snapshot) };
+  });
+
+  app.put('/api/system/resource-limits', async (request, reply) => {
+    csrfGuard(auth, request);
+    const input = updateResourceLimitsRequestSchema.parse(request.body);
+    const capacity = await brokerSnapshot();
+    if (input.desired.mode === 'custom') {
+      if (
+        input.desired.cpuCores! > capacity.capacity.cpuQuotaPercent / 100 ||
+        input.desired.memoryBytes! > capacity.capacity.memoryBytes ||
+        input.desired.tasks! > capacity.capacity.tasks
+      )
+        throw new HttpError(
+          409,
+          'RESOURCE_LIMIT_EXCEEDS_CAPACITY',
+          'Requested resource limit exceeds current host capacity',
+        );
+      if (
+        input.desired.maxParallelAgents !== null &&
+        input.desired.maxParallelAgents >
+          safeParallelAgents(Math.round(input.desired.cpuCores! * 100), input.desired.memoryBytes!)
+      )
+        throw new HttpError(
+          409,
+          'RESOURCE_AGENT_LIMIT_EXCEEDS_CAPACITY',
+          'Agent concurrency exceeds the selected CPU and memory ceilings',
+        );
+    }
+    const updated = repository.setResourceLimitDesired(
+      input.desired,
+      input.expectedVersion,
+      'pending-idle',
+    );
+    if (!updated) throw new HttpError(409, 'RESOURCE_LIMIT_VERSION_CONFLICT');
+    repository.audit('resource_limits.update', 'succeeded', {
+      version: updated.version,
+      mode: updated.desired.mode,
+    });
+    if (resourceWorkActive())
+      return reply.code(202).send({ data: publicResourceSnapshot(capacity) });
+    const applied = await applyPendingResources();
+    return reply.code(200).send({ data: applied });
+  });
+
+  app.post('/api/system/resource-limits/apply', async (request, reply) => {
+    csrfGuard(auth, request);
+    const input = applyResourceLimitsRequestSchema.parse(request.body);
+    const stored = repository.getResourceLimits();
+    if (stored.version !== input.expectedVersion)
+      throw new HttpError(409, 'RESOURCE_LIMIT_VERSION_CONFLICT');
+    const hash = requestHash({ version: input.expectedVersion });
+    const operation = 'resource-limits:apply';
+    const reservation = repository.reserveIdempotent(operation, input.idempotencyKey, hash);
+    if (!reservation.reserved) {
+      if (reservation.record.requestHash !== hash) throw new HttpError(409, 'IDEMPOTENCY_CONFLICT');
+      if (reservation.record.state === 'completed')
+        return reply.code(200).send(reservation.record.response);
+      throw new HttpError(409, 'IDEMPOTENCY_PENDING');
+    }
+    if (resourceWorkActive()) {
+      const snapshot = publicResourceSnapshot(await brokerSnapshot());
+      const response = { data: snapshot };
+      repository.completeIdempotent(operation, input.idempotencyKey, hash, response);
+      repository.audit('resource_limits.apply', 'deferred', { version: stored.version });
+      return reply.code(202).send(response);
+    }
+    try {
+      const snapshot = await applyPendingResources();
+      const response = { data: snapshot };
+      repository.completeIdempotent(operation, input.idempotencyKey, hash, response);
+      return reply.code(200).send(response);
+    } catch (error) {
+      repository.markIdempotentUnknown(operation, input.idempotencyKey, hash);
+      throw error;
+    }
   });
 
   app.get('/api/projects', (request) => {
@@ -1020,6 +1273,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const cwd = await canonicalProjectPath(pathPolicy, project);
     const preset = input.permissionPreset ?? project.defaultPermissionPreset;
     const reasoningEffort = input.reasoningEffort ?? project.defaultReasoningEffort;
+    const configuredAgentLimit = repository.getResourceLimits().desired.maxParallelAgents;
     const result = threadResponseSchema.parse(
       await appServer.request('thread/start', {
         cwd,
@@ -1028,9 +1282,17 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         approvalsReviewer: 'user',
         sandbox: preset === 'full-access' ? 'danger-full-access' : preset,
         config:
-          reasoningEffort === null || reasoningEffort === undefined
+          (reasoningEffort === null || reasoningEffort === undefined) &&
+          configuredAgentLimit === null
             ? null
-            : { model_reasoning_effort: reasoningEffort },
+            : {
+                ...(reasoningEffort === null || reasoningEffort === undefined
+                  ? {}
+                  : { model_reasoning_effort: reasoningEffort }),
+                ...(configuredAgentLimit === null
+                  ? {}
+                  : { agents: { max_threads: configuredAgentLimit } }),
+              },
         ephemeral: false,
         serviceName: 'codex-web-ui',
       }),
@@ -1065,7 +1327,18 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         repository.audit('thread.refresh', 'failed', { threadId: id });
       }
     }
-    return { data: thread, events: repository.listEvents(id, 0) };
+    return {
+      data: thread,
+      events: repository.listEvents(id, 0),
+      subagents: repository.listSubagents(id),
+    };
+  });
+
+  app.get('/api/threads/:id/subagents', (request) => {
+    auth.authenticate(request);
+    const id = parseId(request);
+    if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    return { data: repository.listSubagents(id) };
   });
 
   app.patch('/api/threads/:id', async (request) => {
@@ -1267,7 +1540,45 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
       throw new HttpError(429, 'TURN_CAPACITY_EXHAUSTED');
     }
+    if (dependencies.resourceBroker) {
+      const resourceState = repository.getResourceLimits().state;
+      if (resourceState !== 'applied') {
+        repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
+        throw new HttpError(
+          503,
+          'RESOURCE_RECONFIGURING',
+          'Resource policy must be applied before a new task can start',
+        );
+      }
+    }
     pendingTurnStarts += 1;
+    let executionAgentLimit: number | undefined;
+    if (dependencies.resourceBroker) {
+      try {
+        const capacity = await brokerSnapshot();
+        const maximumExecutionUnits =
+          repository.getResourceLimits().desired.maxParallelAgents ?? autoParallelAgents(capacity);
+        executionAgentLimit = maximumExecutionUnits;
+        const activeExecutionUnits =
+          activeTurns.size + pendingTurnStarts + repository.countActiveSubagents();
+        if (activeExecutionUnits > maximumExecutionUnits)
+          throw new HttpError(
+            429,
+            'RESOURCE_CAPACITY_EXHAUSTED',
+            'All resource-safe execution slots are currently in use',
+          );
+        if (capacity.capacity.memoryAvailableBytes < 512 * 1_024 * 1_024)
+          throw new HttpError(
+            429,
+            'RESOURCE_CAPACITY_EXHAUSTED',
+            'The host does not have enough free memory to start another task safely',
+          );
+      } catch (error) {
+        pendingTurnStarts -= 1;
+        repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
+        throw error;
+      }
+    }
     const preset = input.permissionPreset ?? project.defaultPermissionPreset;
     const attachmentClaim = `pending:${input.idempotencyKey}`;
     if (!repository.claimAttachments(id, input.attachmentIds, attachmentClaim)) {
@@ -1279,13 +1590,19 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     let turnStartIssued = false;
     try {
       const resumeCwd = await canonicalProjectPath(pathPolicy, project);
-      if (loadedThreadGenerations.get(id) !== appServer.generation) {
+      if (
+        loadedThreadGenerations.get(id) !== appServer.generation ||
+        executionAgentLimit !== undefined
+      ) {
         if (!repository.isThreadHistoryHydrated(id)) await hydrateThreadHistory(thread);
         const resumed = threadResponseSchema.parse(
           await appServer.request('thread/resume', {
             threadId: id,
             cwd: resumeCwd,
             excludeTurns: true,
+            ...(executionAgentLimit === undefined
+              ? {}
+              : { config: { agents: { max_threads: executionAgentLimit } } }),
           }),
         );
         if (resumed.thread.cwd !== resumeCwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');

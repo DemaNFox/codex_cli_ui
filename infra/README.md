@@ -80,6 +80,31 @@ activation.
   seconds. Keep both values aligned with the application contract rather than
   raising the edge limit independently.
 
+## CPU, RAM and process safety
+
+The API and every app-server runner are members of `codex-web-ui-workload.slice`, so their CPU, memory and
+task use is enforced as one aggregate rather than as independent per-process allowances. The installer starts
+the slice and reconciles its persisted policy before the Web service starts. Automatic mode is the default: it
+uses the smallest live host/ancestor-cgroup capacity, then reserves one CPU core and
+`max(15% of RAM, 1 GiB)` for the operating system. It does not mean capacity beyond the machine.
+
+Only `codex-web-ui-api` can connect to the mode-0600 resource socket. The socket-activated root broker accepts
+no command, path, systemd unit or property name from the client; it can change only the fixed workload slice.
+It rejects ceilings above live capacity or below current use plus a safety margin, persists changes atomically,
+reads the kernel/systemd result back and rolls back on failure. The Web UI stages changes while any root turn,
+turn start or subagent remains active and blocks new work until the staged policy has been applied.
+
+Useful read-only checks after installation are:
+
+```sh
+systemctl status codex-web-ui-workload.slice codex-web-ui-resource-broker.socket
+systemctl show codex-web-ui-workload.slice -p CPUQuotaPerSecUSec -p MemoryCurrent -p MemoryMax -p TasksCurrent -p TasksMax
+sudo cat /etc/codex-web-ui/resource-limits.json
+```
+
+Do not edit the generated slice drop-in or policy file while the service is running. Use the authenticated Web
+UI so updates are serialized against active work and audited.
+
 ## Codex sandbox prerequisites
 
 Codex `workspace-write` uses Bubblewrap on Linux. Keep `ProtectProc=invisible`,

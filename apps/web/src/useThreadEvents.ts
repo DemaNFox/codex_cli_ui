@@ -16,6 +16,7 @@ const safeEventKinds = [
   'approval',
   'user-input',
   'permission-approval',
+  'subagent',
   'usage',
   'warning',
   'error',

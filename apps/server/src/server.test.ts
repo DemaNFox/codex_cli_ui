@@ -23,6 +23,7 @@ import { SqliteRepository } from './database.js';
 import { normalizeNotification, sanitizeEventPayload } from './event-normalizer.js';
 import { normalizeThreadHistory } from './history-normalizer.js';
 import { ProjectPathPolicy } from './path-policy.js';
+import type { BrokerResourceSnapshot, ResourceBroker } from './resource-broker.js';
 import { buildServer } from './server.js';
 import { createSseDelivery } from './sse.js';
 
@@ -243,6 +244,49 @@ class FakeAppServer implements AppServerClient {
   }
 }
 
+type BrokerApplyRequest = Parameters<ResourceBroker['apply']>[0];
+
+class FakeResourceBroker implements ResourceBroker {
+  readonly applyRequests: BrokerApplyRequest[] = [];
+  failApply = false;
+  current: BrokerResourceSnapshot = {
+    capacity: {
+      cpuQuotaPercent: 800,
+      memoryBytes: 16 * 1_024 * 1_024 * 1_024,
+      memoryAvailableBytes: 8 * 1_024 * 1_024 * 1_024,
+      tasks: 4_096,
+      measuredAt: new Date(0).toISOString(),
+    },
+    effective: {
+      cpuQuotaPercent: 700,
+      memoryMaxBytes: 13 * 1_024 * 1_024 * 1_024,
+      tasksMax: 3_500,
+    },
+    policy: { mode: 'auto', cpuQuotaPercent: null, memoryMaxBytes: null, tasksMax: null },
+    generation: 1,
+  };
+
+  async snapshot(): Promise<BrokerResourceSnapshot> {
+    return this.current;
+  }
+
+  async apply(request: BrokerApplyRequest): Promise<BrokerResourceSnapshot> {
+    this.applyRequests.push(request);
+    if (this.failApply) throw new Error('broker failed');
+    this.current = {
+      ...this.current,
+      policy: request,
+      effective: {
+        cpuQuotaPercent: request.cpuQuotaPercent ?? 700,
+        memoryMaxBytes: request.memoryMaxBytes ?? 13 * 1_024 * 1_024 * 1_024,
+        tasksMax: request.tasksMax ?? 3_500,
+      },
+      generation: this.current.generation + 1,
+    };
+    return this.current;
+  }
+}
+
 class FailingRemoveAttachmentStore extends AttachmentStore {
   failRemove = true;
 
@@ -266,6 +310,7 @@ async function fixture(
   maxConcurrentTurns = 2,
   seed?: (context: { repository: SqliteRepository; projectPath: string }) => void,
   attachmentStoreFactory: (root: string) => AttachmentStore = (root) => new AttachmentStore(root),
+  resourceBroker?: ResourceBroker,
 ) {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-server-'));
   const root = path.join(temp, 'projects');
@@ -289,6 +334,7 @@ async function fixture(
     eventRetentionPerThread: 1_000,
     maxEventBytes: 4_096,
     maxConcurrentTurns,
+    resourceBrokerSocket: path.join(temp, 'resource-broker.sock'),
   };
   const repository = new SqliteRepository(':memory:', config.eventRetentionPerThread);
   seed?.({ repository, projectPath });
@@ -302,6 +348,7 @@ async function fixture(
     appServer,
     attachmentStore,
     upgradeDrainPath,
+    ...(resourceBroker ? { resourceBroker } : {}),
   });
   openApps.push(app);
   await app.ready();
@@ -2545,6 +2592,188 @@ describe('Codex routes', () => {
     });
     expect(stale.statusCode).toBe(409);
     expect(appServer.responses.some((response) => response.id === 85)).toBe(false);
+  });
+  it('applies bounded resource policies and rejects host-overcommit requests', async () => {
+    const broker = new FakeResourceBroker();
+    const { app } = await fixture(2, undefined, (root) => new AttachmentStore(root), broker);
+    const session = await login(app);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const initial = await app.inject({
+      method: 'GET',
+      url: '/api/system/resource-limits',
+      headers: { cookie: session.cookie },
+    });
+    expect(initial.statusCode).toBe(200);
+    expect(
+      initial.json<{ data: { desired: { mode: string }; state: string } }>().data,
+    ).toMatchObject({
+      desired: { mode: 'auto' },
+      state: 'applied',
+    });
+
+    const updated = await app.inject({
+      method: 'PUT',
+      url: '/api/system/resource-limits',
+      headers: session.headers,
+      payload: {
+        expectedVersion: 0,
+        desired: {
+          mode: 'custom',
+          cpuCores: 4,
+          memoryBytes: 8 * 1_024 * 1_024 * 1_024,
+          tasks: 1_024,
+          maxParallelAgents: 3,
+        },
+      },
+    });
+    expect(updated.statusCode).toBe(200);
+    expect(broker.applyRequests.at(-1)).toEqual({
+      mode: 'custom',
+      cpuQuotaPercent: 400,
+      memoryMaxBytes: 8 * 1_024 * 1_024 * 1_024,
+      tasksMax: 1_024,
+    });
+
+    const excessive = await app.inject({
+      method: 'PUT',
+      url: '/api/system/resource-limits',
+      headers: session.headers,
+      payload: {
+        expectedVersion: 1,
+        desired: {
+          mode: 'custom',
+          cpuCores: 9,
+          memoryBytes: 8 * 1_024 * 1_024 * 1_024,
+          tasks: 1_024,
+          maxParallelAgents: null,
+        },
+      },
+    });
+    expect(excessive.statusCode).toBe(409);
+    expect(excessive.json<{ error: { code: string } }>().error.code).toBe(
+      'RESOURCE_LIMIT_EXCEEDS_CAPACITY',
+    );
+
+    const unsafeConcurrency = await app.inject({
+      method: 'PUT',
+      url: '/api/system/resource-limits',
+      headers: session.headers,
+      payload: {
+        expectedVersion: 1,
+        desired: {
+          mode: 'custom',
+          cpuCores: 4,
+          memoryBytes: 4 * 1_024 * 1_024 * 1_024,
+          tasks: 1_024,
+          maxParallelAgents: 4,
+        },
+      },
+    });
+    expect(unsafeConcurrency.statusCode).toBe(409);
+    expect(unsafeConcurrency.json<{ error: { code: string } }>().error.code).toBe(
+      'RESOURCE_AGENT_LIMIT_EXCEEDS_CAPACITY',
+    );
+  });
+
+  it('persists and returns sanitized subagent lifecycle projections', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'item/started',
+      params: {
+        threadId,
+        turnId: 'turn-1',
+        startedAtMs: Date.now(),
+        item: {
+          type: 'collabAgentToolCall',
+          id: 'collab-1',
+          tool: 'spawnAgent',
+          status: 'inProgress',
+          senderThreadId: threadId,
+          receiverThreadIds: ['agent-1'],
+          agentsStates: { 'agent-1': { status: 'running', message: 'Bearer secret-token-value' } },
+          model: 'gpt-6-sol',
+          reasoningEffort: 'medium',
+          prompt: 'must never be persisted',
+        },
+      },
+    });
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/subagents`,
+      headers: { cookie: session.cookie },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json<{ data: { id: string; status: string; message: string }[] }>();
+    expect(body.data).toHaveLength(1);
+    expect(body.data[0]).toMatchObject({ id: 'agent-1', status: 'running' });
+    expect(body.data[0]!.message).toContain('[REDACTED]');
+    expect(response.body).not.toContain('must never be persisted');
+  });
+
+  it('defers policy changes during work and passes the effective agent ceiling to Codex', async () => {
+    const broker = new FakeResourceBroker();
+    const { app, appServer, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      broker,
+    );
+    const session = await login(app);
+    await new Promise((resolve) => setImmediate(resolve));
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'run safely',
+        idempotencyKey: '00000000-0000-4000-8000-000000000123',
+      },
+    });
+    expect(turn.statusCode).toBe(202);
+    const resume = [...appServer.requests]
+      .reverse()
+      .find((request) => request.method === 'thread/resume');
+    expect(resume?.params).toMatchObject({ config: { agents: { max_threads: 6 } } });
+
+    const applyCount = broker.applyRequests.length;
+    const deferred = await app.inject({
+      method: 'PUT',
+      url: '/api/system/resource-limits',
+      headers: session.headers,
+      payload: {
+        expectedVersion: 0,
+        desired: {
+          mode: 'custom',
+          cpuCores: 4,
+          memoryBytes: 8 * 1_024 * 1_024 * 1_024,
+          tasks: 1_024,
+          maxParallelAgents: 2,
+        },
+      },
+    });
+    expect(deferred.statusCode).toBe(202);
+    expect(deferred.json<{ data: { state: string } }>().data.state).toBe('pending-idle');
+    expect(broker.applyRequests).toHaveLength(applyCount);
+
+    const turnId = turn.json<{ data: { turnId: string } }>().data.turnId;
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(broker.applyRequests).toHaveLength(applyCount + 1);
+    const current = await app.inject({
+      method: 'GET',
+      url: '/api/system/resource-limits',
+      headers: { cookie: session.cookie },
+    });
+    expect(current.json<{ data: { state: string } }>().data.state).toBe('applied');
   });
 });
 

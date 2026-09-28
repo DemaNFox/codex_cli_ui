@@ -6,6 +6,8 @@ import {
   capabilitySchema,
   resolvePermissionRequestSchema,
   resolveUserInputRequestSchema,
+  resourceLimitPolicySchema,
+  subagentSchema,
   updateRuntimePreferencesRequestSchema,
   startTurnRequestSchema,
 } from './index.js';
@@ -36,6 +38,56 @@ describe('contracts', () => {
         approvalPolicy: 'never',
       }).success,
     ).toBe(false);
+  });
+
+  it('keeps automatic limits unbounded by user values and requires a complete custom policy', () => {
+    expect(
+      resourceLimitPolicySchema.safeParse({
+        mode: 'auto',
+        cpuCores: null,
+        memoryBytes: null,
+        tasks: null,
+        maxParallelAgents: null,
+      }).success,
+    ).toBe(true);
+    expect(
+      resourceLimitPolicySchema.safeParse({
+        mode: 'auto',
+        cpuCores: 4,
+        memoryBytes: null,
+        tasks: null,
+        maxParallelAgents: null,
+      }).success,
+    ).toBe(false);
+    expect(
+      resourceLimitPolicySchema.safeParse({
+        mode: 'custom',
+        cpuCores: 4,
+        memoryBytes: 8 * 1_024 * 1_024 * 1_024,
+        tasks: 1_024,
+        maxParallelAgents: 3,
+      }).success,
+    ).toBe(true);
+  });
+
+  it('accepts only bounded public subagent projections', () => {
+    const subagent = {
+      id: 'agent-1',
+      rootThreadId: 'thread-1',
+      parentThreadId: 'thread-1',
+      agentPath: '/root/reviewer',
+      nickname: 'Reviewer',
+      role: 'review',
+      model: 'gpt-6-sol',
+      reasoningEffort: 'medium',
+      status: 'running',
+      message: null,
+      startedAt: '2026-09-28T10:00:00.000Z',
+      lastActivityAt: '2026-09-28T10:01:00.000Z',
+      completedAt: null,
+    };
+    expect(subagentSchema.safeParse(subagent).success).toBe(true);
+    expect(subagentSchema.safeParse({ ...subagent, status: 'invented' }).success).toBe(false);
   });
 
   it('allows attachment-only turns and bounds safe attachment metadata', () => {

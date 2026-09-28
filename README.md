@@ -62,6 +62,11 @@ For a shared host, add `--no-start`, establish filesystem byte/inode quotas,
 then enable the units; the default start path is intended for a dedicated
 personal server.
 
+The installed service starts in automatic resource mode. It uses the live host/ancestor-cgroup capacity,
+keeps one CPU core and at least 15% RAM (minimum 1 GiB) outside the Codex workload, and derives a safe
+concurrency ceiling. The administrator can inspect or lower CPU, RAM, task and agent limits in the Status
+drawer. Changes wait for all root turns and subagents to finish; they never terminate active work.
+
 A new host needs only:
 
 1. Ubuntu 22.04 or 24.04 on x64/arm64, Git, internet access and a normal sudo-capable user;

@@ -15,6 +15,10 @@ const envSchema = z.object({
   CODEX_BIN: z.string().min(1).default('codex'),
   CODEX_HOME: z.string().min(1).optional(),
   CODEX_WEB_APP_SERVER_SOCKET: z.string().startsWith('/').optional(),
+  CODEX_WEB_RESOURCE_BROKER_SOCKET: z
+    .string()
+    .startsWith('/')
+    .default('/run/codex-web-ui/resource-broker.sock'),
   CODEX_WEB_CODEX_VERSION_PIN: z.string().regex(/^codex-cli \d+\.\d+\.\d+$/),
   CODEX_WEB_COOKIE_SECURE: z.enum(['true', 'false']).default('true'),
   CODEX_WEB_EVENT_RETENTION_PER_THREAD: z.coerce.number().int().min(100).max(1_000).default(1_000),
@@ -36,6 +40,7 @@ export interface ServerConfig {
   readonly codexBinary: string;
   readonly codexHome?: string;
   readonly appServerSocket?: string;
+  readonly resourceBrokerSocket: string;
   readonly codexVersionPin: string;
   readonly cookieSecure: boolean;
   readonly cookieName: string;
@@ -72,6 +77,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     ...(parsed.CODEX_WEB_APP_SERVER_SOCKET === undefined
       ? {}
       : { appServerSocket: parsed.CODEX_WEB_APP_SERVER_SOCKET }),
+    resourceBrokerSocket: parsed.CODEX_WEB_RESOURCE_BROKER_SOCKET,
     codexVersionPin: parsed.CODEX_WEB_CODEX_VERSION_PIN,
     cookieSecure: parsed.CODEX_WEB_COOKIE_SECURE === 'true',
     cookieName: '__Host-codex_web_session',
