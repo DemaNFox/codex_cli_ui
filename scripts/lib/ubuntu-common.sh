@@ -97,6 +97,50 @@ atomic_symlink() {
   mv -Tf -- "$temporary" "$link"
 }
 
+snapshot_activation_file() {
+  local backup_root=${1:?backup root required} key=${2:?backup key required}
+  local source=${3:?source path required} mode owner group
+  [[ $key =~ ^[A-Za-z0-9._-]+$ ]] || die 'invalid activation backup key'
+  install -d -m 0700 "$backup_root"
+  if [[ -e $source || -L $source ]]; then
+    [[ -f $source && ! -L $source ]] || die "activation artifact is not a regular file: $source"
+    mode=$(stat -c '%a' -- "$source")
+    owner=$(stat -c '%u' -- "$source")
+    group=$(stat -c '%g' -- "$source")
+    install -m "$mode" -o "$owner" -g "$group" -- "$source" "$backup_root/$key.data"
+    printf 'present %s %s %s\n' "$mode" "$owner" "$group" >"$backup_root/$key.meta"
+  else
+    printf 'absent\n' >"$backup_root/$key.meta"
+  fi
+  chmod 0600 "$backup_root/$key.meta"
+}
+
+restore_activation_file() {
+  local backup_root=${1:?backup root required} key=${2:?backup key required}
+  local destination=${3:?destination path required} state mode owner group
+  [[ -f $backup_root/$key.meta && ! -L $backup_root/$key.meta ]] || return 1
+  read -r state mode owner group <"$backup_root/$key.meta"
+  case "$state" in
+    present)
+      [[ -f $backup_root/$key.data && ! -L $backup_root/$key.data ]] || return 1
+      install -D -m "$mode" -o "$owner" -g "$group" -- "$backup_root/$key.data" "$destination"
+      ;;
+    absent) rm -f -- "$destination" ;;
+    *) return 1 ;;
+  esac
+}
+
+remove_activation_backup() {
+  local backup_root=${1:?backup root required}
+  case "$backup_root" in
+    /var/lib/codex-web-ui/.activation-rollback.*)
+      [[ -d $backup_root && ! -L $backup_root ]] || return 1
+      rm -rf --one-file-system -- "$backup_root"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
 write_path_drop_in() {
   local user=${1:?user required} codex_home=${2:?codex home required}
   shift 2

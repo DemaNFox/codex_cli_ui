@@ -270,6 +270,63 @@ if [[ -f $runner_config ]]; then
   runner_config_backup=$(mktemp /etc/codex-web-ui/.runner-config.rollback.XXXXXX)
   install -m 0600 -o root -g root "$runner_config" "$runner_config_backup"
 fi
+resource_rollback_keys=(
+  api-unit
+  app-server-unit
+  broker-socket-unit
+  broker-service-unit
+  workload-slice-unit
+  broker-helper
+  resource-policy
+  resource-drop-in
+)
+resource_rollback_paths=(
+  /etc/systemd/system/codex-web-ui@.service
+  /etc/systemd/system/codex-web-ui-app-server@.service
+  /etc/systemd/system/codex-web-ui-resource-broker.socket
+  /etc/systemd/system/codex-web-ui-resource-broker@.service
+  /etc/systemd/system/codex-web-ui-workload.slice
+  /usr/local/libexec/codex-web-ui-resource-broker
+  /etc/codex-web-ui/resource-limits.json
+  /etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf
+)
+resource_rollback_dir=$(mktemp -d /var/lib/codex-web-ui/.activation-rollback.XXXXXX)
+for index in "${!resource_rollback_paths[@]}"; do
+  snapshot_activation_file \
+    "$resource_rollback_dir" "${resource_rollback_keys[$index]}" "${resource_rollback_paths[$index]}"
+done
+broker_socket_was_active=false
+if systemctl is-active --quiet codex-web-ui-resource-broker.socket; then broker_socket_was_active=true; fi
+broker_socket_was_enabled=false
+if systemctl is-enabled --quiet codex-web-ui-resource-broker.socket; then broker_socket_was_enabled=true; fi
+workload_slice_was_active=false
+if systemctl is-active --quiet codex-web-ui-workload.slice; then workload_slice_was_active=true; fi
+
+restore_resource_boundary() {
+  if systemctl is-active --quiet codex-web-ui-resource-broker.socket; then
+    systemctl stop codex-web-ui-resource-broker.socket || return 1
+  fi
+  systemctl stop 'codex-web-ui-resource-broker@*.service' >/dev/null 2>&1 || true
+  if systemctl is-active --quiet codex-web-ui-workload.slice; then
+    systemctl stop codex-web-ui-workload.slice || return 1
+  fi
+  if ! $broker_socket_was_enabled && systemctl is-enabled --quiet codex-web-ui-resource-broker.socket; then
+    systemctl disable codex-web-ui-resource-broker.socket || return 1
+  fi
+  local index
+  for index in "${!resource_rollback_paths[@]}"; do
+    restore_activation_file \
+      "$resource_rollback_dir" "${resource_rollback_keys[$index]}" "${resource_rollback_paths[$index]}" || return 1
+  done
+  systemctl daemon-reload || return 1
+  if $workload_slice_was_active; then systemctl start codex-web-ui-workload.slice || return 1; fi
+  if $broker_socket_was_enabled; then systemctl enable codex-web-ui-resource-broker.socket || return 1; fi
+  if $broker_socket_was_active; then
+    systemctl restart codex-web-ui-resource-broker.socket || return 1
+  else
+    systemctl stop codex-web-ui-resource-broker.socket >/dev/null 2>&1 || true
+  fi
+}
 activation_complete=false
 rollback_activation() {
   local status=$?
@@ -280,6 +337,11 @@ rollback_activation() {
       atomic_symlink "$previous" /opt/codex-web-ui/current
     else
       rm -f -- /opt/codex-web-ui/current
+    fi
+    resource_boundary_restored=true
+    if ! restore_resource_boundary; then
+      resource_boundary_restored=false
+      printf 'Rollback could not restore the previous resource boundary exactly.\n' >&2
     fi
     if [[ -n $runner_config_backup ]]; then
       install -m 0600 -o root -g root "$runner_config_backup" "$runner_config"
@@ -295,6 +357,12 @@ rollback_activation() {
       fi
     else
       printf 'Rollback release failed its health check; the drain remains engaged.\n' >&2
+    fi
+    if $resource_boundary_restored; then
+      remove_activation_backup "$resource_rollback_dir" || \
+        printf 'Rollback backup could not be removed: %s\n' "$resource_rollback_dir" >&2
+    else
+      printf 'Rollback backup retained for recovery: %s\n' "$resource_rollback_dir" >&2
     fi
   fi
   exit "$status"
@@ -367,4 +435,6 @@ else
 fi
 activation_complete=true
 if [[ -n $runner_config_backup ]]; then rm -f -- "$runner_config_backup"; fi
+remove_activation_backup "$resource_rollback_dir" || \
+  printf 'Activation backup could not be removed: %s\n' "$resource_rollback_dir" >&2
 trap - EXIT INT TERM

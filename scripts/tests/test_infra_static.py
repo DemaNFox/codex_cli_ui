@@ -229,6 +229,87 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn('[[ -f $drain_marker ]] && drain_engaged=true', updater)
         self.assertIn('if $drain_engaged; then', updater)
 
+    def test_resource_boundary_install_and_rollback_are_transactional(self) -> None:
+        installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        updater = (ROOT / "scripts/update-ubuntu.sh").read_text(encoding="utf-8")
+        common = (ROOT / "scripts/lib/ubuntu-common.sh").read_text(encoding="utf-8")
+
+        managed_paths = (
+            "/etc/systemd/system/codex-web-ui@.service",
+            "/etc/systemd/system/codex-web-ui-app-server@.service",
+            "/etc/systemd/system/codex-web-ui-resource-broker.socket",
+            "/etc/systemd/system/codex-web-ui-resource-broker@.service",
+            "/etc/systemd/system/codex-web-ui-workload.slice",
+            "/usr/local/libexec/codex-web-ui-resource-broker",
+            "/etc/codex-web-ui/resource-limits.json",
+            "/etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf",
+        )
+        for script in (installer, updater):
+            for path in managed_paths:
+                self.assertIn(path, script)
+            self.assertIn("snapshot_activation_file", script)
+            self.assertIn("restore_activation_file", script)
+            self.assertIn("broker_socket_was_active", script)
+            self.assertIn("broker_socket_was_enabled", script)
+            self.assertIn("workload_slice_was_active", script)
+            self.assertIn("restore_resource_boundary", script)
+            self.assertIn("Rollback could not restore the previous resource boundary exactly.", script)
+            self.assertLess(
+                script.index('resource_rollback_dir=$(mktemp -d'),
+                script.index('atomic_symlink "$release_dir" /opt/codex-web-ui/current'),
+            )
+            rollback = script.index("if ! restore_resource_boundary; then")
+            restart = script.index("systemctl restart", rollback)
+            self.assertLess(rollback, restart)
+
+        for unit in (
+            "codex-web-ui@.service",
+            "codex-web-ui-app-server@.service",
+            "codex-web-ui-resource-broker.socket",
+            "codex-web-ui-resource-broker@.service",
+            "codex-web-ui-workload.slice",
+        ):
+            self.assertIn(unit, updater)
+        helper_install = (
+            'install -m 0755 "$release_dir/scripts/resource-broker.py" '
+            "/usr/local/libexec/codex-web-ui-resource-broker"
+        )
+        self.assertIn(helper_install, updater)
+        self.assertNotIn(
+            "if [[ -x /usr/local/libexec/codex-web-ui-resource-broker ]]", updater
+        )
+        helper = updater.index(helper_install)
+        reload = updater.index("systemctl daemon-reload", helper)
+        slice_start = updater.index("systemctl start codex-web-ui-workload.slice", reload)
+        socket_enable = updater.index(
+            "systemctl enable codex-web-ui-resource-broker.socket", slice_start
+        )
+        socket_restart = updater.index(
+            "systemctl restart codex-web-ui-resource-broker.socket", socket_enable
+        )
+        reconcile = updater.index(
+            "/usr/local/libexec/codex-web-ui-resource-broker --initialize", socket_restart
+        )
+        api_restart = updater.index('systemctl restart "codex-web-ui@${service_user}.service"', reconcile)
+        self.assertLess(helper, reload)
+        self.assertLess(reload, slice_start)
+        self.assertLess(slice_start, socket_enable)
+        self.assertLess(socket_enable, socket_restart)
+        self.assertLess(socket_restart, reconcile)
+        self.assertLess(reconcile, api_restart)
+
+        for expected in (
+            "snapshot_activation_file()",
+            "restore_activation_file()",
+            "activation artifact is not a regular file",
+            "stat -c '%a'",
+            "stat -c '%u'",
+            "stat -c '%g'",
+            "/var/lib/codex-web-ui/.activation-rollback.*",
+            "rm -rf --one-file-system",
+        ):
+            self.assertIn(expected, common)
+
     def test_drain_health_contract_is_fail_closed(self) -> None:
         drain = (ROOT / "scripts/graceful-drain.sh").read_text(encoding="utf-8")
         requested_checks = (

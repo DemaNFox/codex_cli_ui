@@ -25,7 +25,7 @@ while (($#)); do
 done
 
 require_root
-require_command python3
+for command in python3 install stat mktemp rm systemctl; do require_command "$command"; done
 validate_service_user "$service_user"
 service_group=$(id -gn "$service_user")
 validate_release_id "$release_id"
@@ -67,6 +67,71 @@ printf '%s\n' "$previous" >/var/lib/codex-web-ui/previous-release
 chown root:"$service_group" /var/lib/codex-web-ui/previous-release
 chmod 0640 /var/lib/codex-web-ui/previous-release
 
+resource_units=(
+  codex-web-ui@.service
+  codex-web-ui-app-server@.service
+  codex-web-ui-resource-broker.socket
+  codex-web-ui-resource-broker@.service
+  codex-web-ui-workload.slice
+)
+resource_rollback_keys=(
+  api-unit
+  app-server-unit
+  broker-socket-unit
+  broker-service-unit
+  workload-slice-unit
+  broker-helper
+  resource-policy
+  resource-drop-in
+)
+resource_rollback_paths=(
+  /etc/systemd/system/codex-web-ui@.service
+  /etc/systemd/system/codex-web-ui-app-server@.service
+  /etc/systemd/system/codex-web-ui-resource-broker.socket
+  /etc/systemd/system/codex-web-ui-resource-broker@.service
+  /etc/systemd/system/codex-web-ui-workload.slice
+  /usr/local/libexec/codex-web-ui-resource-broker
+  /etc/codex-web-ui/resource-limits.json
+  /etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf
+)
+resource_rollback_dir=$(mktemp -d /var/lib/codex-web-ui/.activation-rollback.XXXXXX)
+for index in "${!resource_rollback_paths[@]}"; do
+  snapshot_activation_file \
+    "$resource_rollback_dir" "${resource_rollback_keys[$index]}" "${resource_rollback_paths[$index]}"
+done
+broker_socket_was_active=false
+if systemctl is-active --quiet codex-web-ui-resource-broker.socket; then broker_socket_was_active=true; fi
+broker_socket_was_enabled=false
+if systemctl is-enabled --quiet codex-web-ui-resource-broker.socket; then broker_socket_was_enabled=true; fi
+workload_slice_was_active=false
+if systemctl is-active --quiet codex-web-ui-workload.slice; then workload_slice_was_active=true; fi
+
+restore_resource_boundary() {
+  if systemctl is-active --quiet codex-web-ui-resource-broker.socket; then
+    systemctl stop codex-web-ui-resource-broker.socket || return 1
+  fi
+  systemctl stop 'codex-web-ui-resource-broker@*.service' >/dev/null 2>&1 || true
+  if systemctl is-active --quiet codex-web-ui-workload.slice; then
+    systemctl stop codex-web-ui-workload.slice || return 1
+  fi
+  if ! $broker_socket_was_enabled && systemctl is-enabled --quiet codex-web-ui-resource-broker.socket; then
+    systemctl disable codex-web-ui-resource-broker.socket || return 1
+  fi
+  local index
+  for index in "${!resource_rollback_paths[@]}"; do
+    restore_activation_file \
+      "$resource_rollback_dir" "${resource_rollback_keys[$index]}" "${resource_rollback_paths[$index]}" || return 1
+  done
+  systemctl daemon-reload || return 1
+  if $workload_slice_was_active; then systemctl start codex-web-ui-workload.slice || return 1; fi
+  if $broker_socket_was_enabled; then systemctl enable codex-web-ui-resource-broker.socket || return 1; fi
+  if $broker_socket_was_active; then
+    systemctl restart codex-web-ui-resource-broker.socket || return 1
+  else
+    systemctl stop codex-web-ui-resource-broker.socket >/dev/null 2>&1 || true
+  fi
+}
+
 activation_complete=false
 rollback_activation() {
   local status=$?
@@ -74,6 +139,11 @@ rollback_activation() {
   if ! $activation_complete; then
     printf 'Activation failed; restoring the previous release.\n' >&2
     atomic_symlink "$previous" /opt/codex-web-ui/current
+    resource_boundary_restored=true
+    if ! restore_resource_boundary; then
+      resource_boundary_restored=false
+      printf 'Rollback could not restore the previous resource boundary exactly.\n' >&2
+    fi
     if systemctl restart "codex-web-ui@${service_user}.service"; then
       if "$SCRIPT_DIR/health-check.sh" --timeout "$health_timeout" --service-user "$service_user"; then
         if $drain_engaged; then
@@ -87,15 +157,27 @@ rollback_activation() {
     else
       printf 'Rollback release could not be restarted.\n' >&2
     fi
+    if $resource_boundary_restored; then
+      remove_activation_backup "$resource_rollback_dir" || \
+        printf 'Rollback backup could not be removed: %s\n' "$resource_rollback_dir" >&2
+    else
+      printf 'Rollback backup retained for recovery: %s\n' "$resource_rollback_dir" >&2
+    fi
   fi
   exit "$status"
 }
 trap rollback_activation EXIT
 atomic_symlink "$release_dir" /opt/codex-web-ui/current
-if [[ -x /usr/local/libexec/codex-web-ui-resource-broker ]]; then
-  systemctl start codex-web-ui-workload.slice
-  /usr/local/libexec/codex-web-ui-resource-broker --initialize >/dev/null
-fi
+systemctl stop codex-web-ui-resource-broker.socket 'codex-web-ui-resource-broker@*.service' >/dev/null 2>&1 || true
+for unit in "${resource_units[@]}"; do
+  install -m 0644 "$release_dir/infra/systemd/$unit" "/etc/systemd/system/$unit"
+done
+install -m 0755 "$release_dir/scripts/resource-broker.py" /usr/local/libexec/codex-web-ui-resource-broker
+systemctl daemon-reload
+systemctl start codex-web-ui-workload.slice
+systemctl enable codex-web-ui-resource-broker.socket
+systemctl restart codex-web-ui-resource-broker.socket
+/usr/local/libexec/codex-web-ui-resource-broker --initialize >/dev/null
 systemctl restart "codex-web-ui@${service_user}.service"
 if ! "$SCRIPT_DIR/health-check.sh" --timeout "$health_timeout" --service-user "$service_user"; then
   die 'update failed health check and will be rolled back'
@@ -105,5 +187,7 @@ if $drain_engaged; then
     --release --config "$config" --service-user "$service_user" --timeout "$health_timeout"
 fi
 activation_complete=true
+remove_activation_backup "$resource_rollback_dir" || \
+  printf 'Activation backup could not be removed: %s\n' "$resource_rollback_dir" >&2
 trap - EXIT INT TERM
 printf 'Updated Codex Web UI to %s. Previous release retained at %s.\n' "$release_id" "$previous"
