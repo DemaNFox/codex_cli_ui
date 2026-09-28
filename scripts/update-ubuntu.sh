@@ -39,15 +39,18 @@ codex_home=$(canonical_existing_dir "$codex_home")
 source_dir=$(validate_release_source "${source_dir:?--source is required}" "$codex_home")
 
 release_dir="/opt/codex-web-ui/releases/$release_id"
+drain_marker=/var/lib/codex-web-ui/data/upgrade-drain
 bash "$SCRIPT_DIR/graceful-drain.sh" \
   --begin --config "$config" --service-user "$service_user" --timeout "$health_timeout"
+drain_engaged=false
+[[ -f $drain_marker ]] && drain_engaged=true
 pre_activation_cleanup() {
   local status=$?
   trap - EXIT INT TERM
   if [[ -e $release_dir ]]; then
     printf 'Pre-activation cleanup retained incomplete release: %s\n' "$release_dir" >&2
   fi
-  if ! bash "$SCRIPT_DIR/graceful-drain.sh" \
+  if $drain_engaged && ! bash "$SCRIPT_DIR/graceful-drain.sh" \
     --release --config "$config" --service-user "$service_user" --timeout "$health_timeout"; then
     printf 'Failed to release the pre-activation drain cleanly.\n' >&2
   fi
@@ -73,9 +76,11 @@ rollback_activation() {
     atomic_symlink "$previous" /opt/codex-web-ui/current
     if systemctl restart "codex-web-ui@${service_user}.service"; then
       if "$SCRIPT_DIR/health-check.sh" --timeout "$health_timeout" --service-user "$service_user"; then
-        bash "$SCRIPT_DIR/graceful-drain.sh" \
-          --release --config "$config" --service-user "$service_user" --timeout "$health_timeout" || \
-          printf 'Rollback is healthy but the drain could not be released.\n' >&2
+        if $drain_engaged; then
+          bash "$SCRIPT_DIR/graceful-drain.sh" \
+            --release --config "$config" --service-user "$service_user" --timeout "$health_timeout" || \
+            printf 'Rollback is healthy but the drain could not be released.\n' >&2
+        fi
       else
         printf 'Rollback release failed its health check; the drain remains engaged.\n' >&2
       fi
@@ -91,8 +96,10 @@ systemctl restart "codex-web-ui@${service_user}.service"
 if ! "$SCRIPT_DIR/health-check.sh" --timeout "$health_timeout" --service-user "$service_user"; then
   die 'update failed health check and will be rolled back'
 fi
-bash "$SCRIPT_DIR/graceful-drain.sh" \
-  --release --config "$config" --service-user "$service_user" --timeout "$health_timeout"
+if $drain_engaged; then
+  bash "$SCRIPT_DIR/graceful-drain.sh" \
+    --release --config "$config" --service-user "$service_user" --timeout "$health_timeout"
+fi
 activation_complete=true
 trap - EXIT INT TERM
 printf 'Updated Codex Web UI to %s. Previous release retained at %s.\n' "$release_id" "$previous"

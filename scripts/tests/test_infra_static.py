@@ -200,6 +200,8 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn('Rollback release failed its health check; the drain remains engaged.', updater)
         self.assertNotIn('rm -f -- "$drain_marker"', updater)
         self.assertIn('Rollback is healthy but the drain could not be released.', updater)
+        self.assertIn('[[ -f $drain_marker ]] && drain_engaged=true', updater)
+        self.assertIn('if $drain_engaged; then', updater)
 
     def test_drain_health_contract_is_fail_closed(self) -> None:
         drain = (ROOT / "scripts/graceful-drain.sh").read_text(encoding="utf-8")

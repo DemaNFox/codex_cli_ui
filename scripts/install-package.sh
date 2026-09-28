@@ -231,11 +231,11 @@ revision=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["gitR
 release_id="$(date -u +%Y%m%dT%H%M%SZ)-$revision"
 release_dir="/opt/codex-web-ui/releases/$release_id"
 if [[ -e $config ]]; then python3 "$package/scripts/storage-guard.py" --config "$config" --check-releases --additional-releases 1; fi
-drain_started=false
+drain_engaged=false
 if [[ $mode == upgrade ]]; then
   drain_args=(--begin --config "$config" --service-user api)
   bash "$package/scripts/graceful-drain.sh" "${drain_args[@]}"
-  drain_started=true
+  [[ -f $drain_marker ]] && drain_engaged=true
   clear_pre_activation_drain() {
     local status=$?
     trap - EXIT INT TERM
@@ -247,7 +247,7 @@ if [[ $mode == upgrade ]]; then
         ;;
       *) printf 'Refusing unsafe incomplete release cleanup: %s\n' "$release_dir" >&2 ;;
     esac
-    if ! bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user api --timeout 45; then
+    if $drain_engaged && ! bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user api --timeout 45; then
       printf 'Failed to release the pre-activation drain cleanly.\n' >&2
     fi
     exit "$status"
@@ -288,7 +288,7 @@ rollback_activation() {
     systemctl daemon-reload >/dev/null 2>&1 || true
     if systemctl restart codex-web-ui@api.service >/dev/null 2>&1 && \
       "$package/scripts/health-check.sh" --service-user api --timeout 45 >/dev/null 2>&1; then
-      if $drain_started; then
+      if $drain_engaged; then
         bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user api --timeout 45 || \
           printf 'Rollback is healthy but the drain could not be released.\n' >&2
       fi
@@ -353,12 +353,12 @@ if $start_service; then
   systemctl stop 'codex-web-ui-app-server@*.service' >/dev/null 2>&1 || true
   systemctl restart codex-web-ui-app-server.socket codex-web-ui@api.service codex-web-ui-storage-guard@api.timer
   "$package/scripts/health-check.sh" --service-user api --timeout 45
-  if $drain_started; then
+  if $drain_engaged; then
     bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user api --timeout 45
   fi
   printf 'Codex Web UI %s is installed at %s\n' "$release_id" "$public_origin"
 else
-  if $drain_started; then rm -f -- "$drain_marker"; fi
+  if $drain_engaged; then rm -f -- "$drain_marker"; fi
   printf 'Codex Web UI %s is installed but not started; establish hard storage bounds, then enable the API, socket and storage timer.\n' "$release_id"
 fi
 activation_complete=true
