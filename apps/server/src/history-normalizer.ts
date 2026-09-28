@@ -2,6 +2,7 @@ import type { SafeEvent } from '@codex-web/contracts';
 import path from 'node:path';
 
 import { sanitizeEventPayload } from './event-normalizer.js';
+import { publicSubagentItem } from './subagents.js';
 
 type JournalEvent = Omit<SafeEvent, 'id' | 'createdAt'>;
 const ATTACHMENT_REFERENCE_MARKER =
@@ -141,6 +142,31 @@ function normalizeItem(
         { status: item.status, summary: `${changes.length} file change(s)`, changes },
         maxBytes,
       ),
+    };
+  }
+
+  const publicSubagent = publicSubagentItem(item);
+  if (publicSubagent) {
+    const phase: SafeEvent['phase'] =
+      item.type === 'subAgentActivity'
+        ? item.kind === 'completed'
+          ? 'completed'
+          : item.kind === 'interrupted'
+            ? 'failed'
+            : item.kind === 'interacted'
+              ? 'state'
+              : 'started'
+        : item.status === 'inProgress'
+          ? 'started'
+          : item.status === 'failed' || item.status === 'interrupted'
+            ? 'failed'
+            : 'completed';
+    return {
+      threadId,
+      turnId,
+      kind: 'tool',
+      phase,
+      payload: sanitizeEventPayload({ item: publicSubagent }, maxBytes),
     };
   }
 

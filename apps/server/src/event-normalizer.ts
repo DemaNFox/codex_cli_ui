@@ -1,5 +1,7 @@
 import type { SafeEvent } from '@codex-web/contracts';
 
+import { publicSubagentItem } from './subagents.js';
+
 export interface RpcNotification {
   readonly method: string;
   readonly params: unknown;
@@ -133,7 +135,11 @@ export function normalizeNotification(
   const threadId = nestedString(params, ['threadId'], ['thread', 'id']);
   if (!threadId) return null;
   const turnId = nestedString(params, ['turnId'], ['turn', 'id']);
-  const payload = sanitizeEventPayload(params, maxBytes);
+  const publicItem = publicSubagentItem(params.item);
+  const payload = sanitizeEventPayload(
+    publicItem ? { ...params, item: publicItem } : params,
+    maxBytes,
+  );
   return {
     threadId,
     turnId,
