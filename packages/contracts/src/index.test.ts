@@ -169,10 +169,23 @@ describe('contracts', () => {
         },
         dailyUsageBuckets: [{ startDate: '2026-09-27', tokens: 500 }],
       },
+      transcription: {
+        available: true,
+        model: 'gpt-transcribe',
+        maxBytes: 10 * 1_024 * 1_024,
+        maxDurationSeconds: 120,
+      },
       warnings: [],
     });
     expect(parsed.rateLimits?.[0]).not.toHaveProperty('accountId');
     expect(parsed.usage?.summary).not.toHaveProperty('email');
+    expect(parsed.transcription).toEqual({
+      available: true,
+      model: 'gpt-transcribe',
+      maxBytes: 10 * 1_024 * 1_024,
+      maxDurationSeconds: 120,
+    });
+    expect(capabilitySchema.safeParse({ ...parsed, transcription: undefined }).success).toBe(true);
     expect(
       capabilitySchema.safeParse({
         ...parsed,

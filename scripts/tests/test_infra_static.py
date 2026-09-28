@@ -86,6 +86,7 @@ class InfraStaticTest(unittest.TestCase):
             "proxy_buffering off;",
             "proxy_read_timeout 1h;",
             "Content-Security-Policy",
+            'microphone=(self)',
             "img-src 'self' data: blob:;",
             "X-Content-Type-Options",
             "root /opt/codex-web-ui/web-current;",
@@ -113,6 +114,7 @@ class InfraStaticTest(unittest.TestCase):
             "CODEX_WEB_ADMIN_USERNAME",
             "CODEX_WEB_ADMIN_PASSWORD_HASH",
             "CODEX_WEB_SESSION_SECRET",
+            "OPENAI_API_KEY",
         ):
             self.assertIn(f"{name}=\n", environment)
         self.assertIn('CODEX_WEB_CODEX_VERSION_PIN="codex-cli 0.153.4"', environment)

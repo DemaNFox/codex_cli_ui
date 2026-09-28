@@ -24,6 +24,14 @@ const envSchema = z.object({
   CODEX_WEB_EVENT_RETENTION_PER_THREAD: z.coerce.number().int().min(100).max(1_000).default(1_000),
   CODEX_WEB_MAX_EVENT_BYTES: z.coerce.number().int().min(1_024).max(32_768).default(32_768),
   CODEX_WEB_MAX_CONCURRENT_TURNS: z.coerce.number().int().min(1).max(5).default(2),
+  OPENAI_API_KEY: z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    z.string().min(1).optional(),
+  ),
+  CODEX_WEB_TRANSCRIPTION_MODEL: z
+    .string()
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/)
+    .default('gpt-transcribe'),
 });
 
 export interface ServerConfig {
@@ -47,6 +55,8 @@ export interface ServerConfig {
   readonly eventRetentionPerThread: number;
   readonly maxEventBytes: number;
   readonly maxConcurrentTurns: number;
+  readonly openAiApiKey?: string;
+  readonly transcriptionModel: string;
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
@@ -84,5 +94,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     eventRetentionPerThread: parsed.CODEX_WEB_EVENT_RETENTION_PER_THREAD,
     maxEventBytes: parsed.CODEX_WEB_MAX_EVENT_BYTES,
     maxConcurrentTurns: parsed.CODEX_WEB_MAX_CONCURRENT_TURNS,
+    ...(parsed.OPENAI_API_KEY === undefined ? {} : { openAiApiKey: parsed.OPENAI_API_KEY }),
+    transcriptionModel: parsed.CODEX_WEB_TRANSCRIPTION_MODEL,
   };
 }

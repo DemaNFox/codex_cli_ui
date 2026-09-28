@@ -189,6 +189,10 @@ alternative installation path:
    shared host until hard byte/inode storage bounds have been established.
 3. Populate `/etc/codex-web-ui/codex-web-ui.env` through a protected channel;
    keep it `root:root 0600`.
+   To enable optional voice input, set `OPENAI_API_KEY` in that file and keep
+   `CODEX_WEB_TRANSCRIPTION_MODEL=gpt-transcribe`. The key is used only by the
+   Web API for bounded ephemeral transcription and is not shared with the browser
+   or the isolated Codex runner. Leave the key empty to disable the feature.
 4. Install the bounded storage boundary described above before exposing the
    service. Do not remove its timestamped source backups until health and
    remount recovery have been verified.

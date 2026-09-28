@@ -54,6 +54,12 @@ const capabilities = {
   codexVersion: '1.2.3',
   authenticated: true,
   appServerReady: true,
+  transcription: {
+    available: true,
+    model: 'gpt-transcribe',
+    maxBytes: 10 * 1024 * 1024,
+    maxDurationSeconds: 300,
+  },
   projectRoots: ['/srv/projects'],
   skills: [
     { name: 'multi-agent-orchestrator', path: '/etc/codex/skills/orchestrator', enabled: true },
@@ -288,6 +294,20 @@ beforeEach(() => {
 });
 
 describe('App', () => {
+  it('remains compatible with a backend that predates transcription capabilities', async () => {
+    installAuthenticatedApi((url) => {
+      if (url !== '/api/system/capabilities') return undefined;
+      const legacyCapabilities = { ...capabilities, transcription: undefined };
+      return jsonResponse(legacyCapabilities);
+    });
+
+    render(<App />);
+    await screen.findByLabelText('Сообщение Codex');
+    expect(screen.getByRole('button', { name: 'Голосовой ввод' }).getAttribute('title')).toBe(
+      'Голосовой ввод не настроен на сервере',
+    );
+  });
+
   it('authenticates the operator and opens the workspace', async () => {
     const fetchMock = vi.fn((input: RequestInfo | URL) => {
       const url = requestUrl(input);
@@ -355,6 +375,20 @@ describe('App', () => {
 
     expect(await screen.findByText('<img src=x onerror=alert(1)>')).not.toBeNull();
     expect(document.querySelector('.message-text img')).toBeNull();
+
+    act(() => {
+      source?.emit({
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-2',
+        kind: 'user-message',
+        phase: 'completed',
+        payload: { text: '**plain user text**' },
+        createdAt: '2026-09-27T10:02:00.000Z',
+      });
+    });
+    const userText = await screen.findByText('**plain user text**');
+    expect(userText.querySelector('strong')).toBeNull();
     expect(source?.addEventListener).toHaveBeenCalledWith('agent-message', expect.any(Function));
     expect(source?.addEventListener).toHaveBeenCalledWith('message', expect.any(Function));
 

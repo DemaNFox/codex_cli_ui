@@ -345,6 +345,14 @@ export const capabilitySchema = z.object({
   skills: z.array(z.object({ name: z.string(), path: z.string(), enabled: z.boolean() })),
   rateLimits: z.array(accountRateLimitSchema).nullable(),
   usage: accountUsageSchema.nullable(),
+  transcription: z
+    .object({
+      available: z.boolean(),
+      model: z.string().min(1).max(120),
+      maxBytes: z.number().int().positive(),
+      maxDurationSeconds: z.number().int().positive(),
+    })
+    .optional(),
   warnings: z.array(z.string()),
 });
 export type Capability = z.infer<typeof capabilitySchema>;

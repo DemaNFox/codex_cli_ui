@@ -156,4 +156,24 @@ describe('api response envelopes', () => {
       }),
     );
   });
+
+  it('retries a network-ambiguous transcription with the same idempotency key', async () => {
+    vi.spyOn(crypto, 'randomUUID').mockReturnValue('00000000-0000-4000-8000-000000000301');
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError('network lost'))
+      .mockResolvedValueOnce(response({ text: 'Готовый текст' }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      api.transcribeAudio('csrf', new File(['voice'], 'voice.webm', { type: 'audio/webm' })),
+    ).resolves.toEqual({ text: 'Готовый текст' });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(new Headers(init?.headers).get('Idempotency-Key')).toBe(
+        '00000000-0000-4000-8000-000000000301',
+      );
+    }
+  });
 });

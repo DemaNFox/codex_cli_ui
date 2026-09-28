@@ -689,6 +689,71 @@ button:disabled {
   border-radius: 0.9rem 0.9rem 0.2rem 0.9rem;
   background: #242a30;
 }
+.markdown-content > :first-child {
+  margin-top: 0;
+}
+.markdown-content > :last-child {
+  margin-bottom: 0;
+}
+.markdown-content :where(h1, h2, h3, h4, h5, h6) {
+  margin: 1.1em 0 0.45em;
+  line-height: 1.25;
+}
+.markdown-content :where(p, ul, ol, blockquote, pre) {
+  margin: 0.65em 0;
+}
+.markdown-content :where(ul, ol) {
+  padding-left: 1.5rem;
+}
+.markdown-content blockquote {
+  padding-left: 0.8rem;
+  border-left: 3px solid var(--border);
+  color: var(--muted);
+}
+.markdown-content a {
+  color: #83b9ff;
+  overflow-wrap: anywhere;
+}
+.markdown-content :not(pre) > code {
+  padding: 0.12em 0.32em;
+  border-radius: 0.3rem;
+  background: #242a30;
+}
+.markdown-content pre {
+  max-width: 100%;
+  overflow: auto;
+  padding: 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  background: #111417;
+  white-space: pre;
+}
+.markdown-content code {
+  font-family: ui-monospace, SFMono-Regular, Consolas, 'Liberation Mono', monospace;
+  font-size: 0.88em;
+}
+.markdown-table-scroll {
+  max-width: 100%;
+  margin: 0.7em 0;
+  overflow-x: auto;
+}
+.markdown-content table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+}
+.markdown-content :where(th, td) {
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--border);
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+.markdown-content th {
+  background: #20252a;
+}
+.markdown-image-alt {
+  overflow-wrap: anywhere;
+}
 .message-attachments,
 .attachment-queue {
   margin: 0;
@@ -1107,7 +1172,7 @@ button:disabled {
   width: 100%;
   min-height: 4.6rem;
   max-height: 12rem;
-  padding: 0.85rem 3.4rem 0.85rem 3.4rem;
+  padding: 0.85rem 3.4rem 0.85rem 5.85rem;
   resize: vertical;
   border: 0;
   outline: 0;
@@ -1177,7 +1242,9 @@ button:disabled {
   accent-color: var(--accent);
 }
 .remove-attachment,
-.attach-button {
+.attach-button,
+.voice-button,
+.voice-cancel {
   display: grid;
   place-items: center;
   color: var(--muted);
@@ -1205,6 +1272,49 @@ button:disabled {
 .attach-button:hover:not(:disabled) {
   color: var(--text);
   background: #252c31;
+}
+.voice-input {
+  position: absolute;
+  left: 3.05rem;
+  bottom: 0.7rem;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+}
+.voice-button,
+.voice-cancel {
+  height: 2.15rem;
+  border-radius: 0.6rem;
+}
+.voice-button {
+  min-width: 2.15rem;
+  padding: 0 0.65rem;
+  color: var(--muted);
+  background: transparent;
+  font-size: 0.85rem;
+}
+.voice-button svg {
+  width: 1rem;
+  height: 1rem;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.voice-button:hover:not(:disabled) {
+  color: var(--text);
+  background: #252c31;
+}
+.voice-input.recording .voice-button {
+  color: #ffaaa7;
+  background: rgba(255, 113, 111, 0.12);
+}
+.voice-cancel {
+  width: 2.15rem;
+  color: #ffaaa7;
+  background: #252024;
+  font-size: 1rem;
 }
 .send-button {
   position: absolute;
@@ -1737,10 +1847,11 @@ button:disabled {
     padding-top: 0.65rem;
     padding-bottom: 0.65rem;
     padding-right: 3.1rem;
-    padding-left: 3.1rem;
+    padding-left: 5.55rem;
   }
   .send-button,
-  .attach-button {
+  .attach-button,
+  .voice-input {
     bottom: 0.55rem;
   }
   .send-button {
@@ -1748,6 +1859,9 @@ button:disabled {
   }
   .attach-button {
     left: 0.55rem;
+  }
+  .voice-input {
+    left: 2.9rem;
   }
   .composer-hint {
     display: none;

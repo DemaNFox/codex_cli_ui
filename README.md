@@ -6,7 +6,10 @@ The service keeps Codex on the server and provides projects, durable chats, stre
 interactive questions, one-turn permission grants, model/reasoning selection, interruption and continuation
 from any browser. Images and common project files can be attached to a turn by selecting, pasting or dropping
 them into the composer; image analysis is delegated to Codex and stored uploads remain inside the bounded
-application state. It uses the official Codex app-server protocol over local stdio; the app-server transport
+application state. Agent messages render safe GitHub-flavored Markdown, including responsive tables and code
+blocks, while raw HTML remains inert. An optional microphone control records a bounded clip in the browser,
+transcribes it through the server and places the resulting text in the composer for review before sending.
+It uses the official Codex app-server protocol over local stdio; the app-server transport
 is never exposed publicly.
 
 The workspace uses one navigation sidebar: projects expand to their chats, each project has its own new-chat
@@ -76,6 +79,10 @@ A new host needs only:
 
 Codex authentication, website passwords, `.env` values, databases, transcripts and project worktrees are
 host state and are never committed. The installer must validate the pinned CLI protocol before activation.
+Voice transcription is optional and independent from Codex device authentication: add an OpenAI API key as
+`OPENAI_API_KEY` to the protected root-owned Web environment file to enable it. The browser never receives
+that key. The browser stops long recordings, while the API enforces type, byte-size, request-rate,
+concurrency and upstream-timeout limits without storing the audio.
 
 ## Verification and release
 

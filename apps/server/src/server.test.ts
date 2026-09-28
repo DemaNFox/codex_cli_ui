@@ -18,6 +18,7 @@ import {
   type RpcId,
 } from './app-server.js';
 import { AttachmentStore } from './attachment-store.js';
+import type { AudioTranscriptionClient, TranscriptionUpload } from './audio-transcription.js';
 import { loadConfig, type ServerConfig } from './config.js';
 import { SqliteRepository } from './database.js';
 import { normalizeNotification, sanitizeEventPayload } from './event-normalizer.js';
@@ -317,6 +318,15 @@ class FailingRemoveAttachmentStore extends AttachmentStore {
   }
 }
 
+class FakeAudioTranscriptionClient implements AudioTranscriptionClient {
+  readonly uploads: TranscriptionUpload[] = [];
+
+  async transcribe(upload: TranscriptionUpload): Promise<string> {
+    this.uploads.push(upload);
+    return 'Распознанный текст';
+  }
+}
+
 let passwordHash: string;
 const openApps: Awaited<ReturnType<typeof buildServer>>[] = [];
 
@@ -332,6 +342,7 @@ async function fixture(
   seed?: (context: { repository: SqliteRepository; projectPath: string }) => void,
   attachmentStoreFactory: (root: string) => AttachmentStore = (root) => new AttachmentStore(root),
   resourceBroker?: ResourceBroker,
+  transcriptionClient?: AudioTranscriptionClient,
 ) {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-server-'));
   const root = path.join(temp, 'projects');
@@ -356,6 +367,7 @@ async function fixture(
     maxEventBytes: 4_096,
     maxConcurrentTurns,
     resourceBrokerSocket: path.join(temp, 'resource-broker.sock'),
+    transcriptionModel: 'gpt-transcribe',
   };
   const repository = new SqliteRepository(':memory:', config.eventRetentionPerThread);
   seed?.({ repository, projectPath });
@@ -370,6 +382,7 @@ async function fixture(
     attachmentStore,
     upgradeDrainPath,
     ...(resourceBroker ? { resourceBroker } : {}),
+    ...(transcriptionClient ? { transcriptionClient } : {}),
   });
   openApps.push(app);
   await app.ready();
@@ -572,7 +585,23 @@ describe('security and repository boundary', () => {
     expect(loadConfig(environment)).toMatchObject({
       eventRetentionPerThread: 1_000,
       maxEventBytes: 32_768,
+      transcriptionModel: 'gpt-transcribe',
     });
+    expect(loadConfig(environment)).not.toHaveProperty('openAiApiKey');
+    expect(loadConfig({ ...environment, OPENAI_API_KEY: '' })).not.toHaveProperty('openAiApiKey');
+    expect(
+      loadConfig({
+        ...environment,
+        OPENAI_API_KEY: 'server-secret',
+        CODEX_WEB_TRANSCRIPTION_MODEL: 'custom-transcribe',
+      }),
+    ).toMatchObject({
+      openAiApiKey: 'server-secret',
+      transcriptionModel: 'custom-transcribe',
+    });
+    expect(() =>
+      loadConfig({ ...environment, CODEX_WEB_TRANSCRIPTION_MODEL: '../unsafe model' }),
+    ).toThrow();
     expect(() =>
       loadConfig({ ...environment, CODEX_WEB_EVENT_RETENTION_PER_THREAD: '1001' }),
     ).toThrow();
@@ -685,6 +714,234 @@ describe('security and repository boundary', () => {
 });
 
 describe('Codex routes', () => {
+  it('exposes transcription capability and protects the paid endpoint with auth, Origin and CSRF', async () => {
+    const client = new FakeAudioTranscriptionClient();
+    const { app } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      client,
+    );
+    const audio = multipartFile(
+      'voice.webm',
+      'audio/webm',
+      Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x01]),
+    );
+    const anonymous = await app.inject({
+      method: 'POST',
+      url: '/api/audio/transcriptions',
+      headers: { origin: 'https://codex.test', 'content-type': audio.contentType },
+      payload: audio.body,
+    });
+    expect(anonymous.statusCode).toBe(401);
+
+    const session = await login(app);
+    const missingOrigin = await app.inject({
+      method: 'POST',
+      url: '/api/audio/transcriptions',
+      headers: {
+        cookie: session.cookie,
+        'x-csrf-token': session.csrf,
+        'content-type': audio.contentType,
+      },
+      payload: audio.body,
+    });
+    expect(missingOrigin.statusCode).toBe(403);
+    expect(missingOrigin.json()).toMatchObject({ error: { code: 'ORIGIN_REQUIRED' } });
+
+    const missingCsrf = await app.inject({
+      method: 'POST',
+      url: '/api/audio/transcriptions',
+      headers: {
+        origin: 'https://codex.test',
+        cookie: session.cookie,
+        'content-type': audio.contentType,
+      },
+      payload: audio.body,
+    });
+    expect(missingCsrf.statusCode).toBe(403);
+    expect(missingCsrf.json()).toMatchObject({ error: { code: 'CSRF_REQUIRED' } });
+
+    const missingIdempotency = await app.inject({
+      method: 'POST',
+      url: '/api/audio/transcriptions',
+      headers: { ...session.headers, 'content-type': audio.contentType },
+      payload: audio.body,
+    });
+    expect(missingIdempotency.statusCode).toBe(400);
+    expect(missingIdempotency.json()).toMatchObject({
+      error: { code: 'IDEMPOTENCY_KEY_INVALID' },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/audio/transcriptions',
+      headers: {
+        ...session.headers,
+        'content-type': audio.contentType,
+        'idempotency-key': '00000000-0000-4000-8000-000000000201',
+      },
+      payload: audio.body,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ text: 'Распознанный текст' });
+    expect(client.uploads).toHaveLength(1);
+    expect(client.uploads[0]).toMatchObject({ name: 'voice.webm', mimeType: 'audio/webm' });
+
+    const replay = await app.inject({
+      method: 'POST',
+      url: '/api/audio/transcriptions',
+      headers: {
+        ...session.headers,
+        'content-type': audio.contentType,
+        'idempotency-key': '00000000-0000-4000-8000-000000000201',
+      },
+      payload: audio.body,
+    });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toEqual({ text: 'Распознанный текст' });
+    expect(client.uploads).toHaveLength(1);
+
+    const changedAudio = multipartFile(
+      'voice.webm',
+      'audio/webm',
+      Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x02]),
+    );
+    const conflict = await app.inject({
+      method: 'POST',
+      url: '/api/audio/transcriptions',
+      headers: {
+        ...session.headers,
+        'content-type': changedAudio.contentType,
+        'idempotency-key': '00000000-0000-4000-8000-000000000201',
+      },
+      payload: changedAudio.body,
+    });
+    expect(conflict.statusCode).toBe(409);
+    expect(conflict.json()).toMatchObject({ error: { code: 'IDEMPOTENCY_CONFLICT' } });
+
+    const capabilities = await app.inject({
+      method: 'GET',
+      url: '/api/system/capabilities',
+      headers: { cookie: session.cookie },
+    });
+    expect(capabilities.statusCode).toBe(200);
+    expect(capabilities.json()).toMatchObject({
+      transcription: {
+        available: true,
+        model: 'gpt-transcribe',
+        maxBytes: 10 * 1_024 * 1_024,
+        maxDurationSeconds: 120,
+      },
+    });
+  });
+
+  it('fails closed without a configured transcription client', async () => {
+    const { app } = await fixture();
+    const session = await login(app);
+    const capabilities = await app.inject({
+      method: 'GET',
+      url: '/api/system/capabilities',
+      headers: { cookie: session.cookie },
+    });
+    expect(capabilities.json()).toMatchObject({ transcription: { available: false } });
+    const audio = multipartFile('voice.webm', 'audio/webm', Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/audio/transcriptions',
+      headers: { ...session.headers, 'content-type': audio.contentType },
+      payload: audio.body,
+    });
+    expect(response.statusCode).toBe(503);
+    expect(response.json()).toMatchObject({ error: { code: 'TRANSCRIPTION_UNAVAILABLE' } });
+  });
+
+  it('rate-limits transcription calls per session and globally bounds concurrency', async () => {
+    let release!: () => void;
+    let entered!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const blockingClient: AudioTranscriptionClient = {
+      async transcribe() {
+        entered();
+        await gate;
+        return 'done';
+      },
+    };
+    const { app } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      blockingClient,
+    );
+    const session = await login(app);
+    const audio = multipartFile('voice.webm', 'audio/webm', Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+    let requestIndex = 0;
+    const request = () => {
+      requestIndex += 1;
+      const key = `00000000-0000-4000-8000-${String(requestIndex).padStart(12, '0')}`;
+      return app.inject({
+        method: 'POST',
+        url: '/api/audio/transcriptions',
+        headers: {
+          ...session.headers,
+          'content-type': audio.contentType,
+          'idempotency-key': key,
+        },
+        payload: audio.body,
+      });
+    };
+    const first = request();
+    await started;
+    const concurrent = await request();
+    expect(concurrent.statusCode).toBe(429);
+    expect(concurrent.json()).toMatchObject({ error: { code: 'TRANSCRIPTION_BUSY' } });
+    release();
+    expect((await first).statusCode).toBe(200);
+
+    const client = new FakeAudioTranscriptionClient();
+    const { app: rateLimitedApp } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      client,
+    );
+    const rateSession = await login(rateLimitedApp);
+    for (let index = 0; index < 10; index += 1) {
+      const allowed = await rateLimitedApp.inject({
+        method: 'POST',
+        url: '/api/audio/transcriptions',
+        headers: {
+          ...rateSession.headers,
+          'content-type': audio.contentType,
+          'idempotency-key': `10000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+        },
+        payload: audio.body,
+      });
+      expect(allowed.statusCode).toBe(200);
+    }
+    const limited = await rateLimitedApp.inject({
+      method: 'POST',
+      url: '/api/audio/transcriptions',
+      headers: {
+        ...rateSession.headers,
+        'content-type': audio.contentType,
+        'idempotency-key': '10000000-0000-4000-8000-000000000010',
+      },
+      payload: audio.body,
+    });
+    expect(limited.statusCode).toBe(429);
+    expect(limited.json()).toMatchObject({ error: { code: 'TRANSCRIPTION_RATE_LIMITED' } });
+    expect(client.uploads).toHaveLength(10);
+  });
+
   it('uploads, downloads, lists and deletes a signature-checked attachment without exposing local paths', async () => {
     const { app, projectPath } = await fixture();
     const session = await login(app);

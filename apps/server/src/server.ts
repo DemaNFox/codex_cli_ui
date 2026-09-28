@@ -35,6 +35,12 @@ import { z } from 'zod';
 
 import type { AppServerClient, AppServerInbound } from './app-server.js';
 import {
+  MAX_TRANSCRIPTION_BYTES,
+  MAX_TRANSCRIPTION_DURATION_SECONDS,
+  parseAudioMultipart,
+  type AudioTranscriptionClient,
+} from './audio-transcription.js';
+import {
   MAX_ATTACHMENT_BYTES,
   MAX_THREAD_ATTACHMENT_BYTES,
   type AttachmentStore,
@@ -90,6 +96,17 @@ const threadNameUpdatedSchema = z.object({
 const eventCursorSchema = z
   .union([z.number(), z.string().regex(/^\d+$/).transform(Number)])
   .pipe(z.number().int().min(0).max(Number.MAX_SAFE_INTEGER));
+const TRANSCRIPTION_RATE_LIMIT = 10;
+const TRANSCRIPTION_RATE_WINDOW_MS = 10 * 60 * 1_000;
+const TRANSCRIPTION_IDEMPOTENCY_TTL_MS = 10 * 60 * 1_000;
+const MAX_TRANSCRIPTION_IDEMPOTENCY_ENTRIES = 200;
+const transcriptionIdempotencyKeySchema = z.string().uuid();
+
+interface TranscriptionIdempotencyEntry {
+  readonly requestHash: string;
+  readonly expiresAt: number;
+  readonly result: Promise<{ text: string }>;
+}
 
 const rpcThreadSchema = z
   .object({
@@ -238,6 +255,7 @@ export interface ServerDependencies {
   readonly appServer: AppServerClient;
   readonly attachmentStore: AttachmentStore;
   readonly resourceBroker?: ResourceBroker;
+  readonly transcriptionClient?: AudioTranscriptionClient;
   readonly upgradeDrainPath?: string;
 }
 
@@ -442,6 +460,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   repository.resetActiveThreadRuntime();
   repository.resetActiveSubagentRuntime();
   let pendingTurnStarts = 0;
+  let activeTranscriptions = 0;
+  const transcriptionAttempts = new Map<string, number[]>();
+  const transcriptionIdempotency = new Map<string, TranscriptionIdempotencyEntry>();
   let resourceApplyPromise: Promise<ResourceLimitSnapshot> | null = null;
   let resourceApplyVersion: number | null = null;
   let resourceStartupRetry: NodeJS.Timeout | null = null;
@@ -974,7 +995,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     reply.header('Cache-Control', 'no-store');
   });
 
-  app.setErrorHandler((error, _request, reply) => {
+  app.setErrorHandler((error, request, reply) => {
     if (error instanceof HttpError) {
       void reply
         .code(error.statusCode)
@@ -988,9 +1009,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       return;
     }
     if ('statusCode' in error && error.statusCode === 413) {
-      void reply
-        .code(413)
-        .send({ error: { code: 'ATTACHMENT_TOO_LARGE', message: 'Request failed' } });
+      const code = request.url.startsWith('/api/audio/transcriptions')
+        ? 'AUDIO_TOO_LARGE'
+        : 'ATTACHMENT_TOO_LARGE';
+      void reply.code(413).send({ error: { code, message: 'Request failed' } });
       return;
     }
     const code = error.message === 'APP_SERVER_UNAVAILABLE' ? 503 : 500;
@@ -1071,6 +1093,76 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     repository.audit('auth.logout', 'succeeded');
     return { loggedOut: true };
   });
+
+  app.post(
+    '/api/audio/transcriptions',
+    { bodyLimit: MAX_TRANSCRIPTION_BYTES + 16_384 },
+    async (request) => {
+      const context = csrfGuard(auth, request);
+      const transcriptionClient = dependencies.transcriptionClient;
+      if (!transcriptionClient)
+        throw new HttpError(503, 'TRANSCRIPTION_UNAVAILABLE', 'Transcription is unavailable');
+      if (!Buffer.isBuffer(request.body)) throw new HttpError(400, 'MULTIPART_FILE_REQUIRED');
+      const contentType = request.headers['content-type'];
+      if (typeof contentType !== 'string') throw new HttpError(400, 'MULTIPART_FILE_REQUIRED');
+      const parsedIdempotencyKey = transcriptionIdempotencyKeySchema.safeParse(
+        request.headers['idempotency-key'],
+      );
+      if (!parsedIdempotencyKey.success)
+        throw new HttpError(400, 'IDEMPOTENCY_KEY_INVALID', 'Idempotency key is required');
+      const upload = parseAudioMultipart(contentType, request.body);
+      const now = Date.now();
+      for (const [key, entry] of transcriptionIdempotency) {
+        if (entry.expiresAt <= now) transcriptionIdempotency.delete(key);
+      }
+      for (const [sessionId, timestamps] of transcriptionAttempts) {
+        const recent = timestamps.filter(
+          (timestamp) => timestamp > now - TRANSCRIPTION_RATE_WINDOW_MS,
+        );
+        if (recent.length === 0) transcriptionAttempts.delete(sessionId);
+        else transcriptionAttempts.set(sessionId, recent);
+      }
+      const attempts = transcriptionAttempts.get(context.sessionId) ?? [];
+      if (attempts.length >= TRANSCRIPTION_RATE_LIMIT)
+        throw new HttpError(429, 'TRANSCRIPTION_RATE_LIMITED', 'Transcription rate limit exceeded');
+      attempts.push(now);
+      transcriptionAttempts.set(context.sessionId, attempts);
+      const idempotencyKey = `${context.sessionId}:${parsedIdempotencyKey.data}`;
+      const transcriptionHash = createHash('sha256')
+        .update(upload.mimeType)
+        .update('\0')
+        .update(upload.name)
+        .update('\0')
+        .update(upload.bytes)
+        .digest('hex');
+      const existing = transcriptionIdempotency.get(idempotencyKey);
+      if (existing) {
+        if (existing.requestHash !== transcriptionHash)
+          throw new HttpError(409, 'IDEMPOTENCY_CONFLICT');
+        return await existing.result;
+      }
+      if (transcriptionIdempotency.size >= MAX_TRANSCRIPTION_IDEMPOTENCY_ENTRIES)
+        throw new HttpError(503, 'TRANSCRIPTION_IDEMPOTENCY_CAPACITY');
+      if (activeTranscriptions >= 1)
+        throw new HttpError(429, 'TRANSCRIPTION_BUSY', 'Transcription is busy');
+      const result = (async () => {
+        activeTranscriptions += 1;
+        try {
+          return {
+            text: await transcriptionClient.transcribe(upload, parsedIdempotencyKey.data),
+          };
+        } finally {
+          activeTranscriptions -= 1;
+        }
+      })();
+      transcriptionIdempotency.set(idempotencyKey, {
+        requestHash: transcriptionHash,
+        expiresAt: now + TRANSCRIPTION_IDEMPOTENCY_TTL_MS,
+        result,
+      });
+      return await result;
+    },
+  );
 
   app.get('/api/preferences/runtime', (request) => {
     auth.authenticate(request);
@@ -2035,6 +2127,12 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       ),
       rateLimits,
       usage,
+      transcription: {
+        available: dependencies.transcriptionClient !== undefined,
+        model: config.transcriptionModel,
+        maxBytes: MAX_TRANSCRIPTION_BYTES,
+        maxDurationSeconds: MAX_TRANSCRIPTION_DURATION_SECONDS,
+      },
       warnings,
     });
   });

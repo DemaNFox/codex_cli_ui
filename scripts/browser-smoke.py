@@ -161,6 +161,12 @@ def main() -> int:
                         },
                         "dailyUsageBuckets": None,
                     },
+                    "transcription": {
+                        "available": True,
+                        "model": "gpt-transcribe",
+                        "maxBytes": 10485760,
+                        "maxDurationSeconds": 120,
+                    },
                     "warnings": [],
                 },
             )
@@ -262,7 +268,11 @@ def main() -> int:
                             "kind": "agent-message",
                             "phase": "completed",
                             "payload": {
-                                "text": f"Историческое сообщение {index}: длинный чат остаётся прокручиваемым."
+                                "text": (
+                                    "| Контур | Состояние |\n| --- | --- |\n| Web | Готово |"
+                                    if index == 1
+                                    else f"Историческое сообщение {index}: длинный чат остаётся прокручиваемым."
+                                )
                             },
                             "createdAt": "2026-09-27T11:59:00.000Z",
                         }
@@ -490,6 +500,9 @@ def main() -> int:
 
         if page.get_by_label("Навигация").count() != 1:
             raise AssertionError("workspace must use one unified navigation sidebar")
+        page.get_by_role("table").get_by_role("cell", name="Готово").wait_for()
+        if page.get_by_role("button", name="Голосовой ввод").count() != 1:
+            raise AssertionError("voice input control is not available in the composer")
         transcript_metrics = page.locator(".conversation-scroll").evaluate(
             "element => ({scrollHeight: element.scrollHeight, clientHeight: element.clientHeight})"
         )

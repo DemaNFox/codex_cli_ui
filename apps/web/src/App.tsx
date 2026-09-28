@@ -17,6 +17,7 @@ import type {
 } from '@codex-web/contracts';
 
 import { ApiError, api } from './api.js';
+import { AgentMessageContent } from './AgentMessageContent.js';
 import type {
   Attachment,
   Capability,
@@ -32,6 +33,7 @@ import type {
   Thread,
 } from './api.js';
 import { useThreadEvents } from './useThreadEvents.js';
+import { VoiceInputButton } from './VoiceInputButton.js';
 
 type LoadState = 'loading' | 'ready' | 'signed-out';
 
@@ -1387,7 +1389,12 @@ function Transcript({ events }: { events: SafeEvent[] }) {
                   {formatEventDateTime(block.event.createdAt)}
                 </time>
               </div>
-              {text && <div className="message-text">{text}</div>}
+              {text &&
+                (block.event.kind === 'agent-message' ? (
+                  <AgentMessageContent text={text} />
+                ) : (
+                  <div className="message-text">{text}</div>
+                ))}
               <AttachmentList attachments={attachments} />
             </article>
           );
@@ -1832,6 +1839,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   const [interrupting, setInterrupting] = useState(false);
   const [showScrollToLatest, setShowScrollToLatest] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const composerInputRef = useRef<HTMLTextAreaElement>(null);
   const conversationScrollRef = useRef<HTMLDivElement>(null);
   const followingLatestRef = useRef(true);
   const lastEventIdRef = useRef<number | null>(null);
@@ -2941,6 +2949,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
               </ul>
             )}
             <textarea
+              ref={composerInputRef}
               aria-label={active ? 'Уточнение для активной задачи' : 'Сообщение Codex'}
               placeholder={
                 threadId
@@ -2979,6 +2988,18 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
             >
               ＋
             </button>
+            <VoiceInputButton
+              available={capability?.transcription?.available ?? false}
+              csrfToken={session.csrfToken}
+              disabled={!threadId || archiveView || busy}
+              maxBytes={capability?.transcription?.maxBytes ?? 10 * 1024 * 1024}
+              maxDurationSeconds={capability?.transcription?.maxDurationSeconds ?? 120}
+              onError={setError}
+              onTranscript={(text) => {
+                setComposer((current) => `${current}${current.trim() ? '\n' : ''}${text}`);
+                window.requestAnimationFrame(() => composerInputRef.current?.focus());
+              }}
+            />
             <button
               className="send-button"
               onClick={() => void send()}

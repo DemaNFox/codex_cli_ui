@@ -139,6 +139,45 @@ function uploadAttachment(
   return { promise, abort: () => xhr.abort() };
 }
 
+async function transcribeAudio(csrfToken: string, file: File): Promise<{ text: string }> {
+  const body = new FormData();
+  body.append('file', file, file.name);
+  const idempotencyKey = crypto.randomUUID();
+  const send = () =>
+    fetch('/api/audio/transcriptions', {
+      method: 'POST',
+      body,
+      credentials: 'same-origin',
+      headers: { 'X-CSRF-Token': csrfToken, 'Idempotency-Key': idempotencyKey },
+    });
+  let response: Response;
+  try {
+    response = await send();
+  } catch {
+    response = await send();
+  }
+  if (!response.ok) {
+    let message = `Распознавание завершилось с ошибкой (${response.status})`;
+    try {
+      const payload = (await response.json()) as { message?: unknown; error?: unknown };
+      if (typeof payload.message === 'string') message = payload.message;
+      else if (typeof payload.error === 'string') message = payload.error;
+      else if (
+        payload.error &&
+        typeof payload.error === 'object' &&
+        'message' in payload.error &&
+        typeof payload.error.message === 'string'
+      ) {
+        message = payload.error.message;
+      }
+    } catch {
+      // The response can intentionally have no JSON body.
+    }
+    throw new ApiError(message, response.status);
+  }
+  return unwrapData((await response.json()) as { text: string } | { data: { text: string } });
+}
+
 export const api = {
   session: () => request<Session>('/api/auth/session'),
   login: (username: string, password: string) =>
@@ -271,6 +310,7 @@ export const api = {
       },
     ).then(unwrapData),
   uploadAttachment,
+  transcribeAudio,
   steer: async (csrfToken: string, threadId: string, text: string, expectedTurnId: string) =>
     unwrapData(
       await request<{ turnId: string } | { data: { turnId: string } }>(

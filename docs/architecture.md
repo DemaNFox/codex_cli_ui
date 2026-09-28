@@ -44,6 +44,28 @@ Browser
 - `instructionSources` from thread start/resume and `skills/list` are visible in the status drawer so the operator can verify that `AGENTS.md` and required skills loaded.
 - The backend reads account rate limits and aggregate usage through the app-server read-only account methods. Its public projection omits account identity, email, credits, authentication material and unknown upstream fields; an unsupported optional method degrades to `null` plus a static warning.
 - The browser handles `/status` and `/skills` locally instead of sending them as model turns. Other text, including unknown slash-prefixed text, remains an ordinary Codex prompt.
+- Completed agent messages are rendered as sanitized GitHub-flavored Markdown. Raw HTML is disabled, links
+  receive safe navigation attributes and wide tables scroll inside their own mobile-safe container; model
+  output is never executed as JavaScript.
+
+## Voice transcription
+
+- The browser records a short audio clip only after an explicit microphone action, then sends one
+  authenticated multipart request to the Web API. Stopping a recording never sends a Codex turn: the returned
+  transcript is inserted into the composer for operator review and editing.
+- The browser stops a recording at the advertised duration. The API independently accepts only an allowlisted
+  audio media type within a hard byte bound, permits only bounded transcription concurrency/rate and applies
+  an upstream timeout before forwarding the in-memory file to the configured OpenAI transcription model.
+  Audio bytes are never written to SQLite, attachment storage or logs. Container duration is not decoded
+  server-side; the byte limit remains the hostile-client availability boundary.
+- One recording receives one UUID idempotency key. A bounded ten-minute in-memory cache binds that key to the
+  authenticated session and audio hash, shares an in-flight result and rejects conflicting replay; the same
+  key is forwarded upstream and reused for the client's single network-error retry. The cache intentionally
+  does not make transcription text durable.
+- `OPENAI_API_KEY` lives only in the root-owned Web service environment. It is separate from the isolated
+  runner's Codex device credential and is never returned through capabilities, errors or browser assets.
+- When the key is absent, capabilities report transcription unavailable and the microphone control explains
+  that server setup is required. The rest of Codex Web UI continues to work normally.
 
 ## Attachments
 
@@ -109,6 +131,7 @@ that derived ceiling is rejected.
 - `GET /api/threads/:id/subagents` for the durable root-chat subagent projection
 - `POST/GET /api/threads/:id/attachments`, `GET/DELETE /api/threads/:id/attachments/:attachmentId`; uploads use multipart field `file`
 - `GET /api/system/capabilities` for safe version/auth/instruction/skill, rate-limit and aggregate-usage status
+- `POST /api/audio/transcriptions` for bounded ephemeral speech-to-text; uploads use multipart field `file`
 - `GET/PUT /api/system/resource-limits` and `POST /api/system/resource-limits/apply` for the
   authenticated, CSRF-protected resource policy workflow
 
