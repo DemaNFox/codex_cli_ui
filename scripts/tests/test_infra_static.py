@@ -435,6 +435,13 @@ class InfraStaticTest(unittest.TestCase):
         ):
             self.assertIn(dependency, release_script)
         self.assertNotIn('deploy --prod --legacy', release_script)
+        for runtime_asset in (
+            "codex-web-ui-resource-broker.socket",
+            "codex-web-ui-resource-broker@.service",
+            "codex-web-ui-workload.slice",
+            "scripts/resource-broker.py",
+        ):
+            self.assertIn(runtime_asset, release_script)
         self.assertIn('SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")"', health_script)
 
     def test_web_only_update_is_atomic_compatible_and_never_restarts_codex(self) -> None:

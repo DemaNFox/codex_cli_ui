@@ -45,7 +45,17 @@ for (const dependency of [
 JS
 mkdir -p "$output/apps/web"
 cp -a apps/web/dist "$output/apps/web/dist"
+mkdir -p "$output/infra/systemd" "$output/scripts"
+for unit in \
+  codex-web-ui-resource-broker.socket \
+  codex-web-ui-resource-broker@.service \
+  codex-web-ui-workload.slice; do
+  cp -a "infra/systemd/$unit" "$output/infra/systemd/$unit"
+done
+cp -a scripts/resource-broker.py "$output/scripts/resource-broker.py"
 
 [[ -f $output/apps/server/dist/index.js ]]
 [[ -f $output/apps/web/dist/index.html ]]
+[[ -f $output/infra/systemd/codex-web-ui-workload.slice ]]
+[[ -x $output/scripts/resource-broker.py ]]
 printf 'Prepared verified release: %s\n' "$output"
