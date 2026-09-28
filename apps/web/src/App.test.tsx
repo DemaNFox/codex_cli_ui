@@ -664,7 +664,7 @@ describe('App', () => {
     });
     scroll.scrollTop = 1_000;
     fireEvent.scroll(scroll);
-    fireEvent.wheel(scroll, { deltaY: -100 });
+    fireEvent.touchMove(scroll);
     scroll.scrollTop = 100;
     fireEvent.scroll(scroll);
 
@@ -683,6 +683,14 @@ describe('App', () => {
     expect(scroll.scrollTop).toBe(1_000);
     expect(screen.queryByRole('button', { name: 'Перейти к новым сообщениям' })).toBeNull();
 
+    fireEvent.keyDown(scroll, { key: 'PageUp' });
+    scroll.scrollTop = 100;
+    fireEvent.scroll(scroll);
+    const keyboardJump = await screen.findByRole('button', {
+      name: 'Перейти к новым сообщениям',
+    });
+    await user.click(keyboardJump);
+
     Object.defineProperty(scroll, 'scrollHeight', { configurable: true, value: 1_200 });
     act(() => {
       FakeEventSource.instances.at(-1)?.emit({
@@ -693,6 +701,53 @@ describe('App', () => {
       });
     });
     await screen.findByText('Ещё одно новое сообщение');
+    await waitFor(() => expect(scroll.scrollTop).toBe(1_200));
+    expect(screen.queryByRole('button', { name: 'Перейти к новым сообщениям' })).toBeNull();
+  });
+
+  it('keeps the latest message anchored when the mobile transcript viewport resizes', async () => {
+    const callbacks: ResizeObserverCallback[] = [];
+    const observed = new Set<Element>();
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        callbacks.push(callback);
+      }
+      observe(target: Element) {
+        observed.add(target);
+      }
+      disconnect() {}
+      unobserve() {}
+    }
+    vi.stubGlobal('ResizeObserver', TestResizeObserver);
+    const initialEvent = {
+      id: 1,
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Мобильное последнее сообщение' },
+      createdAt: '2026-09-27T10:01:00.000Z',
+    };
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [initialEvent] });
+      return undefined;
+    });
+    render(<App />);
+
+    await screen.findByText('Мобильное последнее сообщение');
+    const scroll = document.querySelector<HTMLDivElement>('.conversation-scroll');
+    const content = document.querySelector<HTMLDivElement>('.conversation-content');
+    if (!scroll || !content) throw new Error('conversation layout was not rendered');
+    Object.defineProperties(scroll, {
+      scrollHeight: { configurable: true, value: 1_200 },
+      clientHeight: { configurable: true, value: 400 },
+      scrollTop: { configurable: true, writable: true, value: 0 },
+    });
+    expect(observed.has(scroll)).toBe(true);
+    expect(observed.has(content)).toBe(true);
+
+    act(() => callbacks.forEach((callback) => callback([], {} as ResizeObserver)));
     await waitFor(() => expect(scroll.scrollTop).toBe(1_200));
     expect(screen.queryByRole('button', { name: 'Перейти к новым сообщениям' })).toBeNull();
   });

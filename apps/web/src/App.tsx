@@ -2,6 +2,7 @@ import {
   ClipboardEvent,
   DragEvent,
   FormEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
   useEffect,
   useLayoutEffect,
@@ -1923,7 +1924,7 @@ function Workspace({
   const conversationScrollRef = useRef<HTMLDivElement>(null);
   const conversationContentRef = useRef<HTMLDivElement>(null);
   const followingLatestRef = useRef(true);
-  const userScrollIntentAtRef = useRef(0);
+  const userScrollIntentRef = useRef(false);
   const lastEventIdRef = useRef<number | null>(null);
   const positionedThreadRef = useRef<string | null>(null);
   const mobileNavigationToggleRef = useRef<HTMLButtonElement>(null);
@@ -1991,7 +1992,7 @@ function Workspace({
     setActionNotice(null);
     setShowScrollToLatest(false);
     followingLatestRef.current = true;
-    userScrollIntentAtRef.current = 0;
+    userScrollIntentRef.current = false;
     lastEventIdRef.current = null;
   }, [threadId]);
 
@@ -2098,6 +2099,10 @@ function Workspace({
       });
     });
     observer.observe(content);
+    observer.observe(scroll);
+    frame = window.requestAnimationFrame(() => {
+      if (followingLatestRef.current) positionAtLatestImmediately(scroll);
+    });
     return () => {
       observer.disconnect();
       window.cancelAnimationFrame(frame);
@@ -2108,23 +2113,31 @@ function Workspace({
     const scroll = conversationScrollRef.current;
     if (!scroll) return;
     const nearLatest = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight <= 80;
-    if (nearLatest) followingLatestRef.current = true;
-    else if (
-      userScrollIntentAtRef.current > 0 &&
-      performance.now() - userScrollIntentAtRef.current < 500
-    )
+    if (nearLatest) {
+      const wasFollowingLatest = followingLatestRef.current;
+      followingLatestRef.current = true;
+      if (!wasFollowingLatest) userScrollIntentRef.current = false;
+    } else if (userScrollIntentRef.current) {
       followingLatestRef.current = false;
+    }
     setShowScrollToLatest(!followingLatestRef.current);
   }
 
   function markConversationScrollIntent(): void {
-    userScrollIntentAtRef.current = performance.now();
+    userScrollIntentRef.current = true;
+  }
+
+  function markConversationKeyboardScrollIntent(event: ReactKeyboardEvent<HTMLDivElement>): void {
+    if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)) {
+      markConversationScrollIntent();
+    }
   }
 
   function scrollToLatest(): void {
     const scroll = conversationScrollRef.current;
     if (!scroll) return;
     followingLatestRef.current = true;
+    userScrollIntentRef.current = false;
     setShowScrollToLatest(false);
     positionAtLatestImmediately(scroll);
   }
@@ -3008,10 +3021,13 @@ function Workspace({
         <div
           className="conversation-scroll"
           ref={conversationScrollRef}
+          tabIndex={0}
+          aria-label="История чата"
           onScroll={trackConversationScroll}
           onWheel={markConversationScrollIntent}
           onTouchMove={markConversationScrollIntent}
           onPointerDown={markConversationScrollIntent}
+          onKeyDown={markConversationKeyboardScrollIntent}
         >
           <div className="conversation-content" ref={conversationContentRef}>
             <SubagentPanel subagents={subagents} />

@@ -493,7 +493,7 @@ def main() -> int:
 
     with sync_playwright() as playwright:
         browser = playwright.chromium.launch()
-        page = browser.new_page(viewport={"width": 1440, "height": 900})
+        page = browser.new_page(viewport={"width": 390, "height": 600})
         page.on(
             "console",
             lambda message: console_errors.append(message.text)
@@ -590,13 +590,64 @@ def main() -> int:
         page.get_by_role("button", name="Войти").click()
         page.get_by_role("heading", name="Переносимый чат").wait_for()
 
+        if page.evaluate("window.innerWidth") != 390:
+            raise AssertionError("long chat was not opened with the mobile viewport")
+        page.wait_for_timeout(500)
+        mobile_open_metrics = page.locator(".conversation-scroll").evaluate(
+            "element => ({scrollHeight: element.scrollHeight, clientHeight: element.clientHeight, scrollTop: element.scrollTop})"
+        )
+        if mobile_open_metrics["scrollHeight"] <= mobile_open_metrics["clientHeight"]:
+            raise AssertionError("long mobile transcript is not independently scrollable")
+        if (
+            mobile_open_metrics["scrollHeight"]
+            - mobile_open_metrics["scrollTop"]
+            - mobile_open_metrics["clientHeight"]
+            > 80
+        ):
+            raise AssertionError(
+                f"mobile chat did not open at its latest message: metrics={mobile_open_metrics}"
+            )
+        jump_to_latest = page.get_by_role("button", name="Перейти к новым сообщениям")
+        if jump_to_latest.count():
+            raise AssertionError("scroll-to-latest control is visible when mobile chat opens at the bottom")
+        conversation_scroll = page.locator(".conversation-scroll")
+        conversation_scroll.hover()
+        page.mouse.wheel(0, -10_000)
+        page.wait_for_function(
+            """() => {
+                const element = document.querySelector('.conversation-scroll');
+                return element && element.scrollTop <= 80;
+            }"""
+        )
+        jump_to_latest.wait_for()
+        jump_to_latest.click()
+        page.wait_for_function(
+            """() => {
+                const element = document.querySelector('.conversation-scroll');
+                return element && element.scrollHeight - element.scrollTop - element.clientHeight <= 80;
+            }"""
+        )
+        if jump_to_latest.count():
+            raise AssertionError("scroll-to-latest control remains visible at the bottom")
+
+        conversation_scroll.press("PageUp")
+        page.wait_for_function(
+            """() => {
+                const element = document.querySelector('.conversation-scroll');
+                return element && element.scrollHeight - element.scrollTop - element.clientHeight > 80;
+            }"""
+        )
+        jump_to_latest.wait_for()
+        jump_to_latest.click()
+
+        page.set_viewport_size({"width": 1440, "height": 900})
         page.get_by_text("GitHub").wait_for()
         if page.get_by_label("Навигация").count() != 1:
             raise AssertionError("workspace must use one unified navigation sidebar")
         page.get_by_role(
             "button", name="Открыть чат проекта Фоновая задача — в работе"
         ).wait_for()
-        if page.locator(".thread-running-badge").count() != 2:
+        if page.locator(".thread-running-dot").count() != 2:
             raise AssertionError("active chat indicator must appear in project and recent lists")
         page.get_by_role("table").get_by_role("cell", name="Готово").wait_for()
         if page.get_by_role("button", name="Голосовой ввод").count() != 1:
