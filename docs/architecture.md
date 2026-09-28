@@ -167,3 +167,6 @@ Full updates remain authoritative for backend and UI together: they drain active
 switch both pointers and restart the service. Any API compatibility change, server/config/systemd change or
 package lacking compatibility metadata must use that full path. Both update modes record independent previous
 targets, so a static rollback cannot roll back the backend and a full rollback restores both components.
+During a retained single-identity deployment migration, the updater also clears legacy per-service CPU,
+memory and task ceilings. The aggregate workload slice remains the sole resource-control owner, preventing an
+older static unit limit from silently overriding the current automatic or operator-selected policy.

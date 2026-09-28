@@ -241,7 +241,18 @@ grep -q -- "--serve-fd 0 --api-user $service_user$" "$broker_service_unit" || \
   die 'resource broker API identity rendering failed'
 install -m 0644 "$broker_service_unit" /etc/systemd/system/codex-web-ui-resource-broker@.service
 install -d -m 0755 "$legacy_resource_drop_in_dir"
-printf '[Service]\nSlice=codex-web-ui-workload.slice\n' >"$legacy_resource_drop_in"
+cat >"$legacy_resource_drop_in" <<'EOF'
+[Service]
+Slice=codex-web-ui-workload.slice
+# The aggregate slice is the single resource-control owner. Clear the static
+# limits retained by legacy base units so they cannot silently throttle work
+# below the operator-selected slice policy after a reboot.
+CPUQuota=
+MemoryHigh=infinity
+MemoryMax=infinity
+MemorySwapMax=infinity
+TasksMax=infinity
+EOF
 chmod 0644 "$legacy_resource_drop_in"
 install -m 0755 "$release_dir/scripts/resource-broker.py" /usr/local/libexec/codex-web-ui-resource-broker
 systemctl daemon-reload
