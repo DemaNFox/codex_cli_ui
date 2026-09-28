@@ -1306,7 +1306,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const cwd = await canonicalProjectPath(pathPolicy, project);
     const preset = input.permissionPreset ?? project.defaultPermissionPreset;
     const reasoningEffort = input.reasoningEffort ?? project.defaultReasoningEffort;
-    const configuredAgentLimit = repository.getResourceLimits().desired.maxParallelAgents;
+    const storedAgentLimit = repository.getResourceLimits().desired.maxParallelAgents;
+    const configuredAgentLimit =
+      storedAgentLimit ??
+      (dependencies.resourceBroker ? autoParallelAgents(await brokerSnapshot()) : null);
     const result = threadResponseSchema.parse(
       await appServer.request('thread/start', {
         cwd,
@@ -1623,10 +1626,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     let turnStartIssued = false;
     try {
       const resumeCwd = await canonicalProjectPath(pathPolicy, project);
-      if (
-        loadedThreadGenerations.get(id) !== appServer.generation ||
-        executionAgentLimit !== undefined
-      ) {
+      if (loadedThreadGenerations.get(id) !== appServer.generation) {
         if (!repository.isThreadHistoryHydrated(id)) await hydrateThreadHistory(thread);
         const resumed = threadResponseSchema.parse(
           await appServer.request('thread/resume', {

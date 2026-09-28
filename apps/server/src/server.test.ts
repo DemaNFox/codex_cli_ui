@@ -2004,8 +2004,20 @@ describe('Codex routes', () => {
     expect((await firstPromise).statusCode).toBe(202);
   });
 
-  it('reuses a newly started thread writer and resumes it only after app-server restart', async () => {
-    const { app, appServer, projectPath } = await fixture();
+  it('reuses a resource-bounded thread writer and resumes it only after app-server restart', async () => {
+    const broker = new FakeResourceBroker();
+    const { app, appServer, projectPath, repository } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      broker,
+    );
+    for (
+      let attempt = 0;
+      attempt < 20 && repository.getResourceLimits().state !== 'applied';
+      attempt += 1
+    )
+      await new Promise((resolve) => setImmediate(resolve));
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const thread = (
@@ -2016,6 +2028,9 @@ describe('Codex routes', () => {
         payload: { projectId: project.id },
       })
     ).json<{ data: { id: string } }>().data;
+    expect(appServer.requests.find((item) => item.method === 'thread/start')?.params).toMatchObject(
+      { config: { agents: { max_threads: 6 } } },
+    );
 
     const first = await app.inject({
       method: 'POST',
@@ -2052,6 +2067,9 @@ describe('Codex routes', () => {
     });
     expect(second.statusCode).toBe(202);
     expect(appServer.requests.filter((item) => item.method === 'thread/resume')).toHaveLength(1);
+    expect(
+      appServer.requests.find((item) => item.method === 'thread/resume')?.params,
+    ).toMatchObject({ config: { agents: { max_threads: 6 } } });
   });
 
   it('serves hydrated journal history when a post-restart metadata refresh fails', async () => {
@@ -2875,10 +2893,11 @@ describe('Codex routes', () => {
       },
     });
     expect(turn.statusCode).toBe(202);
-    const resume = [...appServer.requests]
-      .reverse()
-      .find((request) => request.method === 'thread/resume');
-    expect(resume?.params).toMatchObject({ config: { agents: { max_threads: 6 } } });
+    const startedThread = appServer.requests.find((request) => request.method === 'thread/start');
+    expect(startedThread?.params).toMatchObject({ config: { agents: { max_threads: 6 } } });
+    expect(appServer.requests.filter((request) => request.method === 'thread/resume')).toHaveLength(
+      0,
+    );
 
     const applyCount = broker.applyRequests.length;
     const deferred = await app.inject({
