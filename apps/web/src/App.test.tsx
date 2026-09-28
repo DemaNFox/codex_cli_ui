@@ -1180,6 +1180,54 @@ describe('App', () => {
     });
   });
 
+  it('refreshes stale CSRF after a rejected steer without retrying or losing the draft', async () => {
+    const activeThread = { ...thread, status: 'active' as const, activeTurnId: 'turn-active' };
+    let sessionReads = 0;
+    let steerCalls = 0;
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/auth/session') {
+        sessionReads += 1;
+        return jsonResponse({
+          ...session,
+          csrfToken: sessionReads === 1 ? 'stale-csrf' : 'fresh-csrf',
+        });
+      }
+      if (url.includes('/api/threads?')) return jsonResponse([activeThread]);
+      if (url === '/api/threads/thread-1') {
+        return jsonResponse({ data: activeThread, events: [] });
+      }
+      if (url === '/api/threads/thread-1/steer' && init?.method === 'POST') {
+        steerCalls += 1;
+        if (steerCalls === 1) {
+          return jsonResponse({ error: { code: 'CSRF_INVALID', message: 'CSRF_INVALID' } }, 403);
+        }
+        return jsonResponse({ data: { turnId: 'turn-active' } });
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const input = await screen.findByLabelText('Уточнение для активной задачи');
+    await user.type(input, 'Не потеряй этот текст');
+    await user.click(screen.getByRole('button', { name: 'Направить задачу' }));
+
+    expect((await screen.findByRole('alert')).textContent).toContain(
+      'Сессия обновлена. Текст сохранён — отправьте уточнение ещё раз.',
+    );
+    expect((input as HTMLTextAreaElement).value).toBe('Не потеряй этот текст');
+    expect(steerCalls).toBe(1);
+    expect(sessionReads).toBe(2);
+
+    await user.click(screen.getByRole('button', { name: 'Направить задачу' }));
+    expect((await screen.findByRole('status')).textContent).toContain('Уточнение принято');
+    expect(steerCalls).toBe(2);
+    const steerRequests = fetchMock.mock.calls.filter(
+      ([request]) => requestUrl(request) === '/api/threads/thread-1/steer',
+    );
+    expect(new Headers(steerRequests[1]?.[1]?.headers).get('X-CSRF-Token')).toBe('fresh-csrf');
+  });
+
   it('shows an interrupt failure and restores the stop control', async () => {
     installAuthenticatedApi((url) => {
       if (url === '/api/threads/thread-1/interrupt')

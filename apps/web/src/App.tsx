@@ -1865,7 +1865,15 @@ function Diagnostics({
   );
 }
 
-function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: () => void }) {
+function Workspace({
+  session,
+  onSessionRefresh,
+  onSignedOut,
+}: {
+  session: Session;
+  onSessionRefresh: (session: Session) => void;
+  onSignedOut: () => void;
+}) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
   const [recentThreads, setRecentThreads] = useState<Thread[]>([]);
@@ -2704,7 +2712,26 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
       setComposer('');
     } catch (cause) {
       setActionNotice(null);
-      if (attachmentThreadRef.current === threadId) setError(errorMessage(cause));
+      if (
+        active &&
+        cause instanceof ApiError &&
+        cause.status === 403 &&
+        cause.code === 'CSRF_INVALID'
+      ) {
+        try {
+          const refreshedSession = await api.session();
+          onSessionRefresh(refreshedSession);
+          if (attachmentThreadRef.current === threadId) {
+            setError('Сессия обновлена. Текст сохранён — отправьте уточнение ещё раз.');
+          }
+        } catch {
+          if (attachmentThreadRef.current === threadId) {
+            setError('Сессия изменилась. Текст сохранён; обновите страницу и отправьте его снова.');
+          }
+        }
+      } else if (attachmentThreadRef.current === threadId) {
+        setError(errorMessage(cause));
+      }
     } finally {
       setBusy(false);
     }
@@ -3341,6 +3368,7 @@ export function App() {
   return (
     <Workspace
       session={session}
+      onSessionRefresh={setSession}
       onSignedOut={() => {
         setSession(null);
         setState('signed-out');

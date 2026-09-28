@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { api } from './api.js';
+import { ApiError, api } from './api.js';
 
 const project = {
   id: '11111111-1111-4111-8111-111111111111',
@@ -58,6 +58,25 @@ function response(data: unknown): Response {
 }
 
 describe('api response envelopes', () => {
+  it('preserves structured API error codes for safe recovery decisions', async () => {
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(() =>
+        Promise.resolve(
+          new Response(
+            JSON.stringify({ error: { code: 'CSRF_INVALID', message: 'CSRF_INVALID' } }),
+            { status: 403, headers: { 'Content-Type': 'application/json' } },
+          ),
+        ),
+      ),
+    );
+
+    const error = await api.session().catch((cause: unknown) => cause);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect(error).toMatchObject({ status: 403, code: 'CSRF_INVALID', message: 'CSRF_INVALID' });
+  });
+
   it('unwraps create, thread, turn, archive and interrupt responses', async () => {
     vi.stubGlobal(
       'fetch',

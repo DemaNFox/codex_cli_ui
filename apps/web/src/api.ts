@@ -18,11 +18,13 @@ import type {
 
 export class ApiError extends Error {
   readonly status: number;
+  readonly code: string | null;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, code: string | null = null) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -48,6 +50,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 
   if (!response.ok) {
     let message = `Запрос завершился с ошибкой (${response.status})`;
+    let code: string | null = null;
     try {
       const payload = (await response.json()) as {
         message?: unknown;
@@ -63,10 +66,18 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
       ) {
         message = payload.error.message;
       }
+      if (
+        payload.error &&
+        typeof payload.error === 'object' &&
+        'code' in payload.error &&
+        typeof payload.error.code === 'string'
+      ) {
+        code = payload.error.code;
+      }
     } catch {
       // The response can intentionally have no JSON body.
     }
-    throw new ApiError(message, response.status);
+    throw new ApiError(message, response.status, code);
   }
 
   if (response.status === 204) return undefined as T;
