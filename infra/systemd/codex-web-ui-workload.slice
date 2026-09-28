@@ -6,4 +6,3 @@ CPUAccounting=yes
 MemoryAccounting=yes
 TasksAccounting=yes
 MemorySwapMax=0
-

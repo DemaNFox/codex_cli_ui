@@ -37,4 +37,3 @@ LockPersonality=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 RestrictAddressFamilies=AF_UNIX
-
