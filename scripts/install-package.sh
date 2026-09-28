@@ -226,6 +226,7 @@ chown -R codex-web-ui-api:codex-web-ui /var/lib/codex-web-ui/data
 find /var/lib/codex-web-ui/data/attachments -type d -exec chmod 0750 {} +
 find /var/lib/codex-web-ui/data/attachments -type f -exec chmod 0640 {} +
 install -d -m 0755 /opt/codex-web-ui/releases /etc/codex-web-ui /usr/local/libexec
+install -d -m 0755 /etc/systemd/system/codex-web-ui-workload.slice.d
 
 revision=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["gitRevision"][:12])' "$package/release.json")
 release_id="$(date -u +%Y%m%dT%H%M%SZ)-$revision"
@@ -301,11 +302,12 @@ rollback_activation() {
 trap rollback_activation EXIT
 atomic_symlink "$release_dir" /opt/codex-web-ui/current
 
-for unit in codex-web-ui@.service codex-web-ui-app-server.socket codex-web-ui-app-server@.service codex-web-ui-storage-guard@.service codex-web-ui-storage-guard@.timer; do
+for unit in codex-web-ui@.service codex-web-ui-app-server.socket codex-web-ui-app-server@.service codex-web-ui-resource-broker.socket codex-web-ui-resource-broker@.service codex-web-ui-workload.slice codex-web-ui-storage-guard@.service codex-web-ui-storage-guard@.timer; do
   install -m 0644 "$package/infra/systemd/$unit" "/etc/systemd/system/$unit"
 done
 install -m 0755 "$package/scripts/validate-config.sh" /usr/local/libexec/codex-web-ui-validate-config
 install -m 0755 "$package/scripts/run-app-server.sh" /usr/local/libexec/codex-web-ui-run-app-server
+install -m 0755 "$package/scripts/resource-broker.py" /usr/local/libexec/codex-web-ui-resource-broker
 install -m 0755 "$package/scripts/storage-guard.py" /usr/local/libexec/codex-web-ui-storage-guard
 install -m 0755 "$package/scripts/storage-enforce.sh" /usr/local/libexec/codex-web-ui-storage-enforce
 
@@ -344,14 +346,16 @@ chown root:root "$config" "$runner_config"
 
 CODEX_WEB_CONFIG="$config" /usr/local/libexec/codex-web-ui-validate-config
 systemctl daemon-reload
+systemctl start codex-web-ui-workload.slice
+/usr/local/libexec/codex-web-ui-resource-broker --initialize >/dev/null
 if ! $external_proxy; then
   domain=${public_origin#https://}
   "$package/scripts/install-nginx.sh" --domain "$domain" --tls-cert "$tls_cert" --tls-key "$tls_key" --reload
 fi
 if $start_service; then
-  systemctl enable codex-web-ui-app-server.socket codex-web-ui@api.service codex-web-ui-storage-guard@api.timer
+  systemctl enable codex-web-ui-resource-broker.socket codex-web-ui-app-server.socket codex-web-ui@api.service codex-web-ui-storage-guard@api.timer
   systemctl stop 'codex-web-ui-app-server@*.service' >/dev/null 2>&1 || true
-  systemctl restart codex-web-ui-app-server.socket codex-web-ui@api.service codex-web-ui-storage-guard@api.timer
+  systemctl restart codex-web-ui-resource-broker.socket codex-web-ui-app-server.socket codex-web-ui@api.service codex-web-ui-storage-guard@api.timer
   "$package/scripts/health-check.sh" --service-user api --timeout 45
   if $drain_engaged; then
     bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user api --timeout 45
@@ -359,7 +363,7 @@ if $start_service; then
   printf 'Codex Web UI %s is installed at %s\n' "$release_id" "$public_origin"
 else
   if $drain_engaged; then rm -f -- "$drain_marker"; fi
-  printf 'Codex Web UI %s is installed but not started; establish hard storage bounds, then enable the API, socket and storage timer.\n' "$release_id"
+  printf 'Codex Web UI %s is installed but not started; establish hard storage bounds, then enable the API, app-server socket, resource-broker socket and storage timer.\n' "$release_id"
 fi
 activation_complete=true
 if [[ -n $runner_config_backup ]]; then rm -f -- "$runner_config_backup"; fi

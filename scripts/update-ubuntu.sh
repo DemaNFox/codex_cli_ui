@@ -92,6 +92,10 @@ rollback_activation() {
 }
 trap rollback_activation EXIT
 atomic_symlink "$release_dir" /opt/codex-web-ui/current
+if [[ -x /usr/local/libexec/codex-web-ui-resource-broker ]]; then
+  systemctl start codex-web-ui-workload.slice
+  /usr/local/libexec/codex-web-ui-resource-broker --initialize >/dev/null
+fi
 systemctl restart "codex-web-ui@${service_user}.service"
 if ! "$SCRIPT_DIR/health-check.sh" --timeout "$health_timeout" --service-user "$service_user"; then
   die 'update failed health check and will be rolled back'

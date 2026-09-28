@@ -49,6 +49,7 @@ class PreparePackageTest(unittest.TestCase):
             "install.sh": "#!/usr/bin/env bash\n",
             "scripts/install-package.sh": "#!/usr/bin/env bash\n",
             "scripts/graceful-drain.sh": "#!/usr/bin/env bash\n",
+            "scripts/resource-broker.py": "#!/usr/bin/env python3\n",
             "scripts/bootstrap-ubuntu.sh": "#!/usr/bin/env bash\n",
             "apps/server/dist/index.js": "console.log('server');\n",
             "apps/web/dist/index.html": "<!doctype html>\n",
@@ -64,6 +65,9 @@ class PreparePackageTest(unittest.TestCase):
                 f"CODEX_LINUX_ARM64_TARBALL_SHA512={'6' * 128}\n"
             ),
             "infra/release-manifest.schema.json": "{}\n",
+            "infra/systemd/codex-web-ui-resource-broker.socket": "[Socket]\n",
+            "infra/systemd/codex-web-ui-resource-broker@.service": "[Service]\n",
+            "infra/systemd/codex-web-ui-workload.slice": "[Slice]\n",
         }
         binary_names = (
             ("argon2.glibc.node", "argon2.musl.node")

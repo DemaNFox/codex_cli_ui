@@ -7,9 +7,12 @@ import type {
   PermissionPreset,
   Project,
   ResolveUserInputRequest,
+  ResourceLimitPolicy,
+  ResourceLimitSnapshot,
   RuntimePreferences,
   SafeEvent,
   Session,
+  Subagent,
   Thread,
 } from '@codex-web/contracts';
 
@@ -155,6 +158,38 @@ export const api = {
         body: input,
       }),
     ),
+  resourceLimits: async () =>
+    unwrapData(
+      await request<ResourceLimitSnapshot | { data: ResourceLimitSnapshot }>(
+        '/api/system/resource-limits',
+      ),
+    ),
+  updateResourceLimits: async (
+    csrfToken: string,
+    desired: ResourceLimitPolicy,
+    expectedVersion: number,
+  ) =>
+    unwrapData(
+      await request<ResourceLimitSnapshot | { data: ResourceLimitSnapshot }>(
+        '/api/system/resource-limits',
+        {
+          method: 'PUT',
+          csrfToken,
+          body: { desired, expectedVersion },
+        },
+      ),
+    ),
+  applyResourceLimits: async (csrfToken: string, expectedVersion: number, idempotencyKey: string) =>
+    unwrapData(
+      await request<ResourceLimitSnapshot | { data: ResourceLimitSnapshot }>(
+        '/api/system/resource-limits/apply',
+        {
+          method: 'POST',
+          csrfToken,
+          body: { idempotencyKey, expectedVersion },
+        },
+      ),
+    ),
   projects: async () => asList(await request<Project[] | { data: Project[] }>('/api/projects')),
   createProject: async (csrfToken: string, input: { name: string; path: string }) =>
     unwrapData(
@@ -173,6 +208,12 @@ export const api = {
     ),
   thread: (threadId: string) =>
     request<ThreadHistory>(`/api/threads/${encodeURIComponent(threadId)}`),
+  subagents: async (threadId: string) =>
+    asList(
+      await request<Subagent[] | { data: Subagent[] }>(
+        `/api/threads/${encodeURIComponent(threadId)}/subagents`,
+      ),
+    ),
   renameThread: async (csrfToken: string, threadId: string, name: string) =>
     unwrapData(
       await request<Thread | { data: Thread }>(`/api/threads/${encodeURIComponent(threadId)}`, {
@@ -306,8 +347,11 @@ export type {
   ModelOption,
   PendingApproval,
   Project,
+  ResourceLimitPolicy,
+  ResourceLimitSnapshot,
   RuntimePreferences,
   SafeEvent,
   Session,
+  Subagent,
   Thread,
 };

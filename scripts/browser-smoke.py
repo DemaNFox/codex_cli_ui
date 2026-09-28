@@ -29,9 +29,37 @@ def main() -> int:
     console_errors: list[str] = []
     resolved_user_input: dict[str, object] | None = None
     resolved_permission: dict[str, object] | None = None
+    resource_snapshot = {
+        "capacity": {
+            "cpuCores": 8,
+            "memoryBytes": 16 * 1024**3,
+            "memoryAvailableBytes": 10 * 1024**3,
+            "tasks": 1024,
+            "measuredAt": "2026-09-28T10:00:00.000Z",
+        },
+        "desired": {
+            "mode": "auto",
+            "cpuCores": None,
+            "memoryBytes": None,
+            "tasks": None,
+            "maxParallelAgents": None,
+        },
+        "effective": {
+            "cpuCores": 8,
+            "memoryBytes": 16 * 1024**3,
+            "tasks": 1024,
+            "maxParallelAgents": 4,
+        },
+        "state": "applied",
+        "version": 1,
+        "updatedAt": "2026-09-28T10:00:00.000Z",
+        "appliedAt": "2026-09-28T10:00:00.000Z",
+        "warning": None,
+    }
 
     def api(route: Route) -> None:
         nonlocal signed_in, archived, thread_name, resolved_user_input, resolved_permission
+        nonlocal resource_snapshot
         request = route.request
         parsed = urlparse(request.url)
         path = parsed.path
@@ -136,6 +164,20 @@ def main() -> int:
                     "warnings": [],
                 },
             )
+        elif path == "/api/system/resource-limits" and request.method == "GET":
+            payload(route, 200, {"data": resource_snapshot})
+        elif path == "/api/system/resource-limits" and request.method == "PUT":
+            requested = request.post_data_json
+            resource_snapshot = {
+                **resource_snapshot,
+                "desired": requested["desired"],
+                "state": "pending-idle",
+                "version": resource_snapshot["version"] + 1,
+                "updatedAt": "2026-09-28T10:01:00.000Z",
+            }
+            payload(route, 200, {"data": resource_snapshot})
+        elif path == "/api/system/resource-limits/apply" and request.method == "POST":
+            payload(route, 202, {"data": resource_snapshot})
         elif path == "/api/threads" and request.method == "GET":
             wants_archived = query.get("archived", ["false"])[0] == "true"
             visible = wants_archived == archived
@@ -225,6 +267,30 @@ def main() -> int:
             )
         elif path == "/api/threads/t1/attachments" and request.method == "GET":
             payload(route, 200, {"data": []})
+        elif path == "/api/threads/t1/subagents" and request.method == "GET":
+            payload(
+                route,
+                200,
+                {
+                    "data": [
+                        {
+                            "id": "agent-ui",
+                            "rootThreadId": "t1",
+                            "parentThreadId": "t1",
+                            "agentPath": "/root/ui",
+                            "nickname": "Верстальщик",
+                            "role": "Адаптивный интерфейс",
+                            "model": "gpt-6-astra",
+                            "reasoningEffort": "high",
+                            "status": "running",
+                            "message": "Проверяет интерфейс",
+                            "startedAt": "2026-09-28T09:59:00.000Z",
+                            "lastActivityAt": "2026-09-28T10:00:00.000Z",
+                            "completedAt": None,
+                        }
+                    ]
+                },
+            )
         elif path == "/api/threads/t1/archive":
             archived = True
             payload(route, 200, {"data": {"id": "t1", "archived": True}})
@@ -385,6 +451,16 @@ def main() -> int:
         page.get_by_label("Статус Codex").wait_for()
         page.get_by_text("31% использовано · 300 мин.").wait_for()
         page.get_by_text("multi-agent-orchestrator", exact=True).wait_for()
+        page.get_by_text("Верстальщик", exact=True).wait_for()
+        diagnostics = page.get_by_label("Статус Codex")
+        diagnostics.get_by_label("Настроить вручную").click()
+        diagnostics.get_by_label("Лимит CPU, ядер").fill("4")
+        diagnostics.get_by_role("button", name="Сохранить").click()
+        diagnostics.get_by_text("Ожидает завершения текущих задач").wait_for()
+        diagnostics.get_by_role("button", name="Применить").click()
+        diagnostics.get_by_text("Ожидает завершения текущих задач").wait_for()
+        if diagnostics.get_by_text("Применено", exact=True).count():
+            raise AssertionError("pending resource apply was rendered as applied")
         page.get_by_label("Закрыть диагностику").click()
 
         page.get_by_label("Вопросы Codex").wait_for()
@@ -526,6 +602,22 @@ def main() -> int:
         page.get_by_role("option", name="/status Статус, лимиты и использование").click()
         composer.press("Enter")
         page.get_by_label("Статус Codex").wait_for()
+        resource_box = page.locator(".resource-settings").bounding_box()
+        if (
+            not resource_box
+            or resource_box["x"] < 0
+            or resource_box["x"] + resource_box["width"] > 390
+        ):
+            raise AssertionError("mobile resource settings are outside the viewport")
+        for label in (
+            "Лимит CPU, ядер",
+            "Лимит памяти, ГБ",
+            "Лимит процессов",
+            "Максимум параллельных агентов",
+        ):
+            field_box = page.get_by_label(label).bounding_box()
+            if not field_box or field_box["x"] < 0 or field_box["x"] + field_box["width"] > 390:
+                raise AssertionError(f"mobile resource control is outside the viewport: {label}")
         page.get_by_label("Закрыть диагностику").click()
 
         page.set_viewport_size({"width": 390, "height": 780})
@@ -549,7 +641,7 @@ def main() -> int:
         browser.close()
 
     print(
-        "browser-smoke: rename, unified sidebar, long-chat scroll, status/skills, archive/restore and constrained layout passed"
+        "browser-smoke: resources, subagents, status, archive/restore and responsive layout passed"
     )
     return 0
 

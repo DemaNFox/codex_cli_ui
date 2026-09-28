@@ -1,0 +1,9 @@
+[Unit]
+Description=Codex Web UI aggregate workload resource boundary
+
+[Slice]
+CPUAccounting=yes
+MemoryAccounting=yes
+TasksAccounting=yes
+MemorySwapMax=0
+

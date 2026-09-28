@@ -7,6 +7,7 @@ Wants=network-online.target
 Type=simple
 User=codex-web-ui-runner
 SupplementaryGroups=codex-web-ui
+Slice=codex-web-ui-workload.slice
 WorkingDirectory=/opt/codex-web-ui/current
 Environment=NODE_ENV=production
 EnvironmentFile=/etc/codex-web-ui/codex-runner.env
@@ -20,11 +21,7 @@ TimeoutStopSec=30s
 KillMode=control-group
 UMask=0077
 
-CPUQuota=300%
-MemoryHigh=3G
-MemoryMax=4G
-MemorySwapMax=0
-TasksMax=512
+# The aggregate workload slice owns CPU, RAM and task ceilings.
 Nice=5
 
 NoNewPrivileges=yes

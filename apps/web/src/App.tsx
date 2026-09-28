@@ -23,9 +23,12 @@ import type {
   ModelOption,
   PendingApproval,
   Project,
+  ResourceLimitPolicy,
+  ResourceLimitSnapshot,
   RuntimePreferences,
   SafeEvent,
   Session,
+  Subagent,
   Thread,
 } from './api.js';
 import { useThreadEvents } from './useThreadEvents.js';
@@ -54,6 +57,21 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} Б`;
   if (bytes < 1024 * 1024) return `${Math.ceil(bytes / 1024)} КБ`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
+}
+
+function formatResourceBytes(bytes: number): string {
+  return `${(bytes / 1024 ** 3).toLocaleString('ru', { maximumFractionDigits: 1 })} ГБ`;
+}
+
+function formatDuration(startedAt: string, completedAt: string | null): string {
+  const elapsed = Math.max(
+    0,
+    Date.parse(completedAt ?? new Date().toISOString()) - Date.parse(startedAt),
+  );
+  if (!Number.isFinite(elapsed)) return 'время неизвестно';
+  const minutes = Math.floor(elapsed / 60_000);
+  const seconds = Math.floor((elapsed % 60_000) / 1000);
+  return minutes ? `${minutes} мин. ${seconds} сек.` : `${seconds} сек.`;
 }
 
 function formatResetTime(value: number | null): string {
@@ -90,6 +108,42 @@ function attachmentsFrom(event: SafeEvent): Attachment[] {
       typeof value.url === 'string'
     );
   });
+}
+
+const SUBAGENT_STATUSES = new Set<Subagent['status']>([
+  'pendingInit',
+  'running',
+  'interrupted',
+  'completed',
+  'errored',
+  'shutdown',
+  'notFound',
+]);
+
+function subagentFrom(event: SafeEvent): Subagent | null {
+  if (event.kind !== 'subagent') return null;
+  const value = event.payload.subagent;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const nullableString = (item: unknown) => item === null || typeof item === 'string';
+  if (
+    typeof record.id !== 'string' ||
+    typeof record.rootThreadId !== 'string' ||
+    typeof record.parentThreadId !== 'string' ||
+    !nullableString(record.agentPath) ||
+    !nullableString(record.nickname) ||
+    !nullableString(record.role) ||
+    !nullableString(record.model) ||
+    !nullableString(record.reasoningEffort) ||
+    typeof record.status !== 'string' ||
+    !SUBAGENT_STATUSES.has(record.status as Subagent['status']) ||
+    !nullableString(record.message) ||
+    typeof record.startedAt !== 'string' ||
+    typeof record.lastActivityAt !== 'string' ||
+    !nullableString(record.completedAt)
+  )
+    return null;
+  return record as unknown as Subagent;
 }
 
 function safeAttachmentUrl(value: string): string | null {
@@ -1194,23 +1248,298 @@ function Transcript({ events }: { events: SafeEvent[] }) {
   );
 }
 
+const RESOURCE_STATE_LABELS: Record<ResourceLimitSnapshot['state'], string> = {
+  applied: 'Применено',
+  'pending-idle': 'Ожидает завершения текущих задач',
+  applying: 'Применяется…',
+  degraded: 'Не удалось применить',
+};
+
+function ResourceSettings({
+  snapshot,
+  busy,
+  error,
+  onRefresh,
+  onSave,
+  onApply,
+}: {
+  snapshot: ResourceLimitSnapshot | null;
+  busy: boolean;
+  error: string | null;
+  onRefresh: () => void;
+  onSave: (desired: ResourceLimitPolicy) => Promise<void>;
+  onApply: () => Promise<void>;
+}) {
+  const [draft, setDraft] = useState<ResourceLimitPolicy | null>(snapshot?.desired ?? null);
+
+  useEffect(() => setDraft(snapshot?.desired ?? null), [snapshot?.version]);
+
+  if (!snapshot || !draft) return <p className="empty-hint compact">Загрузка ресурсов…</p>;
+
+  const custom = draft.mode === 'custom';
+  const normalizedDraft: ResourceLimitPolicy = custom
+    ? draft
+    : {
+        mode: 'auto',
+        cpuCores: null,
+        memoryBytes: null,
+        tasks: null,
+        maxParallelAgents: null,
+      };
+  const dirty = JSON.stringify(normalizedDraft) !== JSON.stringify(snapshot.desired);
+  const maxMemoryGiB = snapshot.capacity.memoryBytes / 1024 ** 3;
+  const memoryGiB = draft.memoryBytes === null ? '' : draft.memoryBytes / 1024 ** 3;
+  const fieldsValid =
+    !custom ||
+    (draft.cpuCores !== null &&
+      draft.cpuCores > 0 &&
+      draft.cpuCores <= snapshot.capacity.cpuCores &&
+      draft.memoryBytes !== null &&
+      draft.memoryBytes > 0 &&
+      draft.memoryBytes <= snapshot.capacity.memoryBytes &&
+      draft.tasks !== null &&
+      draft.tasks >= 64 &&
+      draft.tasks <= snapshot.capacity.tasks &&
+      (draft.maxParallelAgents === null ||
+        (draft.maxParallelAgents > 0 &&
+          draft.maxParallelAgents <= Math.min(64, snapshot.capacity.tasks))));
+
+  const setNumber = (key: keyof ResourceLimitPolicy, value: string, multiplier = 1) => {
+    const parsed = value === '' ? null : Number(value) * multiplier;
+    setDraft((current) => (current ? { ...current, [key]: parsed } : current));
+  };
+
+  return (
+    <section className="resource-settings" aria-labelledby="resource-settings-title">
+      <div className="resource-heading">
+        <div>
+          <h3 id="resource-settings-title">Ресурсы задач Codex</h3>
+          <small>Настройки хранятся на сервере и действуют на всех устройствах.</small>
+        </div>
+        <button className="text-button" type="button" onClick={onRefresh} disabled={busy}>
+          Обновить
+        </button>
+      </div>
+      <div className={`resource-state ${snapshot.state}`} role="status">
+        <strong>{RESOURCE_STATE_LABELS[snapshot.state]}</strong>
+        <span>
+          Сейчас: {snapshot.effective.cpuCores.toLocaleString('ru')} CPU ·{' '}
+          {formatResourceBytes(snapshot.effective.memoryBytes)} · {snapshot.effective.tasks}{' '}
+          процессов · {snapshot.effective.maxParallelAgents} агентов
+        </span>
+      </div>
+      <p className="resource-capacity">
+        Доступно на машине: {snapshot.capacity.cpuCores.toLocaleString('ru')} CPU ·{' '}
+        {formatResourceBytes(snapshot.capacity.memoryBytes)} ·{' '}
+        {snapshot.capacity.tasks.toLocaleString('ru')} процессов. Автоматический режим не превышает
+        этот потолок.
+      </p>
+      {snapshot.warning && <div className="notice warning">{snapshot.warning}</div>}
+      {error && (
+        <div className="notice error" role="alert">
+          {error}
+        </div>
+      )}
+      <fieldset className="resource-mode" disabled={busy}>
+        <legend>Режим</legend>
+        <label>
+          <input
+            type="radio"
+            name="resource-mode"
+            checked={draft.mode === 'auto'}
+            onChange={() =>
+              setDraft({
+                mode: 'auto',
+                cpuCores: null,
+                memoryBytes: null,
+                tasks: null,
+                maxParallelAgents: null,
+              })
+            }
+          />
+          Автоматически — без дополнительного ограничения
+        </label>
+        <label>
+          <input
+            type="radio"
+            name="resource-mode"
+            checked={custom}
+            onChange={() =>
+              setDraft({
+                mode: 'custom',
+                cpuCores: snapshot.desired.cpuCores ?? snapshot.effective.cpuCores,
+                memoryBytes: snapshot.desired.memoryBytes ?? snapshot.effective.memoryBytes,
+                tasks: snapshot.desired.tasks ?? snapshot.effective.tasks,
+                maxParallelAgents:
+                  snapshot.desired.maxParallelAgents ?? snapshot.effective.maxParallelAgents,
+              })
+            }
+          />
+          Настроить вручную
+        </label>
+      </fieldset>
+      {custom && (
+        <div className="resource-fields">
+          <label>
+            CPU, ядер
+            <input
+              aria-label="Лимит CPU, ядер"
+              type="number"
+              min="0.25"
+              max={snapshot.capacity.cpuCores}
+              step="0.1"
+              value={draft.cpuCores ?? ''}
+              onChange={(event) => setNumber('cpuCores', event.target.value)}
+              disabled={busy}
+            />
+            <small>Максимум: {snapshot.capacity.cpuCores.toLocaleString('ru')}</small>
+          </label>
+          <label>
+            Память, ГБ
+            <input
+              aria-label="Лимит памяти, ГБ"
+              type="number"
+              min="0.1"
+              max={maxMemoryGiB}
+              step="0.1"
+              value={memoryGiB}
+              onChange={(event) => setNumber('memoryBytes', event.target.value, 1024 ** 3)}
+              disabled={busy}
+            />
+            <small>
+              Максимум: {formatResourceBytes(snapshot.capacity.memoryBytes)} · свободно{' '}
+              {formatResourceBytes(snapshot.capacity.memoryAvailableBytes)}
+            </small>
+          </label>
+          <label>
+            Процессы
+            <input
+              aria-label="Лимит процессов"
+              type="number"
+              min="64"
+              max={snapshot.capacity.tasks}
+              step="1"
+              value={draft.tasks ?? ''}
+              onChange={(event) => setNumber('tasks', event.target.value)}
+              disabled={busy}
+            />
+            <small>Максимум: {snapshot.capacity.tasks.toLocaleString('ru')}</small>
+          </label>
+          <label>
+            Параллельные агенты
+            <input
+              aria-label="Максимум параллельных агентов"
+              type="number"
+              min="1"
+              max={Math.min(64, snapshot.capacity.tasks)}
+              step="1"
+              value={draft.maxParallelAgents ?? ''}
+              onChange={(event) => setNumber('maxParallelAgents', event.target.value)}
+              disabled={busy}
+            />
+            <small>Максимум: {Math.min(64, snapshot.capacity.tasks)}</small>
+          </label>
+        </div>
+      )}
+      {dirty && <p className="resource-unsaved">Изменения ещё не сохранены.</p>}
+      <div className="resource-actions">
+        <button
+          className="ghost"
+          type="button"
+          disabled={!dirty || !fieldsValid || busy}
+          onClick={() => void onSave(normalizedDraft)}
+        >
+          {busy ? 'Сохранение…' : 'Сохранить'}
+        </button>
+        <button
+          type="button"
+          disabled={dirty || snapshot.state === 'applied' || snapshot.state === 'applying' || busy}
+          onClick={() => void onApply()}
+        >
+          Применить
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function SubagentPanel({ subagents }: { subagents: Subagent[] }) {
+  if (!subagents.length) return null;
+  const statusLabel = (status: Subagent['status']) => {
+    if (status === 'pendingInit') return 'Запускается';
+    if (status === 'running') return 'Работает';
+    if (status === 'completed') return 'Завершён';
+    if (status === 'errored') return 'Ошибка';
+    if (status === 'interrupted') return 'Остановлен';
+    if (status === 'shutdown') return 'Выключен';
+    if (status === 'notFound') return 'Недоступен';
+    return status;
+  };
+  return (
+    <section className="subagent-panel" aria-labelledby="subagent-panel-title">
+      <div className="subagent-panel-heading">
+        <h2 id="subagent-panel-title">Агенты задачи</h2>
+        <span>{subagents.length}</span>
+      </div>
+      <ul>
+        {subagents.map((subagent) => (
+          <li key={subagent.id}>
+            <div>
+              <strong>{subagent.nickname || subagent.agentPath || 'Агент'}</strong>
+              <span className={`subagent-status ${subagent.status}`}>
+                {statusLabel(subagent.status)}
+              </span>
+            </div>
+            {subagent.role && <p>{subagent.role}</p>}
+            {subagent.message && <small>{subagent.message}</small>}
+            <footer>
+              {subagent.model && <span>{subagent.model}</span>}
+              {subagent.reasoningEffort && <span>{subagent.reasoningEffort}</span>}
+              <time dateTime={subagent.startedAt}>
+                {formatDuration(subagent.startedAt, subagent.completedAt)}
+              </time>
+            </footer>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
 function Diagnostics({
   capability,
+  resourceLimits,
+  resourceBusy,
+  resourceError,
   thread,
+  onRefreshResources,
+  onSaveResources,
+  onApplyResources,
   onClose,
 }: {
   capability: Capability | null;
+  resourceLimits: ResourceLimitSnapshot | null;
+  resourceBusy: boolean;
+  resourceError: string | null;
   thread: Thread | null;
+  onRefreshResources: () => void;
+  onSaveResources: (desired: ResourceLimitPolicy) => Promise<void>;
+  onApplyResources: () => Promise<void>;
   onClose: () => void;
 }) {
   return (
-    <aside className="diagnostics" aria-label="Статус Codex">
+    <aside id="codex-diagnostics" className="diagnostics" aria-label="Статус Codex">
       <header>
         <div>
           <p className="eyebrow">CODEX STATUS</p>
           <h2>Статус</h2>
         </div>
-        <button className="icon-button" onClick={onClose} aria-label="Закрыть диагностику">
+        <button
+          className="icon-button"
+          onClick={onClose}
+          aria-label="Закрыть диагностику"
+          autoFocus
+        >
           ×
         </button>
       </header>
@@ -1226,7 +1555,15 @@ function Diagnostics({
             <dt>App Server</dt>
             <dd>{capability.appServerReady ? 'готов' : 'недоступен'}</dd>
           </dl>
-          <h3>Лимиты</h3>
+          <ResourceSettings
+            snapshot={resourceLimits}
+            busy={resourceBusy}
+            error={resourceError}
+            onRefresh={onRefreshResources}
+            onSave={onSaveResources}
+            onApply={onApplyResources}
+          />
+          <h3>Лимиты аккаунта</h3>
           {capability.rateLimits?.length ? (
             <div className="rate-limit-list">
               {capability.rateLimits.map((limit, limitIndex) => (
@@ -1307,6 +1644,10 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   const [recentThreads, setRecentThreads] = useState<Thread[]>([]);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [capability, setCapability] = useState<Capability | null>(null);
+  const [resourceLimits, setResourceLimits] = useState<ResourceLimitSnapshot | null>(null);
+  const [resourceBusy, setResourceBusy] = useState(false);
+  const [resourceError, setResourceError] = useState<string | null>(null);
+  const [subagents, setSubagents] = useState<Subagent[]>([]);
   const [projectId, setProjectId] = useState<string | null>(null);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [archiveView, setArchiveView] = useState(false);
@@ -1329,6 +1670,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   const [interrupting, setInterrupting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const mobileNavigationToggleRef = useRef<HTMLButtonElement>(null);
+  const statusToggleRef = useRef<HTMLButtonElement>(null);
   const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
   const attachmentThreadRef = useRef<string | null>(null);
   const activeUploadsRef = useRef(new Map<string, { threadId: string; abort: () => void }>());
@@ -1430,6 +1772,16 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   }, [lastTurnEvent]);
 
   useEffect(() => {
+    const updates = events.map(subagentFrom).filter((item): item is Subagent => item !== null);
+    if (!updates.length) return;
+    setSubagents((current) => {
+      const next = new Map(current.map((subagent) => [subagent.id, subagent]));
+      for (const update of updates) next.set(update.id, update);
+      return [...next.values()];
+    });
+  }, [events]);
+
+  useEffect(() => {
     queuedAttachmentsRef.current = queuedAttachments;
   }, [queuedAttachments]);
 
@@ -1471,6 +1823,23 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
   function closeMobileNavigation() {
     setMobileNavigationOpen(false);
     window.setTimeout(() => mobileNavigationToggleRef.current?.focus());
+  }
+
+  useEffect(() => {
+    if (!showDiagnostics) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      setShowDiagnostics(false);
+      window.setTimeout(() => statusToggleRef.current?.focus());
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [showDiagnostics]);
+
+  function closeDiagnostics() {
+    setShowDiagnostics(false);
+    window.setTimeout(() => statusToggleRef.current?.focus());
   }
 
   function persistRuntimePreferences(input: Omit<RuntimePreferences, 'updatedAt'>) {
@@ -1522,6 +1891,10 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
         );
       })
       .catch((cause: unknown) => setError(errorMessage(cause)));
+    void api
+      .resourceLimits()
+      .then(setResourceLimits)
+      .catch((cause: unknown) => setResourceError(errorMessage(cause)));
   }, []);
 
   useEffect(() => {
@@ -1550,7 +1923,11 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
       if (refreshing || document.visibilityState === 'hidden') return;
       refreshing = true;
       try {
-        const projectList = await api.projects();
+        const [projectList, resourceSnapshot, threadSubagents] = await Promise.all([
+          api.projects(),
+          api.resourceLimits().catch(() => null),
+          threadId ? api.subagents(threadId).catch(() => null) : Promise.resolve([]),
+        ]);
         const activeThreads = await Promise.all(
           projectList.map((project) => api.threads(project.id, false)),
         );
@@ -1558,6 +1935,8 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
           archiveView && projectId ? await api.threads(projectId, true) : null;
         if (cancelled) return;
         setProjects(projectList);
+        if (resourceSnapshot) setResourceLimits(resourceSnapshot);
+        if (threadSubagents) setSubagents(threadSubagents);
         const selectedIndex = projectList.findIndex((project) => project.id === projectId);
         if (selectedIndex >= 0)
           setThreads(archiveView ? (archivedThreads ?? []) : (activeThreads[selectedIndex] ?? []));
@@ -1584,7 +1963,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', onVisibilityChange);
     };
-  }, [archiveView, projectId]);
+  }, [archiveView, projectId, threadId]);
 
   useEffect(() => {
     const previousThreadId = attachmentThreadRef.current;
@@ -1609,6 +1988,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     });
     setAttachmentNotice(null);
     setThreadAttachmentBytes(0);
+    setSubagents([]);
     if (!threadId) return;
     const requestedThreadId = threadId;
     let cancelled = false;
@@ -1628,6 +2008,14 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
       })
       .catch((cause: unknown) => {
         if (!cancelled) setError(errorMessage(cause));
+      });
+    void api
+      .subagents(requestedThreadId)
+      .then((threadSubagents) => {
+        if (!cancelled) setSubagents(threadSubagents);
+      })
+      .catch(() => {
+        // Subagent observability is optional and must not hide the chat history.
       });
     return () => {
       cancelled = true;
@@ -1908,11 +2296,68 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
     setStatusRefreshing(true);
     setError(null);
     try {
-      setCapability(await api.capabilities());
+      const [capabilityResult, resourceResult] = await Promise.allSettled([
+        api.capabilities(),
+        api.resourceLimits(),
+      ]);
+      if (capabilityResult.status === 'rejected') throw capabilityResult.reason;
+      setCapability(capabilityResult.value);
+      if (resourceResult.status === 'fulfilled') {
+        setResourceLimits(resourceResult.value);
+        setResourceError(null);
+      } else {
+        setResourceError(errorMessage(resourceResult.reason));
+      }
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
       setStatusRefreshing(false);
+    }
+  }
+
+  async function refreshResourceLimits() {
+    setResourceBusy(true);
+    setResourceError(null);
+    try {
+      setResourceLimits(await api.resourceLimits());
+    } catch (cause) {
+      setResourceError(errorMessage(cause));
+    } finally {
+      setResourceBusy(false);
+    }
+  }
+
+  async function saveResourceLimits(desired: ResourceLimitPolicy) {
+    if (!resourceLimits) return;
+    setResourceBusy(true);
+    setResourceError(null);
+    try {
+      setResourceLimits(
+        await api.updateResourceLimits(session.csrfToken, desired, resourceLimits.version),
+      );
+    } catch (cause) {
+      setResourceError(`${errorMessage(cause)} Обновите данные и повторите попытку.`);
+    } finally {
+      setResourceBusy(false);
+    }
+  }
+
+  async function applyResourceLimits() {
+    if (!resourceLimits) return;
+    setResourceBusy(true);
+    setResourceError(null);
+    try {
+      setResourceLimits(
+        await api.applyResourceLimits(
+          session.csrfToken,
+          resourceLimits.version,
+          crypto.randomUUID(),
+        ),
+      );
+    } catch (cause) {
+      setResourceError(errorMessage(cause));
+    } finally {
+      setResourceBusy(false);
     }
   }
 
@@ -2029,9 +2474,11 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
               </button>
             )}
             <button
+              ref={statusToggleRef}
               className="ghost"
-              onClick={() => (showDiagnostics ? setShowDiagnostics(false) : void openStatus())}
+              onClick={() => (showDiagnostics ? closeDiagnostics() : void openStatus())}
               aria-expanded={showDiagnostics}
+              aria-controls="codex-diagnostics"
               disabled={statusRefreshing}
             >
               {statusRefreshing ? 'Обновление…' : 'Статус'}
@@ -2052,6 +2499,7 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
           </div>
         )}
         <div className="conversation-scroll">
+          <SubagentPanel subagents={subagents} />
           <Transcript events={events} />
           {approvals.map((approval) => (
             <ApprovalCard
@@ -2341,8 +2789,14 @@ function Workspace({ session, onSignedOut }: { session: Session; onSignedOut: ()
       {showDiagnostics && (
         <Diagnostics
           capability={capability}
+          resourceLimits={resourceLimits}
+          resourceBusy={resourceBusy}
+          resourceError={resourceError}
           thread={selectedThread}
-          onClose={() => setShowDiagnostics(false)}
+          onRefreshResources={() => void refreshResourceLimits()}
+          onSaveResources={saveResourceLimits}
+          onApplyResources={applyResourceLimits}
+          onClose={closeDiagnostics}
         />
       )}
     </main>

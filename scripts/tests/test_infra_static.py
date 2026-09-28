@@ -15,7 +15,7 @@ class InfraStaticTest(unittest.TestCase):
             "ProtectSystem=strict",
             "NoNewPrivileges=yes",
             "CapabilityBoundingSet=",
-            "MemoryMax=4G",
+            "Slice=codex-web-ui-workload.slice",
             "KillMode=control-group",
             "ProtectProc=invisible",
             "PrivateTmp=no",
@@ -35,11 +35,33 @@ class InfraStaticTest(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("User=codex-web-ui-runner", runner)
+        self.assertIn("Slice=codex-web-ui-workload.slice", runner)
         self.assertIn("EnvironmentFile=/etc/codex-web-ui/codex-runner.env", runner)
         self.assertIn("InaccessiblePaths=-/etc/codex-web-ui/codex-web-ui.env", runner)
         self.assertIn("ReadOnlyPaths=-/var/lib/codex-web-ui/data/attachments", runner)
         self.assertIn("Accept=yes", socket)
         self.assertIn("SocketMode=0600", socket)
+
+        workload_slice = (ROOT / "infra/systemd/codex-web-ui-workload.slice").read_text(
+            encoding="utf-8"
+        )
+        broker_socket = (
+            ROOT / "infra/systemd/codex-web-ui-resource-broker.socket"
+        ).read_text(encoding="utf-8")
+        broker_service = (
+            ROOT / "infra/systemd/codex-web-ui-resource-broker@.service"
+        ).read_text(encoding="utf-8")
+        self.assertIn("MemorySwapMax=0", workload_slice)
+        self.assertNotIn("MemoryMax=4G", unit + runner + workload_slice)
+        self.assertIn("Accept=yes", broker_socket)
+        self.assertIn("SocketUser=codex-web-ui-api", broker_socket)
+        self.assertIn("SocketMode=0600", broker_socket)
+        self.assertIn("User=root", broker_service)
+        self.assertIn("Slice=system.slice", broker_service)
+        self.assertIn("CapabilityBoundingSet=", broker_service)
+        self.assertIn("ProtectSystem=strict", broker_service)
+        self.assertIn("InaccessiblePaths=-/etc/codex-web-ui/codex-web-ui.env", broker_service)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX", broker_service)
 
         guard_unit = (ROOT / "infra/systemd/codex-web-ui-storage-guard@.service").read_text(
             encoding="utf-8"
@@ -117,6 +139,10 @@ class InfraStaticTest(unittest.TestCase):
             "setup-admin.mjs",
             "--external-proxy",
             "codex-web-ui-app-server.socket",
+            "codex-web-ui-resource-broker.socket",
+            "codex-web-ui-resource-broker@.service",
+            "codex-web-ui-workload.slice",
+            "codex-web-ui-resource-broker --initialize",
             "changing the runner user requires an explicit migration workflow",
             "managed_codex_bin=",
             "an explicit --codex-home must already exist",
@@ -124,7 +150,7 @@ class InfraStaticTest(unittest.TestCase):
             "runner_config_backup=",
             "load_toolchain_pins",
             "trap rollback_activation EXIT",
-            "systemctl restart codex-web-ui-app-server.socket codex-web-ui@api.service",
+            "systemctl restart codex-web-ui-resource-broker.socket codex-web-ui-app-server.socket codex-web-ui@api.service",
             'bash "$package/scripts/graceful-drain.sh" "${drain_args[@]}"',
             'bash "$package/scripts/graceful-drain.sh" --release',
             "trap clear_pre_activation_drain EXIT",

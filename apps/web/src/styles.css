@@ -1175,6 +1175,174 @@ button:disabled {
   letter-spacing: 0.07em;
   color: var(--muted);
 }
+.resource-settings {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 1rem;
+}
+.resource-settings h3 {
+  margin: 0;
+}
+.resource-heading,
+.resource-actions,
+.subagent-panel-heading,
+.subagent-panel li > div,
+.subagent-panel footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+.resource-heading small,
+.resource-fields small,
+.resource-state span {
+  display: block;
+  margin-top: 0.2rem;
+  color: var(--muted);
+  font-size: 0.67rem;
+  line-height: 1.4;
+}
+.text-button {
+  padding: 0;
+  border: 0;
+  color: var(--accent);
+  background: transparent;
+  font-size: 0.72rem;
+}
+.resource-state {
+  padding: 0.7rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 0.7rem;
+  background: #0b0e10;
+  font-size: 0.73rem;
+}
+.resource-state.pending-idle,
+.resource-state.applying {
+  border-color: #806b2f;
+}
+.resource-state.degraded {
+  border-color: #8c4343;
+}
+.resource-mode {
+  display: grid;
+  gap: 0.55rem;
+  min-width: 0;
+  margin: 0;
+  padding: 0.75rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 0.7rem;
+}
+.resource-mode legend {
+  padding: 0 0.3rem;
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+.resource-mode label {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.45rem;
+  font-size: 0.72rem;
+  line-height: 1.35;
+}
+.resource-mode input {
+  flex: 0 0 auto;
+  margin-top: 0.12rem;
+}
+.resource-fields {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
+}
+.resource-fields label {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.68rem;
+}
+.resource-fields input {
+  width: 100%;
+  margin-top: 0.3rem;
+}
+.resource-unsaved {
+  margin: 0;
+  color: #e9c76d;
+  font-size: 0.7rem;
+}
+.resource-capacity {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.45;
+}
+.resource-actions button {
+  flex: 1 1 0;
+}
+.subagent-panel {
+  width: min(50rem, 100%);
+  margin: 0 auto 1rem;
+  padding: 0.85rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 0.8rem;
+  background: #0d1114;
+}
+.subagent-panel h2 {
+  margin: 0;
+  font-size: 0.82rem;
+}
+.subagent-panel-heading > span {
+  min-width: 1.4rem;
+  padding: 0.15rem 0.4rem;
+  border-radius: 999px;
+  color: var(--muted);
+  background: #20262b;
+  text-align: center;
+  font-size: 0.67rem;
+}
+.subagent-panel ul {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0.7rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+.subagent-panel li {
+  min-width: 0;
+  padding: 0.65rem;
+  border-radius: 0.65rem;
+  background: #151a1e;
+}
+.subagent-panel li strong,
+.subagent-panel li p,
+.subagent-panel li small {
+  overflow-wrap: anywhere;
+}
+.subagent-panel li p {
+  margin: 0.35rem 0 0;
+  color: #c5cdd3;
+  font-size: 0.73rem;
+}
+.subagent-panel li small {
+  display: block;
+  margin-top: 0.3rem;
+  color: var(--muted);
+}
+.subagent-panel footer {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  margin-top: 0.45rem;
+  color: var(--muted);
+  font-size: 0.65rem;
+}
+.subagent-status {
+  flex: 0 0 auto;
+  color: var(--muted);
+  font-size: 0.67rem;
+}
+.subagent-status.running {
+  color: #78d4a0;
+}
+.subagent-status.errored {
+  color: #ef8b8b;
+}
 .status-grid {
   display: grid;
   grid-template-columns: auto 1fr;
@@ -1266,7 +1434,7 @@ button:disabled {
     top: 0;
     right: 0;
     bottom: 0;
-    width: min(22rem, 92vw);
+    width: min(28rem, 94vw);
     box-shadow: -1rem 0 3rem rgba(0, 0, 0, 0.45);
   }
   .runtime-selectors {
@@ -1366,6 +1534,12 @@ button:disabled {
   .conversation-scroll {
     min-height: 0;
     padding: 1.25rem 1rem;
+  }
+  .resource-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .subagent-panel footer {
+    gap: 0.4rem 0.65rem;
   }
   .composer-wrap {
     position: relative;

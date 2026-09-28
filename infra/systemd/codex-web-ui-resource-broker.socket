@@ -1,0 +1,15 @@
+[Unit]
+Description=Codex Web UI privileged resource broker socket
+
+[Socket]
+ListenStream=/run/codex-web-ui/resource-broker.sock
+Accept=yes
+SocketUser=codex-web-ui-api
+SocketMode=0600
+DirectoryMode=0755
+RemoveOnStop=yes
+MaxConnections=4
+
+[Install]
+WantedBy=sockets.target
+

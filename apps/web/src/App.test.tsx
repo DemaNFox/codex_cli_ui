@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from './App.js';
+import type { ResourceLimitSnapshot } from './api.js';
 
 const session = {
   authenticated: true,
@@ -78,6 +79,47 @@ const capabilities = {
   },
   warnings: [],
 };
+
+const resourceLimits = {
+  capacity: {
+    cpuCores: 8,
+    memoryBytes: 16 * 1024 ** 3,
+    memoryAvailableBytes: 10 * 1024 ** 3,
+    tasks: 1024,
+    measuredAt: '2026-09-28T10:00:00.000Z',
+  },
+  desired: {
+    mode: 'auto' as const,
+    cpuCores: null,
+    memoryBytes: null,
+    tasks: null,
+    maxParallelAgents: null,
+  },
+  effective: { cpuCores: 8, memoryBytes: 16 * 1024 ** 3, tasks: 1024, maxParallelAgents: 4 },
+  state: 'applied' as const,
+  version: 1,
+  updatedAt: '2026-09-28T10:00:00.000Z',
+  appliedAt: '2026-09-28T10:00:00.000Z',
+  warning: null,
+};
+
+const subagents = [
+  {
+    id: 'agent-1',
+    rootThreadId: 'thread-1',
+    parentThreadId: 'thread-1',
+    agentPath: '/root/ui',
+    nickname: 'Верстальщик',
+    role: 'Адаптивный интерфейс',
+    model: 'gpt-test',
+    reasoningEffort: 'medium',
+    status: 'running' as const,
+    message: 'Проверяет мобильный вид',
+    startedAt: '2026-09-28T09:59:00.000Z',
+    lastActivityAt: '2026-09-28T10:00:00.000Z',
+    completedAt: null,
+  },
+];
 
 class FakeEventSource {
   static instances: FakeEventSource[] = [];
@@ -212,7 +254,11 @@ function installAuthenticatedApi(
       );
     if (url === '/api/models') return Promise.resolve(jsonResponse(models));
     if (url === '/api/system/capabilities') return Promise.resolve(jsonResponse(capabilities));
+    if (url === '/api/system/resource-limits')
+      return Promise.resolve(jsonResponse({ data: resourceLimits }));
     if (url.includes('/api/threads?')) return Promise.resolve(jsonResponse([thread]));
+    if (url === '/api/threads/thread-1/subagents')
+      return Promise.resolve(jsonResponse({ data: subagents }));
     if (/^\/api\/threads\/[^/]+\/attachments$/.test(url)) {
       return Promise.resolve(jsonResponse([]));
     }
@@ -251,7 +297,23 @@ describe('App', () => {
       if (url === '/api/projects') return Promise.resolve(jsonResponse([project]));
       if (url === '/api/models') return Promise.resolve(jsonResponse(models));
       if (url === '/api/system/capabilities') return Promise.resolve(jsonResponse(capabilities));
+      if (url === '/api/system/resource-limits')
+        return Promise.resolve(jsonResponse({ data: resourceLimits }));
+      if (url === '/api/preferences/runtime')
+        return Promise.resolve(
+          jsonResponse({
+            data: {
+              model: 'gpt-test',
+              reasoningEffort: 'medium',
+              permissionPreset: 'workspace-write',
+              approvalPolicy: 'on-request',
+              updatedAt: '2026-09-27T10:00:00.000Z',
+            },
+          }),
+        );
       if (url.includes('/api/threads?')) return Promise.resolve(jsonResponse([thread]));
+      if (url === '/api/threads/thread-1/subagents')
+        return Promise.resolve(jsonResponse({ data: subagents }));
       if (url === '/api/threads/thread-1') {
         return Promise.resolve(jsonResponse({ data: thread, events: [] }));
       }
@@ -404,6 +466,68 @@ describe('App', () => {
         }),
       ),
     );
+  });
+
+  it('saves resource limits explicitly and reports a pending apply without optimistic success', async () => {
+    let stored: ResourceLimitSnapshot = resourceLimits;
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/system/resource-limits' && init?.method === 'PUT') {
+        if (typeof init.body !== 'string') throw new TypeError('expected serialized limits');
+        const body = JSON.parse(init.body) as {
+          desired: typeof resourceLimits.desired;
+          expectedVersion: number;
+        };
+        stored = {
+          ...resourceLimits,
+          desired: body.desired,
+          state: 'pending-idle',
+          version: 2,
+          updatedAt: '2026-09-28T10:01:00.000Z',
+        };
+        return jsonResponse({ data: stored });
+      }
+      if (url === '/api/system/resource-limits/apply' && init?.method === 'POST') {
+        return jsonResponse({ data: stored }, 202);
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    expect(await screen.findByText('Ресурсы задач Codex')).not.toBeNull();
+    await user.click(screen.getByLabelText('Настроить вручную'));
+    const cpu = screen.getByLabelText('Лимит CPU, ядер');
+    await user.clear(cpu);
+    await user.type(cpu, '4');
+    expect(screen.getByText('Изменения ещё не сохранены.')).not.toBeNull();
+    await user.click(screen.getByRole('button', { name: 'Сохранить' }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/system/resource-limits',
+        expect.objectContaining({ method: 'PUT' }),
+      ),
+    );
+    expect(await screen.findByText('Ожидает завершения текущих задач')).not.toBeNull();
+    await user.click(screen.getByRole('button', { name: 'Применить' }));
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/system/resource-limits/apply',
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    );
+    expect(screen.queryByText('Применено')).toBeNull();
+  });
+
+  it('shows server-owned subagents for the selected chat', async () => {
+    installAuthenticatedApi();
+    render(<App />);
+
+    expect(await screen.findByRole('heading', { name: 'Агенты задачи' })).not.toBeNull();
+    expect(screen.getByText('Верстальщик')).not.toBeNull();
+    expect(screen.getByText('Адаптивный интерфейс')).not.toBeNull();
+    expect(screen.getByText('Работает')).not.toBeNull();
   });
 
   it('keeps execution history compact and removes redundant lifecycle noise', async () => {
