@@ -305,6 +305,12 @@ function AttachmentList({ attachments }: { attachments: Attachment[] }) {
 }
 
 function errorMessage(error: unknown): string {
+  if (
+    error instanceof ApiError &&
+    (error.code === 'TURN_CAPACITY_EXHAUSTED' || error.code === 'RESOURCE_CAPACITY_EXHAUSTED')
+  ) {
+    return 'Сейчас заняты все безопасные слоты задач. Дождитесь завершения или остановите один из чатов с пометкой «В работе» и отправьте снова. Текст сохранён.';
+  }
   return error instanceof Error ? error.message : 'Неизвестная ошибка';
 }
 
@@ -813,17 +819,26 @@ function NavigationSidebar({
   const threadRows = (items: Thread[], showProject: boolean, archivedRows = false) =>
     items.map((thread) => {
       const project = projects.find((candidate) => candidate.id === thread.projectId);
+      const running = thread.status === 'active';
+      const displayName = thread.name || thread.preview || 'Новый чат';
       return (
         <div
           className={`thread-row ${thread.id === selectedThreadId ? 'selected' : ''}`}
           key={thread.id}
         >
           <button
-            aria-label={`${showProject ? 'Открыть недавний чат' : 'Открыть чат проекта'} ${thread.name || thread.preview || 'Новый чат'}`}
+            aria-label={`${showProject ? 'Открыть недавний чат' : 'Открыть чат проекта'} ${displayName}${running ? ' — в работе' : ''}`}
             onClick={() => onSelectThread(thread.projectId, thread.id)}
             disabled={disabled}
           >
-            <strong>{thread.name || thread.preview || 'Новый чат'}</strong>
+            <span className="thread-row-title">
+              <strong>{displayName}</strong>
+              {running && (
+                <span className="thread-running-badge" aria-hidden="true">
+                  <span className="thread-running-dot" />В работе
+                </span>
+              )}
+            </span>
             <small>
               {showProject && project ? `${project.name} · ` : ''}
               {new Date(thread.updatedAt).toLocaleString('ru')}
