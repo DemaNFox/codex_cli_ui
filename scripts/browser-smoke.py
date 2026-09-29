@@ -652,6 +652,19 @@ def main() -> int:
         page.get_by_role("table").get_by_role("cell", name="Готово").wait_for()
         if page.get_by_role("button", name="Голосовой ввод").count() != 1:
             raise AssertionError("voice input control is not available in the composer")
+        agent_toggle = page.get_by_label("Агенты задачи: активных 1, всего 1")
+        agent_toggle.click()
+        agent_popover = page.get_by_label("Агенты задачи", exact=True)
+        agent_popover.get_by_text("Верстальщик", exact=True).wait_for()
+        agent_popover.get_by_text("Работает", exact=True).wait_for()
+        popover_box = agent_popover.bounding_box()
+        if (
+            not popover_box
+            or popover_box["x"] < 0
+            or popover_box["x"] + popover_box["width"] > 1440
+        ):
+            raise AssertionError(f"agent popover is clipped on desktop: {popover_box}")
+        agent_toggle.click()
         push_toggle = page.get_by_role("button", name="Включить уведомления для этого чата")
         push_toggle.click()
         page.get_by_role("button", name="Отключить уведомления для этого чата").wait_for()
@@ -753,7 +766,6 @@ def main() -> int:
         page.get_by_label("Статус Codex").wait_for()
         page.get_by_text("31% использовано · 300 мин.").wait_for()
         page.get_by_text("multi-agent-orchestrator", exact=True).wait_for()
-        page.get_by_text("Верстальщик", exact=True).wait_for()
         diagnostics = page.get_by_label("Статус Codex")
         diagnostics.get_by_label("Настроить вручную").click()
         diagnostics.get_by_label("Лимит CPU, ядер").fill("4")
@@ -813,6 +825,19 @@ def main() -> int:
         overflow = page.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth")
         if overflow:
             raise AssertionError("mobile layout has horizontal page overflow")
+        agent_toggle.click()
+        agent_popover.wait_for(state="visible")
+        mobile_agent_box = agent_popover.bounding_box()
+        if (
+            not mobile_agent_box
+            or mobile_agent_box["x"] < 0
+            or mobile_agent_box["x"] + mobile_agent_box["width"] > 390
+            or mobile_agent_box["y"] < 0
+        ):
+            raise AssertionError(f"agent popover is outside the mobile viewport: {mobile_agent_box}")
+        if page.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth"):
+            raise AssertionError("open agent popover creates horizontal page overflow")
+        agent_toggle.click()
 
         navigation = page.get_by_label("Навигация")
         navigation.wait_for(state="hidden")

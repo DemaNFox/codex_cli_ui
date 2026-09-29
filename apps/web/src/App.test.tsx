@@ -949,12 +949,47 @@ describe('App', () => {
 
   it('shows server-owned subagents for the selected chat', async () => {
     installAuthenticatedApi();
+    const user = userEvent.setup();
     render(<App />);
 
+    await user.click(await screen.findByLabelText('Агенты задачи: активных 1, всего 1'));
     expect(await screen.findByRole('heading', { name: 'Агенты задачи' })).not.toBeNull();
     expect(screen.getByText('Верстальщик')).not.toBeNull();
     expect(screen.getByText('Адаптивный интерфейс')).not.toBeNull();
     expect(screen.getByText('Работает')).not.toBeNull();
+  });
+
+  it('starts a follow-up turn when only child agents remain active', async () => {
+    const childOnlyThread = {
+      ...thread,
+      status: 'active' as const,
+      activeTurnId: null,
+      updatedAt: '2026-09-29T00:00:01.000Z',
+    };
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url.includes('/api/threads?')) return jsonResponse([childOnlyThread]);
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: childOnlyThread, events: [], subagents });
+      if (url === '/api/threads/thread-1/subagents') return jsonResponse({ data: subagents });
+      if (url === '/api/threads/thread-1/turns' && init?.method === 'POST')
+        return jsonResponse({ data: { turnId: 'turn-follow-up' } }, 202);
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByLabelText('Агенты задачи: активных 1, всего 1');
+    const input = await screen.findByLabelText('Сообщение Codex');
+    await user.type(input, 'Продолжай с учётом результатов агентов');
+    await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/threads/thread-1/turns',
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    );
+    expect(screen.queryByText(/потеряла идентификатор/)).toBeNull();
   });
 
   it('merges thread, REST and SSE subagents monotonically without terminal regression', async () => {
@@ -1061,7 +1096,7 @@ describe('App', () => {
         createdAt: '2026-09-29T00:00:00.000Z',
       }),
     );
-    expect(await screen.findByText(/Codex работает/)).not.toBeNull();
+    expect(await screen.findByText('Субагенты работают: 1')).not.toBeNull();
 
     act(() =>
       FakeEventSource.instances.at(-1)?.emit({
@@ -1078,7 +1113,7 @@ describe('App', () => {
         createdAt: '2026-09-29T00:00:01.000Z',
       }),
     );
-    expect(screen.getByText(/Codex работает/)).not.toBeNull();
+    expect(screen.getByText('Субагенты работают: 1')).not.toBeNull();
 
     act(() =>
       FakeEventSource.instances.at(-1)?.emit({

@@ -1737,7 +1737,7 @@ function ResourceSettings({
   );
 }
 
-function SubagentPanel({ subagents }: { subagents: Subagent[] }) {
+function SubagentMenu({ subagents }: { subagents: Subagent[] }) {
   if (!subagents.length) return null;
   const statusLabel = (status: Subagent['status']) => {
     if (status === 'pendingInit') return 'Запускается';
@@ -1749,34 +1749,62 @@ function SubagentPanel({ subagents }: { subagents: Subagent[] }) {
     if (status === 'notFound') return 'Недоступен';
     return status;
   };
-  return (
-    <section className="subagent-panel" aria-labelledby="subagent-panel-title">
-      <div className="subagent-panel-heading">
-        <h2 id="subagent-panel-title">Агенты задачи</h2>
-        <span>{subagents.length}</span>
+  const activeSubagents = subagents.filter(
+    (subagent) => subagent.status === 'pendingInit' || subagent.status === 'running',
+  );
+  const completedSubagents = subagents.filter(
+    (subagent) => subagent.status !== 'pendingInit' && subagent.status !== 'running',
+  );
+  const renderSubagent = (subagent: Subagent) => (
+    <li key={subagent.id}>
+      <div>
+        <strong>{subagent.nickname || subagent.agentPath || 'Агент'}</strong>
+        <span className={`subagent-status ${subagent.status}`}>{statusLabel(subagent.status)}</span>
       </div>
-      <ul>
-        {subagents.map((subagent) => (
-          <li key={subagent.id}>
-            <div>
-              <strong>{subagent.nickname || subagent.agentPath || 'Агент'}</strong>
-              <span className={`subagent-status ${subagent.status}`}>
-                {statusLabel(subagent.status)}
-              </span>
-            </div>
-            {subagent.role && <p>{subagent.role}</p>}
-            {subagent.message && <small>{subagent.message}</small>}
-            <footer>
-              {subagent.model && <span>{subagent.model}</span>}
-              {subagent.reasoningEffort && <span>{subagent.reasoningEffort}</span>}
-              <time dateTime={subagent.startedAt}>
-                {formatDuration(subagent.startedAt, subagent.completedAt)}
-              </time>
-            </footer>
-          </li>
-        ))}
-      </ul>
-    </section>
+      {subagent.role && <p>{subagent.role}</p>}
+      {subagent.message && <small>{subagent.message}</small>}
+      <footer>
+        {subagent.model && <span>{subagent.model}</span>}
+        {subagent.reasoningEffort && <span>{subagent.reasoningEffort}</span>}
+        <time dateTime={subagent.startedAt}>
+          {formatDuration(subagent.startedAt, subagent.completedAt)}
+        </time>
+      </footer>
+    </li>
+  );
+  return (
+    <details className="subagent-menu">
+      <summary
+        aria-label={`Агенты задачи: активных ${activeSubagents.length}, всего ${subagents.length}`}
+      >
+        <span className={activeSubagents.length ? 'subagent-live-dot' : ''} aria-hidden="true" />
+        <span>Агенты</span>
+        <strong>{activeSubagents.length}</strong>
+        <small>/ {subagents.length}</small>
+      </summary>
+      <section className="subagent-popover" aria-label="Агенты задачи">
+        <header>
+          <div>
+            <h2>Агенты задачи</h2>
+            <small>
+              Активны {activeSubagents.length} из {subagents.length}
+            </small>
+          </div>
+        </header>
+        {activeSubagents.length > 0 && (
+          <div className="subagent-group">
+            <h2>Активные</h2>
+            <ul>{activeSubagents.map(renderSubagent)}</ul>
+          </div>
+        )}
+        {completedSubagents.length > 0 && (
+          <details className="subagent-history">
+            <summary>Завершённые и остановленные · {completedSubagents.length}</summary>
+            <ul>{completedSubagents.map(renderSubagent)}</ul>
+          </details>
+        )}
+      </section>
+    </details>
   );
 }
 
@@ -1980,6 +2008,11 @@ function Workspace({
   const lastRuntimeEvent = [...events].reverse().find((event) => threadRuntimeFrom(event) !== null);
   const active = selectedThread?.status === 'active';
   const activeTurnId = active ? selectedThread.activeTurnId : null;
+  const activeSubagentCount = subagents.filter(
+    (subagent) => subagent.status === 'pendingInit' || subagent.status === 'running',
+  ).length;
+  const activeRootTurn = active && activeTurnId !== null;
+  const subagentsOnlyActive = active && !activeTurnId && activeSubagentCount > 0;
   const activeTurnDuration = useActiveTurnDuration(events, activeTurnId, active);
 
   useLayoutEffect(() => {
@@ -2726,11 +2759,11 @@ function Workspace({
       return;
     }
     if (!threadId || archiveView || (!text && !queuedAttachments.length)) return;
-    if (active && !activeTurnId) {
+    if (active && !activeTurnId && !subagentsOnlyActive) {
       setError('Активная задача потеряла идентификатор после переподключения. Обновите чат.');
       return;
     }
-    if (active && queuedAttachments.length) {
+    if (activeRootTurn && queuedAttachments.length) {
       setAttachmentNotice(
         'Вложения нельзя отправить во время активной задачи. Дождитесь её завершения или удалите вложения.',
       );
@@ -2738,9 +2771,11 @@ function Workspace({
     }
     setBusy(true);
     setError(null);
-    setActionNotice(active ? 'Передаём уточнение активной задаче…' : 'Передаём задачу Codex…');
+    setActionNotice(
+      activeRootTurn ? 'Передаём уточнение активной задаче…' : 'Передаём задачу Codex…',
+    );
     try {
-      if (active && activeTurnId) {
+      if (activeRootTurn && activeTurnId) {
         await api.steer(session.csrfToken, threadId, text, activeTurnId);
         setActionNotice('Уточнение принято активной задачей.');
       } else {
@@ -2984,13 +3019,16 @@ function Workspace({
             <span className={`live-status ${active ? 'running' : ''}`}>
               <i />
               {active
-                ? `Codex работает${activeTurnDuration ? ` уже ${activeTurnDuration}` : ''}`
+                ? subagentsOnlyActive
+                  ? `Субагенты работают: ${activeSubagentCount}`
+                  : `Codex работает${activeTurnDuration ? ` уже ${activeTurnDuration}` : ''}`
                 : streamState === 'offline'
                   ? 'Нет подключения'
                   : 'Готов'}
             </span>
           </div>
           <div className="toolbar-actions">
+            <SubagentMenu subagents={subagents} />
             <button
               className={`icon-button push-notification-toggle ${pushNotificationState === 'subscribed' ? 'enabled' : ''}`}
               type="button"
@@ -3016,7 +3054,7 @@ function Workspace({
                     : '🔕'}
               </span>
             </button>
-            {active && threadId && (
+            {activeRootTurn && threadId && (
               <button
                 className="danger"
                 disabled={interrupting || !activeTurnId}
@@ -3062,7 +3100,6 @@ function Workspace({
           onKeyDown={markConversationKeyboardScrollIntent}
         >
           <div className="conversation-content" ref={conversationContentRef}>
-            <SubagentPanel subagents={subagents} />
             <Transcript events={events} />
             {approvals.map((approval) => (
               <ApprovalCard
@@ -3298,14 +3335,16 @@ function Workspace({
             )}
             <textarea
               ref={composerInputRef}
-              aria-label={active ? 'Уточнение для активной задачи' : 'Сообщение Codex'}
+              aria-label={activeRootTurn ? 'Уточнение для активной задачи' : 'Сообщение Codex'}
               placeholder={
                 threadId
                   ? archiveView
                     ? 'Восстановите чат, чтобы продолжить'
-                    : active
+                    : activeRootTurn
                       ? 'Направить активную задачу…'
-                      : 'Опишите задачу…'
+                      : subagentsOnlyActive
+                        ? 'Поставить новую задачу, пока субагенты завершают работу…'
+                        : 'Опишите задачу…'
                   : 'Создайте чат, чтобы начать'
               }
               value={composer}
@@ -3334,9 +3373,13 @@ function Workspace({
                 type="button"
                 className="attach-button"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={!threadId || archiveView || active || busy}
+                disabled={!threadId || archiveView || activeRootTurn || busy}
                 aria-label="Прикрепить файлы"
-                title={active ? 'Вложения недоступны во время активной задачи' : 'Прикрепить файлы'}
+                title={
+                  activeRootTurn
+                    ? 'Вложения недоступны во время активной задачи'
+                    : 'Прикрепить файлы'
+                }
               >
                 ＋
               </button>
@@ -3359,16 +3402,16 @@ function Workspace({
                   !threadId ||
                   archiveView ||
                   (!composer.trim() && !queuedAttachments.length) ||
-                  (active && queuedAttachments.length > 0) ||
+                  (activeRootTurn && queuedAttachments.length > 0) ||
                   busy
                 }
-                aria-label={active ? 'Направить задачу' : 'Отправить сообщение'}
+                aria-label={activeRootTurn ? 'Направить задачу' : 'Отправить сообщение'}
               >
-                {active ? '↗' : '↑'}
+                {activeRootTurn ? '↗' : '↑'}
               </button>
             </div>
           </div>
-          {(attachmentNotice || (active && queuedAttachments.length > 0)) && (
+          {(attachmentNotice || (activeRootTurn && queuedAttachments.length > 0)) && (
             <p className="attachment-notice" role="status">
               {attachmentNotice ??
                 'Вложения нельзя отправить во время активной задачи. Дождитесь её завершения или удалите вложения.'}
