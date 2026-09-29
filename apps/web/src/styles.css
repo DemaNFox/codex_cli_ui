@@ -731,7 +731,8 @@ button:disabled {
 .message.user .message-text {
   padding: 0.75rem 0.9rem;
   border-radius: 0.9rem 0.9rem 0.2rem 0.9rem;
-  background: #242a30;
+  color: #f7faff;
+  background: #1f4f8d;
 }
 .markdown-content > :first-child {
   margin-top: 0;
