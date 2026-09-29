@@ -296,16 +296,25 @@ def main() -> int:
                         {
                             "id": index,
                             "threadId": "t1",
-                            "turnId": f"history-{index}",
+                            "turnId": "history-0" if index <= 2 else f"history-{index}",
                             "kind": "agent-message",
                             "phase": "completed",
                             "payload": {
                                 "text": (
-                                    "| Контур | Состояние |\n| --- | --- |\n| Web | Готово |"
+                                    "Промежуточный отчёт, который должен скрыться после завершения."
                                     if index == 1
+                                    else
+                                    "| Контур | Состояние |\n| --- | --- |\n| Web | Готово |"
+                                    if index == 2
                                     else f"Историческое сообщение {index}: длинный чат остаётся прокручиваемым."
                                 ),
-                                **({"messagePhase": "final_answer"} if index == 48 else {}),
+                                **(
+                                    {"messagePhase": "commentary"}
+                                    if index == 1
+                                    else {"messagePhase": "final_answer"}
+                                    if index == 2
+                                    else {}
+                                ),
                             },
                             "createdAt": "2026-09-27T11:59:00.000Z",
                         }
@@ -315,11 +324,20 @@ def main() -> int:
                         {
                             "id": 49,
                             "threadId": "t1",
-                            "turnId": "history-48",
+                            "turnId": "history-0",
                             "kind": "turn",
                             "phase": "completed",
                             "payload": {"status": "completed"},
                             "createdAt": "2026-09-27T11:59:01.000Z",
+                        },
+                        {
+                            "id": 50,
+                            "threadId": "t1",
+                            "turnId": "turn-1",
+                            "kind": "user-message",
+                            "phase": "completed",
+                            "payload": {"text": "Проверить активную задачу"},
+                            "createdAt": "2026-09-27T11:59:02.000Z",
                         }
                     ],
                 },
@@ -709,6 +727,16 @@ def main() -> int:
         final_answer.wait_for()
         if final_answer.count() != 1 or "Итоговый ответ" not in final_answer.inner_text():
             raise AssertionError("completed Codex answer is not visually identified as final")
+        if page.get_by_text("Промежуточный отчёт, который должен скрыться после завершения.").count():
+            raise AssertionError("completed turn commentary remains visible after its final answer")
+        turn_navigation = page.get_by_role("navigation", name="Переходы по задачам")
+        turn_navigation.wait_for()
+        if turn_navigation.get_by_role("button").count() != 2:
+            raise AssertionError("turn navigation does not expose every user call")
+        turn_navigation.get_by_role("button").first.click()
+        if page.get_by_role("button", name="Перейти к новым сообщениям").count() != 1:
+            raise AssertionError("turn navigation did not leave follow-latest mode")
+        page.get_by_role("button", name="Перейти к новым сообщениям").click()
         activity_group = page.get_by_role("region", name="Ход работы: 6 действий")
         activity_group.wait_for()
         if activity_group.locator(".activity-row").count() != 3:

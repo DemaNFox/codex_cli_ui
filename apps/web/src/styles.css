@@ -676,6 +676,83 @@ button:disabled {
   margin: 0;
   color: var(--muted);
 }
+.transcript-shell {
+  min-width: 0;
+  width: 100%;
+}
+.transcript-shell.has-turn-navigation {
+  display: grid;
+  grid-template-columns: 1.5rem minmax(0, 1fr);
+  align-items: start;
+  gap: 0.65rem;
+}
+.turn-navigation {
+  position: sticky;
+  top: 0.75rem;
+  z-index: 4;
+  display: grid;
+  align-content: start;
+  justify-items: center;
+  gap: 0.18rem;
+  max-height: calc(100dvh - 10rem);
+  padding: 0.35rem 0;
+}
+.turn-jump {
+  position: relative;
+  display: grid;
+  width: 1.5rem;
+  height: 1.1rem;
+  padding: 0;
+  place-items: center;
+  border-radius: 0.25rem;
+  color: #65707a;
+  background: transparent;
+}
+.turn-jump span {
+  width: 0.48rem;
+  height: 1px;
+  border-radius: 999px;
+  background: currentColor;
+  transition:
+    width 140ms ease,
+    color 140ms ease;
+}
+.turn-jump:hover,
+.turn-jump:focus-visible {
+  color: var(--accent);
+}
+.turn-jump:hover span,
+.turn-jump:focus-visible span {
+  width: 1rem;
+}
+.turn-jump::after {
+  position: absolute;
+  top: 50%;
+  left: calc(100% + 0.45rem);
+  z-index: 5;
+  width: min(18rem, 55vw);
+  padding: 0.5rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  color: #dce2e6;
+  background: #20252a;
+  box-shadow: 0 0.8rem 2rem rgba(0, 0, 0, 0.32);
+  content: attr(data-preview);
+  font-size: 0.72rem;
+  line-height: 1.35;
+  opacity: 0;
+  overflow-wrap: anywhere;
+  pointer-events: none;
+  transform: translateY(-50%) translateX(-0.2rem);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+}
+.turn-jump:hover::after,
+.turn-jump:focus-visible::after {
+  opacity: 1;
+  transform: translateY(-50%) translateX(0);
+}
 .transcript {
   display: grid;
   gap: 1rem;
@@ -1890,6 +1967,35 @@ button:disabled {
   .conversation-scroll {
     min-height: 0;
     padding: 1.25rem 1rem;
+  }
+  .transcript-shell.has-turn-navigation {
+    display: block;
+  }
+  .turn-navigation {
+    top: 0;
+    display: flex;
+    width: 100%;
+    max-height: none;
+    margin-bottom: 0.55rem;
+    padding: 0.35rem 0.45rem;
+    overflow-x: auto;
+    border: 1px solid var(--border-soft);
+    border-radius: 0.65rem;
+    background: rgba(15, 18, 21, 0.94);
+    scrollbar-width: none;
+  }
+  .turn-navigation::-webkit-scrollbar {
+    display: none;
+  }
+  .turn-jump {
+    flex: 0 0 auto;
+    width: 1.65rem;
+  }
+  .turn-jump span {
+    width: 0.8rem;
+  }
+  .turn-jump::after {
+    display: none;
   }
   .message,
   .message.user {

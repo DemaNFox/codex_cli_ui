@@ -51,6 +51,10 @@ Browser
   messages. The transcript gives `final_answer` a labelled visual boundary while commentary remains visually
   neutral. For journal entries created before this phase was persisted, the last phase-less agent message of
   a successfully completed turn is treated as the compatibility final; explicit commentary is never promoted.
+- Once a successfully completed turn has a final answer, its transcript projection keeps the operator prompt
+  and final answer but hides commentary and execution activity. Active, failed, interrupted or final-less
+  turns retain their progress and diagnostic events. A compact prompt-derived turn rail navigates between
+  calls without changing server state; on narrow screens the same rail becomes horizontally scrollable.
 
 ## Voice transcription
 

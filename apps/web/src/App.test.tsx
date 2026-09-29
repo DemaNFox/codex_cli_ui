@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -635,10 +635,19 @@ describe('App', () => {
     expect(source?.close).toHaveBeenCalledOnce();
   });
 
-  it('visually distinguishes final answers from commentary and legacy completed turns', async () => {
+  it('summarizes completed turns, preserves active progress, and navigates between tasks', async () => {
     const events = [
       {
         id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        kind: 'user-message',
+        phase: 'completed',
+        payload: { text: 'Первая задача' },
+        createdAt: '2026-09-27T10:00:00.000Z',
+      },
+      {
+        id: 2,
         threadId: 'thread-1',
         turnId: 'turn-1',
         kind: 'agent-message',
@@ -647,7 +656,16 @@ describe('App', () => {
         createdAt: '2026-09-27T10:01:00.000Z',
       },
       {
-        id: 2,
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        kind: 'command',
+        phase: 'completed',
+        payload: { command: 'pnpm test' },
+        createdAt: '2026-09-27T10:01:30.000Z',
+      },
+      {
+        id: 4,
         threadId: 'thread-1',
         turnId: 'turn-1',
         kind: 'agent-message',
@@ -656,7 +674,7 @@ describe('App', () => {
         createdAt: '2026-09-27T10:02:00.000Z',
       },
       {
-        id: 3,
+        id: 5,
         threadId: 'thread-1',
         turnId: 'turn-1',
         kind: 'turn',
@@ -665,7 +683,43 @@ describe('App', () => {
         createdAt: '2026-09-27T10:02:01.000Z',
       },
       {
-        id: 4,
+        id: 6,
+        threadId: 'thread-1',
+        turnId: 'active-turn',
+        kind: 'user-message',
+        phase: 'completed',
+        payload: { text: 'Активная задача' },
+        createdAt: '2026-09-27T10:02:30.000Z',
+      },
+      {
+        id: 7,
+        threadId: 'thread-1',
+        turnId: 'active-turn',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Активный промежуточный статус', messagePhase: 'commentary' },
+        createdAt: '2026-09-27T10:02:31.000Z',
+      },
+      {
+        id: 8,
+        threadId: 'thread-1',
+        turnId: 'active-turn',
+        kind: 'command',
+        phase: 'completed',
+        payload: { command: 'pnpm typecheck' },
+        createdAt: '2026-09-27T10:02:32.000Z',
+      },
+      {
+        id: 9,
+        threadId: 'thread-1',
+        turnId: 'legacy-turn',
+        kind: 'user-message',
+        phase: 'completed',
+        payload: { text: 'Старая задача' },
+        createdAt: '2026-09-27T10:02:59.000Z',
+      },
+      {
+        id: 10,
         threadId: 'thread-1',
         turnId: 'legacy-turn',
         kind: 'agent-message',
@@ -674,13 +728,40 @@ describe('App', () => {
         createdAt: '2026-09-27T10:03:00.000Z',
       },
       {
-        id: 5,
+        id: 11,
         threadId: 'thread-1',
         turnId: 'legacy-turn',
         kind: 'turn',
         phase: 'completed',
         payload: { status: 'completed' },
         createdAt: '2026-09-27T10:03:01.000Z',
+      },
+      {
+        id: 12,
+        threadId: 'thread-1',
+        turnId: 'failed-turn',
+        kind: 'user-message',
+        phase: 'completed',
+        payload: { text: 'Упавшая задача' },
+        createdAt: '2026-09-27T10:04:00.000Z',
+      },
+      {
+        id: 13,
+        threadId: 'thread-1',
+        turnId: 'failed-turn',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Диагностика упавшей задачи', messagePhase: 'commentary' },
+        createdAt: '2026-09-27T10:04:01.000Z',
+      },
+      {
+        id: 14,
+        threadId: 'thread-1',
+        turnId: 'failed-turn',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'failed' },
+        createdAt: '2026-09-27T10:04:02.000Z',
       },
     ];
     installAuthenticatedApi((url) => {
@@ -697,13 +778,29 @@ describe('App', () => {
     if (!final) throw new Error('explicit final answer was not rendered');
     expect(final.textContent).toContain('Подтверждённый итог');
     expect(final.textContent).toContain('Итоговый ответ');
-    expect(screen.getByText('Промежуточный статус').closest('article')?.classList).not.toContain(
-      'final-answer',
-    );
+    expect(screen.queryByText('Промежуточный статус')).toBeNull();
+    expect(screen.queryByText('pnpm test')).toBeNull();
+    expect(screen.getByText('Активный промежуточный статус')).not.toBeNull();
+    expect(screen.getByText('pnpm typecheck')).not.toBeNull();
+    expect(screen.getByText('Диагностика упавшей задачи')).not.toBeNull();
     expect(screen.getByText('Старый итог без фазы').closest('article')?.classList).toContain(
       'final-answer',
     );
     expect(finalAnswers).toHaveLength(2);
+
+    const navigation = screen.getByRole('navigation', { name: 'Переходы по задачам' });
+    expect(within(navigation).getAllByRole('button')).toHaveLength(4);
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    const user = userEvent.setup();
+    await user.click(
+      within(navigation).getByRole('button', { name: 'Перейти к задаче 1: Первая задача' }),
+    );
+    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'start' });
+    expect(document.activeElement).toBe(document.getElementById('turn-message-1'));
   });
 
   it('offers a scroll-to-latest control when new events arrive below the viewport', async () => {

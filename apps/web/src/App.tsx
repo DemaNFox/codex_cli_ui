@@ -1421,7 +1421,13 @@ function ActivityGroup({ events }: { events: SafeEvent[] }) {
   );
 }
 
-function Transcript({ events }: { events: SafeEvent[] }) {
+function Transcript({
+  events,
+  onNavigateTurn,
+}: {
+  events: SafeEvent[];
+  onNavigateTurn: (anchorId: string) => void;
+}) {
   const displayEvents = useMemo(() => {
     const output: SafeEvent[] = [];
     const startedActivities = new Map<string, SafeEvent>();
@@ -1471,26 +1477,54 @@ function Transcript({ events }: { events: SafeEvent[] }) {
     }
     return output;
   }, [events]);
+  const completedTurnIds = useMemo(() => successfullyCompletedTurnIds(events), [events]);
   const finalAgentMessageIds = useMemo(() => {
     const result = new Set<number>();
     const legacyCandidates = new Map<string, number>();
-    const completedTurns = successfullyCompletedTurnIds(events);
     for (const event of displayEvents) {
       if (event.kind !== 'agent-message' || event.phase !== 'completed') continue;
       const messagePhase = agentMessagePhase(event);
       if (messagePhase === 'final_answer') result.add(event.id);
-      if (messagePhase === null && event.turnId && completedTurns.has(event.turnId)) {
+      if (messagePhase === null && event.turnId && completedTurnIds.has(event.turnId)) {
         legacyCandidates.set(event.turnId, event.id);
       }
     }
     for (const id of legacyCandidates.values()) result.add(id);
     return result;
-  }, [displayEvents, events]);
+  }, [completedTurnIds, displayEvents]);
+  const summarizedTurnIds = useMemo(() => {
+    const result = new Set<string>();
+    for (const event of displayEvents) {
+      if (
+        event.turnId &&
+        completedTurnIds.has(event.turnId) &&
+        finalAgentMessageIds.has(event.id)
+      ) {
+        result.add(event.turnId);
+      }
+    }
+    return result;
+  }, [completedTurnIds, displayEvents, finalAgentMessageIds]);
+  const visibleEvents = useMemo(
+    () =>
+      displayEvents.filter((event) => {
+        if (!event.turnId || !summarizedTurnIds.has(event.turnId)) return true;
+        return event.kind === 'user-message' || finalAgentMessageIds.has(event.id);
+      }),
+    [displayEvents, finalAgentMessageIds, summarizedTurnIds],
+  );
+  const turnNavigation = useMemo(() => {
+    return visibleEvents.flatMap((event) => {
+      if (event.kind !== 'user-message' || !event.turnId) return [];
+      const label = eventText(event).replace(/\s+/g, ' ').trim() || 'Задача без текста';
+      return [{ anchorId: `turn-message-${event.id}`, label }];
+    });
+  }, [visibleEvents]);
   const blocks = useMemo(() => {
     const output: Array<
       { type: 'message'; event: SafeEvent } | { type: 'activities'; events: SafeEvent[] }
     > = [];
-    for (const event of displayEvents) {
+    for (const event of visibleEvents) {
       if (event.kind === 'user-message' || event.kind === 'agent-message') {
         output.push({ type: 'message', event });
         continue;
@@ -1503,9 +1537,9 @@ function Transcript({ events }: { events: SafeEvent[] }) {
       }
     }
     return output;
-  }, [displayEvents]);
+  }, [visibleEvents]);
 
-  if (!displayEvents.length) {
+  if (!visibleEvents.length) {
     return (
       <div className="welcome-state">
         <div className="welcome-orb">C</div>
@@ -1516,48 +1550,73 @@ function Transcript({ events }: { events: SafeEvent[] }) {
   }
 
   return (
-    <div className="transcript" aria-live="polite">
-      {blocks.map((block) => {
-        if (block.type === 'message') {
-          const attachments = attachmentsFrom(block.event);
-          const text = eventText(block.event);
-          const finalAnswer = finalAgentMessageIds.has(block.event.id);
-          return (
-            <article
-              className={`message ${block.event.kind === 'user-message' ? 'user' : 'agent'}${finalAnswer ? ' final-answer' : ''}`}
-              key={block.event.id}
-              aria-label={finalAnswer ? 'Итоговый ответ Codex' : undefined}
+    <div className={`transcript-shell${turnNavigation.length > 1 ? ' has-turn-navigation' : ''}`}>
+      {turnNavigation.length > 1 && (
+        <nav className="turn-navigation" aria-label="Переходы по задачам">
+          {turnNavigation.map((turn, index) => (
+            <button
+              className="turn-jump"
+              type="button"
+              key={turn.anchorId}
+              aria-label={`Перейти к задаче ${index + 1}: ${turn.label}`}
+              title={turn.label}
+              data-preview={turn.label}
+              onClick={() => onNavigateTurn(turn.anchorId)}
             >
-              <div className="message-meta">
-                <span className="message-role">
-                  {block.event.kind === 'user-message' ? 'Вы' : 'Codex'}
-                </span>
-                {finalAnswer && (
-                  <span className="final-answer-badge">
-                    <span aria-hidden="true">✓</span> Итоговый ответ
+              <span aria-hidden="true" />
+            </button>
+          ))}
+        </nav>
+      )}
+      <div className="transcript" aria-live="polite">
+        {blocks.map((block) => {
+          if (block.type === 'message') {
+            const attachments = attachmentsFrom(block.event);
+            const text = eventText(block.event);
+            const finalAnswer = finalAgentMessageIds.has(block.event.id);
+            const turnAnchorId =
+              block.event.kind === 'user-message' && block.event.turnId
+                ? `turn-message-${block.event.id}`
+                : undefined;
+            return (
+              <article
+                className={`message ${block.event.kind === 'user-message' ? 'user' : 'agent'}${finalAnswer ? ' final-answer' : ''}`}
+                key={block.event.id}
+                id={turnAnchorId}
+                tabIndex={turnAnchorId ? -1 : undefined}
+                aria-label={finalAnswer ? 'Итоговый ответ Codex' : undefined}
+              >
+                <div className="message-meta">
+                  <span className="message-role">
+                    {block.event.kind === 'user-message' ? 'Вы' : 'Codex'}
                   </span>
-                )}
-                <time className="event-time" dateTime={block.event.createdAt}>
-                  {formatEventDateTime(block.event.createdAt)}
-                </time>
-              </div>
-              {text &&
-                (block.event.kind === 'agent-message' ? (
-                  <AgentMessageContent text={text} />
-                ) : (
-                  <div className="message-text">{text}</div>
-                ))}
-              <AttachmentList attachments={attachments} />
-            </article>
+                  {finalAnswer && (
+                    <span className="final-answer-badge">
+                      <span aria-hidden="true">✓</span> Итоговый ответ
+                    </span>
+                  )}
+                  <time className="event-time" dateTime={block.event.createdAt}>
+                    {formatEventDateTime(block.event.createdAt)}
+                  </time>
+                </div>
+                {text &&
+                  (block.event.kind === 'agent-message' ? (
+                    <AgentMessageContent text={text} />
+                  ) : (
+                    <div className="message-text">{text}</div>
+                  ))}
+                <AttachmentList attachments={attachments} />
+              </article>
+            );
+          }
+          return (
+            <ActivityGroup
+              events={block.events}
+              key={`activities-${block.events[0]?.id ?? 'empty'}`}
+            />
           );
-        }
-        return (
-          <ActivityGroup
-            events={block.events}
-            key={`activities-${block.events[0]?.id ?? 'empty'}`}
-          />
-        );
-      })}
+        })}
+      </div>
     </div>
   );
 }
@@ -2266,6 +2325,16 @@ function Workspace({
     userScrollIntentRef.current = false;
     setShowScrollToLatest(false);
     positionAtLatestImmediately(scroll);
+  }
+
+  function navigateToTurn(anchorId: string): void {
+    const target = document.getElementById(anchorId);
+    if (!target) return;
+    followingLatestRef.current = false;
+    userScrollIntentRef.current = true;
+    setShowScrollToLatest(true);
+    target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    target.focus({ preventScroll: true });
   }
 
   useEffect(() => {
@@ -3213,7 +3282,7 @@ function Workspace({
           onKeyDown={markConversationKeyboardScrollIntent}
         >
           <div className="conversation-content" ref={conversationContentRef}>
-            <Transcript events={events} />
+            <Transcript events={events} onNavigateTurn={navigateToTurn} />
             {approvals.map((approval) => (
               <ApprovalCard
                 key={approval.id}
