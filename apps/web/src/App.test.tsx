@@ -1047,6 +1047,64 @@ describe('App', () => {
     expect(screen.queryByText(/потеряла идентификатор/)).toBeNull();
   });
 
+  it('does not replay a stale active runtime event over an authoritative idle snapshot', async () => {
+    const ambiguousThread = {
+      ...thread,
+      status: 'active' as const,
+      activeTurnId: null,
+      updatedAt: '2026-09-29T00:00:01.000Z',
+    };
+    const terminalSubagents = Array.from({ length: 36 }, (_, index) => ({
+      ...subagents[0]!,
+      id: `terminal-agent-${index}`,
+      status: 'completed' as const,
+      lastActivityAt: '2026-09-29T00:00:02.000Z',
+      completedAt: '2026-09-29T00:00:02.000Z',
+    }));
+    const staleActiveEvent = {
+      id: 41,
+      threadId: 'thread-1',
+      turnId: null,
+      kind: 'thread' as const,
+      phase: 'state' as const,
+      payload: { threadRuntime: { status: 'active', activeTurnId: null } },
+      createdAt: '2026-09-29T00:00:03.000Z',
+    };
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url.includes('/api/threads?')) return jsonResponse([ambiguousThread]);
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({
+          data: thread,
+          events: [staleActiveEvent],
+          eventCursor: staleActiveEvent.id,
+          subagents: terminalSubagents,
+        });
+      if (url === '/api/threads/thread-1/subagents')
+        return jsonResponse({ data: terminalSubagents });
+      if (url === '/api/threads/thread-1/turns' && init?.method === 'POST')
+        return jsonResponse({ data: { turnId: 'turn-after-stale-event' } }, 202);
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText('Готов')).not.toBeNull();
+    expect(screen.queryByText(/Codex работает/)).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Остановить' })).toBeNull();
+
+    const input = await screen.findByLabelText('Сообщение Codex');
+    await user.type(input, 'Продолжить завершённый чат');
+    await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/threads/thread-1/turns',
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    );
+    expect(screen.queryByText(/Не удалось определить активную задачу/)).toBeNull();
+  });
+
   it('does not let an older reconciliation response override a newer active turn event', async () => {
     const ambiguousThread = {
       ...thread,

@@ -837,7 +837,26 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         activeTurnId: current.activeTurnId,
       };
     }
+    const previousThread = repository.getThread(existing.id) ?? existing;
     const thread = repository.upsertThread(mappedThread);
+    if (
+      nativeObservationUnchanged &&
+      (thread.status !== previousThread.status ||
+        thread.activeTurnId !== previousThread.activeTurnId)
+    ) {
+      publish(
+        repository.appendEvent({
+          threadId: thread.id,
+          turnId: thread.activeTurnId,
+          kind: 'thread',
+          phase: 'state',
+          payload: {
+            threadRuntime: threadRuntimePayload(thread.id),
+            appServerReconciled: true,
+          },
+        }),
+      );
+    }
     return { thread, turns: result.thread.turns };
   };
 
@@ -1806,9 +1825,12 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         repository.audit('thread.refresh', 'failed', { threadId: id });
       }
     }
+    const data = repository.getThread(id) ?? thread;
+    const events = repository.listEvents(id, 0);
     return {
-      data: thread,
-      events: repository.listEvents(id, 0),
+      data,
+      events,
+      eventCursor: events.at(-1)?.id ?? 0,
       subagents: repository.listSubagents(id),
     };
   });

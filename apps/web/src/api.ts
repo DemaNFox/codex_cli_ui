@@ -96,6 +96,7 @@ function unwrapData<T>(value: T | { data: T }): T {
 export interface ThreadHistory {
   data: Thread;
   events: SafeEvent[];
+  eventCursor?: number;
   subagents?: Subagent[];
 }
 

@@ -2005,12 +2005,15 @@ function Workspace({
   const { events, streamState, mergeEvents } = useThreadEvents(threadId);
   const latestEvent = events.at(-1) ?? null;
   const latestEventId = latestEvent?.id ?? null;
+  const runtimeSnapshotCursorRef = useRef(0);
 
   const selectedThread = threads.find((item) => item.id === threadId) ?? null;
   const selectedThreadRef = useRef<Thread | null>(selectedThread);
   selectedThreadRef.current = selectedThread;
   const modelOption = models.find((item) => item.id === model) ?? null;
   const lastRuntimeEvent = [...events].reverse().find((event) => threadRuntimeFrom(event) !== null);
+  const lastRuntimeEventRef = useRef<SafeEvent | undefined>(lastRuntimeEvent);
+  lastRuntimeEventRef.current = lastRuntimeEvent;
   const active = selectedThread?.status === 'active';
   const activeTurnId = active ? selectedThread.activeTurnId : null;
   const activeSubagentCount = subagents.filter(
@@ -2236,11 +2239,11 @@ function Workspace({
 
   useEffect(() => {
     if (!lastRuntimeEvent) return;
+    if (lastRuntimeEvent.id <= runtimeSnapshotCursorRef.current) return;
     const runtime = threadRuntimeFrom(lastRuntimeEvent);
     if (!runtime) return;
     const update = (item: Thread) =>
-      item.id === lastRuntimeEvent.threadId &&
-      Date.parse(lastRuntimeEvent.createdAt) >= Date.parse(item.updatedAt)
+      item.id === lastRuntimeEvent.threadId
         ? {
             ...item,
             status: runtime.status,
@@ -2529,12 +2532,14 @@ function Workspace({
     setAttachmentNotice(null);
     setThreadAttachmentBytes(0);
     setSubagents([]);
+    runtimeSnapshotCursorRef.current = 0;
     if (!threadId) return;
     const requestedThreadId = threadId;
     let cancelled = false;
     void Promise.all([api.thread(requestedThreadId), api.attachments(requestedThreadId)])
       .then(([history, attachments]) => {
         if (cancelled) return;
+        runtimeSnapshotCursorRef.current = history.eventCursor ?? history.events.at(-1)?.id ?? 0;
         setThreads((current) =>
           current.map((item) => (item.id === requestedThreadId ? history.data : item)),
         );
@@ -2777,12 +2782,16 @@ function Workspace({
     if (active && !activeTurnId && !subagentsOnlyActive) {
       try {
         const refreshed = await api.thread(threadId);
+        const refreshedEventCursor = refreshed.eventCursor ?? refreshed.events.at(-1)?.id ?? 0;
         const currentSnapshot = selectedThreadRef.current;
+        const currentRuntimeEvent = lastRuntimeEventRef.current;
         const reconciledThread =
           currentSnapshot?.id === threadId &&
-          Date.parse(currentSnapshot.updatedAt) > Date.parse(refreshed.data.updatedAt)
+          currentRuntimeEvent !== undefined &&
+          currentRuntimeEvent.id > refreshedEventCursor
             ? currentSnapshot
             : refreshed.data;
+        runtimeSnapshotCursorRef.current = refreshedEventCursor;
         const refreshedSubagents = refreshed.subagents ?? [];
         const reconciledSubagents = mergeSubagents(
           attachmentThreadRef.current === threadId ? subagentsRef.current : [],
@@ -2792,20 +2801,10 @@ function Workspace({
           (subagent) => subagent.status === 'pendingInit' || subagent.status === 'running',
         ).length;
         setThreads((current) =>
-          current.map((item) =>
-            item.id === threadId &&
-            Date.parse(refreshed.data.updatedAt) >= Date.parse(item.updatedAt)
-              ? refreshed.data
-              : item,
-          ),
+          current.map((item) => (item.id === threadId ? reconciledThread : item)),
         );
         setRecentThreads((current) =>
-          current.map((item) =>
-            item.id === threadId &&
-            Date.parse(refreshed.data.updatedAt) >= Date.parse(item.updatedAt)
-              ? refreshed.data
-              : item,
-          ),
+          current.map((item) => (item.id === threadId ? reconciledThread : item)),
         );
         mergeEvents(refreshed.events, threadId);
         setSubagents(reconciledSubagents);

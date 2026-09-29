@@ -2039,6 +2039,7 @@ describe('Codex routes', () => {
       { id: 'turn-finished', status: 'completed', items: [] },
       { id: 'turn-interrupted', status: 'interrupted', items: [] },
     ]);
+    repository.updateThreadRuntime(threadId, { status: 'active', activeTurnId: null });
     appServer.restart();
 
     const history = await app.inject({
@@ -2052,7 +2053,52 @@ describe('Codex routes', () => {
       status: 'idle',
       activeTurnId: null,
     });
+    const reconciledHistory = history.json<{
+      eventCursor: number;
+      events: Array<{ id: number; payload: Record<string, unknown> }>;
+    }>();
+    expect(reconciledHistory.eventCursor).toBe(reconciledHistory.events.at(-1)?.id);
+    expect(reconciledHistory.events.at(-1)?.payload).toEqual({
+      threadRuntime: { status: 'idle', activeTurnId: null },
+      appServerReconciled: true,
+    });
     expect(repository.getThread(threadId)).toMatchObject({ status: 'idle', activeTurnId: null });
+  });
+
+  it('supersedes a retained active runtime event with the reconciled post-restart snapshot', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    repository.appendEvent({
+      threadId,
+      turnId: null,
+      kind: 'thread',
+      phase: 'state',
+      payload: { threadRuntime: { status: 'active', activeTurnId: null } },
+    });
+    repository.updateThreadRuntime(threadId, { status: 'notLoaded', activeTurnId: null });
+    appServer.setThreadStatus(threadId, 'idle');
+    appServer.restart();
+
+    const history = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(history.statusCode).toBe(200);
+    const body = history.json<{
+      data: Thread;
+      eventCursor: number;
+      events: Array<{ id: number; payload: Record<string, unknown> }>;
+    }>();
+    expect(body.data).toMatchObject({ status: 'idle', activeTurnId: null });
+    expect(body.eventCursor).toBe(body.events.at(-1)?.id);
+    expect(body.events.at(-1)?.payload).toEqual({
+      threadRuntime: { status: 'idle', activeTurnId: null },
+      appServerReconciled: true,
+    });
   });
 
   it('keeps an unknown active root fail-closed without a complete child projection', async () => {
