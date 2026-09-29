@@ -242,7 +242,7 @@ function requestUrl(input: RequestInfo | URL): string {
 }
 
 function installAuthenticatedApi(
-  overrides?: (url: string, init?: RequestInit) => Response | undefined,
+  overrides?: (url: string, init?: RequestInit) => Response | Promise<Response> | undefined,
 ) {
   const fetchMock = vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
     const url = requestUrl(input);
@@ -990,6 +990,197 @@ describe('App', () => {
       ),
     );
     expect(screen.queryByText(/потеряла идентификатор/)).toBeNull();
+  });
+
+  it('reconciles an ambiguous active chat before sending instead of failing locally', async () => {
+    const ambiguousThread = {
+      ...thread,
+      status: 'active' as const,
+      activeTurnId: null,
+      updatedAt: '2026-09-29T00:00:01.000Z',
+    };
+    const reconciledIdleThread = {
+      ...thread,
+      updatedAt: '2026-09-29T00:00:02.000Z',
+    };
+    let historyReads = 0;
+    let resolveReconciliation!: (response: Response) => void;
+    const reconciliation = new Promise<Response>((resolve) => {
+      resolveReconciliation = resolve;
+    });
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url.includes('/api/threads?')) return jsonResponse([ambiguousThread]);
+      if (url === '/api/threads/thread-1') {
+        historyReads += 1;
+        if (historyReads === 1)
+          return jsonResponse({ data: ambiguousThread, events: [], subagents: [] });
+        return reconciliation;
+      }
+      if (url === '/api/threads/thread-1/subagents') return jsonResponse({ data: [] });
+      if (url === '/api/threads/thread-1/turns' && init?.method === 'POST')
+        return jsonResponse({ data: { turnId: 'turn-after-reconcile' } }, 202);
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText(/Codex работает/)).not.toBeNull();
+    const input = await screen.findByLabelText('Сообщение Codex');
+    await user.type(input, 'Продолжить после переподключения');
+    await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
+    await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
+
+    await waitFor(() => expect(historyReads).toBe(2));
+    resolveReconciliation(jsonResponse({ data: reconciledIdleThread, events: [], subagents: [] }));
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/threads/thread-1/turns',
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    );
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input, init]) =>
+          requestUrl(input) === '/api/threads/thread-1/turns' && init?.method === 'POST',
+      ),
+    ).toHaveLength(1);
+    expect(screen.queryByText(/потеряла идентификатор/)).toBeNull();
+  });
+
+  it('does not let an older reconciliation response override a newer active turn event', async () => {
+    const ambiguousThread = {
+      ...thread,
+      status: 'active' as const,
+      activeTurnId: null,
+      updatedAt: '2026-09-29T00:00:01.000Z',
+    };
+    let historyReads = 0;
+    let resolveReconciliation!: (response: Response) => void;
+    const reconciliation = new Promise<Response>((resolve) => {
+      resolveReconciliation = resolve;
+    });
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url.includes('/api/threads?')) return jsonResponse([ambiguousThread]);
+      if (url === '/api/threads/thread-1') {
+        historyReads += 1;
+        if (historyReads === 1)
+          return jsonResponse({ data: ambiguousThread, events: [], subagents: [] });
+        return reconciliation;
+      }
+      if (url === '/api/threads/thread-1/subagents') return jsonResponse({ data: [] });
+      if (url === '/api/threads/thread-1/steer' && init?.method === 'POST')
+        return jsonResponse({ data: { turnId: 'turn-new' } }, 202);
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText(/Codex работает/)).not.toBeNull();
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+    const input = await screen.findByLabelText('Сообщение Codex');
+    await user.type(input, 'Уточнение после нового события');
+    await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
+    await waitFor(() => expect(historyReads).toBe(2));
+
+    act(() =>
+      FakeEventSource.instances.at(-1)?.emit({
+        id: 500,
+        threadId: 'thread-1',
+        turnId: 'turn-new',
+        kind: 'turn',
+        phase: 'started',
+        payload: { threadRuntime: { status: 'active', activeTurnId: 'turn-new' } },
+        createdAt: '2026-09-29T00:00:03.000Z',
+      }),
+    );
+    await screen.findByLabelText('Уточнение для активной задачи');
+    resolveReconciliation(jsonResponse({ data: thread, events: [], subagents: [] }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/threads/thread-1/steer',
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    );
+    const steerCall = fetchMock.mock.calls.find(
+      ([request, init]) =>
+        requestUrl(request) === '/api/threads/thread-1/steer' && init?.method === 'POST',
+    );
+    const steerBody = steerCall?.[1]?.body;
+    expect(typeof steerBody).toBe('string');
+    if (typeof steerBody !== 'string') throw new Error('Expected a serialized steer body');
+    expect(steerBody).toContain('"expectedTurnId":"turn-new"');
+    expect(
+      fetchMock.mock.calls.some(
+        ([request, init]) =>
+          requestUrl(request) === '/api/threads/thread-1/turns' && init?.method === 'POST',
+      ),
+    ).toBe(false);
+  });
+
+  it('keeps a newer running subagent while an older reconciliation response is pending', async () => {
+    const ambiguousThread = {
+      ...thread,
+      status: 'active' as const,
+      activeTurnId: null,
+      updatedAt: '2026-09-29T00:00:01.000Z',
+    };
+    let historyReads = 0;
+    let resolveReconciliation!: (response: Response) => void;
+    const reconciliation = new Promise<Response>((resolve) => {
+      resolveReconciliation = resolve;
+    });
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url.includes('/api/threads?')) return jsonResponse([ambiguousThread]);
+      if (url === '/api/threads/thread-1') {
+        historyReads += 1;
+        if (historyReads === 1)
+          return jsonResponse({ data: ambiguousThread, events: [], subagents: [] });
+        return reconciliation;
+      }
+      if (url === '/api/threads/thread-1/subagents') return jsonResponse({ data: [] });
+      if (url === '/api/threads/thread-1/turns' && init?.method === 'POST')
+        return jsonResponse({ data: { turnId: 'turn-follow-up' } }, 202);
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText(/Codex работает/)).not.toBeNull();
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+    const input = await screen.findByLabelText('Сообщение Codex');
+    await user.type(input, 'Новая задача после дочерней');
+    await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
+    await waitFor(() => expect(historyReads).toBe(2));
+
+    act(() =>
+      FakeEventSource.instances.at(-1)?.emit({
+        id: 501,
+        threadId: 'thread-1',
+        turnId: null,
+        kind: 'subagent',
+        phase: 'state',
+        payload: {
+          subagent: {
+            ...subagents[0],
+            id: 'new-running-child',
+            lastActivityAt: '2026-09-29T00:00:03.000Z',
+          },
+          threadRuntime: { status: 'active', activeTurnId: null },
+        },
+        createdAt: '2026-09-29T00:00:03.000Z',
+      }),
+    );
+    await screen.findByText('Субагенты работают: 1');
+    resolveReconciliation(jsonResponse({ data: thread, events: [], subagents: [] }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/threads/thread-1/turns',
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    );
+    expect(screen.queryByText(/Не удалось определить активную задачу/)).toBeNull();
   });
 
   it('merges thread, REST and SSE subagents monotonically without terminal regression', async () => {

@@ -357,6 +357,16 @@ function statusType(value: z.infer<typeof rpcThreadSchema>['status']): Thread['s
     : 'unknown';
 }
 
+function activeTurnIdFromHistory(turns: unknown): string | null {
+  if (!Array.isArray(turns)) return null;
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = inputRecord(turns[index]);
+    if (turn?.status === 'inProgress' && typeof turn.id === 'string' && turn.id.length > 0)
+      return turn.id;
+  }
+  return null;
+}
+
 function dateFromSeconds(value: number): string {
   return new Date(value * 1_000).toISOString();
 }
@@ -744,18 +754,60 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
     const cwd = await canonicalProjectPath(pathPolicy, project);
     const nativeVersionBeforeRead = nativeActivityVersions.get(existing.id) ?? null;
-    const result = threadResponseSchema.parse(
+    let result = threadResponseSchema.parse(
       await appServer.request('thread/read', { threadId: existing.id, includeTurns }),
     );
     if (result.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
-    const liveActiveTurnId = activeTurnIdForThread(existing.id);
-    const authoritativeStatus = statusType(result.thread.status);
+    let liveActiveTurnId = activeTurnIdForThread(existing.id);
+    let authoritativeStatus = statusType(result.thread.status);
+    if (
+      authoritativeStatus === 'active' &&
+      liveActiveTurnId === null &&
+      !Array.isArray(result.thread.turns)
+    ) {
+      result = threadResponseSchema.parse(
+        await appServer.request('thread/read', { threadId: existing.id, includeTurns: true }),
+      );
+      if (result.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
+      authoritativeStatus = statusType(result.thread.status);
+    }
+    const turnHistoryAvailable = Array.isArray(result.thread.turns);
+    let recoveredTurnId: string | null = null;
+    if (authoritativeStatus === 'active' && liveActiveTurnId === null && turnHistoryAvailable) {
+      recoveredTurnId = activeTurnIdFromHistory(result.thread.turns);
+      if (recoveredTurnId) {
+        liveActiveTurnId = recoveredTurnId;
+      } else if (
+        repository.listSubagents(existing.id).length > 0 &&
+        repository.countActiveSubagentsForRoot(existing.id) === 0
+      ) {
+        const confirmation = threadResponseSchema.parse(
+          await appServer.request('thread/read', { threadId: existing.id, includeTurns: true }),
+        );
+        if (confirmation.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
+        const confirmationTurnId = activeTurnIdFromHistory(confirmation.thread.turns);
+        const stableNativeSnapshot =
+          statusType(confirmation.thread.status) === 'active' &&
+          confirmation.thread.updatedAt === result.thread.updatedAt;
+        result = confirmation;
+        authoritativeStatus = statusType(confirmation.thread.status);
+        if (confirmationTurnId) {
+          recoveredTurnId = confirmationTurnId;
+          liveActiveTurnId = confirmationTurnId;
+        } else if (stableNativeSnapshot) {
+          // `thread/read(includeTurns)` is one native snapshot. Confirm the same terminal
+          // tree twice so a fresh root that materializes between reads wins instead.
+          authoritativeStatus = 'idle';
+        }
+      }
+    }
     const nativeObservationUnchanged =
       (nativeActivityVersions.get(existing.id) ?? null) === nativeVersionBeforeRead;
     if (nativeObservationUnchanged) {
+      if (recoveredTurnId) setActiveTurn(existing.id, recoveredTurnId);
       if (authoritativeStatus === 'active' && liveActiveTurnId === null)
         markNativeActive(existing.id);
-      else if (authoritativeStatus !== 'active') clearNativeActive(existing.id);
+      else clearNativeActive(existing.id);
     }
     const preserveLiveRuntime =
       reconcileTurnId === undefined ||
@@ -763,8 +815,12 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const preserveTreeRuntime =
       reconcileTurnId === undefined && repository.countActiveSubagentsForRoot(existing.id) > 0;
     const preserveNativeRuntime = nativeActiveThreads.has(existing.id);
+    const reconciledRpcThread = {
+      ...result.thread,
+      status: authoritativeStatus === 'unknown' ? result.thread.status : authoritativeStatus,
+    };
     let mappedThread = mapThread(
-      result.thread,
+      reconciledRpcThread,
       project.id,
       existing.archived,
       existing.instructionSources,
@@ -1739,7 +1795,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     let thread = existing;
     if (!repository.isThreadHistoryHydrated(id)) {
       thread = await hydrateThreadHistory(existing);
-    } else if (loadedThreadGenerations.get(id) !== appServer.generation) {
+    } else if (
+      loadedThreadGenerations.get(id) !== appServer.generation ||
+      (existing.status === 'active' && existing.activeTurnId === null)
+    ) {
       try {
         thread = (await readThreadFromAppServer(existing, false)).thread;
       } catch (error) {

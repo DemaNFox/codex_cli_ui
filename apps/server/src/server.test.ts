@@ -88,6 +88,11 @@ class FakeAppServer implements AppServerClient {
     if (thread) thread.status = { type };
   }
 
+  setThreadUpdatedAt(threadId: string, updatedAt: number): void {
+    const thread = this.threads.get(threadId);
+    if (thread) thread.updatedAt = updatedAt;
+  }
+
   setThreadListPageSize(size: number): void {
     this.listPageSize = size;
   }
@@ -203,7 +208,11 @@ class FakeAppServer implements AppServerClient {
       if (this.threadReadGate) await this.threadReadGate;
       this.threadReadGate = null;
       const thread = this.threads.get(String(values.threadId));
-      return { thread, model: thread?.model ?? 'gpt-test', instructionSources: [] };
+      return {
+        thread: thread && values.includeTurns === false ? { ...thread, turns: undefined } : thread,
+        model: thread?.model ?? 'gpt-test',
+        instructionSources: [],
+      };
     }
     if (method === 'thread/resume') {
       const thread = this.threads.get(String(values.threadId));
@@ -1965,6 +1974,178 @@ describe('Codex routes', () => {
     expect(repository.getThread(threadId)).toMatchObject({ status: 'idle', activeTurnId: null });
     expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
       upgradeDrain: { activeTurns: 0 },
+    });
+  });
+
+  it('recovers an active turn id from authoritative history after reconnect', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.setThreadUpdatedAt(threadId, Math.floor(Date.now() / 1_000) + 60);
+    appServer.setThreadStatus(threadId, 'active');
+    appServer.setThreadTurns(threadId, [{ id: 'turn-recovered', status: 'inProgress', items: [] }]);
+    appServer.restart();
+
+    const history = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(history.statusCode).toBe(200);
+    expect(history.json<{ data: Thread }>().data).toMatchObject({
+      status: 'active',
+      activeTurnId: 'turn-recovered',
+    });
+    expect(repository.getThread(threadId)).toMatchObject({
+      status: 'active',
+      activeTurnId: 'turn-recovered',
+    });
+    expect(
+      appServer.requests
+        .filter((request) => request.method === 'thread/read')
+        .slice(-2)
+        .map((request) => request.params),
+    ).toEqual([
+      { threadId, includeTurns: false },
+      { threadId, includeTurns: true },
+    ]);
+  });
+
+  it('clears a stale native active status when every retained turn is terminal', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    repository.upsertSubagent({
+      id: 'terminal-child',
+      rootThreadId: threadId,
+      parentThreadId: threadId,
+      agentPath: '/root/terminal-child',
+      nickname: 'Terminal child',
+      role: null,
+      model: 'gpt-test',
+      reasoningEffort: 'medium',
+      status: 'completed',
+      message: 'done',
+      startedAt: '2026-09-29T00:00:00.000Z',
+      lastActivityAt: '2026-09-29T00:01:00.000Z',
+      completedAt: '2026-09-29T00:01:00.000Z',
+    });
+    appServer.setThreadUpdatedAt(threadId, Date.parse('2026-09-29T00:00:30.000Z') / 1_000);
+    appServer.setThreadStatus(threadId, 'active');
+    appServer.setThreadTurns(threadId, [
+      { id: 'turn-finished', status: 'completed', items: [] },
+      { id: 'turn-interrupted', status: 'interrupted', items: [] },
+    ]);
+    appServer.restart();
+
+    const history = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(history.statusCode).toBe(200);
+    expect(history.json<{ data: Thread }>().data).toMatchObject({
+      status: 'idle',
+      activeTurnId: null,
+    });
+    expect(repository.getThread(threadId)).toMatchObject({ status: 'idle', activeTurnId: null });
+  });
+
+  it('keeps an unknown active root fail-closed without a complete child projection', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.setThreadUpdatedAt(threadId, Math.floor(Date.now() / 1_000) + 60);
+    appServer.setThreadStatus(threadId, 'active');
+    appServer.setThreadTurns(threadId, [{ id: 'turn-previous', status: 'completed', items: [] }]);
+    appServer.restart();
+
+    const history = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(history.statusCode).toBe(200);
+    expect(history.json<{ data: Thread }>().data).toMatchObject({
+      status: 'active',
+      activeTurnId: null,
+    });
+    expect(repository.getThread(threadId)).toMatchObject({ status: 'active', activeTurnId: null });
+  });
+
+  it('recovers a fresh native active turn even when older terminal children remain', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    repository.upsertSubagent({
+      id: 'previous-child',
+      rootThreadId: threadId,
+      parentThreadId: threadId,
+      agentPath: '/root/previous-child',
+      nickname: 'Previous child',
+      role: null,
+      model: 'gpt-test',
+      reasoningEffort: 'medium',
+      status: 'completed',
+      message: 'done',
+      startedAt: '2026-09-29T00:00:00.000Z',
+      lastActivityAt: '2026-09-29T00:01:00.000Z',
+      completedAt: '2026-09-29T00:01:00.000Z',
+    });
+    appServer.setThreadUpdatedAt(threadId, Math.floor(Date.now() / 1_000) + 60);
+    appServer.setThreadStatus(threadId, 'active');
+    appServer.setThreadTurns(threadId, [
+      { id: 'turn-previous', status: 'completed', items: [] },
+      { id: 'turn-fresh', status: 'inProgress', items: [] },
+    ]);
+    appServer.restart();
+
+    const history = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(history.statusCode).toBe(200);
+    expect(history.json<{ data: Thread }>().data).toMatchObject({
+      status: 'active',
+      activeTurnId: 'turn-fresh',
+    });
+  });
+
+  it('does not retain a recovered turn when a newer terminal event wins the read race', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.setThreadStatus(threadId, 'active');
+    appServer.setThreadTurns(threadId, [{ id: 'turn-racing', status: 'inProgress', items: [] }]);
+    appServer.restart();
+    const gate = appServer.blockThreadReads();
+
+    const history = app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    await gate.entered;
+    appServer.emit({
+      method: 'thread/status/changed',
+      params: { threadId, status: { type: 'idle' } },
+    });
+    gate.release();
+
+    expect((await history).statusCode).toBe(200);
+    expect(repository.getThread(threadId)).toMatchObject({ status: 'idle', activeTurnId: null });
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      upgradeDrain: { activeTurns: 0, activeExecutionUnits: 0 },
     });
   });
 

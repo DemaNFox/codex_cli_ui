@@ -1996,6 +1996,9 @@ function Workspace({
   const attachmentThreadRef = useRef<string | null>(null);
   const activeUploadsRef = useRef(new Map<string, { threadId: string; abort: () => void }>());
   const preferencesWriteRef = useRef<Promise<void>>(Promise.resolve());
+  const sendInFlightRef = useRef(false);
+  const subagentsRef = useRef<Subagent[]>(subagents);
+  subagentsRef.current = subagents;
   const [locallyResolvedRequests, setLocallyResolvedRequests] = useState<Set<string>>(
     () => new Set(),
   );
@@ -2004,6 +2007,8 @@ function Workspace({
   const latestEventId = latestEvent?.id ?? null;
 
   const selectedThread = threads.find((item) => item.id === threadId) ?? null;
+  const selectedThreadRef = useRef<Thread | null>(selectedThread);
+  selectedThreadRef.current = selectedThread;
   const modelOption = models.find((item) => item.id === model) ?? null;
   const lastRuntimeEvent = [...events].reverse().find((event) => threadRuntimeFrom(event) !== null);
   const active = selectedThread?.status === 'active';
@@ -2759,24 +2764,86 @@ function Workspace({
       return;
     }
     if (!threadId || archiveView || (!text && !queuedAttachments.length)) return;
+    if (sendInFlightRef.current) return;
+    sendInFlightRef.current = true;
+    setBusy(true);
+    setError(null);
+    const releaseSend = () => {
+      sendInFlightRef.current = false;
+      setBusy(false);
+    };
+    let targetActiveTurnId = activeTurnId;
+    let targetActiveRootTurn = activeRootTurn;
     if (active && !activeTurnId && !subagentsOnlyActive) {
-      setError('Активная задача потеряла идентификатор после переподключения. Обновите чат.');
-      return;
+      try {
+        const refreshed = await api.thread(threadId);
+        const currentSnapshot = selectedThreadRef.current;
+        const reconciledThread =
+          currentSnapshot?.id === threadId &&
+          Date.parse(currentSnapshot.updatedAt) > Date.parse(refreshed.data.updatedAt)
+            ? currentSnapshot
+            : refreshed.data;
+        const refreshedSubagents = refreshed.subagents ?? [];
+        const reconciledSubagents = mergeSubagents(
+          attachmentThreadRef.current === threadId ? subagentsRef.current : [],
+          refreshedSubagents,
+        );
+        const refreshedActiveSubagents = reconciledSubagents.filter(
+          (subagent) => subagent.status === 'pendingInit' || subagent.status === 'running',
+        ).length;
+        setThreads((current) =>
+          current.map((item) =>
+            item.id === threadId &&
+            Date.parse(refreshed.data.updatedAt) >= Date.parse(item.updatedAt)
+              ? refreshed.data
+              : item,
+          ),
+        );
+        setRecentThreads((current) =>
+          current.map((item) =>
+            item.id === threadId &&
+            Date.parse(refreshed.data.updatedAt) >= Date.parse(item.updatedAt)
+              ? refreshed.data
+              : item,
+          ),
+        );
+        mergeEvents(refreshed.events, threadId);
+        setSubagents(reconciledSubagents);
+        targetActiveTurnId = reconciledThread.activeTurnId;
+        targetActiveRootTurn =
+          reconciledThread.status === 'active' && reconciledThread.activeTurnId !== null;
+        const refreshedSubagentsOnlyActive =
+          reconciledThread.status === 'active' &&
+          reconciledThread.activeTurnId === null &&
+          refreshedActiveSubagents > 0;
+        if (
+          reconciledThread.status === 'active' &&
+          !targetActiveTurnId &&
+          !refreshedSubagentsOnlyActive
+        ) {
+          setError('Не удалось определить активную задачу после сверки с Codex. Повторите позже.');
+          releaseSend();
+          return;
+        }
+      } catch (cause) {
+        setError(`Не удалось сверить состояние активной задачи: ${errorMessage(cause)}`);
+        releaseSend();
+        return;
+      }
     }
-    if (activeRootTurn && queuedAttachments.length) {
+    if (targetActiveRootTurn && queuedAttachments.length) {
       setAttachmentNotice(
         'Вложения нельзя отправить во время активной задачи. Дождитесь её завершения или удалите вложения.',
       );
+      releaseSend();
       return;
     }
-    setBusy(true);
-    setError(null);
     setActionNotice(
-      activeRootTurn ? 'Передаём уточнение активной задаче…' : 'Передаём задачу Codex…',
+      targetActiveRootTurn ? 'Передаём уточнение активной задаче…' : 'Передаём задачу Codex…',
     );
     try {
-      if (activeRootTurn && activeTurnId) {
-        await api.steer(session.csrfToken, threadId, text, activeTurnId);
+      if (targetActiveRootTurn && targetActiveTurnId) {
+        await api.steer(session.csrfToken, threadId, text, targetActiveTurnId);
         setActionNotice('Уточнение принято активной задачей.');
       } else {
         const attachments = await uploadQueued(threadId);
@@ -2824,7 +2891,7 @@ function Workspace({
         setError(errorMessage(cause));
       }
     } finally {
-      setBusy(false);
+      releaseSend();
     }
   }
 
