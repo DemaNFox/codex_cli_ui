@@ -79,7 +79,7 @@ export function VoiceInputButton({
 
   async function startRecording(): Promise<void> {
     if (!available) {
-      onError('Голосовой ввод не настроен на сервере.');
+      onError('На сервере не задан API-ключ для расшифровки голоса.');
       return;
     }
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {

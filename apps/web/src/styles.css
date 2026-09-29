@@ -694,6 +694,14 @@ button:disabled {
   width: min(36rem, 88%);
   max-width: 100%;
 }
+.message.agent.final-answer {
+  padding: 0.9rem 1rem 1rem;
+  border: 1px solid rgba(215, 255, 100, 0.3);
+  border-left: 3px solid var(--accent);
+  border-radius: 0.8rem;
+  background: linear-gradient(135deg, rgba(215, 255, 100, 0.075), rgba(20, 24, 28, 0.72));
+  box-shadow: 0 0.75rem 2.5rem rgba(0, 0, 0, 0.14);
+}
 .message-role {
   color: var(--muted);
   font-size: 0.68rem;
@@ -712,6 +720,19 @@ button:disabled {
 }
 .message.user .message-meta {
   justify-content: flex-end;
+}
+.final-answer-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-right: auto;
+  padding: 0.18rem 0.45rem;
+  border-radius: 999px;
+  color: var(--accent);
+  background: rgba(215, 255, 100, 0.1);
+  font-size: 0.68rem;
+  font-weight: 750;
+  letter-spacing: 0.02em;
 }
 .event-time {
   flex: 0 0 auto;

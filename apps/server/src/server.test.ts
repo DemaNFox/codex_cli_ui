@@ -1219,13 +1219,14 @@ describe('Codex routes', () => {
       params: {
         threadId,
         turnId: 'turn-1',
-        item: { type: 'agentMessage', text: `read ${privatePath}` },
+        item: { type: 'agentMessage', phase: 'final_answer', text: `read ${privatePath}` },
       },
     });
     const agentEvent = repository
       .listEvents(threadId, 0)
       .find((event) => event.kind === 'agent-message')!;
     expect(agentEvent.phase).toBe('completed');
+    expect(agentEvent.payload.messagePhase).toBe('final_answer');
     expect(JSON.stringify(agentEvent)).not.toContain(privatePath);
     expect(JSON.stringify(agentEvent)).toContain('[attachment-storage]');
     const hydrated = normalizeThreadHistory(
@@ -1665,6 +1666,7 @@ describe('Codex routes', () => {
           {
             id: 'agent',
             type: 'agentMessage',
+            phase: 'final_answer',
             text: `safe answer from ${attachmentStore.root}/private-file.txt`,
           },
           { id: 'plan', type: 'plan', text: 'public plan' },
@@ -1721,6 +1723,7 @@ describe('Codex routes', () => {
       'turn',
     ]);
     expect(first.body).toContain('public reasoning summary');
+    expect(first.body).toContain('final_answer');
     expect(first.body).toContain('src/safe.ts');
     expect(first.body).not.toContain('hidden chain of thought');
     expect(first.body).not.toContain('raw diff');

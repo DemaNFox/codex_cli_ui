@@ -83,7 +83,18 @@ function normalizeItem(
   }
 
   if (item.type === 'agentMessage' && typeof item.text === 'string') {
-    return textEvent(threadId, turnId, 'agent-message', 'text', item.text, maxBytes);
+    const messagePhase =
+      item.phase === 'commentary' || item.phase === 'final_answer' ? item.phase : null;
+    return {
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: sanitizeEventPayload(
+        { text: item.text, ...(messagePhase ? { messagePhase } : {}) },
+        maxBytes,
+      ),
+    };
   }
 
   if (item.type === 'plan' && typeof item.text === 'string') {

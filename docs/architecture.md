@@ -47,6 +47,10 @@ Browser
 - Completed agent messages are rendered as sanitized GitHub-flavored Markdown. Raw HTML is disabled, links
   receive safe navigation attributes and wide tables scroll inside their own mobile-safe container; model
   output is never executed as JavaScript.
+- The public event projection preserves only the bounded `commentary`/`final_answer` phase of completed agent
+  messages. The transcript gives `final_answer` a labelled visual boundary while commentary remains visually
+  neutral. For journal entries created before this phase was persisted, the last phase-less agent message of
+  a successfully completed turn is treated as the compatibility final; explicit commentary is never promoted.
 
 ## Voice transcription
 

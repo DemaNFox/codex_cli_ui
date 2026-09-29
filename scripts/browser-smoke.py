@@ -304,11 +304,23 @@ def main() -> int:
                                     "| Контур | Состояние |\n| --- | --- |\n| Web | Готово |"
                                     if index == 1
                                     else f"Историческое сообщение {index}: длинный чат остаётся прокручиваемым."
-                                )
+                                ),
+                                **({"messagePhase": "final_answer"} if index == 48 else {}),
                             },
                             "createdAt": "2026-09-27T11:59:00.000Z",
                         }
                         for index in range(1, 49)
+                    ]
+                    + [
+                        {
+                            "id": 49,
+                            "threadId": "t1",
+                            "turnId": "history-48",
+                            "kind": "turn",
+                            "phase": "completed",
+                            "payload": {"status": "completed"},
+                            "createdAt": "2026-09-27T11:59:01.000Z",
+                        }
                     ],
                 },
             )
@@ -693,6 +705,10 @@ def main() -> int:
             raise AssertionError("thread lifecycle noise is still rendered")
         if page.get_by_text("Использует инструмент").count():
             raise AssertionError("completed tool lifecycle was not collapsed")
+        final_answer = page.get_by_role("article", name="Итоговый ответ Codex")
+        final_answer.wait_for()
+        if final_answer.count() != 1 or "Итоговый ответ" not in final_answer.inner_text():
+            raise AssertionError("completed Codex answer is not visually identified as final")
         activity_group = page.get_by_role("region", name="Ход работы: 6 действий")
         activity_group.wait_for()
         if activity_group.locator(".activity-row").count() != 3:

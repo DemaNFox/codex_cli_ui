@@ -309,12 +309,17 @@ function completedAgentMessage(
     typeof item.text !== 'string'
   )
     return null;
+  const messagePhase =
+    item.phase === 'commentary' || item.phase === 'final_answer' ? item.phase : null;
   return {
     threadId: params.threadId,
     turnId: params.turnId,
     kind: 'agent-message',
     phase: 'completed',
-    payload: sanitizeEventPayload({ text: item.text }, maxBytes),
+    payload: sanitizeEventPayload(
+      { text: item.text, ...(messagePhase ? { messagePhase } : {}) },
+      maxBytes,
+    ),
   };
 }
 

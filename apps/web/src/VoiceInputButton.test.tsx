@@ -88,7 +88,7 @@ describe('VoiceInputButton', () => {
     );
 
     await user.click(screen.getByRole('button', { name: 'Голосовой ввод' }));
-    expect(onError).toHaveBeenCalledWith('Голосовой ввод не настроен на сервере.');
+    expect(onError).toHaveBeenCalledWith('На сервере не задан API-ключ для расшифровки голоса.');
   });
 
   it('releases the microphone when MediaRecorder cannot start', async () => {

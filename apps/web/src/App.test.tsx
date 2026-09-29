@@ -635,6 +635,77 @@ describe('App', () => {
     expect(source?.close).toHaveBeenCalledOnce();
   });
 
+  it('visually distinguishes final answers from commentary and legacy completed turns', async () => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Промежуточный статус', messagePhase: 'commentary' },
+        createdAt: '2026-09-27T10:01:00.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Подтверждённый итог', messagePhase: 'final_answer' },
+        createdAt: '2026-09-27T10:02:00.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T10:02:01.000Z',
+      },
+      {
+        id: 4,
+        threadId: 'thread-1',
+        turnId: 'legacy-turn',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Старый итог без фазы' },
+        createdAt: '2026-09-27T10:03:00.000Z',
+      },
+      {
+        id: 5,
+        threadId: 'thread-1',
+        turnId: 'legacy-turn',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T10:03:01.000Z',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const finalAnswers = await screen.findAllByRole('article', { name: 'Итоговый ответ Codex' });
+    const final = finalAnswers.find((article) =>
+      article.textContent?.includes('Подтверждённый итог'),
+    );
+    if (!final) throw new Error('explicit final answer was not rendered');
+    expect(final.textContent).toContain('Подтверждённый итог');
+    expect(final.textContent).toContain('Итоговый ответ');
+    expect(screen.getByText('Промежуточный статус').closest('article')?.classList).not.toContain(
+      'final-answer',
+    );
+    expect(screen.getByText('Старый итог без фазы').closest('article')?.classList).toContain(
+      'final-answer',
+    );
+    expect(finalAnswers).toHaveLength(2);
+  });
+
   it('offers a scroll-to-latest control when new events arrive below the viewport', async () => {
     const initialEvent = {
       id: 1,

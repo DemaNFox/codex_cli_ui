@@ -394,6 +394,31 @@ function eventText(event: SafeEvent): string {
   return `${event.kind}: ${event.phase}`;
 }
 
+function agentMessagePhase(event: SafeEvent): 'commentary' | 'final_answer' | null {
+  if (event.kind !== 'agent-message') return null;
+  const phase = event.payload.messagePhase;
+  return phase === 'commentary' || phase === 'final_answer' ? phase : null;
+}
+
+function successfullyCompletedTurnIds(events: readonly SafeEvent[]): Set<string> {
+  const completed = new Set<string>();
+  for (const event of events) {
+    if (event.kind !== 'turn' || event.phase !== 'completed' || !event.turnId) continue;
+    const nestedTurn =
+      event.payload.turn && typeof event.payload.turn === 'object'
+        ? (event.payload.turn as Record<string, unknown>)
+        : null;
+    const status =
+      typeof event.payload.status === 'string'
+        ? event.payload.status
+        : typeof nestedTurn?.status === 'string'
+          ? nestedTurn.status
+          : null;
+    if (status !== 'failed' && status !== 'interrupted') completed.add(event.turnId);
+  }
+  return completed;
+}
+
 function eventTitle(event: SafeEvent): string {
   if (event.kind === 'turn' && event.payload.status === 'interruptRequested')
     return 'Остановка запрошена';
@@ -1446,6 +1471,21 @@ function Transcript({ events }: { events: SafeEvent[] }) {
     }
     return output;
   }, [events]);
+  const finalAgentMessageIds = useMemo(() => {
+    const result = new Set<number>();
+    const legacyCandidates = new Map<string, number>();
+    const completedTurns = successfullyCompletedTurnIds(events);
+    for (const event of displayEvents) {
+      if (event.kind !== 'agent-message' || event.phase !== 'completed') continue;
+      const messagePhase = agentMessagePhase(event);
+      if (messagePhase === 'final_answer') result.add(event.id);
+      if (messagePhase === null && event.turnId && completedTurns.has(event.turnId)) {
+        legacyCandidates.set(event.turnId, event.id);
+      }
+    }
+    for (const id of legacyCandidates.values()) result.add(id);
+    return result;
+  }, [displayEvents, events]);
   const blocks = useMemo(() => {
     const output: Array<
       { type: 'message'; event: SafeEvent } | { type: 'activities'; events: SafeEvent[] }
@@ -1481,15 +1521,22 @@ function Transcript({ events }: { events: SafeEvent[] }) {
         if (block.type === 'message') {
           const attachments = attachmentsFrom(block.event);
           const text = eventText(block.event);
+          const finalAnswer = finalAgentMessageIds.has(block.event.id);
           return (
             <article
-              className={`message ${block.event.kind === 'user-message' ? 'user' : 'agent'}`}
+              className={`message ${block.event.kind === 'user-message' ? 'user' : 'agent'}${finalAnswer ? ' final-answer' : ''}`}
               key={block.event.id}
+              aria-label={finalAnswer ? 'Итоговый ответ Codex' : undefined}
             >
               <div className="message-meta">
                 <span className="message-role">
                   {block.event.kind === 'user-message' ? 'Вы' : 'Codex'}
                 </span>
+                {finalAnswer && (
+                  <span className="final-answer-badge">
+                    <span aria-hidden="true">✓</span> Итоговый ответ
+                  </span>
+                )}
                 <time className="event-time" dateTime={block.event.createdAt}>
                   {formatEventDateTime(block.event.createdAt)}
                 </time>
