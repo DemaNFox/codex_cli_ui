@@ -6,8 +6,9 @@ The service keeps Codex on the server and provides projects, durable chats, stre
 interactive questions, one-turn permission grants, model/reasoning selection, interruption and continuation
 from any browser. Images and common project files can be attached to a turn by selecting, pasting or dropping
 them into the composer; image analysis is delegated to Codex and stored uploads remain inside the bounded
-application state. Agent messages render safe GitHub-flavored Markdown, including responsive tables and code
-blocks, while raw HTML remains inert. An optional microphone control records a bounded clip in the browser,
+application state. Relative file links in Codex answers download generated files from the registered project
+through an authenticated, traversal-safe route. Agent messages render safe GitHub-flavored Markdown, including
+responsive tables and code blocks, while raw HTML remains inert. An optional microphone control records a bounded clip in the browser,
 transcribes it through the server and places the resulting text in the composer for review before sending.
 It uses the official Codex app-server protocol over local stdio; the app-server transport
 is never exposed publicly.

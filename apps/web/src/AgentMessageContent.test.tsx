@@ -57,6 +57,7 @@ describe('AgentMessageContent', () => {
         text={
           '[External](https://example.com/path) [Internal](/projects/one) [Unsafe](javascript:alert(1))'
         }
+        threadId="thread-1"
       />,
     );
 
@@ -70,5 +71,24 @@ describe('AgentMessageContent', () => {
     expect(internal.getAttribute('target')).toBeNull();
 
     expect(screen.getByText('Unsafe').closest('a')).toBeNull();
+  });
+
+  it('turns relative result links into authenticated project-file downloads', () => {
+    render(
+      <AgentMessageContent
+        text={
+          '[Скачать отчёт](reports/%D0%B8%D1%82%D0%BE%D0%B3%D0%BE%D0%B2%D1%8B%D0%B9%20%D0%B0%D1%83%D0%B4%D0%B8%D1%82.md) [Раздел](#summary)'
+        }
+        threadId="thread-1"
+      />,
+    );
+
+    const download = screen.getByRole('link', { name: 'Скачать отчёт' });
+    expect(download.getAttribute('href')).toBe(
+      '/api/threads/thread-1/project-files/download?path=reports%2F%D0%B8%D1%82%D0%BE%D0%B3%D0%BE%D0%B2%D1%8B%D0%B9%20%D0%B0%D1%83%D0%B4%D0%B8%D1%82.md',
+    );
+    expect(download.getAttribute('download')).toBe('итоговый аудит.md');
+    expect(download.getAttribute('title')).toBe('Скачать файл из проекта');
+    expect(screen.getByRole('link', { name: 'Раздел' }).getAttribute('href')).toBe('#summary');
   });
 });

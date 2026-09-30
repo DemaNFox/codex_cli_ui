@@ -1104,6 +1104,61 @@ describe('Codex routes', () => {
     expect(deleted.statusCode).toBe(204);
   });
 
+  it('downloads generated project files without allowing traversal outside the selected project', async () => {
+    const { app, projectPath, root } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const reports = path.join(projectPath, 'reports');
+    await mkdir(reports);
+    await writeFile(path.join(reports, 'итоговый аудит.md'), '# Готово\n', 'utf8');
+    await writeFile(path.join(root, 'outside.md'), 'outside', 'utf8');
+    await symlink(path.join(root, 'outside.md'), path.join(projectPath, 'outside-link.md'), 'file');
+
+    const url = `/api/threads/${threadId}/project-files/download?path=${encodeURIComponent('reports/итоговый аудит.md')}`;
+    const unauthenticated = await app.inject({ method: 'GET', url });
+    expect(unauthenticated.statusCode).toBe(401);
+
+    const downloaded = await app.inject({
+      method: 'GET',
+      url,
+      headers: { cookie: session.cookie },
+    });
+    expect(downloaded.statusCode).toBe(200);
+    expect(downloaded.body).toBe('# Готово\n');
+    expect(downloaded.headers['content-type']).toBe('application/octet-stream');
+    expect(downloaded.headers['content-disposition']).toContain(
+      "filename*=UTF-8''%D0%B8%D1%82%D0%BE%D0%B3%D0%BE%D0%B2%D1%8B%D0%B9%20%D0%B0%D1%83%D0%B4%D0%B8%D1%82.md",
+    );
+    expect(downloaded.headers['x-content-type-options']).toBe('nosniff');
+
+    const traversal = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/project-files/download?path=${encodeURIComponent('../outside.md')}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(traversal.statusCode).toBe(404);
+    expect(traversal.json()).toMatchObject({ error: { code: 'PROJECT_FILE_NOT_FOUND' } });
+
+    const symlinkEscape = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/project-files/download?path=outside-link.md`,
+      headers: { cookie: session.cookie },
+    });
+    expect(symlinkEscape.statusCode).toBe(404);
+    expect(symlinkEscape.json()).toMatchObject({
+      error: { code: 'PROJECT_FILE_NOT_FOUND' },
+    });
+
+    const absolute = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/project-files/download?path=${encodeURIComponent(path.join(root, 'outside.md'))}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(absolute.statusCode).toBe(400);
+    expect(absolute.json()).toMatchObject({ error: { code: 'PROJECT_FILE_PATH_INVALID' } });
+  });
+
   it('keeps attachment metadata retryable when filesystem deletion fails', async () => {
     const { app, repository, attachmentStore, projectPath } = await fixture(
       2,

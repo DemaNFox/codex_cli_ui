@@ -858,6 +858,13 @@ button:disabled {
   color: #83b9ff;
   overflow-wrap: anywhere;
 }
+.markdown-content a.generated-file-link::after {
+  margin-left: 0.28rem;
+  content: '↓';
+  color: var(--accent);
+  font-size: 0.82em;
+  font-weight: 800;
+}
 .markdown-content :not(pre) > code {
   padding: 0.12em 0.32em;
   border-radius: 0.3rem;

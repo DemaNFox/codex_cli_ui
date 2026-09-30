@@ -1601,7 +1601,7 @@ function Transcript({
                 </div>
                 {text &&
                   (block.event.kind === 'agent-message' ? (
-                    <AgentMessageContent text={text} />
+                    <AgentMessageContent text={text} threadId={block.event.threadId} />
                   ) : (
                     <div className="message-text">{text}</div>
                   ))}

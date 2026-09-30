@@ -55,6 +55,10 @@ Browser
   and final answer but hides commentary and execution activity. Active, failed, interrupted or final-less
   turns retain their progress and diagnostic events. A compact prompt-derived turn rail navigates between
   calls without changing server state; on narrow screens the same rail becomes horizontally scrollable.
+- Relative Markdown links emitted by Codex are presented as generated project-file downloads. The authenticated
+  download route resolves the requested file against the thread's registered canonical project directory,
+  rejects absolute paths, traversal, symlink escape, directories and files above 100 MiB, and always serves an
+  attachment with `nosniff`. External, root-relative and fragment links retain their normal link behavior.
 
 ## Voice transcription
 

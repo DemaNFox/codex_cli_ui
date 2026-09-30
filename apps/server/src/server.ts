@@ -33,7 +33,9 @@ import {
 import cookie from '@fastify/cookie';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
 import { createHash } from 'node:crypto';
-import { lstatSync } from 'node:fs';
+import { createReadStream, lstatSync } from 'node:fs';
+import { realpath, stat } from 'node:fs/promises';
+import path from 'node:path';
 import { z } from 'zod';
 
 import type { AppServerClient, AppServerInbound } from './app-server.js';
@@ -84,6 +86,8 @@ const attachmentParamsSchema = z.object({
   id: z.string().min(1).max(200),
   attachmentId: z.string().uuid(),
 });
+const projectFileQuerySchema = z.object({ path: z.string().min(1).max(4_096) });
+const MAX_PROJECT_FILE_DOWNLOAD_BYTES = 100 * 1_024 * 1_024;
 const projectPatchSchema = z
   .object({
     name: z.string().trim().min(1).max(120).optional(),
@@ -334,6 +338,43 @@ function terminalPushStatus(message: AppServerInbound): PushNotificationPayload[
 function safeContentDisposition(name: string, inline: boolean): string {
   const encoded = encodeURIComponent(name).replaceAll("'", '%27');
   return `${inline ? 'inline' : 'attachment'}; filename="attachment"; filename*=UTF-8''${encoded}`;
+}
+
+function pathIsInside(root: string, candidate: string): boolean {
+  const relative = path.relative(root, candidate);
+  return (
+    relative === '' ||
+    (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))
+  );
+}
+
+async function downloadableProjectFile(
+  projectRoot: string,
+  requestedPath: string,
+): Promise<{ canonical: string; name: string; size: number }> {
+  if (
+    requestedPath.includes('\0') ||
+    path.posix.isAbsolute(requestedPath) ||
+    path.win32.isAbsolute(requestedPath)
+  )
+    throw new HttpError(400, 'PROJECT_FILE_PATH_INVALID');
+  let canonical: string;
+  try {
+    canonical = await realpath(path.resolve(projectRoot, requestedPath));
+  } catch {
+    throw new HttpError(404, 'PROJECT_FILE_NOT_FOUND');
+  }
+  if (!pathIsInside(projectRoot, canonical)) throw new HttpError(404, 'PROJECT_FILE_NOT_FOUND');
+  let metadata: Awaited<ReturnType<typeof stat>>;
+  try {
+    metadata = await stat(canonical);
+  } catch {
+    throw new HttpError(404, 'PROJECT_FILE_NOT_FOUND');
+  }
+  if (!metadata.isFile()) throw new HttpError(400, 'PROJECT_FILE_NOT_DOWNLOADABLE');
+  if (metadata.size > MAX_PROJECT_FILE_DOWNLOAD_BYTES)
+    throw new HttpError(413, 'PROJECT_FILE_TOO_LARGE');
+  return { canonical, name: path.basename(canonical), size: metadata.size };
 }
 
 function redactAttachmentStorage(value: unknown, storageRoot: string): unknown {
@@ -1948,6 +1989,26 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const id = parseId(request);
     if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
     return { data: repository.listAttachments(id).map(publicAttachment) };
+  });
+
+  app.get('/api/threads/:id/project-files/download', async (request, reply) => {
+    auth.authenticate(request);
+    const id = parseId(request);
+    const query = projectFileQuerySchema.parse(request.query);
+    const thread = repository.getThread(id);
+    if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    const project = repository.getProject(thread.projectId);
+    if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+    const projectRoot = await canonicalProjectPath(pathPolicy, project);
+    const file = await downloadableProjectFile(projectRoot, query.path);
+    repository.audit('project-file.download', 'succeeded', {
+      threadId: id,
+      size: file.size,
+    });
+    reply.header('Content-Type', 'application/octet-stream');
+    reply.header('Content-Length', String(file.size));
+    reply.header('Content-Disposition', safeContentDisposition(file.name, false));
+    return reply.send(createReadStream(file.canonical));
   });
 
   const requirePushThread = (request: FastifyRequest): string => {
