@@ -49,6 +49,8 @@ mkdir -p "$output/infra/systemd" "$output/scripts"
 for unit in \
   codex-web-ui-resource-broker.socket \
   codex-web-ui-resource-broker@.service \
+  codex-web-ui-project-path-broker.socket \
+  codex-web-ui-project-path-broker@.service \
   codex-web-ui-codex-update-broker.socket \
   codex-web-ui-codex-update-broker@.service \
   codex-web-ui-codex-update.service \
@@ -56,6 +58,7 @@ for unit in \
   cp -a "infra/systemd/$unit" "$output/infra/systemd/$unit"
 done
 cp -a scripts/resource-broker.py "$output/scripts/resource-broker.py"
+cp -a scripts/project-path-broker.py "$output/scripts/project-path-broker.py"
 cp -a scripts/codex-update-broker.py "$output/scripts/codex-update-broker.py"
 cp -a scripts/codex-update-worker.sh "$output/scripts/codex-update-worker.sh"
 cp -a scripts/stage-codex-update.sh "$output/scripts/stage-codex-update.sh"
@@ -64,6 +67,7 @@ cp -a scripts/stage-codex-update.sh "$output/scripts/stage-codex-update.sh"
 [[ -f $output/apps/web/dist/index.html ]]
 [[ -f $output/infra/systemd/codex-web-ui-workload.slice ]]
 [[ -x $output/scripts/resource-broker.py ]]
+[[ -x $output/scripts/project-path-broker.py ]]
 [[ -x $output/scripts/codex-update-broker.py ]]
 [[ -x $output/scripts/codex-update-worker.sh ]]
 [[ -x $output/scripts/stage-codex-update.sh ]]

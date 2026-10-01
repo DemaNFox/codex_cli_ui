@@ -5,13 +5,19 @@ import { UnixCodexUpdateBrokerClient } from './codex-update-broker.js';
 import { loadConfig } from './config.js';
 import { SqliteRepository } from './database.js';
 import { ProjectPathPolicy } from './path-policy.js';
+import { UnixProjectPathBrokerClient } from './project-path-broker.js';
 import { WebPushSender } from './push-notifications.js';
 import { UnixResourceBrokerClient } from './resource-broker.js';
 import { buildServer } from './server.js';
 
 const config = loadConfig();
 const repository = new SqliteRepository(config.databasePath, config.eventRetentionPerThread);
-const pathPolicy = await ProjectPathPolicy.create(config.projectRoots);
+const pathPolicy = await ProjectPathPolicy.create(
+  config.projectRoots,
+  config.projectPathBrokerSocket
+    ? new UnixProjectPathBrokerClient(config.projectPathBrokerSocket)
+    : undefined,
+);
 const appServer = config.appServerSocket
   ? new CodexAppServerSocketClient({ socketPath: config.appServerSocket })
   : new CodexAppServerSupervisor({

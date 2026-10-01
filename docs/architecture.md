@@ -121,6 +121,13 @@ broker is not part of a Codex permission preset: it is a separate root-owned, so
 that accepts only `status` and `apply` for one fixed, operator-staged release. Neither the browser nor the API
 can supply a URL, filesystem path, package name, version, systemd unit or shell command.
 
+Because the non-root API cannot traverse every valid host-admin project (notably `0700` paths below `/root`),
+host-admin installs also use a separate read-only project-path broker. Its private socket accepts only an exact
+canonicalization request from the API service identity. The broker reads the root-owned project allowlist,
+opens the candidate without reading file content, resolves symlinks, checks stable inode identity, type and
+canonical containment, and returns only the canonical path or a coarse error. It has no write path and is not
+combined with the resource or update brokers.
+
 ## Portability
 
 All executable source, database migrations, protocol snapshots, service templates, installer scripts and
@@ -137,6 +144,9 @@ content. It tells Codex that the Web UI runner is already executing on the physi
 local commands instead of SSHing to a loopback, current-hostname or same-host address. An explicit migration to
 host-admin drains work, preserves SQLite, copies the complete Codex home without merging profiles, keeps a
 root-only rollback source until health succeeds and then changes only the app-server runner identity/unit.
+Host-admin installation stores the canonical project allowlist separately for the path broker and enables that
+broker before the API starts; restricted mode continues validating paths directly as its own runner-visible
+roots.
 
 Deployment secrets are kept in a root-owned `0600` environment file. systemd
 loads it before changing to the unprivileged service identity, so the service

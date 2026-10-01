@@ -137,6 +137,10 @@ activation.
 - Each allowed project root and `CODEX_HOME` is an existing canonical directory. Restricted mode rejects
   overlap and broad protected roots, then grants write access only to those paths. Host-admin may register `/`
   and intentionally has whole-host access.
+- In host-admin mode the API remains non-root and therefore delegates only project-path canonicalization to
+  `codex-web-ui-project-path-broker.socket`. The root broker reads `/etc/codex-web-ui/project-roots` (root-owned
+  mode `0600`), validates the API peer and candidate inode/type/containment, and exposes no file-content,
+  directory-listing, write or caller-supplied policy operation. Restricted mode does not enable this broker.
 - `/api/health` returns a 2xx response on the configured loopback listener.
 - `/etc/codex-web-ui/codex-web-ui.env` is a regular, non-symlink file owned by
   `root:root` with mode `0600`. The systemd manager reads `EnvironmentFile=`

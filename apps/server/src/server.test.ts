@@ -776,6 +776,14 @@ describe('security and repository boundary', () => {
     expect(
       loadConfig({
         ...environment,
+        CODEX_WEB_PROJECT_PATH_BROKER_SOCKET: '/run/codex-web-ui/project-path-broker.sock',
+      }),
+    ).toMatchObject({
+      projectPathBrokerSocket: '/run/codex-web-ui/project-path-broker.sock',
+    });
+    expect(
+      loadConfig({
+        ...environment,
         CODEX_WEB_VAPID_PUBLIC_KEY: 'A'.repeat(64),
         CODEX_WEB_VAPID_PRIVATE_KEY: 'B'.repeat(64),
         CODEX_WEB_VAPID_SUBJECT: 'mailto:owner@codex.test',
@@ -911,6 +919,23 @@ describe('security and repository boundary', () => {
     await expect(policy.canonicalize(path.dirname(root))).rejects.toMatchObject({
       code: 'PATH_OUTSIDE_ROOTS',
     });
+  });
+
+  it('delegates canonicalization for host-admin paths the API identity cannot traverse', async () => {
+    const requests: Array<{ candidate: string; kind: 'existing' | 'directory' }> = [];
+    const policy = await ProjectPathPolicy.create(['/'], {
+      async canonicalize(candidate, kind) {
+        requests.push({ candidate, kind });
+        return candidate;
+      },
+    });
+    await expect(policy.canonicalize('/root/private-project')).resolves.toBe(
+      '/root/private-project',
+    );
+    expect(requests).toEqual([
+      { candidate: '/', kind: 'directory' },
+      { candidate: '/root/private-project', kind: 'directory' },
+    ]);
   });
 });
 

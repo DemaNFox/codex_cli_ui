@@ -1,0 +1,38 @@
+[Unit]
+Description=Codex Web UI privileged project path broker request
+
+[Service]
+Type=exec
+User=root
+Slice=system.slice
+ExecStart=/usr/local/libexec/codex-web-ui-project-path-broker --serve-fd 0
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+SyslogIdentifier=codex-web-ui-project-path-broker
+TimeoutStartSec=10s
+TimeoutStopSec=5s
+UMask=0077
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+ProtectSystem=strict
+ReadOnlyPaths=/
+InaccessiblePaths=-/etc/codex-web-ui/codex-web-ui.env -/etc/codex-web-ui/codex-runner.env -/var/lib/codex-web-ui/data -/var/lib/codex-web-ui/codex-home -/root/.codex -/run/docker.sock -/run/containerd
+ProtectHome=read-only
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+RestrictAddressFamilies=AF_UNIX

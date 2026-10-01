@@ -79,6 +79,7 @@ import {
   validateUserInputAnswers,
 } from './interaction-normalizer.js';
 import type { ProjectPathPolicy } from './path-policy.js';
+import { ProjectPathBrokerError } from './project-path-broker.js';
 import {
   PushNotificationDispatcher,
   isAllowedPushEndpoint,
@@ -594,7 +595,8 @@ async function canonicalProjectPath(
   let canonical: string;
   try {
     canonical = await pathPolicy.canonicalize(project.path);
-  } catch {
+  } catch (error) {
+    if (error instanceof ProjectPathBrokerError) throw error;
     throw new HttpError(409, 'PROJECT_PATH_NO_LONGER_ALLOWED');
   }
   if (canonical !== project.path) throw new HttpError(409, 'PROJECT_PATH_CHANGED');
@@ -1680,6 +1682,12 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       void reply
         .code(400)
         .send({ error: { code: 'INVALID_REQUEST', message: 'Request validation failed' } });
+      return;
+    }
+    if (error instanceof ProjectPathBrokerError) {
+      void reply.code(503).send({
+        error: { code: error.code, message: 'Project path validation is unavailable' },
+      });
       return;
     }
     if ('statusCode' in error && error.statusCode === 413) {

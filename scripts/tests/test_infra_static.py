@@ -309,7 +309,7 @@ class InfraStaticTest(unittest.TestCase):
     def test_legacy_single_service_adoption_rewrites_only_runtime_boundary(self) -> None:
         installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
         command = installer.index(
-            "PROJECT_ROOTS=$roots_csv LEGACY_ADOPTION=$legacy_single_service python3"
+            "PROJECT_ROOTS=$roots_csv LEGACY_ADOPTION=$legacy_single_service RUNNER_MODE=$runner_mode python3"
         )
         body_start = installer.index("\n", command) + 1
         body_end = installer.index("\nPY\n", body_start)
@@ -342,6 +342,7 @@ class InfraStaticTest(unittest.TestCase):
                     "VERSION_PIN": "codex-cli 0.153.4",
                     "PROJECT_ROOTS": "/srv/codex-projects",
                     "LEGACY_ADOPTION": "true",
+                    "RUNNER_MODE": "restricted",
                 }
             )
             result = subprocess.run(
@@ -371,6 +372,7 @@ class InfraStaticTest(unittest.TestCase):
                     "CONFIG_DESTINATION": str(source),
                     "PROJECT_ROOTS": "/",
                     "LEGACY_ADOPTION": "false",
+                    "RUNNER_MODE": "host-admin",
                 }
             )
             result = subprocess.run(
@@ -382,6 +384,10 @@ class InfraStaticTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("CODEX_WEB_PROJECT_ROOTS=/\n", source.read_text(encoding="utf-8"))
+            self.assertIn(
+                "CODEX_WEB_PROJECT_PATH_BROKER_SOCKET=/run/codex-web-ui/project-path-broker.sock",
+                source.read_text(encoding="utf-8"),
+            )
 
     def test_candidate_protocol_accepts_untracked_split_schema_files(self) -> None:
         installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
@@ -545,6 +551,8 @@ class InfraStaticTest(unittest.TestCase):
             "codex-web-ui-app-server.socket",
             "codex-web-ui-resource-broker.socket",
             "codex-web-ui-resource-broker@.service",
+            "codex-web-ui-project-path-broker.socket",
+            "codex-web-ui-project-path-broker@.service",
             "codex-web-ui-workload.slice",
             "codex-web-ui-resource-broker --initialize",
             "changing the runner user requires an explicit migration workflow",
@@ -650,6 +658,11 @@ class InfraStaticTest(unittest.TestCase):
             "/etc/systemd/system/codex-web-ui-resource-broker@.service",
             "/etc/systemd/system/codex-web-ui-workload.slice",
             "/usr/local/libexec/codex-web-ui-resource-broker",
+            "/etc/systemd/system/codex-web-ui-project-path-broker.socket",
+            "/etc/systemd/system/codex-web-ui-project-path-broker@.service",
+            "/usr/local/libexec/codex-web-ui-project-path-broker",
+            "/etc/codex-web-ui/project-roots",
+            "/etc/systemd/system/codex-web-ui-project-path-broker@.service.d/paths.conf",
             "/etc/codex-web-ui/resource-limits.json",
             "/etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf",
         )

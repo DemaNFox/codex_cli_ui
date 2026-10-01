@@ -155,8 +155,17 @@ for name in (
 ):
     if not pathlib.Path(values[name]).is_absolute():
         fail(f"{name} must be absolute")
+if values.get("CODEX_WEB_PROJECT_PATH_BROKER_SOCKET") and not pathlib.Path(
+    values["CODEX_WEB_PROJECT_PATH_BROKER_SOCKET"]
+).is_absolute():
+    fail("CODEX_WEB_PROJECT_PATH_BROKER_SOCKET must be absolute")
 if values["CODEX_WEB_APP_SERVER_SOCKET"] != "/run/codex-web-ui/app-server.sock":
     fail("CODEX_WEB_APP_SERVER_SOCKET must use the protected systemd socket")
+if values.get("CODEX_WEB_PROJECT_PATH_BROKER_SOCKET") not in {
+    None,
+    "/run/codex-web-ui/project-path-broker.sock",
+}:
+    fail("CODEX_WEB_PROJECT_PATH_BROKER_SOCKET must use the protected systemd socket")
 if values.get(
     "CODEX_WEB_CODEX_UPDATE_BROKER_SOCKET",
     "/run/codex-web-ui/codex-update-broker.sock",

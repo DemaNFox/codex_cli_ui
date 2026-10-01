@@ -52,6 +52,7 @@ class PreparePackageTest(unittest.TestCase):
             "scripts/rollback-web-ubuntu.sh": "#!/usr/bin/env bash\n",
             "scripts/graceful-drain.sh": "#!/usr/bin/env bash\n",
             "scripts/resource-broker.py": "#!/usr/bin/env python3\n",
+            "scripts/project-path-broker.py": "#!/usr/bin/env python3\n",
             "scripts/install-local-host-instructions.py": "#!/usr/bin/env python3\n",
             "scripts/migrate-runner-host-admin.sh": "#!/usr/bin/env bash\n",
             "scripts/bootstrap-ubuntu.sh": "#!/usr/bin/env bash\n",
@@ -71,6 +72,8 @@ class PreparePackageTest(unittest.TestCase):
             "infra/release-manifest.schema.json": "{}\n",
             "infra/systemd/codex-web-ui-resource-broker.socket": "[Socket]\n",
             "infra/systemd/codex-web-ui-resource-broker@.service": "[Service]\n",
+            "infra/systemd/codex-web-ui-project-path-broker.socket": "[Socket]\n",
+            "infra/systemd/codex-web-ui-project-path-broker@.service": "[Service]\n",
             "infra/systemd/codex-web-ui-workload.slice": "[Slice]\n",
             "infra/systemd/codex-web-ui-app-server-host-admin@.service": "[Service]\nUser=root\n",
         }

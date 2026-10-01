@@ -478,6 +478,7 @@ fi
 runner_config_backup=
 config_backup=
 config_temporary=
+roots_temporary=
 if [[ -f $runner_config ]]; then
   runner_config_backup=$(mktemp /etc/codex-web-ui/.runner-config.rollback.XXXXXX)
   install -m 0600 -o root -g root "$runner_config" "$runner_config_backup"
@@ -493,6 +494,11 @@ resource_rollback_keys=(
   broker-service-unit
   workload-slice-unit
   broker-helper
+  path-broker-socket-unit
+  path-broker-service-unit
+  path-broker-helper
+  project-roots-file
+  path-broker-paths-drop-in
   resource-policy
   resource-drop-in
   app-server-socket-unit
@@ -518,6 +524,11 @@ resource_rollback_paths=(
   /etc/systemd/system/codex-web-ui-resource-broker@.service
   /etc/systemd/system/codex-web-ui-workload.slice
   /usr/local/libexec/codex-web-ui-resource-broker
+  /etc/systemd/system/codex-web-ui-project-path-broker.socket
+  /etc/systemd/system/codex-web-ui-project-path-broker@.service
+  /usr/local/libexec/codex-web-ui-project-path-broker
+  /etc/codex-web-ui/project-roots
+  /etc/systemd/system/codex-web-ui-project-path-broker@.service.d/paths.conf
   /etc/codex-web-ui/resource-limits.json
   /etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf
   /etc/systemd/system/codex-web-ui-app-server.socket
@@ -545,6 +556,7 @@ cleanup_resource_snapshot() {
   if [[ -n $runner_config_backup ]]; then rm -f -- "$runner_config_backup"; fi
   if [[ -n $config_backup ]]; then rm -f -- "$config_backup"; fi
   if [[ -n $config_temporary ]]; then rm -f -- "$config_temporary"; fi
+  if [[ -n $roots_temporary ]]; then rm -f -- "$roots_temporary"; fi
   if [[ $mode == upgrade ]]; then
     clear_pre_activation_drain "$status"
   else
@@ -571,6 +583,10 @@ broker_socket_was_active=false
 if systemctl is-active --quiet codex-web-ui-resource-broker.socket; then broker_socket_was_active=true; fi
 broker_socket_was_enabled=false
 if systemctl is-enabled --quiet codex-web-ui-resource-broker.socket; then broker_socket_was_enabled=true; fi
+path_broker_socket_was_active=false
+if systemctl is-active --quiet codex-web-ui-project-path-broker.socket; then path_broker_socket_was_active=true; fi
+path_broker_socket_was_enabled=false
+if systemctl is-enabled --quiet codex-web-ui-project-path-broker.socket; then path_broker_socket_was_enabled=true; fi
 update_broker_socket_was_active=false
 if systemctl is-active --quiet codex-web-ui-codex-update-broker.socket; then update_broker_socket_was_active=true; fi
 update_broker_socket_was_enabled=false
@@ -583,6 +599,10 @@ restore_resource_boundary() {
     systemctl stop codex-web-ui-resource-broker.socket || return 1
   fi
   systemctl stop 'codex-web-ui-resource-broker@*.service' >/dev/null 2>&1 || true
+  if systemctl is-active --quiet codex-web-ui-project-path-broker.socket; then
+    systemctl stop codex-web-ui-project-path-broker.socket || return 1
+  fi
+  systemctl stop 'codex-web-ui-project-path-broker@*.service' >/dev/null 2>&1 || true
   if systemctl is-active --quiet codex-web-ui-codex-update-broker.socket; then
     systemctl stop codex-web-ui-codex-update-broker.socket || return 1
   fi
@@ -592,6 +612,9 @@ restore_resource_boundary() {
   fi
   if ! $broker_socket_was_enabled && systemctl is-enabled --quiet codex-web-ui-resource-broker.socket; then
     systemctl disable codex-web-ui-resource-broker.socket || return 1
+  fi
+  if ! $path_broker_socket_was_enabled && systemctl is-enabled --quiet codex-web-ui-project-path-broker.socket; then
+    systemctl disable codex-web-ui-project-path-broker.socket || return 1
   fi
   if ! $update_broker_socket_was_enabled && systemctl is-enabled --quiet codex-web-ui-codex-update-broker.socket; then
     systemctl disable codex-web-ui-codex-update-broker.socket || return 1
@@ -608,6 +631,12 @@ restore_resource_boundary() {
     systemctl restart codex-web-ui-resource-broker.socket || return 1
   else
     systemctl stop codex-web-ui-resource-broker.socket >/dev/null 2>&1 || true
+  fi
+  if $path_broker_socket_was_enabled; then systemctl enable codex-web-ui-project-path-broker.socket || return 1; fi
+  if $path_broker_socket_was_active; then
+    systemctl restart codex-web-ui-project-path-broker.socket || return 1
+  else
+    systemctl stop codex-web-ui-project-path-broker.socket >/dev/null 2>&1 || true
   fi
   if $update_broker_socket_was_enabled; then systemctl enable codex-web-ui-codex-update-broker.socket || return 1; fi
   if $update_broker_socket_was_active; then
@@ -739,7 +768,7 @@ fi
 atomic_symlink "$release_dir/apps/web/dist" /opt/codex-web-ui/web-current
 web_switched=true
 
-for unit in codex-web-ui@.service codex-web-ui-app-server.socket codex-web-ui-resource-broker.socket codex-web-ui-resource-broker@.service codex-web-ui-codex-update-broker.socket codex-web-ui-codex-update-broker@.service codex-web-ui-codex-update.service codex-web-ui-workload.slice codex-web-ui-storage-guard@.service codex-web-ui-storage-guard@.timer; do
+for unit in codex-web-ui@.service codex-web-ui-app-server.socket codex-web-ui-resource-broker.socket codex-web-ui-resource-broker@.service codex-web-ui-project-path-broker.socket codex-web-ui-project-path-broker@.service codex-web-ui-codex-update-broker.socket codex-web-ui-codex-update-broker@.service codex-web-ui-codex-update.service codex-web-ui-workload.slice codex-web-ui-storage-guard@.service codex-web-ui-storage-guard@.timer; do
   install -m 0644 "$package/infra/systemd/$unit" "/etc/systemd/system/$unit"
 done
 if [[ $runner_mode == host-admin ]]; then
@@ -752,6 +781,7 @@ fi
 install -m 0755 "$package/scripts/validate-config.sh" /usr/local/libexec/codex-web-ui-validate-config
 install -m 0755 "$package/scripts/run-app-server.sh" /usr/local/libexec/codex-web-ui-run-app-server
 install -m 0755 "$package/scripts/resource-broker.py" /usr/local/libexec/codex-web-ui-resource-broker
+install -m 0755 "$package/scripts/project-path-broker.py" /usr/local/libexec/codex-web-ui-project-path-broker
 install -m 0755 "$package/scripts/codex-update-broker.py" /usr/local/libexec/codex-web-ui-codex-update-broker
 install -m 0755 "$package/scripts/codex-update-worker.sh" /usr/local/libexec/codex-web-ui-codex-update-worker
 install -m 0755 "$package/scripts/stage-codex-update.sh" /usr/local/sbin/codex-web-ui-stage-codex-update
@@ -774,6 +804,22 @@ api_dropin=/etc/systemd/system/codex-web-ui@api.service.d
 install -d -m 0755 "$api_dropin"
 printf '[Service]\nInaccessiblePaths=%s\n' "$codex_home" >"$api_dropin/paths.conf"
 chmod 0644 "$api_dropin/paths.conf"
+path_broker_dropin=/etc/systemd/system/codex-web-ui-project-path-broker@.service.d
+install -d -m 0755 "$path_broker_dropin"
+printf '[Service]\nInaccessiblePaths=%s\n' "$codex_home" >"$path_broker_dropin/paths.conf"
+chmod 0644 "$path_broker_dropin/paths.conf"
+
+if [[ $runner_mode == host-admin ]]; then
+  umask 077
+  roots_temporary=$(mktemp /etc/codex-web-ui/.project-roots.XXXXXX)
+  printf '%s\n' "${canonical_roots[@]}" >"$roots_temporary"
+  chown root:root "$roots_temporary"
+  chmod 0600 "$roots_temporary"
+  mv -f -- "$roots_temporary" /etc/codex-web-ui/project-roots
+  roots_temporary=
+else
+  rm -f -- /etc/codex-web-ui/project-roots
+fi
 
 if [[ ! -e $config ]]; then
   umask 077
@@ -794,7 +840,7 @@ umask 077
 } >"$runner_config"
 config_temporary=$(mktemp /etc/codex-web-ui/.codex-web-ui.env.XXXXXX)
 CONFIG_SOURCE=$config CONFIG_DESTINATION=$config_temporary VERSION_PIN=$version_pin \
-  PROJECT_ROOTS=$roots_csv LEGACY_ADOPTION=$legacy_single_service python3 - <<'PY'
+  PROJECT_ROOTS=$roots_csv LEGACY_ADOPTION=$legacy_single_service RUNNER_MODE=$runner_mode python3 - <<'PY'
 import os
 from pathlib import Path
 
@@ -805,13 +851,19 @@ updates = {
     "CODEX_WEB_CODEX_VERSION_PIN": f'"{os.environ["VERSION_PIN"]}"',
     "CODEX_WEB_PROJECT_ROOTS": os.environ["PROJECT_ROOTS"],
 }
+if os.environ.get("RUNNER_MODE") == "host-admin":
+    updates["CODEX_WEB_PROJECT_PATH_BROKER_SOCKET"] = "/run/codex-web-ui/project-path-broker.sock"
 if legacy:
     updates.update({
         "CODEX_WEB_ATTACHMENT_STORAGE_PATH": "/var/lib/codex-web-ui/data/attachments",
         "CODEX_WEB_APP_SERVER_SOCKET": "/run/codex-web-ui/app-server.sock",
         "CODEX_WEB_CODEX_UPDATE_BROKER_SOCKET": "/run/codex-web-ui/codex-update-broker.sock",
     })
-remove = {"CODEX_BIN", "CODEX_HOME"} if legacy else set()
+remove = {"CODEX_WEB_PROJECT_PATH_BROKER_SOCKET"}
+if legacy:
+    remove.update({"CODEX_BIN", "CODEX_HOME"})
+if os.environ.get("RUNNER_MODE") == "host-admin":
+    remove.discard("CODEX_WEB_PROJECT_PATH_BROKER_SOCKET")
 result = []
 seen = set()
 for line in lines:
@@ -856,7 +908,15 @@ fi
 if $start_service; then
   systemctl enable codex-web-ui-resource-broker.socket codex-web-ui-app-server.socket codex-web-ui@api.service codex-web-ui-storage-guard@api.timer
   systemctl enable codex-web-ui-codex-update-broker.socket
+  if [[ $runner_mode == host-admin ]]; then
+    systemctl enable codex-web-ui-project-path-broker.socket
+  else
+    systemctl disable --now codex-web-ui-project-path-broker.socket >/dev/null 2>&1 || true
+  fi
   systemctl stop 'codex-web-ui-app-server@*.service' >/dev/null 2>&1 || true
+  if [[ $runner_mode == host-admin ]]; then
+    systemctl restart codex-web-ui-project-path-broker.socket
+  fi
   systemctl restart codex-web-ui-resource-broker.socket codex-web-ui-app-server.socket codex-web-ui@api.service codex-web-ui-storage-guard@api.timer
   systemctl restart codex-web-ui-codex-update-broker.socket
   /usr/local/libexec/codex-web-ui-resource-broker --initialize >/dev/null

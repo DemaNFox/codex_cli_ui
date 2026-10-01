@@ -15,6 +15,7 @@ const envSchema = z.object({
   CODEX_BIN: z.string().min(1).default('codex'),
   CODEX_HOME: z.string().min(1).optional(),
   CODEX_WEB_APP_SERVER_SOCKET: z.string().startsWith('/').optional(),
+  CODEX_WEB_PROJECT_PATH_BROKER_SOCKET: z.string().startsWith('/').optional(),
   CODEX_WEB_RESOURCE_BROKER_SOCKET: z
     .string()
     .startsWith('/')
@@ -78,6 +79,7 @@ export interface ServerConfig {
   readonly codexBinary: string;
   readonly codexHome?: string;
   readonly appServerSocket?: string;
+  readonly projectPathBrokerSocket?: string;
   readonly resourceBrokerSocket: string;
   readonly codexUpdateBrokerSocket: string;
   readonly codexVersionPin: string;
@@ -135,6 +137,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     ...(parsed.CODEX_WEB_APP_SERVER_SOCKET === undefined
       ? {}
       : { appServerSocket: parsed.CODEX_WEB_APP_SERVER_SOCKET }),
+    ...(parsed.CODEX_WEB_PROJECT_PATH_BROKER_SOCKET === undefined
+      ? {}
+      : { projectPathBrokerSocket: parsed.CODEX_WEB_PROJECT_PATH_BROKER_SOCKET }),
     resourceBrokerSocket: parsed.CODEX_WEB_RESOURCE_BROKER_SOCKET,
     codexUpdateBrokerSocket: parsed.CODEX_WEB_CODEX_UPDATE_BROKER_SOCKET,
     codexVersionPin: parsed.CODEX_WEB_CODEX_VERSION_PIN,
