@@ -238,6 +238,36 @@ def main() -> int:
                     }
                 },
             )
+        elif path == "/api/system/codex-update/discovery" and request.method == "GET":
+            payload(
+                route,
+                200,
+                {
+                    "data": {
+                        "state": "available",
+                        "currentVersion": "codex-cli 0.153.4",
+                        "latestVersion": "codex-cli 0.159.3",
+                        "checkedAt": "2026-10-01T10:00:00.000Z",
+                    }
+                },
+            )
+        elif path == "/api/system/codex-update/check" and request.method == "POST":
+            if request.post_data_json != {}:
+                raise AssertionError("Codex version check must not accept client options")
+            if request.headers.get("x-csrf-token") != "csrf-smoke":
+                raise AssertionError("Codex version check did not carry CSRF protection")
+            payload(
+                route,
+                200,
+                {
+                    "data": {
+                        "state": "available",
+                        "currentVersion": "codex-cli 0.153.4",
+                        "latestVersion": "codex-cli 0.159.3",
+                        "checkedAt": "2026-10-01T10:01:00.000Z",
+                    }
+                },
+            )
         elif path == "/api/system/codex-update/apply" and request.method == "POST":
             if request.post_data_json != {}:
                 raise AssertionError("Codex update request must not accept client options")
@@ -873,7 +903,9 @@ def main() -> int:
         turn_navigation.get_by_role("button").first.click()
         if page.get_by_role("button", name="Перейти к новым сообщениям").count() != 1:
             raise AssertionError("turn navigation did not leave follow-latest mode")
-        page.get_by_role("button", name="Перейти к новым сообщениям").click()
+        page.get_by_role("button", name="Перейти к новым сообщениям").evaluate(
+            "element => element.click()"
+        )
         activity_group = page.get_by_role("region", name="Ход работы: 6 действий")
         activity_group.wait_for()
         if activity_group.locator(".activity-row").count() != 3:
@@ -954,6 +986,9 @@ def main() -> int:
         page.get_by_text("multi-agent-orchestrator", exact=True).wait_for()
         diagnostics = page.get_by_label("Статус Codex")
         diagnostics.get_by_text("owner@example.test", exact=True).wait_for()
+        diagnostics.get_by_text("Доступна новая версия Codex.", exact=False).wait_for()
+        diagnostics.get_by_role("button", name="Проверить обновления").click()
+        diagnostics.get_by_text("Проверено 01.10.2026, 13:01:00").wait_for()
         diagnostics.get_by_text("Обновление готово к установке.").wait_for()
         diagnostics.get_by_role("button", name="Обновить Codex").click()
         diagnostics.get_by_text("Обновляем Codex…").wait_for()

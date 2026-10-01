@@ -20,6 +20,7 @@ import {
 import { AttachmentStore } from './attachment-store.js';
 import type { AudioTranscriptionClient, TranscriptionUpload } from './audio-transcription.js';
 import type { CodexUpdateBroker } from './codex-update-broker.js';
+import type { CodexVersionChecker } from './codex-version-checker.js';
 import { loadConfig, type ServerConfig } from './config.js';
 import { SqliteRepository } from './database.js';
 import { normalizeNotification, sanitizeEventPayload } from './event-normalizer.js';
@@ -507,6 +508,7 @@ async function fixture(
   pushSender?: PushSender,
   accountLoginTimeoutMs?: number,
   codexUpdateBroker?: CodexUpdateBroker,
+  codexVersionChecker?: CodexVersionChecker,
 ) {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-server-'));
   const root = path.join(temp, 'projects');
@@ -557,6 +559,7 @@ async function fixture(
     upgradeDrainPath,
     ...(resourceBroker ? { resourceBroker } : {}),
     ...(codexUpdateBroker ? { codexUpdateBroker } : {}),
+    ...(codexVersionChecker ? { codexVersionChecker } : {}),
     ...(transcriptionClient ? { transcriptionClient } : {}),
     ...(pushSender ? { pushSender } : {}),
     ...(accountLoginTimeoutMs === undefined ? {} : { accountLoginTimeoutMs }),
@@ -1829,6 +1832,69 @@ describe('Codex routes', () => {
     });
     expect(blockedLogin.statusCode).toBe(409);
     expect(blockedLogin.json()).toMatchObject({ error: { code: 'CODEX_UPDATE_PENDING' } });
+  });
+
+  it('checks the fixed upstream Codex version without accepting a caller target', async () => {
+    const calls: Array<{ currentVersion: string; force: boolean | undefined }> = [];
+    const versionChecker: CodexVersionChecker = {
+      async check(currentVersion, force) {
+        calls.push({ currentVersion, force });
+        return {
+          state: 'available',
+          currentVersion,
+          latestVersion: 'codex-cli 0.159.3',
+          checkedAt: '2026-10-01T16:00:00.000Z',
+        };
+      },
+    };
+    const { app } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      versionChecker,
+    );
+    const session = await login(app);
+
+    const cached = await app.inject({
+      method: 'GET',
+      url: '/api/system/codex-update/discovery',
+      headers: { cookie: session.cookie },
+    });
+    expect(cached.statusCode).toBe(200);
+    expect(cached.json()).toEqual({
+      data: {
+        state: 'available',
+        currentVersion: 'codex-cli 0.153.4',
+        latestVersion: 'codex-cli 0.159.3',
+        checkedAt: '2026-10-01T16:00:00.000Z',
+      },
+    });
+
+    const refreshed = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-update/check',
+      headers: session.headers,
+      payload: {},
+    });
+    expect(refreshed.statusCode).toBe(200);
+    expect(calls).toEqual([
+      { currentVersion: 'codex-cli 0.153.4', force: undefined },
+      { currentVersion: 'codex-cli 0.153.4', force: true },
+    ]);
+
+    const targeted = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-update/check',
+      headers: session.headers,
+      payload: { version: '0.159.3', url: 'https://example.test/package' },
+    });
+    expect(targeted.statusCode).toBe(400);
+    expect(calls).toHaveLength(2);
   });
 
   it('keeps update admission fail-closed after an ambiguous broker apply failure', async () => {

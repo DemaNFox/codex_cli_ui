@@ -1587,6 +1587,23 @@ button:disabled {
 .codex-update-button {
   width: 100%;
 }
+.codex-update-prepared {
+  display: grid;
+  gap: 0.65rem;
+  padding-top: 0.65rem;
+  border-top: 1px solid var(--border-soft);
+}
+.diagnostics .codex-update-prepared h4 {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.codex-update-state.available {
+  color: #f2c46d;
+}
 .account-login-dialog {
   width: min(30rem, 100%);
   min-width: 0;

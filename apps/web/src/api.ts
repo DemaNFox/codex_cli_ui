@@ -4,6 +4,7 @@ import type {
   Capability,
   CodexAccountLogin,
   CodexUpdateSnapshot,
+  CodexVersionDiscovery,
   ModelOption,
   PendingApproval,
   PermissionPreset,
@@ -438,6 +439,19 @@ export const api = {
         '/api/system/codex-update',
       ),
     ),
+  codexUpdateDiscovery: async () =>
+    unwrapData(
+      await request<CodexVersionDiscovery | { data: CodexVersionDiscovery }>(
+        '/api/system/codex-update/discovery',
+      ),
+    ),
+  checkCodexUpdate: async (csrfToken: string) =>
+    unwrapData(
+      await request<CodexVersionDiscovery | { data: CodexVersionDiscovery }>(
+        '/api/system/codex-update/check',
+        { method: 'POST', csrfToken, body: {} },
+      ),
+    ),
   applyCodexUpdate: async (csrfToken: string) =>
     unwrapData(
       await request<CodexUpdateSnapshot | { data: CodexUpdateSnapshot }>(
@@ -472,6 +486,7 @@ export type {
   Capability,
   CodexAccountLogin,
   CodexUpdateSnapshot,
+  CodexVersionDiscovery,
   ModelOption,
   PendingApproval,
   Project,

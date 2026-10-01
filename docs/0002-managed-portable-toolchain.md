@@ -69,8 +69,11 @@ requires access to Ubuntu package repositories, nodejs.org and registry.npmjs.or
   project storage. Restricted remains the default; host-admin is never selected implicitly.
 - Runtime upgrades are deliberate source changes: update versions and digests,
   verify both supported architectures, and release the matching protocol pin.
-- The Status drawer can activate only an operator-staged compatible full release; it is not an npm registry
-  client and cannot change the installed runner mode or grant root to the API.
+- The non-root API performs a bounded, read-only check of the fixed official `@openai/codex/latest` registry
+  endpoint at startup, every six hours and on an authenticated empty-body refresh request. This check is
+  informational only: it cannot select, download, stage or activate a package. The Status drawer can activate
+  only an operator-staged compatible full release and cannot change the installed runner mode or grant root
+  to the API.
 - An explicit application `--upgrade` moves an existing managed Codex path to
   the newly pinned managed version. A custom Codex path remains fixed and must
   use a separate explicit migration workflow.

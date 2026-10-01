@@ -58,6 +58,13 @@ const codexUpdate = {
   lastResult: null,
 };
 
+const codexUpdateDiscovery = {
+  state: 'available' as const,
+  currentVersion: 'codex-cli 0.153.4',
+  latestVersion: 'codex-cli 0.159.3',
+  checkedAt: '2026-10-01T16:00:00.000Z',
+};
+
 function response(data: unknown): Response {
   return new Response(JSON.stringify(data), {
     status: 200,
@@ -205,6 +212,28 @@ describe('api response envelopes', () => {
         method: 'POST',
         body: '{}',
       }),
+    );
+    expect(new Headers(fetchMock.mock.calls[1]?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf');
+  });
+
+  it('reads and manually checks Codex update discovery without sending a target', async () => {
+    const fetchMock = vi.fn<typeof fetch>(() =>
+      Promise.resolve(response({ data: codexUpdateDiscovery })),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.codexUpdateDiscovery()).resolves.toEqual(codexUpdateDiscovery);
+    await expect(api.checkCodexUpdate('csrf')).resolves.toEqual(codexUpdateDiscovery);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/system/codex-update/discovery',
+      expect.objectContaining({ credentials: 'same-origin' }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/system/codex-update/check',
+      expect.objectContaining({ method: 'POST', body: '{}' }),
     );
     expect(new Headers(fetchMock.mock.calls[1]?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf');
   });

@@ -122,6 +122,13 @@ const unavailableCodexUpdate = {
   lastResult: null,
 };
 
+const currentCodexUpdateDiscovery = {
+  state: 'current' as const,
+  currentVersion: 'codex-cli 1.2.3',
+  latestVersion: 'codex-cli 1.2.3',
+  checkedAt: '2026-10-01T16:00:00.000Z',
+};
+
 const subagents = [
   {
     id: 'agent-1',
@@ -275,6 +282,8 @@ function installAuthenticatedApi(
     if (url === '/api/system/capabilities') return Promise.resolve(jsonResponse(capabilities));
     if (url === '/api/system/codex-update')
       return Promise.resolve(jsonResponse({ data: unavailableCodexUpdate }));
+    if (url === '/api/system/codex-update/discovery')
+      return Promise.resolve(jsonResponse({ data: currentCodexUpdateDiscovery }));
     if (url === '/api/system/resource-limits')
       return Promise.resolve(jsonResponse({ data: resourceLimits }));
     if (url.includes('/api/threads?')) return Promise.resolve(jsonResponse([thread]));
@@ -2764,6 +2773,7 @@ describe('App', () => {
   it('starts a prepared Codex update and refreshes its version after completion', async () => {
     let updateReads = 0;
     let capabilityReads = 0;
+    let modelReads = 0;
     const readyUpdate = {
       state: 'ready' as const,
       currentVersion: 'codex-cli 1.2.3',
@@ -2783,6 +2793,25 @@ describe('App', () => {
       },
     };
     const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/models') {
+        modelReads += 1;
+        return jsonResponse(
+          modelReads > 1
+            ? [
+                ...models,
+                {
+                  id: 'gpt-new',
+                  displayName: 'GPT New',
+                  isDefault: false,
+                  defaultReasoningEffort: 'medium',
+                  supportedReasoningEfforts: [
+                    { reasoningEffort: 'medium', description: 'Balanced' },
+                  ],
+                },
+              ]
+            : models,
+        );
+      }
       if (url === '/api/system/capabilities') {
         capabilityReads += 1;
         return jsonResponse({
@@ -2819,6 +2848,11 @@ describe('App', () => {
     expect(screen.getByText(/Обновление запускается только когда Codex свободен/)).not.toBeNull();
     expect(await screen.findByText('Установлена актуальная подготовленная версия.')).not.toBeNull();
     expect(await screen.findByText('Codex обновлён. Чаты и файлы сохранены.')).not.toBeNull();
+    expect(modelReads).toBeGreaterThan(1);
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Модель' }).value).toBe(
+      'gpt-test',
+    );
+    expect(screen.getByRole('option', { name: 'GPT New' })).not.toBeNull();
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/system/codex-update/apply',
       expect.objectContaining({ method: 'POST', body: '{}' }),
@@ -2828,6 +2862,44 @@ describe('App', () => {
         requestUrl(input) === '/api/system/codex-update/apply' && init?.method === 'POST',
     );
     expect(new Headers(applyCall?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf-token');
+  });
+
+  it('checks the latest Codex version automatically and supports a manual refresh', async () => {
+    const availableDiscovery = {
+      state: 'available' as const,
+      currentVersion: 'codex-cli 1.2.3',
+      latestVersion: 'codex-cli 1.2.4',
+      checkedAt: '2026-10-01T16:00:00.000Z',
+    };
+    const currentDiscovery = {
+      ...availableDiscovery,
+      state: 'current' as const,
+      currentVersion: 'codex-cli 1.2.4',
+    };
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/system/codex-update/discovery')
+        return jsonResponse({ data: availableDiscovery });
+      if (url === '/api/system/codex-update/check' && init?.method === 'POST')
+        return jsonResponse({ data: currentDiscovery });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    expect(await screen.findByText('codex-cli 1.2.4')).not.toBeNull();
+    expect(screen.getByText(/Доступна новая версия Codex/)).not.toBeNull();
+    expect(screen.getByText(/Проверено/)).not.toBeNull();
+
+    await user.click(screen.getByRole('button', { name: 'Проверить обновления' }));
+
+    expect(await screen.findByText('Установлена последняя версия Codex.')).not.toBeNull();
+    const checkCall = fetchMock.mock.calls.find(
+      ([input, request]) =>
+        requestUrl(input) === '/api/system/codex-update/check' && request?.method === 'POST',
+    );
+    expect(checkCall?.[1]?.body).toBe('{}');
+    expect(new Headers(checkCall?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf-token');
   });
 
   it('starts Codex account login and presents the device code without accepting credentials', async () => {

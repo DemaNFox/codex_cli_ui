@@ -5,6 +5,7 @@ import {
   attachmentSchema,
   codexAccountLoginSchema,
   codexUpdateSnapshotSchema,
+  codexVersionDiscoverySchema,
   capabilitySchema,
   pushSubscriptionSchema,
   resolvePermissionRequestSchema,
@@ -74,6 +75,25 @@ describe('contracts', () => {
         availableVersion: 'latest',
         candidateReleaseId: '../../tmp',
         lastResult: { status: 'succeeded', message: '', completedAt: 'not-a-date' },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('accepts only bounded Codex version discovery projections', () => {
+    expect(
+      codexVersionDiscoverySchema.safeParse({
+        state: 'available',
+        currentVersion: 'codex-cli 0.153.4',
+        latestVersion: 'codex-cli 0.159.3',
+        checkedAt: '2026-10-01T16:00:00.000Z',
+      }).success,
+    ).toBe(true);
+    expect(
+      codexVersionDiscoverySchema.safeParse({
+        state: 'available',
+        currentVersion: 'codex-cli 0.153.4',
+        latestVersion: 'latest',
+        checkedAt: 'not-a-date',
       }).success,
     ).toBe(false);
   });

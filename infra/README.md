@@ -119,7 +119,7 @@ activation.
   `python3`, `xz-utils` and (for the bundled edge) Nginx through APT. It installs
   exact toolchain versions from `infra/toolchain.env`; startup fails unless
   `codex --version` exactly matches `CODEX_WEB_CODEX_VERSION_PIN` (initially
-  `codex-cli 0.153.4`). `binutils` remains an additional prerequisite only for
+  `codex-cli 0.159.3`). `binutils` remains an additional prerequisite only for
   the optional scoped AppArmor profile.
 - Restricted mode requires an existing non-root service user. The current server may use `ai-chat-agent` with
   `CODEX_HOME=/opt/ai-chat-agents/home/.codex`. Host-admin requires the root runner and defaults to root's
@@ -184,6 +184,11 @@ Do not edit the generated slice drop-in or policy file while the service is runn
 UI so updates are serialized against active work and audited.
 
 ## Staged Codex updates
+
+The API also performs a read-only check of the fixed official npm metadata endpoint at startup and every six
+hours. Opening Status reads the cached result; “Проверить обновления” forces the same bounded check. This may
+report a newer upstream CLI before a compatible full application release has been prepared. It never downloads
+or stages executable content and does not replace the operator staging procedure below.
 
 The Status drawer can activate a newer Codex version only from a complete immutable release that a trusted host
 operator has already installed beneath `/opt/codex-web-ui/releases`. After reviewing and preparing that release,
