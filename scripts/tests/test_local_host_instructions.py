@@ -75,11 +75,14 @@ class InstallerFilesystemTest(unittest.TestCase):
         after_second = agents.read_text(encoding="utf-8")
 
         after = agents.stat()
+        lock = (self.home / ".codex-web-ui-instructions.lock").stat()
         self.assertEqual(after_first, after_second)
         self.assertTrue(after_first.startswith("# Mine\n"))
         self.assertEqual(after.st_uid, before.st_uid)
         self.assertEqual(after.st_gid, before.st_gid)
         self.assertEqual(stat.S_IMODE(after.st_mode), 0o600)
+        self.assertEqual(lock.st_uid, os.getuid())
+        self.assertEqual(stat.S_IMODE(lock.st_mode), 0o600)
 
     def test_rejects_symlink_target_without_touching_victim(self) -> None:
         victim = Path(self.temporary.name) / "victim"

@@ -245,6 +245,10 @@ class InfraStaticTest(unittest.TestCase):
             migration.index('graceful-drain.sh" --begin'),
             migration.index('cp -a --no-preserve=ownership'),
         )
+        self.assertLess(
+            migration.index('python3 "$SCRIPT_DIR/install-local-host-instructions.py"'),
+            migration.index("SOURCE_HOME=$source_codex_home SOURCE_UID=$source_uid"),
+        )
         rename = migration.index('mv -T -- "$stage" "$target_codex_home"')
         self.assertLess(migration.rindex("trap '' INT TERM", 0, rename), rename)
         self.assertLess(rename, migration.index("target_created=true", rename))

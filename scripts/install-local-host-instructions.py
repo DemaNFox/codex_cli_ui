@@ -144,6 +144,8 @@ def install(codex_home: Path, service_user: str) -> None:
         lock_fd = os.open(".codex-web-ui-instructions.lock", lock_flags, 0o600, dir_fd=directory_fd)
         if not stat.S_ISREG(os.fstat(lock_fd).st_mode):
             raise InstallError("instruction lock is not a regular file")
+        os.fchmod(lock_fd, 0o600)
+        os.fchown(lock_fd, account.pw_uid, account.pw_gid)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
         original, original_identity, original_owner = _read_existing(directory_fd, account.pw_uid)

@@ -66,6 +66,8 @@ source_group=$(stat -c '%G' "$source_codex_home")
 source_dir_mode=$(stat -c '%a' "$source_codex_home")
 source_uid=$(id -u "$source_user")
 source_gid=$(stat -c '%g' "$source_codex_home")
+python3 "$SCRIPT_DIR/install-local-host-instructions.py" \
+  --codex-home "$source_codex_home" --service-user "$source_user"
 SOURCE_HOME=$source_codex_home SOURCE_UID=$source_uid SOURCE_GID=$source_gid python3 - <<'PY'
 import os
 from pathlib import Path
