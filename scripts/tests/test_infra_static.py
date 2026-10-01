@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -376,6 +378,45 @@ class InfraStaticTest(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("CODEX_WEB_PROJECT_ROOTS=/\n", source.read_text(encoding="utf-8"))
+
+    def test_candidate_protocol_accepts_untracked_split_schema_files(self) -> None:
+        installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        marker = "import hashlib\nimport json\nimport os\nfrom pathlib import Path"
+        body_start = installer.index(marker, installer.index("PROTOCOL_STAGE=$protocol_stage"))
+        body_end = installer.index("\nPY\nthen", body_start)
+        validator = installer[body_start:body_end]
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "package"
+            generated = root / "generated"
+            (package / "protocol").mkdir(parents=True)
+            generated.mkdir()
+            expected = b"reviewed combined schema"
+            (generated / "combined.json").write_bytes(expected)
+            (generated / "split-extra.json").write_bytes(b"untracked per-type schema")
+            (package / "protocol" / "manifest.json").write_text(
+                json.dumps(
+                    {
+                        "files": {
+                            "0.153.4/combined.json": hashlib.sha256(expected).hexdigest()
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {"PROTOCOL_STAGE": str(generated), "PACKAGE_ROOT": str(package)}
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", validator],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_legacy_adoption_uses_old_identity_for_drain_and_rollback(self) -> None:
         installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")

@@ -327,7 +327,7 @@ if not isinstance(files, dict):
     raise SystemExit("candidate protocol manifest is invalid")
 expected_names = {Path(relative).name for relative in files}
 actual_names = {path.name for path in generated.iterdir() if path.is_file()}
-if actual_names != expected_names:
+if not expected_names.issubset(actual_names):
     raise SystemExit("candidate Codex protocol output is incomplete")
 for relative, expected in files.items():
     output = generated / Path(relative).name
