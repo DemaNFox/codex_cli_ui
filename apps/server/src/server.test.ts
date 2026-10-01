@@ -1688,9 +1688,7 @@ describe('Codex routes', () => {
       },
     });
     expect(ambiguous.statusCode).toBe(502);
-    expect(repository.getAttachment(ambiguousAttachment.id)?.turnId).toMatch(
-      /^pending:steer:/,
-    );
+    expect(repository.getAttachment(ambiguousAttachment.id)?.turnId).toMatch(/^pending:steer:/);
     expect(repository.listEvents(threadId, 0).at(-1)).toMatchObject({
       turnId: 'turn-active',
       kind: 'user-message',

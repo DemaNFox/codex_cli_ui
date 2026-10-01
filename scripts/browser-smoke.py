@@ -550,7 +550,7 @@ def main() -> int:
                         "kind": "file",
                         "sizeBytes": 23,
                         "createdAt": "2026-09-27T12:02:00.000Z",
-                        "url": "/api/threads/t2/attachments/00000000-0000-4000-8000-000000000099",
+                        "url": "/api/threads/t2/attachments/00000000-0000-4000-8000-000000000099/content",
                     }
                 },
             )
@@ -568,7 +568,12 @@ def main() -> int:
                 "turnId": "turn-background",
                 "kind": "thread",
                 "phase": "state",
-                "payload": {"status": "active", "activeTurnId": "turn-background"},
+                "payload": {
+                    "threadRuntime": {
+                        "status": "active",
+                        "activeTurnId": "turn-background",
+                    }
+                },
                 "createdAt": "2026-09-27T12:01:02.000Z",
             }
             route.fulfill(

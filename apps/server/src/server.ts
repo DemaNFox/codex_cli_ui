@@ -2734,8 +2734,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       if (attachment.turnId !== null) throw new HttpError(409, 'ATTACHMENT_ALREADY_SENT');
       return attachment;
     });
-    const project =
-      attachments.length === 0 ? undefined : repository.getProject(thread.projectId);
+    const project = attachments.length === 0 ? undefined : repository.getProject(thread.projectId);
     if (attachments.length > 0 && !project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
     const attachmentClaim = `pending:steer:${randomUUID()}`;
     if (!repository.claimAttachments(id, input.attachmentIds, attachmentClaim))
@@ -2755,10 +2754,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         }),
       );
     } catch (error) {
-      if (
-        !steerIssued ||
-        (error instanceof Error && error.message === 'APP_SERVER_UNAVAILABLE')
-      )
+      if (!steerIssued || (error instanceof Error && error.message === 'APP_SERVER_UNAVAILABLE'))
         repository.releaseAttachmentClaims(id, attachmentClaim);
       return throwTurnCommandFailure(
         thread,

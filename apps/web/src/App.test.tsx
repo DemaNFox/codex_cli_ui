@@ -2120,7 +2120,7 @@ describe('App', () => {
     });
   });
 
-  it('retains an uploaded active-turn attachment after an ambiguous steer failure', async () => {
+  it('does not retry an uploaded active-turn attachment after an ambiguous steer result', async () => {
     const activeThread = { ...thread, status: 'active' as const, activeTurnId: 'turn-active' };
     let steerCalls = 0;
     installAuthenticatedApi((url, init) => {
@@ -2128,31 +2128,69 @@ describe('App', () => {
       if (url === '/api/threads/thread-1') return jsonResponse({ data: activeThread, events: [] });
       if (url === '/api/threads/thread-1/steer' && init?.method === 'POST') {
         steerCalls += 1;
-        if (steerCalls === 1) throw new TypeError('network outcome unknown');
-        return jsonResponse({ data: { turnId: 'turn-active' } });
+        return jsonResponse(
+          {
+            error: {
+              code: 'TURN_COMMAND_OUTCOME_UNKNOWN',
+              message: 'Codex не подтвердил команду. Обновите чат перед повтором.',
+            },
+          },
+          502,
+        );
       }
       return undefined;
     });
     const user = userEvent.setup();
     render(<App />);
 
-    await screen.findByLabelText('Уточнение для активной задачи');
+    const input = await screen.findByLabelText('Уточнение для активной задачи');
     await user.upload(
       screen.getByLabelText('Выбрать вложения'),
       new File(['keep me too'], 'ambiguous.txt', { type: 'text/plain' }),
     );
+    await user.type(input, 'Не потеряй уточнение');
     expect(await screen.findByText('ambiguous.txt')).not.toBeNull();
     await user.click(screen.getByRole('button', { name: 'Направить задачу' }));
 
-    expect((await screen.findByRole('alert')).textContent).toContain('network outcome unknown');
-    expect(screen.getByText('ambiguous.txt')).not.toBeNull();
-    expect(screen.getByText(/загружено/)).not.toBeNull();
-    expect(FakeXMLHttpRequest.instances).toHaveLength(1);
-
-    await user.click(screen.getByRole('button', { name: 'Направить задачу' }));
-    expect((await screen.findByRole('status')).textContent).toContain('Уточнение принято');
+    expect((await screen.findByRole('alert')).textContent).toContain(
+      'Обновите чат перед следующим уточнением',
+    );
+    expect((input as HTMLTextAreaElement).value).toBe('Не потеряй уточнение');
     expect(screen.queryByText('ambiguous.txt')).toBeNull();
     expect(FakeXMLHttpRequest.instances).toHaveLength(1);
+    expect(steerCalls).toBe(1);
+  });
+
+  it('does not blindly retry an attachment after the steer response is lost', async () => {
+    const activeThread = { ...thread, status: 'active' as const, activeTurnId: 'turn-active' };
+    let steerCalls = 0;
+    installAuthenticatedApi((url, init) => {
+      if (url.includes('/api/threads?')) return jsonResponse([activeThread]);
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: activeThread, events: [] });
+      if (url === '/api/threads/thread-1/steer' && init?.method === 'POST') {
+        steerCalls += 1;
+        throw new TypeError('network outcome unknown');
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const input = await screen.findByLabelText('Уточнение для активной задачи');
+    await user.upload(
+      screen.getByLabelText('Выбрать вложения'),
+      new File(['uncertain transport'], 'transport.txt', { type: 'text/plain' }),
+    );
+    await user.type(input, 'Проверь после обновления');
+    await user.click(screen.getByRole('button', { name: 'Направить задачу' }));
+
+    expect((await screen.findByRole('alert')).textContent).toContain(
+      'Вложения уже могли быть приняты',
+    );
+    expect((input as HTMLTextAreaElement).value).toBe('Проверь после обновления');
+    expect(screen.queryByText('transport.txt')).toBeNull();
+    expect(FakeXMLHttpRequest.instances).toHaveLength(1);
+    expect(steerCalls).toBe(1);
   });
 
   it('shows an interrupt failure and restores the stop control', async () => {

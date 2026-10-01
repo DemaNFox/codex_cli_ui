@@ -3484,6 +3484,21 @@ function Workspace({
     );
   }
 
+  function finishQueuedAttachments(targetThreadId: string, attachments: readonly Attachment[]) {
+    if (attachmentThreadRef.current !== targetThreadId) return;
+    setThreadAttachmentBytes(
+      (current) =>
+        current + attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
+    );
+    setQueuedAttachments((current) => {
+      current.forEach((item) => {
+        if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+      });
+      return [];
+    });
+    setAttachmentNotice(null);
+  }
+
   async function send() {
     const text = composer.trim();
     if (text === '/status' || text === '/skills') {
@@ -3557,9 +3572,12 @@ function Workspace({
     setActionNotice(
       targetActiveRootTurn ? 'Передаём уточнение активной задаче…' : 'Передаём задачу Codex…',
     );
+    let attachments: Attachment[] = [];
+    let steerAttempted = false;
     try {
-      const attachments = await uploadQueued(threadId);
+      attachments = await uploadQueued(threadId);
       if (targetActiveRootTurn && targetActiveTurnId) {
+        steerAttempted = true;
         await api.steer(session.csrfToken, threadId, {
           text,
           expectedTurnId: targetActiveTurnId,
@@ -3580,15 +3598,7 @@ function Workspace({
         });
         setActionNotice('Задача принята Codex.');
       }
-      setThreadAttachmentBytes(
-        (current) =>
-          current + attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
-      );
-      queuedAttachments.forEach((item) => {
-        if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
-      });
-      setQueuedAttachments([]);
-      setAttachmentNotice(null);
+      finishQueuedAttachments(threadId, attachments);
       setComposer('');
     } catch (cause) {
       setActionNotice(null);
@@ -3608,6 +3618,20 @@ function Workspace({
           if (attachmentThreadRef.current === threadId) {
             setError('Сессия изменилась. Текст сохранён; обновите страницу и отправьте его снова.');
           }
+        }
+      } else if (
+        targetActiveRootTurn &&
+        steerAttempted &&
+        attachments.length > 0 &&
+        (!(cause instanceof ApiError) ||
+          cause.code === 'TURN_COMMAND_OUTCOME_UNKNOWN' ||
+          cause.code === 'ATTACHMENT_ALREADY_SENT')
+      ) {
+        finishQueuedAttachments(threadId, attachments);
+        if (attachmentThreadRef.current === threadId) {
+          setError(
+            `${errorMessage(cause)} Вложения уже могли быть приняты и не будут отправлены повторно. Обновите чат перед следующим уточнением.`,
+          );
         }
       } else if (attachmentThreadRef.current === threadId) {
         setError(errorMessage(cause));
