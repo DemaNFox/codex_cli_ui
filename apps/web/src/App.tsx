@@ -26,6 +26,7 @@ import type {
   Capability,
   CodexAccountLogin,
   CodexUpdateSnapshot,
+  CodexVersionDiscovery,
   ModelOption,
   PendingApproval,
   Project,
@@ -2007,6 +2008,9 @@ function Diagnostics({
   codexUpdate,
   codexUpdateBusy,
   codexUpdateError,
+  codexUpdateDiscovery,
+  codexUpdateDiscoveryBusy,
+  codexUpdateDiscoveryError,
   resourceLimits,
   resourceBusy,
   resourceError,
@@ -2016,6 +2020,7 @@ function Diagnostics({
   onApplyResources,
   onStartAccountLogin,
   onApplyCodexUpdate,
+  onCheckCodexUpdate,
   accountSwitchButtonRef,
   onClose,
 }: {
@@ -2023,6 +2028,9 @@ function Diagnostics({
   codexUpdate: CodexUpdateSnapshot | null;
   codexUpdateBusy: boolean;
   codexUpdateError: string | null;
+  codexUpdateDiscovery: CodexVersionDiscovery | null;
+  codexUpdateDiscoveryBusy: boolean;
+  codexUpdateDiscoveryError: string | null;
   resourceLimits: ResourceLimitSnapshot | null;
   resourceBusy: boolean;
   resourceError: string | null;
@@ -2032,6 +2040,7 @@ function Diagnostics({
   onApplyResources: () => Promise<void>;
   onStartAccountLogin: () => void;
   onApplyCodexUpdate: () => void;
+  onCheckCodexUpdate: () => void;
   accountSwitchButtonRef: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
 }) {
@@ -2077,47 +2086,87 @@ function Diagnostics({
           </button>
           <section className="codex-update" aria-labelledby="codex-update-title">
             <h3 id="codex-update-title">Обновление Codex</h3>
-            {codexUpdate ? (
+            {codexUpdateDiscovery ? (
               <>
                 <dl className="status-grid codex-update-versions">
-                  <dt>Текущая версия</dt>
-                  <dd>{codexUpdate.currentVersion}</dd>
-                  {codexUpdate.availableVersion && (
-                    <>
-                      <dt>Подготовлена</dt>
-                      <dd>{codexUpdate.availableVersion}</dd>
-                    </>
-                  )}
+                  <dt>Установлена</dt>
+                  <dd>{codexUpdateDiscovery.currentVersion}</dd>
+                  <dt>Последняя</dt>
+                  <dd>{codexUpdateDiscovery.latestVersion ?? 'не удалось определить'}</dd>
                 </dl>
-                <p className="codex-update-state" role="status">
-                  {codexUpdate.state === 'ready' && 'Обновление готово к установке.'}
-                  {codexUpdate.state === 'applying' && 'Обновляем Codex…'}
-                  {codexUpdate.state === 'current' &&
-                    'Установлена актуальная подготовленная версия.'}
-                  {codexUpdate.state === 'unavailable' && 'Подготовленное обновление отсутствует.'}
-                  {codexUpdate.state === 'failed' && 'Обновление не установлено.'}
-                  {codexUpdate.state === 'rollback_failed' &&
-                    'Обновление не установлено, автоматический откат не завершён.'}
+                <p className={`codex-update-state ${codexUpdateDiscovery.state}`} role="status">
+                  {codexUpdateDiscovery.state === 'available' &&
+                    'Доступна новая версия Codex. Для установки нужен подготовленный совместимый пакет.'}
+                  {codexUpdateDiscovery.state === 'current' &&
+                    'Установлена последняя версия Codex.'}
+                  {codexUpdateDiscovery.state === 'failed' &&
+                    'Не удалось проверить доступную версию Codex.'}
                 </p>
-                {codexUpdate.lastResult && codexUpdate.lastResult.status !== 'succeeded' && (
-                  <p className="notice error" role="alert">
-                    {codexUpdate.lastResult.message}
-                  </p>
-                )}
-                {codexUpdate.state === 'ready' && (
-                  <button
-                    className="primary codex-update-button"
-                    type="button"
-                    disabled={codexUpdateBusy}
-                    onClick={onApplyCodexUpdate}
-                  >
-                    {codexUpdateBusy ? 'Запускаем…' : 'Обновить Codex'}
-                  </button>
-                )}
+                <small className="codex-update-checked-at">
+                  Проверено {formatEventDateTime(codexUpdateDiscovery.checkedAt)}
+                </small>
               </>
             ) : (
-              <p className="empty-hint compact">Проверяем подготовленные обновления…</p>
+              <p className="empty-hint compact">Проверяем доступную версию…</p>
             )}
+            <button
+              className="secondary codex-update-button"
+              type="button"
+              disabled={codexUpdateDiscoveryBusy}
+              onClick={onCheckCodexUpdate}
+            >
+              {codexUpdateDiscoveryBusy ? 'Проверяем…' : 'Проверить обновления'}
+            </button>
+            {codexUpdateDiscoveryError && (
+              <p className="notice error" role="alert">
+                {codexUpdateDiscoveryError}
+              </p>
+            )}
+            <div className="codex-update-prepared">
+              <h4>Подготовленное обновление</h4>
+              {codexUpdate ? (
+                <>
+                  <dl className="status-grid codex-update-versions">
+                    <dt>Текущая версия</dt>
+                    <dd>{codexUpdate.currentVersion}</dd>
+                    {codexUpdate.availableVersion && (
+                      <>
+                        <dt>Подготовлена</dt>
+                        <dd>{codexUpdate.availableVersion}</dd>
+                      </>
+                    )}
+                  </dl>
+                  <p className="codex-update-state" role="status">
+                    {codexUpdate.state === 'ready' && 'Обновление готово к установке.'}
+                    {codexUpdate.state === 'applying' && 'Обновляем Codex…'}
+                    {codexUpdate.state === 'current' &&
+                      'Установлена актуальная подготовленная версия.'}
+                    {codexUpdate.state === 'unavailable' &&
+                      'Подготовленное обновление отсутствует.'}
+                    {codexUpdate.state === 'failed' && 'Обновление не установлено.'}
+                    {codexUpdate.state === 'rollback_failed' &&
+                      'Обновление не установлено, автоматический откат не завершён.'}
+                  </p>
+                  {codexUpdate.lastResult && codexUpdate.lastResult.status !== 'succeeded' && (
+                    <p className="notice error" role="alert">
+                      {codexUpdate.lastResult.message}
+                    </p>
+                  )}
+                  {codexUpdate.state === 'ready' && (
+                    <button
+                      className="primary codex-update-button"
+                      type="button"
+                      disabled={codexUpdateBusy}
+                      onClick={onApplyCodexUpdate}
+                    >
+                      {codexUpdateBusy ? 'Запускаем…' : 'Обновить Codex'}
+                    </button>
+                  )}
+                </>
+              ) : (
+                <p className="empty-hint compact">Проверяем подготовленные обновления…</p>
+              )}
+            </div>
             <p className="codex-update-note">
               Обновление запускается только когда Codex свободен и ненадолго перезапускает его. Чаты
               и файлы сохраняются.
@@ -2367,6 +2416,11 @@ function Workspace({
   const [codexUpdate, setCodexUpdate] = useState<CodexUpdateSnapshot | null>(null);
   const [codexUpdateBusy, setCodexUpdateBusy] = useState(false);
   const [codexUpdateError, setCodexUpdateError] = useState<string | null>(null);
+  const [codexUpdateDiscovery, setCodexUpdateDiscovery] = useState<CodexVersionDiscovery | null>(
+    null,
+  );
+  const [codexUpdateDiscoveryBusy, setCodexUpdateDiscoveryBusy] = useState(false);
+  const [codexUpdateDiscoveryError, setCodexUpdateDiscoveryError] = useState<string | null>(null);
   const [resourceLimits, setResourceLimits] = useState<ResourceLimitSnapshot | null>(null);
   const [resourceBusy, setResourceBusy] = useState(false);
   const [resourceError, setResourceError] = useState<string | null>(null);
@@ -2940,10 +2994,23 @@ function Workspace({
     )
       return;
     refreshedCodexUpdateRef.current = codexUpdate.lastResult.completedAt;
-    void api
-      .capabilities()
-      .then((next) => {
-        setCapability(next);
+    void Promise.all([api.capabilities(), api.models()])
+      .then(([nextCapability, nextModels]) => {
+        setCapability(nextCapability);
+        setModels(nextModels);
+        setModel((currentModel) => {
+          const selectedModel = nextModels.find((item) => item.id === currentModel);
+          const nextModel =
+            selectedModel ?? nextModels.find((item) => item.isDefault) ?? nextModels[0] ?? null;
+          setEffort((currentEffort) =>
+            nextModel?.supportedReasoningEfforts.some(
+              (item) => item.reasoningEffort === currentEffort,
+            )
+              ? currentEffort
+              : (nextModel?.defaultReasoningEffort ?? ''),
+          );
+          return nextModel?.id ?? '';
+        });
         setActionNotice('Codex обновлён. Чаты и файлы сохранены.');
       })
       .catch((cause: unknown) => {
@@ -3552,13 +3619,16 @@ function Workspace({
   async function openStatus() {
     setShowDiagnostics(true);
     setStatusRefreshing(true);
+    setCodexUpdateDiscoveryBusy(true);
     setError(null);
     try {
-      const [capabilityResult, resourceResult, codexUpdateResult] = await Promise.allSettled([
-        api.capabilities(),
-        api.resourceLimits(),
-        api.codexUpdate(),
-      ]);
+      const [capabilityResult, resourceResult, codexUpdateResult, discoveryResult] =
+        await Promise.allSettled([
+          api.capabilities(),
+          api.resourceLimits(),
+          api.codexUpdate(),
+          api.codexUpdateDiscovery(),
+        ]);
       if (capabilityResult.status === 'rejected') throw capabilityResult.reason;
       setCapability(capabilityResult.value);
       if (resourceResult.status === 'fulfilled') {
@@ -3573,10 +3643,17 @@ function Workspace({
       } else {
         setCodexUpdateError(errorMessage(codexUpdateResult.reason));
       }
+      if (discoveryResult.status === 'fulfilled') {
+        setCodexUpdateDiscovery(discoveryResult.value);
+        setCodexUpdateDiscoveryError(null);
+      } else {
+        setCodexUpdateDiscoveryError(errorMessage(discoveryResult.reason));
+      }
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
       setStatusRefreshing(false);
+      setCodexUpdateDiscoveryBusy(false);
     }
   }
 
@@ -3596,6 +3673,19 @@ function Workspace({
       setCodexUpdateError(`Не удалось начать обновление: ${errorMessage(cause)}`);
     } finally {
       setCodexUpdateBusy(false);
+    }
+  }
+
+  async function checkCodexUpdate() {
+    if (codexUpdateDiscoveryBusy) return;
+    setCodexUpdateDiscoveryBusy(true);
+    setCodexUpdateDiscoveryError(null);
+    try {
+      setCodexUpdateDiscovery(await api.checkCodexUpdate(session.csrfToken));
+    } catch (cause) {
+      setCodexUpdateDiscoveryError(`Не удалось проверить обновления: ${errorMessage(cause)}`);
+    } finally {
+      setCodexUpdateDiscoveryBusy(false);
     }
   }
 
@@ -4158,6 +4248,9 @@ function Workspace({
           codexUpdate={codexUpdate}
           codexUpdateBusy={codexUpdateBusy}
           codexUpdateError={codexUpdateError}
+          codexUpdateDiscovery={codexUpdateDiscovery}
+          codexUpdateDiscoveryBusy={codexUpdateDiscoveryBusy}
+          codexUpdateDiscoveryError={codexUpdateDiscoveryError}
           resourceLimits={resourceLimits}
           resourceBusy={resourceBusy}
           resourceError={resourceError}
@@ -4167,6 +4260,7 @@ function Workspace({
           onApplyResources={applyResourceLimits}
           onStartAccountLogin={() => void startAccountLogin()}
           onApplyCodexUpdate={() => void applyCodexUpdate()}
+          onCheckCodexUpdate={() => void checkCodexUpdate()}
           accountSwitchButtonRef={accountSwitchButtonRef}
           onClose={closeDiagnostics}
         />

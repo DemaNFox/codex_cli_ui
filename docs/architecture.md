@@ -121,6 +121,13 @@ broker is not part of a Codex permission preset: it is a separate root-owned, so
 that accepts only `status` and `apply` for one fixed, operator-staged release. Neither the browser nor the API
 can supply a URL, filesystem path, package name, version, systemd unit or shell command.
 
+Version discovery is deliberately outside that privileged broker. The non-root API reads only the fixed HTTPS
+`@openai/codex/latest` metadata endpoint with redirects disabled, a five-second timeout, a 32 KiB response cap
+and bounded semantic-version validation. Successful results are cached for fifteen minutes, failures for one
+minute, and a background check runs at startup and every six hours. The authenticated browser may force the
+same fixed check with an empty request but cannot supply a URL, version or package. Discovery never changes the
+prepared candidate and never makes an npm-only CLI eligible for activation.
+
 Because the non-root API cannot traverse every valid host-admin project (notably `0700` paths below `/root`),
 host-admin installs also use a separate read-only project-path broker. Its private socket accepts only an exact
 canonicalization request from the API service identity. The broker reads the root-owned project allowlist,
@@ -253,6 +260,11 @@ bound to that connection. Preserving computation across such a crash would requi
 the API lifecycle.
 
 ## Status-drawer Codex updates
+
+The drawer separately shows the installed CLI and the latest official upstream CLI version. It checks the
+fixed registry source when Status opens, supports an explicit “check now” action and reports registry failure
+without hiding the existing prepared-release state. After a completed activation, capabilities and the model
+catalog are both refreshed; a still-supported selected model is preserved.
 
 An operator first places a complete reviewed application package in the immutable release store and stages its
 release identifier through the root-only host helper. The authenticated Status drawer can then request only

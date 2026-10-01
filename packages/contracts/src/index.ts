@@ -111,6 +111,17 @@ export const codexUpdateSnapshotSchema = z.object({
 });
 export type CodexUpdateSnapshot = z.infer<typeof codexUpdateSnapshotSchema>;
 
+export const codexVersionDiscoverySchema = z.object({
+  state: z.enum(['current', 'available', 'failed']),
+  currentVersion: z.string().regex(/^codex-cli \d+\.\d+\.\d+$/),
+  latestVersion: z
+    .string()
+    .regex(/^codex-cli \d+\.\d+\.\d+$/)
+    .nullable(),
+  checkedAt: z.string().datetime(),
+});
+export type CodexVersionDiscovery = z.infer<typeof codexVersionDiscoverySchema>;
+
 export const subagentStatusSchema = z.enum([
   'pendingInit',
   'running',

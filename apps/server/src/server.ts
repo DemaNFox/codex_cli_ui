@@ -6,6 +6,7 @@ import {
   codexAccountLoginSchema,
   codexAccountSchema,
   codexUpdateSnapshotSchema,
+  codexVersionDiscoverySchema,
   createProjectRequestSchema,
   loginRequestSchema,
   modelOptionSchema,
@@ -47,6 +48,7 @@ import { z } from 'zod';
 
 import type { AppServerClient, AppServerInbound } from './app-server.js';
 import { CodexUpdateBrokerError, type CodexUpdateBroker } from './codex-update-broker.js';
+import type { CodexVersionChecker } from './codex-version-checker.js';
 import {
   MAX_TRANSCRIPTION_BYTES,
   MAX_TRANSCRIPTION_DURATION_SECONDS,
@@ -338,6 +340,7 @@ export interface ServerDependencies {
   readonly attachmentStore: AttachmentStore;
   readonly resourceBroker?: ResourceBroker;
   readonly codexUpdateBroker?: CodexUpdateBroker;
+  readonly codexVersionChecker?: CodexVersionChecker;
   readonly transcriptionClient?: AudioTranscriptionClient;
   readonly pushSender?: PushSender;
   readonly upgradeDrainPath?: string;
@@ -1867,6 +1870,34 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   app.get('/api/system/codex-update', async (request) => {
     auth.authenticate(request);
     return { data: await codexUpdateStatus() };
+  });
+
+  app.get('/api/system/codex-update/discovery', async (request) => {
+    auth.authenticate(request);
+    if (!dependencies.codexVersionChecker)
+      throw new HttpError(503, 'CODEX_VERSION_CHECK_UNAVAILABLE');
+    return {
+      data: codexVersionDiscoverySchema.parse(
+        await dependencies.codexVersionChecker.check(config.codexVersionPin),
+      ),
+    };
+  });
+
+  app.post('/api/system/codex-update/check', async (request) => {
+    csrfGuard(auth, request);
+    z.object({})
+      .strict()
+      .parse(request.body ?? {});
+    if (!dependencies.codexVersionChecker)
+      throw new HttpError(503, 'CODEX_VERSION_CHECK_UNAVAILABLE');
+    const discovery = codexVersionDiscoverySchema.parse(
+      await dependencies.codexVersionChecker.check(config.codexVersionPin, true),
+    );
+    repository.audit('codex_update.check', 'succeeded', {
+      state: discovery.state,
+      latestVersion: discovery.latestVersion,
+    });
+    return { data: discovery };
   });
 
   app.post('/api/system/codex-update/apply', async (request, reply) => {
