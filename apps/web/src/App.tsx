@@ -3269,11 +3269,15 @@ function Workspace({
     };
   }, [mergeEvents, session.csrfToken, threadId]);
 
-  async function refreshThreads(selectId?: string) {
+  async function refreshThreads(selectId?: string | null) {
     if (!projectId) return;
     const items = await api.threads(projectId, archiveView);
     setThreads(items);
-    if (selectId) setThreadId(selectId);
+    setThreadId((current) => {
+      if (selectId === null) return null;
+      const preferred = selectId ?? current;
+      return items.some((item) => item.id === preferred) ? preferred : (items[0]?.id ?? null);
+    });
   }
 
   async function refreshRecentThreads(sourceProjects = projects) {
@@ -3326,18 +3330,41 @@ function Workspace({
   async function archiveThread(id: string) {
     try {
       await api.archiveThread(session.csrfToken, id);
-      await Promise.all([refreshThreads(), refreshRecentThreads()]);
     } catch (cause) {
       setError(errorMessage(cause));
+      return;
+    }
+    setThreads((current) => current.filter((item) => item.id !== id));
+    setRecentThreads((current) => current.filter((item) => item.id !== id));
+    const archivedSelection = threadId === id;
+    if (archivedSelection) setThreadId(null);
+    try {
+      await Promise.all([
+        refreshThreads(archivedSelection ? null : undefined),
+        refreshRecentThreads(),
+      ]);
+    } catch (cause) {
+      setError(`Чат архивирован, но список обновится позже. ${errorMessage(cause)}`);
     }
   }
 
   async function restoreThread(id: string) {
     try {
       await api.unarchiveThread(session.csrfToken, id);
-      await Promise.all([refreshThreads(), refreshRecentThreads()]);
     } catch (cause) {
       setError(errorMessage(cause));
+      return;
+    }
+    setThreads((current) => current.filter((item) => item.id !== id));
+    const restoredSelection = threadId === id;
+    if (restoredSelection) setThreadId(null);
+    try {
+      await Promise.all([
+        refreshThreads(restoredSelection ? null : undefined),
+        refreshRecentThreads(),
+      ]);
+    } catch (cause) {
+      setError(`Чат восстановлен, но список обновится позже. ${errorMessage(cause)}`);
     }
   }
 

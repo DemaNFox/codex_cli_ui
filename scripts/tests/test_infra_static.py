@@ -203,6 +203,7 @@ class InfraStaticTest(unittest.TestCase):
             "--migrate-runner-mode cannot be combined with --no-start",
             'bash "$SCRIPT_DIR/migrate-runner-host-admin.sh"',
             'python3 "$package/scripts/install-local-host-instructions.py"',
+            'python3 "$package/scripts/rebase-codex-home.py"',
         ):
             self.assertIn(expected, installer)
         self.assertLess(
@@ -212,6 +213,19 @@ class InfraStaticTest(unittest.TestCase):
                 installer.index("runner_config="),
             ),
         )
+        repair = installer.index('python3 "$package/scripts/rebase-codex-home.py"')
+        start_branch = installer.index(
+            "if $start_service; then", installer.index('CODEX_WEB_CONFIG="$config"')
+        )
+        self.assertLess(
+            installer.rindex("systemctl stop codex-web-ui-app-server.socket", 0, repair),
+            repair,
+        )
+        self.assertLess(
+            installer.index("app-server socket remained active before Codex state repair"),
+            repair,
+        )
+        self.assertLess(repair, start_branch)
         self.assertLess(
             installer.index(
                 "installed runner configuration is missing or unsafe",
@@ -239,6 +253,7 @@ class InfraStaticTest(unittest.TestCase):
             'chmod 0700 "$source_codex_home"',
             "migration committed independently of the package upgrade",
             'python3 "$SCRIPT_DIR/install-local-host-instructions.py"',
+            'python3 "$SCRIPT_DIR/rebase-codex-home.py"',
         ):
             self.assertIn(expected, migration)
         self.assertLess(
@@ -614,7 +629,7 @@ class InfraStaticTest(unittest.TestCase):
         begin = installer.index('bash "$package/scripts/graceful-drain.sh" "${drain_args[@]}"')
         copy = installer.index('copy_release "$package" "$release_dir"')
         switch = installer.index('atomic_symlink "$release_dir" /opt/codex-web-ui/current')
-        runner_stop = installer.index("systemctl stop 'codex-web-ui-app-server@*.service'")
+        runner_stop = installer.index("systemctl stop codex-web-ui-app-server.socket", switch)
         release = installer.rindex('bash "$package/scripts/graceful-drain.sh" --release')
         post_switch_health = installer.index(
             '"$package/scripts/health-check.sh" --service-user api --timeout 45'

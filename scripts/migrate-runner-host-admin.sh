@@ -191,6 +191,10 @@ if inventory(Path(os.environ["SOURCE_HOME"])) != inventory(Path(os.environ["TARG
     raise SystemExit("copied Codex profile inventory differs from the source")
 PY
 
+python3 "$SCRIPT_DIR/rebase-codex-home.py" \
+  --profile-root "$stage" --target-home "$target_codex_home" \
+  --source-home "$source_codex_home"
+
 root_home=$(getent passwd root | cut -d: -f6)
 [[ $(runuser -u root -- env HOME="$root_home" CODEX_HOME="$stage" "$codex_bin" --version) == "$version_pin" ]] || \
   die 'copied Codex profile cannot run the pinned CLI'

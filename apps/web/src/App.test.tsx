@@ -2425,6 +2425,35 @@ describe('App', () => {
     );
   });
 
+  it('archives the selected chat and clears its stale composer context', async () => {
+    let archived = false;
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1/archive' && init?.method === 'POST') {
+        archived = true;
+        return jsonResponse({ data: { ...thread, archived: true } });
+      }
+      if (url.includes('/api/threads?')) return jsonResponse(archived ? [] : [thread]);
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findAllByText('Frontend task');
+
+    await user.click(screen.getByRole('button', { name: 'Меню недавнего чата Frontend task' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Архивировать чат' }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/threads/thread-1/archive',
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText<HTMLTextAreaElement>('Сообщение Codex').disabled).toBe(true),
+    );
+    expect(screen.queryByText('Frontend task')).toBeNull();
+  });
+
   it('hydrates an imported thread and deduplicates its replayed SSE event', async () => {
     const importedThread = {
       ...thread,
