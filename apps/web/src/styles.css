@@ -686,6 +686,9 @@ button:disabled {
   align-items: start;
   gap: 0.65rem;
 }
+.transcript-shell.has-turn-navigation > .transcript {
+  grid-column: 2;
+}
 .turn-navigation {
   position: fixed;
   top: 50dvh;
