@@ -2022,16 +2022,28 @@ describe('App', () => {
     });
 
     const input = await screen.findByLabelText('Уточнение для активной задачи');
+    const attachment = new File(['active evidence'], 'active-evidence.txt', {
+      type: 'text/plain',
+    });
+    await user.upload(screen.getByLabelText('Выбрать вложения'), attachment);
     await user.type(input, 'Сначала исправь тесты');
     await user.click(screen.getByRole('button', { name: 'Направить задачу' }));
     expect((await screen.findByRole('status')).textContent).toContain('Уточнение принято');
+    expect(screen.queryByText('active-evidence.txt')).toBeNull();
     await user.click(screen.getByRole('button', { name: 'Остановить' }));
     expect((await screen.findByRole('status')).textContent).toContain('Запрос на остановку принят');
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
         '/api/threads/thread-1/steer',
-        expect.objectContaining({ method: 'POST' }),
+        expect.objectContaining({
+          method: 'POST',
+          body: JSON.stringify({
+            text: 'Сначала исправь тесты',
+            expectedTurnId: 'turn-active',
+            attachmentIds: ['attachment-1'],
+          }),
+        }),
       );
       expect(fetchMock).toHaveBeenCalledWith(
         '/api/threads/thread-1/interrupt',
@@ -2072,6 +2084,10 @@ describe('App', () => {
     render(<App />);
 
     const input = await screen.findByLabelText('Уточнение для активной задачи');
+    await user.upload(
+      screen.getByLabelText('Выбрать вложения'),
+      new File(['keep me'], 'keep-me.txt', { type: 'text/plain' }),
+    );
     await user.type(input, 'Не потеряй этот текст');
     await user.click(screen.getByRole('button', { name: 'Направить задачу' }));
 
@@ -2079,16 +2095,64 @@ describe('App', () => {
       'Сессия обновлена. Текст сохранён — отправьте уточнение ещё раз.',
     );
     expect((input as HTMLTextAreaElement).value).toBe('Не потеряй этот текст');
+    expect(screen.getByText('keep-me.txt')).not.toBeNull();
+    expect(screen.getByText(/загружено/)).not.toBeNull();
+    expect(FakeXMLHttpRequest.instances).toHaveLength(1);
     expect(steerCalls).toBe(1);
     expect(sessionReads).toBe(2);
 
     await user.click(screen.getByRole('button', { name: 'Направить задачу' }));
     expect((await screen.findByRole('status')).textContent).toContain('Уточнение принято');
+    expect(screen.queryByText('keep-me.txt')).toBeNull();
+    expect(FakeXMLHttpRequest.instances).toHaveLength(1);
     expect(steerCalls).toBe(2);
     const steerRequests = fetchMock.mock.calls.filter(
       ([request]) => requestUrl(request) === '/api/threads/thread-1/steer',
     );
     expect(new Headers(steerRequests[1]?.[1]?.headers).get('X-CSRF-Token')).toBe('fresh-csrf');
+    const retriedSteerBody = steerRequests[1]?.[1]?.body;
+    expect(typeof retriedSteerBody).toBe('string');
+    if (typeof retriedSteerBody !== 'string') throw new Error('Expected a serialized steer body');
+    expect(JSON.parse(retriedSteerBody)).toEqual({
+      text: 'Не потеряй этот текст',
+      expectedTurnId: 'turn-active',
+      attachmentIds: ['attachment-1'],
+    });
+  });
+
+  it('retains an uploaded active-turn attachment after an ambiguous steer failure', async () => {
+    const activeThread = { ...thread, status: 'active' as const, activeTurnId: 'turn-active' };
+    let steerCalls = 0;
+    installAuthenticatedApi((url, init) => {
+      if (url.includes('/api/threads?')) return jsonResponse([activeThread]);
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: activeThread, events: [] });
+      if (url === '/api/threads/thread-1/steer' && init?.method === 'POST') {
+        steerCalls += 1;
+        if (steerCalls === 1) throw new TypeError('network outcome unknown');
+        return jsonResponse({ data: { turnId: 'turn-active' } });
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByLabelText('Уточнение для активной задачи');
+    await user.upload(
+      screen.getByLabelText('Выбрать вложения'),
+      new File(['keep me too'], 'ambiguous.txt', { type: 'text/plain' }),
+    );
+    expect(await screen.findByText('ambiguous.txt')).not.toBeNull();
+    await user.click(screen.getByRole('button', { name: 'Направить задачу' }));
+
+    expect((await screen.findByRole('alert')).textContent).toContain('network outcome unknown');
+    expect(screen.getByText('ambiguous.txt')).not.toBeNull();
+    expect(screen.getByText(/загружено/)).not.toBeNull();
+    expect(FakeXMLHttpRequest.instances).toHaveLength(1);
+
+    await user.click(screen.getByRole('button', { name: 'Направить задачу' }));
+    expect((await screen.findByRole('status')).textContent).toContain('Уточнение принято');
+    expect(screen.queryByText('ambiguous.txt')).toBeNull();
+    expect(FakeXMLHttpRequest.instances).toHaveLength(1);
   });
 
   it('shows an interrupt failure and restores the stop control', async () => {
@@ -2194,8 +2258,13 @@ describe('App', () => {
     expect(textarea.style.height).toBe('auto');
   });
 
-  it('queues files from picker, clipboard and drop, then removes them before upload', async () => {
-    installAuthenticatedApi();
+  it('queues files from picker, clipboard and drop while a turn is active', async () => {
+    const activeThread = { ...thread, status: 'active' as const, activeTurnId: 'turn-active' };
+    installAuthenticatedApi((url) => {
+      if (url.includes('/api/threads?')) return jsonResponse([activeThread]);
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: activeThread, events: [] });
+      return undefined;
+    });
     const user = userEvent.setup();
     render(<App />);
     await screen.findAllByText('Frontend task');
@@ -2205,7 +2274,7 @@ describe('App', () => {
     await user.upload(screen.getByLabelText('Выбрать вложения'), pickerFile);
     expect(await screen.findByText('picker.txt')).not.toBeNull();
 
-    const textarea = screen.getByLabelText('Сообщение Codex');
+    const textarea = screen.getByLabelText('Уточнение для активной задачи');
     fireEvent.paste(textarea, {
       clipboardData: { files: [new File(['paste'], 'paste.png', { type: 'image/png' })] },
     });

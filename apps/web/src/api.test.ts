@@ -191,6 +191,33 @@ describe('api response envelopes', () => {
     );
   });
 
+  it('sends attachment ids when steering an active turn', async () => {
+    const fetchMock = vi.fn<typeof fetch>(() =>
+      Promise.resolve(response({ data: { turnId: 'turn-active' } })),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      api.steer('csrf', thread.id, {
+        text: '',
+        expectedTurnId: 'turn-active',
+        attachmentIds: ['attachment-1'],
+      }),
+    ).resolves.toEqual({ turnId: 'turn-active' });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/threads/thread-1/steer',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({
+          text: '',
+          expectedTurnId: 'turn-active',
+          attachmentIds: ['attachment-1'],
+        }),
+      }),
+    );
+  });
+
   it('reads and starts the prepared Codex update with CSRF protection', async () => {
     const fetchMock = vi.fn<typeof fetch>(() =>
       Promise.resolve(response({ data: { ...codexUpdate, state: 'applying' } })),

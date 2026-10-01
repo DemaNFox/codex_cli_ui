@@ -2471,6 +2471,8 @@ function Workspace({
   const refreshedCodexUpdateRef = useRef<string | null>(null);
   const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
   const attachmentThreadRef = useRef<string | null>(null);
+  const csrfTokenRef = useRef(session.csrfToken);
+  csrfTokenRef.current = session.csrfToken;
   const activeUploadsRef = useRef(new Map<string, { threadId: string; abort: () => void }>());
   const preferencesWriteRef = useRef<Promise<void>>(Promise.resolve());
   const sendInFlightRef = useRef(false);
@@ -3217,7 +3219,7 @@ function Workspace({
       for (const item of previousQueue) {
         if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
         if (item.uploaded)
-          void api.deleteAttachment(session.csrfToken, previousThreadId, item.uploaded.id);
+          void api.deleteAttachment(csrfTokenRef.current, previousThreadId, item.uploaded.id);
       }
       queuedAttachmentsRef.current = [];
     }
@@ -3267,7 +3269,7 @@ function Workspace({
     return () => {
       cancelled = true;
     };
-  }, [mergeEvents, session.csrfToken, threadId]);
+  }, [mergeEvents, threadId]);
 
   async function refreshThreads(selectId?: string | null) {
     if (!projectId) return;
@@ -3381,12 +3383,6 @@ function Workspace({
 
   function queueFiles(files: File[]) {
     if (!threadId || archiveView) return;
-    if (active) {
-      setAttachmentNotice(
-        'Вложения нельзя добавить во время активной задачи. Дождитесь её завершения или остановите задачу.',
-      );
-      return;
-    }
     setAttachmentNotice(null);
     setQueuedAttachments((current) => {
       const next = [...current];
@@ -3558,22 +3554,21 @@ function Workspace({
         return;
       }
     }
-    if (targetActiveRootTurn && queuedAttachments.length) {
-      setAttachmentNotice(
-        'Вложения нельзя отправить во время активной задачи. Дождитесь её завершения или удалите вложения.',
-      );
-      releaseSend();
-      return;
-    }
     setActionNotice(
       targetActiveRootTurn ? 'Передаём уточнение активной задаче…' : 'Передаём задачу Codex…',
     );
     try {
+      const attachments = await uploadQueued(threadId);
       if (targetActiveRootTurn && targetActiveTurnId) {
-        await api.steer(session.csrfToken, threadId, text, targetActiveTurnId);
+        await api.steer(session.csrfToken, threadId, {
+          text,
+          expectedTurnId: targetActiveTurnId,
+          ...(attachments.length
+            ? { attachmentIds: attachments.map((attachment) => attachment.id) }
+            : {}),
+        });
         setActionNotice('Уточнение принято активной задачей.');
       } else {
-        const attachments = await uploadQueued(threadId);
         await api.startTurn(session.csrfToken, threadId, {
           text,
           ...(model ? { model } : {}),
@@ -3583,17 +3578,17 @@ function Workspace({
           idempotencyKey: crypto.randomUUID(),
           attachmentIds: attachments.map((attachment) => attachment.id),
         });
-        setThreadAttachmentBytes(
-          (current) =>
-            current + attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
-        );
-        queuedAttachments.forEach((item) => {
-          if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
-        });
-        setQueuedAttachments([]);
-        setAttachmentNotice(null);
         setActionNotice('Задача принята Codex.');
       }
+      setThreadAttachmentBytes(
+        (current) =>
+          current + attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
+      );
+      queuedAttachments.forEach((item) => {
+        if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+      });
+      setQueuedAttachments([]);
+      setAttachmentNotice(null);
       setComposer('');
     } catch (cause) {
       setActionNotice(null);
@@ -4096,23 +4091,13 @@ function Workspace({
           <div
             className={`composer ${dragActive ? 'drag-active' : ''}`}
             onDragEnter={(event: DragEvent<HTMLDivElement>) => {
-              if (
-                !active &&
-                !archiveView &&
-                threadId &&
-                event.dataTransfer.types.includes('Files')
-              ) {
+              if (!archiveView && threadId && event.dataTransfer.types.includes('Files')) {
                 event.preventDefault();
                 setDragActive(true);
               }
             }}
             onDragOver={(event: DragEvent<HTMLDivElement>) => {
-              if (
-                !active &&
-                !archiveView &&
-                threadId &&
-                event.dataTransfer.types.includes('Files')
-              ) {
+              if (!archiveView && threadId && event.dataTransfer.types.includes('Files')) {
                 event.preventDefault();
                 event.dataTransfer.dropEffect = 'copy';
               }
@@ -4137,7 +4122,7 @@ function Workspace({
                 queueFiles(Array.from(event.target.files ?? []));
                 event.target.value = '';
               }}
-              disabled={!threadId || archiveView || active || busy}
+              disabled={!threadId || archiveView || busy}
             />
             {queuedAttachments.length > 0 && (
               <ul className="attachment-queue" aria-label="Вложения к отправке">
@@ -4220,13 +4205,9 @@ function Workspace({
                 type="button"
                 className="attach-button"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={!threadId || archiveView || activeRootTurn || busy}
+                disabled={!threadId || archiveView || busy}
                 aria-label="Прикрепить файлы"
-                title={
-                  activeRootTurn
-                    ? 'Вложения недоступны во время активной задачи'
-                    : 'Прикрепить файлы'
-                }
+                title="Прикрепить файлы"
               >
                 ＋
               </button>
@@ -4249,7 +4230,6 @@ function Workspace({
                   !threadId ||
                   archiveView ||
                   (!composer.trim() && !queuedAttachments.length) ||
-                  (activeRootTurn && queuedAttachments.length > 0) ||
                   busy
                 }
                 aria-label={activeRootTurn ? 'Направить задачу' : 'Отправить сообщение'}
@@ -4258,10 +4238,9 @@ function Workspace({
               </button>
             </div>
           </div>
-          {(attachmentNotice || (activeRootTurn && queuedAttachments.length > 0)) && (
+          {attachmentNotice && (
             <p className="attachment-notice" role="status">
-              {attachmentNotice ??
-                'Вложения нельзя отправить во время активной задачи. Дождитесь её завершения или удалите вложения.'}
+              {attachmentNotice}
             </p>
           )}
           <p className="composer-hint">

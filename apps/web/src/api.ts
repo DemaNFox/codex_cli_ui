@@ -332,14 +332,18 @@ export const api = {
     ).then(unwrapData),
   uploadAttachment,
   transcribeAudio,
-  steer: async (csrfToken: string, threadId: string, text: string, expectedTurnId: string) =>
+  steer: async (
+    csrfToken: string,
+    threadId: string,
+    input: { text: string; expectedTurnId: string; attachmentIds?: string[] },
+  ) =>
     unwrapData(
       await request<{ turnId: string } | { data: { turnId: string } }>(
         `/api/threads/${encodeURIComponent(threadId)}/steer`,
         {
           method: 'POST',
           csrfToken,
-          body: { text, expectedTurnId },
+          body: input,
         },
       ),
     ),
