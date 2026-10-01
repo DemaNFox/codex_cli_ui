@@ -226,6 +226,14 @@ class InfraStaticTest(unittest.TestCase):
             repair,
         )
         self.assertLess(repair, start_branch)
+        self.assertIn(
+            "rebase_args+=(--source-home /var/lib/codex-web-ui/codex-home)",
+            installer,
+        )
+        self.assertIn(
+            "rebase_args+=(--source-home /opt/ai-chat-agents/home/.codex)",
+            installer,
+        )
         self.assertLess(
             installer.index(
                 "installed runner configuration is missing or unsafe",

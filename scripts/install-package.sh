@@ -936,6 +936,7 @@ fi
 rebase_args=(--profile-root "$codex_home" --target-home "$codex_home")
 if [[ $runner_mode == host-admin ]]; then
   rebase_args+=(--source-home /var/lib/codex-web-ui/codex-home)
+  rebase_args+=(--source-home /opt/ai-chat-agents/home/.codex)
 fi
 runuser -u "$runner_user" -- python3 "$package/scripts/rebase-codex-home.py" "${rebase_args[@]}"
 if $start_service; then
