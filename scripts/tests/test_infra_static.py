@@ -109,6 +109,25 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("Accept=yes", socket)
         self.assertIn("SocketMode=0600", socket)
 
+        host_admin = (
+            ROOT / "infra/systemd/codex-web-ui-app-server-host-admin@.service"
+        ).read_text(encoding="utf-8")
+        self.assertIn("User=root", host_admin)
+        self.assertIn("Group=root", host_admin)
+        self.assertIn("Slice=codex-web-ui-workload.slice", host_admin)
+        self.assertIn("Nice=5", host_admin)
+        for forbidden in (
+            "NoNewPrivileges=",
+            "CapabilityBoundingSet=",
+            "ProtectSystem=",
+            "ProtectHome=",
+            "PrivateDevices=",
+            "InaccessiblePaths=",
+            "ReadOnlyPaths=",
+            "ReadWritePaths=",
+        ):
+            self.assertNotIn(forbidden, host_admin)
+
         workload_slice = (ROOT / "infra/systemd/codex-web-ui-workload.slice").read_text(
             encoding="utf-8"
         )
@@ -158,6 +177,87 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("User=root", guard_unit)
         self.assertIn("codex-web-ui-storage-enforce %i", guard_unit)
         self.assertIn("OnUnitActiveSec=1min", timer)
+
+    def test_installer_supports_explicit_runner_modes_and_transactional_migration(self) -> None:
+        installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        migration = (ROOT / "scripts/migrate-runner-host-admin.sh").read_text(
+            encoding="utf-8"
+        )
+        common = (ROOT / "scripts/lib/ubuntu-common.sh").read_text(encoding="utf-8")
+        required = (ROOT / "scripts/prepare-package.sh").read_text(encoding="utf-8")
+
+        for expected in (
+            "--runner-mode",
+            "restricted|host-admin",
+            "CODEX_WEB_RUNNER_MODE",
+            "changing the runner mode requires an explicit migration workflow",
+            "codex-web-ui-app-server-host-admin@.service",
+            "--migrate-runner-mode",
+            "Host-admin runner migration is already complete",
+            "--migrate-runner-mode cannot be combined with --no-start",
+            'bash "$SCRIPT_DIR/migrate-runner-host-admin.sh"',
+            'python3 "$package/scripts/install-local-host-instructions.py"',
+        ):
+            self.assertIn(expected, installer)
+        self.assertLess(
+            installer.index('bash "$SCRIPT_DIR/migrate-runner-host-admin.sh"'),
+            installer.index('if [[ $mode == upgrade ]]', installer.index("runner_config=")),
+        )
+        self.assertLess(
+            installer.index(
+                "installed runner configuration is missing or unsafe",
+                installer.index("if [[ -n $migrate_runner_mode ]]")
+            ),
+            installer.index(
+                "installed_runner_mode=$(sed",
+                installer.index("if [[ -n $migrate_runner_mode ]]")
+            ),
+        )
+        for expected in (
+            'graceful-drain.sh" --begin',
+            "systemctl stop codex-web-ui-app-server.socket codex-web-ui@api.service",
+            'cp -a --no-preserve=ownership -- "$source_codex_home/." "$stage/"',
+            "copied Codex profile inventory differs from the source",
+            "contains a symlink and cannot cross the privilege boundary",
+            "target CODEX_HOME already exists; profiles are never merged",
+            "target CODEX_HOME parent must be owned by root",
+            "target CODEX_HOME parent must not be writable by group or other users",
+            'mv -T -- "$stage" "$target_codex_home"',
+            "migrated CODEX_HOME did not activate at the expected path",
+            "login status",
+            "restore_activation_file",
+            'chown -hR root:root "$source_codex_home"',
+            'chmod 0700 "$source_codex_home"',
+            "migration committed independently of the package upgrade",
+            'python3 "$SCRIPT_DIR/install-local-host-instructions.py"',
+        ):
+            self.assertIn(expected, migration)
+        self.assertLess(
+            migration.index('graceful-drain.sh" --begin'),
+            migration.index('cp -a --no-preserve=ownership'),
+        )
+        rename = migration.index('mv -T -- "$stage" "$target_codex_home"')
+        self.assertLess(migration.rindex("trap '' INT TERM", 0, rename), rename)
+        self.assertLess(rename, migration.index("target_created=true", rename))
+        self.assertLess(
+            migration.index("target_created=true", rename),
+            migration.index("trap 'exit 130' INT", rename),
+        )
+        self.assertLess(
+            migration.index('"$SCRIPT_DIR/health-check.sh"'),
+            migration.index('chown -hR root:root "$source_codex_home"'),
+        )
+        self.assertIn("validate_runner_user()", common)
+        self.assertIn("$mode == host-admin && $path == /", common)
+        self.assertIn('"scripts/migrate-runner-host-admin.sh"', required)
+        self.assertIn(
+            '"infra/systemd/codex-web-ui-app-server-host-admin@.service"', required
+        )
+        wrapper = (ROOT / "install.sh").read_text(encoding="utf-8")
+        self.assertIn(
+            "--runner-mode|--migrate-runner-mode|--migration-codex-home|--runner-user",
+            wrapper,
+        )
 
     def test_nginx_edge_is_tls_only_for_application_traffic_and_sse_unbuffered(self) -> None:
         nginx = (ROOT / "infra/nginx/codex-web-ui.conf.template").read_text(encoding="utf-8")

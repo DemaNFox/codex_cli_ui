@@ -2,17 +2,28 @@
 
 ## Executive summary
 
-This service is an Internet-reachable development control plane with remote-code-execution authority under its Linux service user. The dominant risks are account/session compromise, browser injection through untrusted agent output, path escape across projects, credential exfiltration from `CODEX_HOME`, and resource exhaustion on a shared host. Password-only single-user access is accepted by the owner, so strong password hashing, throttling, lockout, secure sessions, TLS and audit are mandatory; optional second-factor support remains recommended.
+This service is an Internet-reachable development control plane. Restricted mode has code-execution authority
+under one non-root Linux user; explicit host-admin mode has host-root authority. The dominant risks are therefore
+account/session compromise, prompt or project injection, browser injection through untrusted output, credential
+exfiltration, unsafe runner migration and resource exhaustion. Password-only single-user access and optional
+root runner authority are accepted by the owner, so strong password hashing, throttling, lockout, secure
+sessions, TLS, audit and an explicit fail-closed mode choice are mandatory; second factor remains recommended.
 
 ## Scope and assumptions
 
 - In scope: the standalone reverse-proxied web/API service, SQLite metadata, bounded attachment storage,
   ephemeral voice transcription, per-device Web Push subscriptions and delivery queue, private app-server
   socket, registered project roots, server Codex home, package/bootstrap installer and runtime units.
-- Out of scope: product CRM/Admin code, product databases and secrets, Provider/Telegram controls, Docker socket, root shell, and automatic deployment.
+- Out of scope: product CRM/Admin code, product databases and Provider/Telegram controls, browser-controlled
+  Docker access, browser-controlled runner-mode changes and automatic deployment. Host-root Codex execution is
+  in scope only when the operator explicitly installs or migrates to `host-admin`.
 - One trusted human operator uses multiple personal devices.
 - The service initially shares the existing Ubuntu host with other workloads.
 - Public access is protected by HTTPS and application login. Password compromise remains a material residual risk.
+- The owner explicitly wants a dedicated-host option in which authenticated Codex tasks may administer the
+  complete machine and accepts that a compromised session or injected task can then become root execution.
+- Restricted remains the fresh-install default. A normal upgrade cannot change runner identity; migration must
+  drain work and preserve both the Web database and complete Codex home with rollback evidence.
 - Resource-control settings are single-owner administrative mutations. The owner confirmed automatic mode must
   reserve at least 15% of host RAM (and never less than 1 GiB) plus one CPU core; disk remains on the fixed
   80 GiB bounded volume. "Unlimited" means no lower manual ceiling, never permission to exceed the detected
@@ -27,14 +38,17 @@ This service is an Internet-reachable development control plane with remote-code
 - Node.js API, session and authorization boundary.
 - SQLite metadata/session/audit/event store.
 - Mode-0600 systemd Unix socket and bounded JSON-RPC adapter.
-- A separate non-root Codex runner, `CODEX_HOME`, and allowlisted projects.
+- A selected Codex runner (`restricted` non-root or explicit `host-admin` root), its `CODEX_HOME`, and configured
+  project roots.
 
 ### Data flows and trust boundaries
 
 - Browser -> edge: credentials, session cookie and UI requests over HTTPS; protected by TLS, limits and security headers.
 - Edge -> API: authenticated REST/SSE; exact Origin, CSRF on mutations, schema and size validation.
 - API -> SQLite: hashed sessions, projects, mappings, normalized events and audit records; no OpenAI token or chain-of-thought.
-- API -> app-server: typed JSON-RPC over a private Unix socket; allowlisted methods, bounded messages and reconnect backoff. API and runner have separate OS identities.
+- API -> app-server: typed JSON-RPC over a private Unix socket; allowlisted methods, bounded messages and
+  reconnect backoff. The API remains non-root in both modes. The restricted runner is a separate non-root
+  identity; the host-admin runner is root and is deliberately not contained from host files/services.
 - API -> resource broker: a fixed, typed local Unix-socket protocol requests only CPU, memory and task-count
   policy for one fixed workload slice. The root broker verifies peer credentials, re-detects host capacity,
   rejects unsafe values and never accepts commands, paths, unit names or property names from the browser/API.
@@ -47,7 +61,11 @@ This service is an Internet-reachable development control plane with remote-code
   the manifest must match the active backend `apiCompatibility`, and a root-owned atomic symlink selects only
   immutable static assets without restarting the API or Codex runner.
 - Codex runner terminal -> OpenAI device login: during bootstrap Codex displays and consumes the device flow
-  directly as the non-root runner; the installer never captures the code or accepts an account token.
+  directly as the selected runner; root is allowed only after explicit host-admin selection. The installer
+  never captures the code or accepts an account token.
+- Restricted state -> host-admin migration: after admission drain and runner shutdown, a root-only local
+  workflow preserves SQLite unchanged, copies the complete Codex home without merging profiles, validates the
+  copy, activates the root runner and retains rollback state through health verification.
 - Authenticated owner browser -> Web API -> app-server device login: after bootstrap the API may relay one
   short-lived verification URL/code from the isolated runner to the current owner session. It never receives
   credential tokens or reads `CODEX_HOME`, and task admission is closed for the lifetime of the flow.
@@ -71,7 +89,7 @@ flowchart LR
   E --> A["Web API"]
   A --> D["SQLite"]
   A --> S["Private Unix socket"]
-  S --> C["Isolated Codex runner"]
+  S --> C["Selected Codex runner"]
   C --> P["Allowed projects"]
   C --> O["OpenAI"]
   A --> W["Web Push service"]
@@ -80,19 +98,21 @@ flowchart LR
 
 ## Assets and security objectives
 
-| Asset                           | Why it matters                                | Objective |
-| ------------------------------- | --------------------------------------------- | --------- |
-| Website password and sessions   | They authorize remote code execution          | C/I       |
-| Codex account credential        | Account access, usage and spend               | C/I       |
-| Source and Git state            | Product integrity and intellectual property   | C/I/A     |
-| `AGENTS.md`, skills and config  | They control agent behavior and safety        | I         |
-| Project secrets                 | May authorize external systems                | C/I       |
-| Chats, diffs and command output | Can contain sensitive development data        | C/I/A     |
-| Host resources                  | Shared-host availability                      | A         |
-| Uploaded images and files       | May contain private data or hostile content   | C/I/A     |
-| Temporary voice recordings      | May contain private speech and incur API cost | C/A       |
-| Push endpoints and key material | Address personal devices and authorize pushes | C/I       |
-| Managed runtime artifacts       | They execute with installer/service authority | I/A       |
+| Asset                           | Why it matters                                                             | Objective |
+| ------------------------------- | -------------------------------------------------------------------------- | --------- |
+| Website password and sessions   | They authorize remote code execution                                       | C/I       |
+| Codex account credential        | Account access, usage and spend                                            | C/I       |
+| Source and Git state            | Product integrity and intellectual property                                | C/I/A     |
+| `AGENTS.md`, skills and config  | They control agent behavior and safety                                     | I         |
+| Project secrets                 | May authorize external systems                                             | C/I       |
+| Chats, diffs and command output | Can contain sensitive development data                                     | C/I/A     |
+| Host resources                  | Shared-host availability                                                   | A         |
+| Uploaded images and files       | May contain private data or hostile content                                | C/I/A     |
+| Temporary voice recordings      | May contain private speech and incur API cost                              | C/A       |
+| Push endpoints and key material | Address personal devices and authorize pushes                              | C/I       |
+| Managed runtime artifacts       | They execute with installer/service authority                              | I/A       |
+| Host root authority             | Controls every local service, credential and file in host-admin mode       | C/I/A     |
+| Migration rollback state        | Preserves chats, rollout history and authentication during identity change | C/I/A     |
 
 ## Attacker model
 
@@ -100,30 +120,35 @@ flowchart LR
 
 - An unauthenticated Internet client can reach the login surface.
 - Repository content and tool output can be attacker-controlled.
-- A logged-in attacker can submit prompts and choose exposed permission presets.
+- A logged-in attacker can submit prompts and choose exposed permission presets. If the operator installed
+  host-admin, full-access work executes as root.
 - A malicious dependency can execute when an authorized Codex run invokes project tooling.
 
 ### Non-capabilities
 
 - The attacker does not initially control the host, TLS private key, server environment or operator device.
-- The service user has no sudo, root, Docker socket or product-runtime secret access by design.
+- In restricted mode the runner has no sudo, root, Docker socket or product-runtime secret access by design.
+- In host-admin mode no filesystem/service boundary protects the host from the Codex runner; only Web
+  authentication, task admission and the operator's prompt/project trust remain before root execution.
 
 ## Entry points and attack surfaces
 
-| Surface               | How reached           | Boundary                    | Planned controls                                                                      |
-| --------------------- | --------------------- | --------------------------- | ------------------------------------------------------------------------------------- |
-| Login                 | Public HTTPS          | Internet to session         | Argon2id, throttling, lockout, generic errors                                         |
-| REST mutations        | Authenticated browser | Session to API              | CSRF, exact Origin, Zod, turn/action idempotency; bounded upload cleanup              |
-| SSE                   | Authenticated browser | API to browser              | Per-thread authorization, replay cursor, no secrets                                   |
-| Markdown/diffs/output | Codex events          | Untrusted output to DOM     | text-safe rendering, no raw HTML, CSP                                                 |
-| Project registration  | Admin form            | API to filesystem           | configured roots, realpath, symlink/path rejection                                    |
-| JSON-RPC              | Local child stdio     | API to Codex                | method/schema allowlist, IDs, size bounds                                             |
-| Attachment upload     | Authenticated browser | Browser to bounded storage  | multipart/type/signature/size limits, opaque IDs                                      |
-| Attachment content    | Authenticated browser | Storage to browser          | thread ownership, `nosniff`, download non-images                                      |
-| Voice transcription   | Authenticated browser | Browser/API to OpenAI       | CSRF/origin, MIME/size/time/rate bounds, idempotency, no persistence, server-only key |
-| Push subscription     | Authenticated browser | Browser/API to push service | Explicit permission; CSRF/origin; bounded HTTPS endpoint/keys; generic payload        |
-| Skills and rules      | Project/server files  | Filesystem to agent policy  | pinned bundle, checksums, visible loaded sources                                      |
-| Codex update          | Authenticated browser | API to narrow root broker   | staged fixed candidate, peer credentials, no caller path/command, checksums, rollback |
+| Surface               | How reached           | Boundary                     | Planned controls                                                                      |
+| --------------------- | --------------------- | ---------------------------- | ------------------------------------------------------------------------------------- |
+| Login                 | Public HTTPS          | Internet to session          | Argon2id, throttling, lockout, generic errors                                         |
+| REST mutations        | Authenticated browser | Session to API               | CSRF, exact Origin, Zod, turn/action idempotency; bounded upload cleanup              |
+| SSE                   | Authenticated browser | API to browser               | Per-thread authorization, replay cursor, no secrets                                   |
+| Markdown/diffs/output | Codex events          | Untrusted output to DOM      | text-safe rendering, no raw HTML, CSP                                                 |
+| Project registration  | Admin form            | API to filesystem            | configured roots, realpath, symlink/path rejection                                    |
+| JSON-RPC              | Local child stdio     | API to Codex                 | method/schema allowlist, IDs, size bounds                                             |
+| Attachment upload     | Authenticated browser | Browser to bounded storage   | multipart/type/signature/size limits, opaque IDs                                      |
+| Attachment content    | Authenticated browser | Storage to browser           | thread ownership, `nosniff`, download non-images                                      |
+| Voice transcription   | Authenticated browser | Browser/API to OpenAI        | CSRF/origin, MIME/size/time/rate bounds, idempotency, no persistence, server-only key |
+| Push subscription     | Authenticated browser | Browser/API to push service  | Explicit permission; CSRF/origin; bounded HTTPS endpoint/keys; generic payload        |
+| Skills and rules      | Project/server files  | Filesystem to agent policy   | pinned bundle, checksums, visible loaded sources                                      |
+| Codex update          | Authenticated browser | API to narrow root broker    | staged fixed candidate, peer credentials, no caller path/command, checksums, rollback |
+| Runner-mode install   | Local root terminal   | Operator to systemd/Codex    | restricted default, explicit host-admin value, protected persisted mode               |
+| Runner migration      | Local root terminal   | Non-root state to root state | idle drain, collision rejection, complete state copy, health-gated rollback           |
 
 ## Top abuse paths
 
@@ -154,34 +179,40 @@ flowchart LR
     delivery, or a detailed payload leaks project content through a push provider or lock screen.
 21. A compromised API abuses a broad updater as a root confused deputy, races candidate replacement, or
     activates a CLI whose generated app-server protocol differs from the reviewed backend contract.
+22. An operator or broken upgrade changes the runner to root implicitly, turning an expected non-root task into
+    host takeover without a deliberate trust decision.
+23. A partial or colliding migration starts root Codex with an empty or unrelated profile, loses rollout/chat
+    continuity, or leaves duplicated credentials readable by the previous non-root identity.
 
 ## Threat model table
 
-| ID     | Threat                                                                      | Existing controls                                           | Required mitigation                                                                                                                                                                                                                                                                                                                                           | Likelihood | Impact   | Priority |
-| ------ | --------------------------------------------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | -------- | -------- |
-| TM-001 | Password/session compromise grants code execution                           | Single owner, TLS planned                                   | Argon2id, strong secret, rate limit, lockout, rotation, audit; add TOTP/passkey later                                                                                                                                                                                                                                                                         | medium     | high     | high     |
-| TM-002 | Stored/reflected XSS through model/tool output                              | React escaping planned                                      | No raw HTML, strict CSP, safe Markdown, hostile-output tests                                                                                                                                                                                                                                                                                                  | medium     | high     | high     |
-| TM-003 | Project path traversal or symlink escape                                    | Root allowlist planned                                      | `realpath` containment on registration and every execution, no client cwd                                                                                                                                                                                                                                                                                     | medium     | high     | high     |
-| TM-004 | Codex/OpenAI or project secret leakage                                      | Server-only Codex home                                      | Redaction, output bounds, no raw env/logging, isolated service user                                                                                                                                                                                                                                                                                           | medium     | high     | high     |
-| TM-005 | CSRF or SSE authorization bypass                                            | Same-site cookie planned                                    | Session-bound CSRF, Origin checks, per-thread authorization                                                                                                                                                                                                                                                                                                   | medium     | high     | high     |
-| TM-006 | Resource exhaustion harms shared host                                       | Bounded volume and static service cgroups                   | Aggregate API/runner in one workload slice; default auto reserve of 15% RAM/minimum 1 GiB plus one CPU; count root turns and subagents; live admission, process-tree cleanup, typed limits and kernel read-back                                                                                                                                               | high       | high     | critical |
-| TM-007 | Skill/rule supply-chain tampering                                           | Git-owned `AGENTS.md`                                       | Checksummed skill manifest, owner-only install, diagnostics and update audit                                                                                                                                                                                                                                                                                  | medium     | high     | high     |
-| TM-008 | Approval confusion after reconnect/restart                                  | App-server request IDs                                      | Durable pending state, fail closed, reconcile active requests, never auto-approve                                                                                                                                                                                                                                                                             | medium     | high     | high     |
-| TM-009 | Backend compromise reaches root/Docker/product secrets                      | None in new service yet                                     | Non-root user, inaccessible paths, no Docker socket, separate deploy broker                                                                                                                                                                                                                                                                                   | low        | high     | high     |
-| TM-010 | Cross-thread attachment access or path traversal                            | Authenticated thread routes                                 | Opaque IDs, thread ownership on every read/claim/delete, generated storage names, realpath containment, hostile-ID tests                                                                                                                                                                                                                                      | medium     | high     | high     |
-| TM-011 | Hostile upload becomes browser or host execution                            | React escaping, dedicated storage                           | Signature-check images, allowlisted types/extensions, `nosniff`, download non-images, never parse/execute/unzip in API                                                                                                                                                                                                                                        | medium     | high     | high     |
-| TM-012 | Uploads exhaust shared-host resources                                       | Bounded ext4 application volume and tmpfs                   | 20 MiB/file, 8/turn, 50 MiB/thread, edge/body timeout, bounded in-memory parsing with failed-write cleanup, existing byte/inode/resource limits                                                                                                                                                                                                               | medium     | high     | high     |
-| TM-013 | Internal attachment path leaks through Codex events                         | Safe normalized event projection                            | Ignore live app-server `userMessage` items and fragmented agent deltas; publish redacted completed messages; persist one backend-authored user event; path-leak regression tests                                                                                                                                                                              | medium     | high     | high     |
-| TM-014 | Bootstrap leaks or silently replaces admin secrets                          | Local root-only bootstrap                                   | Hidden TTY entry, bounded Argon2id, CSPRNG session secret, atomic `0600` replacement, explicit `--rotate`, no secrets in argv/logs                                                                                                                                                                                                                            | low        | high     | high     |
-| TM-015 | Web API compromise reaches Codex credentials/projects                       | Dedicated API and runner identities                         | Private systemd socket, separate environments, API cannot read `CODEX_HOME`, runner cannot read Web secrets/SQLite, explicit project and attachment mounts                                                                                                                                                                                                    | low        | high     | high     |
-| TM-016 | Toolchain supply-chain substitution during bootstrap                        | HTTPS downloads                                             | Exact versions, committed SHA-256/SHA-512 digests, immutable root-owned version directories, no shell-pipe installer or floating tags, package inventory verification                                                                                                                                                                                         | low        | critical | high     |
-| TM-017 | Device authentication leaks, races active work or uses the wrong identity   | Bootstrap uses direct runner TTY; runtime has Web auth/CSRF | Bootstrap via runner `/dev/tty`; runtime uses only pinned app-server device login, exact-Origin/CSRF, strict `auth.openai.com` URL projection, one in-memory flow with timeout/cancel, no code/token persistence or audit, warning against sharing, and an idle-only admission interlock that releases only after a terminal result or confirmed cancellation | low        | high     | high     |
-| TM-018 | Resource settings become a root confused deputy                             | Authenticated API may request resource changes              | Separate root-owned broker; mode-0600 socket and `SO_PEERCRED`; fixed target/properties; strict schema/capacity/floor checks; no shell; atomic policy and rollback; journald plus API audit                                                                                                                                                                   | low        | critical | high     |
-| TM-019 | Reconfiguration interrupts active work or races admission                   | Active root turns/subagents and concurrent Apply/start      | Serialize admission with a pending/applying gate; apply only after root turns, pending starts and active subagents reach zero; recheck current usage and read back kernel state                                                                                                                                                                               | medium     | high     | high     |
-| TM-020 | Web-only release is tampered, escapes storage or mismatches the live API    | Root operator invokes the static updater with a new package | Verify with the installed checksummed package verifier; reject symlink/special-file inventory and `apiCompatibility` mismatch; copy root-owned immutable release; atomic bounded `web-current`; independent rollback; never restart Codex                                                                                                                     | low        | high     | high     |
-| TM-021 | Voice upload leaks private speech/key or causes resource and billing abuse  | Authenticated session and configured transcription key      | Allowlisted MIME and bounded in-memory multipart body; one active transcription plus request window; session/audio-bound TTL idempotency; upstream timeout; generic errors; never persist/log audio, key or upstream body; expose only availability/model/bounds                                                                                              | medium     | high     | high     |
-| TM-022 | Push subscription abuse leaks metadata or amplifies outbound delivery       | Authenticated session, browser permission and VAPID keypair | Exact Origin/CSRF; per-thread and global subscription limits; approved push-provider origins; bounded queue/retries; unique terminal delivery; stale-endpoint deletion; never list endpoints; generic payload without chat names/transcript/tool/file content; audit only safe hashes/IDs                                                                     | medium     | medium   | medium   |
-| TM-023 | Codex updater becomes a root confused deputy or activates incompatible code | Operator-staged immutable full release                      | Dedicated mode-0600 socket and `SO_PEERCRED`; exact status/apply schema; no caller path/URL/version/command/unit; candidate lock and root-owned containment; installed inventory verifier; architecture/API checks; candidate-generated protocol byte comparison; idle interlock; fixed oneshot; health-gated transactional rollback                          | low        | critical | high     |
+| ID     | Threat                                                                      | Existing controls                                                                            | Required mitigation                                                                                                                                                                                                                                                                                                                                           | Likelihood | Impact   | Priority |
+| ------ | --------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- | -------- | -------- |
+| TM-001 | Password/session compromise grants code execution                           | Single owner, TLS planned                                                                    | Argon2id, strong secret, rate limit, lockout, rotation, audit; add TOTP/passkey later                                                                                                                                                                                                                                                                         | medium     | high     | high     |
+| TM-002 | Stored/reflected XSS through model/tool output                              | React escaping planned                                                                       | No raw HTML, strict CSP, safe Markdown, hostile-output tests                                                                                                                                                                                                                                                                                                  | medium     | high     | high     |
+| TM-003 | Project path traversal or symlink escape                                    | Root allowlist planned                                                                       | `realpath` containment on registration and every execution, no client cwd                                                                                                                                                                                                                                                                                     | medium     | high     | high     |
+| TM-004 | Codex/OpenAI or project secret leakage                                      | Server-only Codex home                                                                       | Redaction, output bounds, no raw env/logging, isolated service user                                                                                                                                                                                                                                                                                           | medium     | high     | high     |
+| TM-005 | CSRF or SSE authorization bypass                                            | Same-site cookie planned                                                                     | Session-bound CSRF, Origin checks, per-thread authorization                                                                                                                                                                                                                                                                                                   | medium     | high     | high     |
+| TM-006 | Resource exhaustion harms shared host                                       | Bounded volume and static service cgroups                                                    | Aggregate API/runner in one workload slice; default auto reserve of 15% RAM/minimum 1 GiB plus one CPU; count root turns and subagents; live admission, process-tree cleanup, typed limits and kernel read-back. In host-admin this is an operational default, not containment from a malicious root task.                                                    | high       | high     | critical |
+| TM-007 | Skill/rule supply-chain tampering                                           | Git-owned `AGENTS.md`                                                                        | Checksummed skill manifest, owner-only install, diagnostics and update audit                                                                                                                                                                                                                                                                                  | medium     | high     | high     |
+| TM-008 | Approval confusion after reconnect/restart                                  | App-server request IDs                                                                       | Durable pending state, fail closed, reconcile active requests, never auto-approve                                                                                                                                                                                                                                                                             | medium     | high     | high     |
+| TM-009 | Backend compromise reaches root/Docker/product secrets                      | None in new service yet                                                                      | Non-root user, inaccessible paths, no Docker socket, separate deploy broker                                                                                                                                                                                                                                                                                   | low        | high     | high     |
+| TM-010 | Cross-thread attachment access or path traversal                            | Authenticated thread routes                                                                  | Opaque IDs, thread ownership on every read/claim/delete, generated storage names, realpath containment, hostile-ID tests                                                                                                                                                                                                                                      | medium     | high     | high     |
+| TM-011 | Hostile upload becomes browser or host execution                            | React escaping, dedicated storage                                                            | Signature-check images, allowlisted types/extensions, `nosniff`, download non-images, never parse/execute/unzip in API                                                                                                                                                                                                                                        | medium     | high     | high     |
+| TM-012 | Uploads exhaust shared-host resources                                       | Bounded ext4 application volume and tmpfs                                                    | 20 MiB/file, 8/turn, 50 MiB/thread, edge/body timeout, bounded in-memory parsing with failed-write cleanup, existing byte/inode/resource limits                                                                                                                                                                                                               | medium     | high     | high     |
+| TM-013 | Internal attachment path leaks through Codex events                         | Safe normalized event projection                                                             | Ignore live app-server `userMessage` items and fragmented agent deltas; publish redacted completed messages; persist one backend-authored user event; path-leak regression tests                                                                                                                                                                              | medium     | high     | high     |
+| TM-014 | Bootstrap leaks or silently replaces admin secrets                          | Local root-only bootstrap                                                                    | Hidden TTY entry, bounded Argon2id, CSPRNG session secret, atomic `0600` replacement, explicit `--rotate`, no secrets in argv/logs                                                                                                                                                                                                                            | low        | high     | high     |
+| TM-015 | Web API compromise reaches Codex credentials/projects                       | Dedicated API and runner identities                                                          | Private systemd socket, separate environments, API cannot read `CODEX_HOME`, runner cannot read Web secrets/SQLite, explicit project and attachment mounts                                                                                                                                                                                                    | low        | high     | high     |
+| TM-016 | Toolchain supply-chain substitution during bootstrap                        | HTTPS downloads                                                                              | Exact versions, committed SHA-256/SHA-512 digests, immutable root-owned version directories, no shell-pipe installer or floating tags, package inventory verification                                                                                                                                                                                         | low        | critical | high     |
+| TM-017 | Device authentication leaks, races active work or uses the wrong identity   | Bootstrap uses direct runner TTY; runtime has Web auth/CSRF                                  | Bootstrap via runner `/dev/tty`; runtime uses only pinned app-server device login, exact-Origin/CSRF, strict `auth.openai.com` URL projection, one in-memory flow with timeout/cancel, no code/token persistence or audit, warning against sharing, and an idle-only admission interlock that releases only after a terminal result or confirmed cancellation | low        | high     | high     |
+| TM-018 | Resource settings become a root confused deputy                             | Authenticated API may request resource changes                                               | Separate root-owned broker; mode-0600 socket and `SO_PEERCRED`; fixed target/properties; strict schema/capacity/floor checks; no shell; atomic policy and rollback; journald plus API audit                                                                                                                                                                   | low        | critical | high     |
+| TM-019 | Reconfiguration interrupts active work or races admission                   | Active root turns/subagents and concurrent Apply/start                                       | Serialize admission with a pending/applying gate; apply only after root turns, pending starts and active subagents reach zero; recheck current usage and read back kernel state                                                                                                                                                                               | medium     | high     | high     |
+| TM-020 | Web-only release is tampered, escapes storage or mismatches the live API    | Root operator invokes the static updater with a new package                                  | Verify with the installed checksummed package verifier; reject symlink/special-file inventory and `apiCompatibility` mismatch; copy root-owned immutable release; atomic bounded `web-current`; independent rollback; never restart Codex                                                                                                                     | low        | high     | high     |
+| TM-021 | Voice upload leaks private speech/key or causes resource and billing abuse  | Authenticated session and configured transcription key                                       | Allowlisted MIME and bounded in-memory multipart body; one active transcription plus request window; session/audio-bound TTL idempotency; upstream timeout; generic errors; never persist/log audio, key or upstream body; expose only availability/model/bounds                                                                                              | medium     | high     | high     |
+| TM-022 | Push subscription abuse leaks metadata or amplifies outbound delivery       | Authenticated session, browser permission and VAPID keypair                                  | Exact Origin/CSRF; per-thread and global subscription limits; approved push-provider origins; bounded queue/retries; unique terminal delivery; stale-endpoint deletion; never list endpoints; generic payload without chat names/transcript/tool/file content; audit only safe hashes/IDs                                                                     | medium     | medium   | medium   |
+| TM-023 | Codex updater becomes a root confused deputy or activates incompatible code | Operator-staged immutable full release                                                       | Dedicated mode-0600 socket and `SO_PEERCRED`; exact status/apply schema; no caller path/URL/version/command/unit; candidate lock and root-owned containment; installed inventory verifier; architecture/API checks; candidate-generated protocol byte comparison; idle interlock; fixed oneshot; health-gated transactional rollback                          | low        | critical | high     |
+| TM-024 | Host-admin turns session or prompt compromise into host-root execution      | Restricted is default; Web auth, CSRF/origin, audit and private app-server socket remain     | Require an explicit local install/migration flag; keep API non-root; never expose mode switching in Web UI; recommend a strong unique password and second factor; monitor host-admin/full-access starts                                                                                                                                                       | medium     | critical | critical |
+| TM-025 | Runner migration loses dialogues or leaves a privileged credential residue  | Ordinary upgrade rejects identity changes; Web SQLite and Codex home have separate ownership | Drain and stop all work; refuse profile merge; copy and verify the full Codex home; preserve SQLite; revoke old-user access to the retained rollback source; restore the old unit/config/state on failure                                                                                                                                                     | low        | high     | high     |
 
 ## Criticality calibration
 
@@ -203,7 +234,9 @@ flowchart LR
 | `apps/server/src/push-notifications.ts`  | External delivery, retry and stale endpoints  | TM-022                         |
 | `apps/web/public/push-service-worker.js` | Background display and click navigation       | TM-002, TM-022                 |
 | `apps/web/src/`                          | Rendering of untrusted content                | TM-002, TM-005                 |
-| `infra/`                                 | TLS, non-root service and resource limits     | TM-001, TM-006, TM-009         |
+| `infra/`                                 | TLS, runner modes and resource limits         | TM-001, TM-006, TM-009, TM-024 |
+| `scripts/install-package.sh`             | Explicit mode selection and upgrade guards    | TM-016, TM-017, TM-024, TM-025 |
+| `scripts/` migration/instruction helpers | State preservation and root policy injection  | TM-007, TM-024, TM-025         |
 | `scripts/resource-broker.py`             | Narrow root resource-policy boundary          | TM-006, TM-018, TM-019         |
 | `scripts/bootstrap-ubuntu.sh`            | Root-time package and toolchain bootstrap     | TM-016, TM-017                 |
 | `scripts/update-web-ubuntu.sh`           | Live static activation and compatibility gate | TM-020                         |
@@ -216,6 +249,9 @@ flowchart LR
 - Public login, authenticated API/SSE, local JSON-RPC, filesystem, OpenAI and skill boundaries are covered.
 - Product runtime and its secrets are explicitly outside the dev control plane.
 - The owner confirmed one operator, same-host placement and desktop-equivalent Codex permissions.
+- The owner explicitly confirmed that host-admin should be available and that this installation should migrate
+  to it without losing Web chats or Codex rollout history. Root mode is treated as a dedicated-host trust
+  choice, not as protection against a malicious authenticated task.
 - Password-only exposure remains an accepted residual risk; second factor is recommended.
 - Supported portable targets are Ubuntu 22.04/24.04 on x64/arm64. Public plaintext HTTP and automatically
   generated bare-IP certificates are excluded; operators supply a domain-backed HTTPS proxy or valid keypair.

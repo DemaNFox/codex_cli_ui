@@ -1,0 +1,27 @@
+[Unit]
+Description=Codex Web UI host-administrator app-server connection
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+Slice=codex-web-ui-workload.slice
+WorkingDirectory=/opt/codex-web-ui/current
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/codex-web-ui/codex-runner.env
+ExecStart=/usr/local/libexec/codex-web-ui-run-app-server
+StandardInput=socket
+StandardOutput=socket
+StandardError=journal
+SyslogIdentifier=codex-web-ui-app-server
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillMode=control-group
+UMask=0077
+Nice=5
+
+# This template is selected only by the explicit host-admin installer mode.
+# It intentionally has no systemd sandbox, capability, filesystem, device,
+# namespace or syscall restrictions: the Codex runner is the host root user.

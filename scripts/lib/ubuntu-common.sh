@@ -22,6 +22,20 @@ validate_service_user() {
   getent passwd "$user" >/dev/null || die "service user does not exist: $user"
 }
 
+validate_runner_user() {
+  local user=${1:?runner user required} mode=${2:?runner mode required}
+  case "$mode" in
+    restricted)
+      validate_service_user "$user"
+      ;;
+    host-admin)
+      [[ $user == root ]] || die 'host-admin runner mode requires --runner-user root'
+      getent passwd root >/dev/null || die 'root account is unavailable'
+      ;;
+    *) die "invalid runner mode: $mode" ;;
+  esac
+}
+
 canonical_existing_dir() {
   local path=${1:?path required}
   [[ $path = /* ]] || die "path must be absolute: $path"
@@ -38,8 +52,12 @@ canonical_existing_file() {
 }
 
 validate_project_root() {
-  local path
+  local path mode=${2:-restricted}
   path=$(canonical_existing_dir "$1")
+  if [[ $mode == host-admin && $path == / ]]; then
+    printf '%s\n' "$path"
+    return
+  fi
   case "$path" in
     /|/bin|/boot|/dev|/etc|/lib|/lib64|/proc|/root|/run|/sbin|/sys|/usr|/var|/opt)
       die "project root is too broad or protected: $path"

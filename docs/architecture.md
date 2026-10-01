@@ -10,7 +10,7 @@ Browser
     -> Node.js API (codex-web-ui-api): login, projects, threads, turns, approvals, SSE
       -> SQLite: UI metadata, sessions, audit and bounded event journal
       -> root-created mode-0600 Unix socket
-        -> isolated runner identity -> codex app-server --listen stdio://
+        -> selected runner identity -> codex app-server --listen stdio://
           -> configured CODEX_HOME
           -> allowlisted project roots
 ```
@@ -19,8 +19,10 @@ Browser
 
 - The API owns one bounded Unix-socket client. systemd starts the app-server under the configured,
   already authenticated runner identity and restarts each accepted connection independently.
-- The API cannot read `CODEX_HOME` or the runner environment. The runner cannot read the Web login/session
-  environment or SQLite; it receives read-only attachment access and explicit project/Codex-home paths.
+- The API cannot read `CODEX_HOME` or the runner environment. In restricted mode the runner also cannot read
+  the Web login/session environment or SQLite. In explicit host-admin mode the runner is root and can bypass
+  host filesystem ownership by design, so Web/API isolation prevents accidental API privilege but is not a
+  security boundary against a hostile root Codex turn.
 - JSON-RPC requests are correlated by generated numeric IDs. Server-initiated approval and input requests are recorded as pending UI actions.
 - The backend projects safe, normalized events to per-thread SSE streams. Reconnect uses the last event ID and the durable event journal.
 - Subagent lifecycle notifications are projected into a server-owned table keyed by the root chat and are
@@ -108,13 +110,14 @@ Browser
 
 - `read-only`: read project files and run non-mutating inspection.
 - `workspace-write`: normal development inside the registered project.
-- `full-access`: Codex `danger-full-access` semantics within the privileges of the non-root service account.
+- `full-access`: Codex `danger-full-access` semantics within the installed runner identity. This is bounded by
+  the selected non-root account in `restricted` mode and is host-root authority in `host-admin` mode.
 
-The service does not add sudo, root, Docker socket, product secrets, or deployment credentials. The installed
-update broker is not part of a Codex permission preset: it is a separate root-owned, socket-activated boundary
+Restricted mode does not add sudo, root, Docker socket, product secrets, or deployment credentials. Host-admin
+mode deliberately runs only the Codex app-server runner as root; the API remains non-root. The installed update
+broker is not part of a Codex permission preset: it is a separate root-owned, socket-activated boundary
 that accepts only `status` and `apply` for one fixed, operator-staged release. Neither the browser nor the API
-can supply a URL, filesystem path, package name, version, systemd unit or shell command. Codex and the Web API
-continue to run under their existing non-root identities.
+can supply a URL, filesystem path, package name, version, systemd unit or shell command.
 
 ## Portability
 
@@ -122,9 +125,16 @@ All executable source, database migrations, protocol snapshots, service template
 required custom skills live in this repository. Host-specific absolute paths and credentials live only in
 separate protected Web and runner environment files. The supported installer downloads exact, repository-pinned
 Node.js, pnpm and Codex CLI artifacts, verifies committed digests, and installs them in immutable root-owned
-version directories. Codex authentication is performed only as the selected non-root runner through its direct
-terminal. Installation fails closed when the managed Codex CLI does not match the checked-in compatible protocol
-snapshot.
+version directories. Codex authentication is performed only as the explicitly selected runner through its
+direct terminal. A fresh install defaults to `restricted`; `host-admin` must be named explicitly and cannot be
+entered through a normal upgrade. Installation fails closed when the managed Codex CLI does not match the
+checked-in compatible protocol snapshot.
+
+The installer writes a bounded managed block into the runner's global `CODEX_HOME/AGENTS.md`, preserving other
+content. It tells Codex that the Web UI runner is already executing on the physical target host and must use
+local commands instead of SSHing to a loopback, current-hostname or same-host address. An explicit migration to
+host-admin drains work, preserves SQLite, copies the complete Codex home without merging profiles, keeps a
+root-only rollback source until health succeeds and then changes only the app-server runner identity/unit.
 
 Deployment secrets are kept in a root-owned `0600` environment file. systemd
 loads it before changing to the unprivileged service identity, so the service
@@ -137,6 +147,8 @@ subagent is active and applied only after the workload becomes idle. New work fa
 pending/degraded and when live memory or the effective execution-unit ceiling is exhausted. Disk admission and a periodic guard stop work on low space
 or database overflow, while an administrator-enforced filesystem quota or
 dedicated bounded volume remains mandatory for a hard disk limit.
+In host-admin mode these cgroup settings remain the normal operating defaults, but they are not a security
+boundary against the root runner: a root task can deliberately reconfigure local systemd/cgroup state.
 When the resource broker is configured, its effective root-turn/subagent ceiling is the only application
 concurrency admission limit. `CODEX_WEB_MAX_CONCURRENT_TURNS` remains a fail-safe for local or test deployments
 that run without the broker; it does not silently cap automatic or custom broker policy.

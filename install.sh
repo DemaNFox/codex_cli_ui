@@ -15,7 +15,7 @@ preflight_args=("$@")
 set -- "${preflight_args[@]}"
 while (($#)); do
   case "$1" in
-    --runner-user|--codex-home|--codex-bin|--project-root)
+    --runner-mode|--migrate-runner-mode|--migration-codex-home|--runner-user|--codex-home|--codex-bin|--project-root)
       [[ $# -ge 2 && -n $2 ]] || { printf 'Missing value for %s\n' "$1" >&2; exit 1; }
       shift 2
       ;;

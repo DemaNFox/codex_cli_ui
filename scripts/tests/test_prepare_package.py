@@ -52,6 +52,8 @@ class PreparePackageTest(unittest.TestCase):
             "scripts/rollback-web-ubuntu.sh": "#!/usr/bin/env bash\n",
             "scripts/graceful-drain.sh": "#!/usr/bin/env bash\n",
             "scripts/resource-broker.py": "#!/usr/bin/env python3\n",
+            "scripts/install-local-host-instructions.py": "#!/usr/bin/env python3\n",
+            "scripts/migrate-runner-host-admin.sh": "#!/usr/bin/env bash\n",
             "scripts/bootstrap-ubuntu.sh": "#!/usr/bin/env bash\n",
             "apps/server/dist/index.js": "console.log('server');\n",
             "apps/web/dist/index.html": "<!doctype html>\n",
@@ -70,6 +72,7 @@ class PreparePackageTest(unittest.TestCase):
             "infra/systemd/codex-web-ui-resource-broker.socket": "[Socket]\n",
             "infra/systemd/codex-web-ui-resource-broker@.service": "[Service]\n",
             "infra/systemd/codex-web-ui-workload.slice": "[Slice]\n",
+            "infra/systemd/codex-web-ui-app-server-host-admin@.service": "[Service]\nUser=root\n",
         }
         binary_names = (
             ("argon2.glibc.node", "argon2.musl.node")
@@ -157,6 +160,26 @@ class PreparePackageTest(unittest.TestCase):
         result = self._verify()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Verified portable package", result.stdout)
+
+    def test_same_host_instruction_installer_is_required(self) -> None:
+        (self.root / "scripts/install-local-host-instructions.py").unlink()
+        self._write_checksums()
+        result = self._verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("package is missing scripts/install-local-host-instructions.py", result.stderr)
+
+    def test_host_admin_migration_assets_are_required(self) -> None:
+        for relative in (
+            "scripts/migrate-runner-host-admin.sh",
+            "infra/systemd/codex-web-ui-app-server-host-admin@.service",
+        ):
+            with self.subTest(relative=relative):
+                self._write_fixture("x64")
+                (self.root / relative).unlink()
+                self._write_checksums()
+                result = self._verify()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"package is missing {relative}", result.stderr)
 
     def test_tampered_payload_is_rejected(self) -> None:
         (self.root / "apps/server/dist/index.js").write_text("tampered\n", encoding="utf-8")

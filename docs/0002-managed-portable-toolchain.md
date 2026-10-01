@@ -18,11 +18,27 @@ extraction, and activates immutable root-owned version directories through
 stable `/usr/local/bin` links. It never uses a floating release tag or pipes a
 download into a shell.
 
-Codex credentials remain host state. If the selected non-root runner is not
-authenticated, installation invokes `codex login --device-auth` as that runner
-with input and output attached directly to `/dev/tty`, then rechecks login
-status. The installer never authenticates as root, accepts tokens as arguments,
-or captures the device code.
+Codex credentials remain host state. A fresh installation explicitly chooses one runner mode:
+
+- `restricted` is the default. It uses an existing non-root runner and the hardened app-server unit.
+- `host-admin` is an operator-selected dedicated-host mode. It uses the root Codex profile and an app-server
+  unit without the runner capability/filesystem sandbox, so authenticated Codex turns have host-root authority.
+
+The browser-facing API remains the separate non-root identity in both modes. If the selected runner is not
+authenticated, installation invokes `codex login --device-auth` as that exact identity with input and output
+attached directly to `/dev/tty`, then rechecks login status. Root authentication is therefore possible only
+after the operator explicitly selects `host-admin`. The installer never accepts tokens as arguments or
+captures the device code.
+
+An existing restricted installation cannot change identity through an ordinary upgrade. Its explicit
+host-admin migration first drains all turns and subagents, preserves the Web database unchanged, copies the
+complete Codex home (including rollout history and authentication) without merging it into an unrelated root
+profile, retains a root-only rollback source through health verification, and then activates the root runner.
+Collision or incomplete-copy evidence fails closed.
+
+The installer also maintains a delimited global `CODEX_HOME/AGENTS.md` block telling Codex that it already runs
+on the physical Web UI host. Same-host administration uses local commands; SSH is reserved for a remote host
+that the operator explicitly identifies. Existing operator instructions outside the managed block are kept.
 
 After bootstrap, an authenticated Web owner may replace that same runner account through the pinned Codex
 app-server `chatgptDeviceCode` flow. The Web API temporarily relays only the verification URL and one-time
@@ -35,7 +51,7 @@ After installation, the Web owner may also activate a newer pinned Codex version
 only when a trusted host operator has already placed and staged a complete immutable release. The browser and
 API never select or download a version, URL, path or package. A root-owned broker exposes only fixed `status`
 and `apply` operations, authenticates the API socket peer, and delegates activation to one fixed systemd
-oneshot. Codex and app-server still run as the non-root runner.
+oneshot. The API remains non-root; Codex and app-server retain the explicitly installed runner mode.
 
 The staged package is accepted only when its inventory, architecture and API compatibility match the installed
 boundary. Before drain, the candidate Codex binary generates its schemas as the runner and those bytes must
@@ -49,16 +65,20 @@ requires access to Ubuntu package repositories, nodejs.org and registry.npmjs.or
 
 ## Consequences
 
-- A clean supported server needs only Git, internet access, a sudo-capable
-  non-root operator, HTTPS configuration and project storage.
+- A clean supported server needs only Git, internet access, a sudo-capable operator, HTTPS configuration and
+  project storage. Restricted remains the default; host-admin is never selected implicitly.
 - Runtime upgrades are deliberate source changes: update versions and digests,
   verify both supported architectures, and release the matching protocol pin.
 - The Status drawer can activate only an operator-staged compatible full release; it is not an npm registry
-  client and does not grant Codex or the API general root access.
+  client and cannot change the installed runner mode or grant root to the API.
 - An explicit application `--upgrade` moves an existing managed Codex path to
   the newly pinned managed version. A custom Codex path remains fixed and must
   use a separate explicit migration workflow.
 - Existing authenticated runner state is reused without copying credentials.
+- Explicit restricted-to-host-admin migration preserves both Web-owned chat metadata and the complete Codex
+  home; an ordinary upgrade never migrates identities.
+- In host-admin mode a stolen Web session, prompt injection or malicious project command can become host-root
+  execution. This is an accepted operator-selected dedicated-host trade-off, not a shared-host default.
 - Account replacement does not delete Codex rollout state or Web-owned chat metadata; access to older remote
   conversation history can still depend on the newly selected account's OpenAI authorization.
 - A compromised reviewed Git revision still has root installer authority; the

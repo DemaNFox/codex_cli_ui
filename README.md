@@ -22,9 +22,9 @@ task or subagent is running. The short-lived code is shown only to the authentic
 tokens never pass through the Web application.
 It also shows the installed and prepared Codex versions. An update can be started there only after an operator
 has staged a complete checksummed release and all turns, pending starts, subagents and other exclusive work are
-idle. The browser cannot choose a package, path, command or version. Codex and the Web API remain non-root; a
-narrow root broker activates the fixed prepared release and rolls back automatically if health verification
-fails.
+idle. The browser cannot choose a package, path, command or version. The Web API remains non-root in every
+installation mode; a narrow root broker activates the fixed prepared release and rolls back automatically if
+health verification fails.
 On narrow screens the same navigation becomes a keyboard-accessible drawer, long titles remain on one line,
 and model/access controls collapse into a compact settings row so the transcript and composer keep the
 viewport.
@@ -57,7 +57,7 @@ See [architecture](docs/architecture.md) and the [threat model](docs/Codex_Web_U
 ## Portability contract
 
 The repository is the complete distributable source. On Ubuntu 22.04/24.04
-(x64 or arm64), clone it as the intended non-root Codex user and run:
+(x64 or arm64), clone it and run the default restricted installation:
 
 ```bash
 git clone https://github.com/DemaNFox/codex_cli_ui.git
@@ -79,6 +79,26 @@ For a shared host, add `--no-start`, establish filesystem byte/inode quotas,
 then enable the units; the default start path is intended for a dedicated
 personal server.
 
+On a dedicated personal host the operator may instead give Codex full machine authority explicitly:
+
+```bash
+./install.sh \
+  --runner-mode host-admin \
+  --project-root / \
+  --public-origin https://codex.example.com \
+  --external-proxy
+```
+
+This runs only the local Codex app-server runner as root; the HTTP API remains `codex-web-ui-api`. A stolen Web
+session, prompt injection or malicious project command can therefore become root execution in this mode. The
+installer never chooses it implicitly. It also installs a global Codex instruction that this is the physical
+target host, so local administration uses local commands rather than SSH back to the same machine.
+
+Migrating an existing restricted installation uses the explicit migration workflow documented in
+[infra/README.md](infra/README.md). It preserves the Web SQLite database and copies the complete Codex home,
+including rollout history, before changing the runner. Do not replace the runner user or point at an empty
+root profile with a normal `--upgrade`.
+
 The installed service starts in automatic resource mode. It uses the live host/ancestor-cgroup capacity,
 keeps one CPU core and at least 15% RAM (minimum 1 GiB) outside the Codex workload, and derives a safe
 concurrency ceiling. The administrator can inspect or lower CPU, RAM, task and agent limits in the Status
@@ -88,7 +108,7 @@ A new host needs only:
 
 1. Ubuntu 22.04 or 24.04 on x64/arm64, Git, internet access and a normal sudo-capable user;
 2. an HTTPS domain/proxy or an existing certificate and private key;
-3. write access for the selected Codex user to the intended project roots;
+3. write access for the selected Codex user to the intended project roots, unless explicit `host-admin` is used;
 4. an interactive terminal for the first Codex device login and Web UI administrator bootstrap.
 
 Codex authentication, website passwords, `.env` values, databases, transcripts and project worktrees are

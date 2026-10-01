@@ -31,6 +31,9 @@ load_toolchain_pins "$PACKAGE_ROOT/infra/toolchain.env"
 
 package=$PACKAGE_ROOT
 runner_user=
+runner_mode=
+migrate_runner_mode=
+migration_codex_home=
 codex_home=
 codex_bin=
 public_origin=
@@ -47,10 +50,15 @@ usage() {
   cat <<'EOF'
 Usage: sudo scripts/install-package.sh [options]
 
-  --runner-user USER       Existing non-root OS user for Codex (default: sudo caller)
+  --runner-mode MODE       restricted (default) or host-admin
+  --migrate-runner-mode MODE
+                           On --upgrade, safely migrate restricted to host-admin
+  --migration-codex-home DIR
+                           New CODEX_HOME path for migration (default: /root/.codex)
+  --runner-user USER       Codex OS user (restricted: sudo caller; host-admin: root)
   --codex-home DIR         Its existing CODEX_HOME (default: USER_HOME/.codex)
   --codex-bin FILE         Codex executable (default: managed repository-pinned CLI)
-  --project-root DIR       Allowed project root; repeatable (default: /srv/codex-projects)
+  --project-root DIR       Allowed root; repeatable (restricted: /srv/codex-projects; host-admin: /)
   --public-origin URL      Required HTTPS origin, for example https://codex.example.com
   --external-proxy         TLS terminates in an existing reverse proxy
   --tls-cert FILE          Install bundled Nginx edge with this certificate
@@ -68,6 +76,9 @@ EOF
 while (($#)); do
   case "$1" in
     --package) package=${2:?}; shift 2 ;;
+    --runner-mode) runner_mode=${2:?}; shift 2 ;;
+    --migrate-runner-mode) migrate_runner_mode=${2:?}; shift 2 ;;
+    --migration-codex-home) migration_codex_home=${2:?}; shift 2 ;;
     --runner-user) runner_user=${2:?}; shift 2 ;;
     --codex-home) codex_home=${2:?}; shift 2 ;;
     --codex-bin) codex_bin=${2:?}; shift 2 ;;
@@ -120,11 +131,42 @@ if [[ -e $config && $mode == install ]]; then
   resuming_bootstrap=true
 fi
 if [[ ! -e $config && $mode == upgrade ]]; then die '--upgrade requires an existing installation'; fi
+if [[ -n $migrate_runner_mode ]]; then
+  [[ $mode == upgrade ]] || die '--migrate-runner-mode requires --upgrade'
+  $start_service || die '--migrate-runner-mode cannot be combined with --no-start'
+  [[ -f $runner_config && ! -L $runner_config ]] || die 'installed runner configuration is missing or unsafe'
+  [[ $migrate_runner_mode == host-admin ]] || die 'only migration to host-admin is supported'
+  [[ -z $runner_mode || $runner_mode == host-admin ]] || die '--runner-mode conflicts with --migrate-runner-mode'
+  [[ -z $runner_user || $runner_user == root ]] || die 'host-admin migration requires --runner-user root'
+  installed_runner_mode=$(sed -n 's/^CODEX_WEB_RUNNER_MODE=//p' "$runner_config")
+  [[ -n $installed_runner_mode ]] || installed_runner_mode=restricted
+  if [[ $installed_runner_mode == host-admin ]]; then
+    installed_migration_home=$(sed -n 's/^CODEX_HOME=//p' "$runner_config")
+    [[ -z $migration_codex_home || $migration_codex_home == "$installed_migration_home" ]] || \
+      die 'host-admin migration is already complete with a different CODEX_HOME'
+    printf 'Host-admin runner migration is already complete; continuing the package upgrade.\n' >&2
+  else
+    [[ $installed_runner_mode == restricted ]] || die 'installed runner mode is invalid'
+    migration_args=(
+      --config "$config"
+      --runner-config "$runner_config"
+      --host-admin-unit "$package/infra/systemd/codex-web-ui-app-server-host-admin@.service"
+    )
+    if [[ -n $migration_codex_home ]]; then migration_args+=(--target-codex-home "$migration_codex_home"); fi
+    bash "$SCRIPT_DIR/migrate-runner-host-admin.sh" "${migration_args[@]}"
+  fi
+  runner_mode=host-admin
+  runner_user=root
+fi
 if [[ $mode == upgrade ]]; then
   [[ -f $runner_config && ! -L $runner_config ]] || die 'installed runner configuration is missing or unsafe'
   persisted_home=$(sed -n 's/^CODEX_HOME=//p' "$runner_config")
   persisted_bin=$(sed -n 's/^CODEX_BIN=//p' "$runner_config")
+  persisted_runner_mode=$(sed -n 's/^CODEX_WEB_RUNNER_MODE=//p' "$runner_config")
+  [[ -n $persisted_runner_mode ]] || persisted_runner_mode=restricted
+  case "$persisted_runner_mode" in restricted|host-admin) ;; *) die 'installed runner mode is invalid' ;; esac
   persisted_user=$(stat -c '%U' "$persisted_home")
+  [[ -z $runner_mode || $runner_mode == "$persisted_runner_mode" ]] || die 'changing the runner mode requires an explicit migration workflow'
   [[ -z $runner_user || $runner_user == "$persisted_user" ]] || die 'changing the runner user requires an explicit migration workflow'
   [[ -z $codex_home || $codex_home == "$persisted_home" ]] || die 'changing CODEX_HOME requires an explicit migration workflow'
   if [[ -n $codex_bin ]]; then
@@ -137,12 +179,17 @@ if [[ $mode == upgrade ]]; then
     esac
   fi
   runner_user=$persisted_user
+  runner_mode=$persisted_runner_mode
   codex_home=$persisted_home
 fi
-[[ -n $runner_user ]] || runner_user=${SUDO_USER:-}
+[[ -n $runner_mode ]] || runner_mode=restricted
+case "$runner_mode" in restricted|host-admin) ;; *) die '--runner-mode must be restricted or host-admin' ;; esac
+if [[ -z $runner_user ]]; then
+  if [[ $runner_mode == host-admin ]]; then runner_user=root; else runner_user=${SUDO_USER:-}; fi
+fi
 
 [[ -n $runner_user ]] || die '--runner-user is required when there is no sudo caller'
-validate_service_user "$runner_user"
+validate_runner_user "$runner_user" "$runner_mode"
 runner_group=$(id -gn "$runner_user")
 runner_home=$(getent passwd "$runner_user" | cut -d: -f6)
 if [[ -z $codex_home ]]; then
@@ -236,15 +283,19 @@ fi
 if [[ ${#project_roots[@]} -eq 0 && ( $mode == upgrade || $resuming_bootstrap == true ) ]]; then
   IFS=, read -r -a project_roots <<<"$(sed -n 's/^CODEX_WEB_PROJECT_ROOTS=//p' "$config")"
 fi
-[[ ${#project_roots[@]} -gt 0 ]] || project_roots=(/srv/codex-projects)
+if [[ ${#project_roots[@]} -eq 0 ]]; then
+  if [[ $runner_mode == host-admin ]]; then project_roots=(/); else project_roots=(/srv/codex-projects); fi
+fi
 if [[ ${project_roots[*]} == /srv/codex-projects && ! -e /srv/codex-projects ]]; then
   install -d -m 0750 -o "$runner_user" -g "$runner_group" /srv/codex-projects
 fi
 canonical_roots=()
 for root in "${project_roots[@]}"; do
-  root=$(validate_project_root "$root")
+  root=$(validate_project_root "$root" "$runner_mode")
   [[ $root =~ ^/[A-Za-z0-9_./@+-]+$ ]] || die "project root contains characters unsafe for systemd units: $root"
-  paths_overlap "$root" "$codex_home" && die "project root overlaps CODEX_HOME: $root"
+  if [[ ! ( $runner_mode == host-admin && $root == / ) ]]; then
+    paths_overlap "$root" "$codex_home" && die "project root overlaps CODEX_HOME: $root"
+  fi
   canonical_roots+=("$root")
 done
 roots_csv=$(IFS=,; printf '%s' "${canonical_roots[*]}")
@@ -329,6 +380,8 @@ resource_rollback_keys=(
   broker-helper
   resource-policy
   resource-drop-in
+  runner-drop-in
+  api-paths-drop-in
   update-broker-socket-unit
   update-broker-service-unit
   update-worker-unit
@@ -345,6 +398,8 @@ resource_rollback_paths=(
   /usr/local/libexec/codex-web-ui-resource-broker
   /etc/codex-web-ui/resource-limits.json
   /etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf
+  /etc/systemd/system/codex-web-ui-app-server@.service.d/runner.conf
+  /etc/systemd/system/codex-web-ui@api.service.d/paths.conf
   /etc/systemd/system/codex-web-ui-codex-update-broker.socket
   /etc/systemd/system/codex-web-ui-codex-update-broker@.service
   /etc/systemd/system/codex-web-ui-codex-update.service
@@ -494,9 +549,16 @@ fi
 atomic_symlink "$release_dir/apps/web/dist" /opt/codex-web-ui/web-current
 web_switched=true
 
-for unit in codex-web-ui@.service codex-web-ui-app-server.socket codex-web-ui-app-server@.service codex-web-ui-resource-broker.socket codex-web-ui-resource-broker@.service codex-web-ui-codex-update-broker.socket codex-web-ui-codex-update-broker@.service codex-web-ui-codex-update.service codex-web-ui-workload.slice codex-web-ui-storage-guard@.service codex-web-ui-storage-guard@.timer; do
+for unit in codex-web-ui@.service codex-web-ui-app-server.socket codex-web-ui-resource-broker.socket codex-web-ui-resource-broker@.service codex-web-ui-codex-update-broker.socket codex-web-ui-codex-update-broker@.service codex-web-ui-codex-update.service codex-web-ui-workload.slice codex-web-ui-storage-guard@.service codex-web-ui-storage-guard@.timer; do
   install -m 0644 "$package/infra/systemd/$unit" "/etc/systemd/system/$unit"
 done
+if [[ $runner_mode == host-admin ]]; then
+  install -m 0644 "$package/infra/systemd/codex-web-ui-app-server-host-admin@.service" \
+    /etc/systemd/system/codex-web-ui-app-server@.service
+else
+  install -m 0644 "$package/infra/systemd/codex-web-ui-app-server@.service" \
+    /etc/systemd/system/codex-web-ui-app-server@.service
+fi
 install -m 0755 "$package/scripts/validate-config.sh" /usr/local/libexec/codex-web-ui-validate-config
 install -m 0755 "$package/scripts/run-app-server.sh" /usr/local/libexec/codex-web-ui-run-app-server
 install -m 0755 "$package/scripts/resource-broker.py" /usr/local/libexec/codex-web-ui-resource-broker
@@ -508,12 +570,16 @@ install -m 0755 "$package/scripts/storage-enforce.sh" /usr/local/libexec/codex-w
 
 dropin=/etc/systemd/system/codex-web-ui-app-server@.service.d
 install -d -m 0755 "$dropin"
-{
-  printf '[Service]\nUser=%s\nGroup=%s\n' "$runner_user" "$runner_group"
-  printf 'ReadWritePaths=%s\n' "$codex_home"
-  for root in "${canonical_roots[@]}"; do printf 'ReadWritePaths=%s\n' "$root"; done
-} >"$dropin/runner.conf"
-chmod 0644 "$dropin/runner.conf"
+if [[ $runner_mode == restricted ]]; then
+  {
+    printf '[Service]\nUser=%s\nGroup=%s\n' "$runner_user" "$runner_group"
+    printf 'ReadWritePaths=%s\n' "$codex_home"
+    for root in "${canonical_roots[@]}"; do printf 'ReadWritePaths=%s\n' "$root"; done
+  } >"$dropin/runner.conf"
+  chmod 0644 "$dropin/runner.conf"
+else
+  rm -f -- "$dropin/runner.conf"
+fi
 api_dropin=/etc/systemd/system/codex-web-ui@api.service.d
 install -d -m 0755 "$api_dropin"
 printf '[Service]\nInaccessiblePaths=%s\n' "$codex_home" >"$api_dropin/paths.conf"
@@ -532,6 +598,7 @@ fi
 /usr/local/bin/node "$package/scripts/setup-push.mjs" --config "$config"
 umask 077
 {
+  printf 'CODEX_WEB_RUNNER_MODE=%s\n' "$runner_mode"
   printf 'CODEX_BIN=%s\nCODEX_HOME=%s\n' "$codex_bin" "$codex_home"
   printf 'CODEX_WEB_CODEX_VERSION_PIN="%s"\n' "$version_pin"
 } >"$runner_config"
@@ -556,6 +623,8 @@ chmod 0600 "$runner_config"
 chown root:root "$config" "$runner_config"
 
 "$package/scripts/install-skills.sh" --codex-home "$codex_home" --service-user "$runner_user"
+python3 "$package/scripts/install-local-host-instructions.py" \
+  --codex-home "$codex_home" --service-user "$runner_user"
 
 CODEX_WEB_CONFIG="$config" /usr/local/libexec/codex-web-ui-validate-config
 systemctl daemon-reload

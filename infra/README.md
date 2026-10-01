@@ -1,9 +1,9 @@
 # Ubuntu deployment assets
 
-These files install the standalone Codex Web UI as an unprivileged, loopback-only
-Node.js service behind an HTTPS Nginx edge. They do not deploy automatically and
-they never copy `CODEX_HOME`, Codex authentication, project `.env` files, product
-runtime secrets, Docker access or deployment credentials.
+These files install the standalone Codex Web UI as a loopback-only Node.js service behind an HTTPS Nginx
+edge. The browser-facing API is always unprivileged. The Codex runner defaults to a restricted non-root
+identity, while an explicit dedicated-host mode may run the runner as root. The assets do not deploy
+automatically or copy product runtime secrets and deployment credentials into the Web API.
 
 ## Portable installation
 
@@ -11,9 +11,9 @@ The normal path is `./install.sh` from a clean Git checkout. It builds an
 architecture-specific checksummed package without root, then invokes the root
 installer only for system integration. It first installs the repository-pinned
 Node.js, pnpm and Codex CLI toolchain beneath `/opt/codex-web-ui/runtime` and
-exposes stable launchers in `/usr/local/bin`. The runner defaults to the `sudo`
-caller. Its existing Codex login is reused without copying credentials; otherwise
-the installer starts Codex device login for that user on the controlling terminal:
+exposes stable launchers in `/usr/local/bin`. The runner mode defaults to `restricted` and its user defaults
+to the `sudo` caller. Its existing Codex login is reused without copying credentials; otherwise the installer
+starts Codex device login for that user on the controlling terminal:
 
 ```sh
 ./install.sh \
@@ -28,16 +28,64 @@ and the certificate must cover the origin hostname. Installations fail closed
 on an unsupported OS/architecture, artifact or package checksum mismatch,
 failed Codex login, unsafe Codex ownership, or public plaintext configuration.
 Downloaded artifacts use exact versions and committed SHA-256/SHA-512 digests;
-there is no `curl | sh`, floating `latest` tag or root-owned Codex credential
-store. Use `--upgrade` explicitly to preserve the existing admin config
+there is no `curl | sh` or floating `latest` tag. Use `--upgrade` explicitly to preserve the existing admin config
 while switching to a new immutable release.
 If `/usr/local/bin/codex` is already a regular host-managed executable, bootstrap
 preserves it; the service still uses the exact managed CLI path from its protected
 runner configuration.
 
-The API runs as `codex-web-ui-api`; Codex runs as the selected existing user.
-They communicate only through `/run/codex-web-ui/app-server.sock`. Web secrets
-and runner settings are separate root-owned `0600` files.
+For a dedicated machine that the operator wants Codex to administer completely, select the mode explicitly:
+
+```sh
+./install.sh \
+  --runner-mode host-admin \
+  --project-root / \
+  --public-origin https://codex.example.com \
+  --external-proxy
+```
+
+`host-admin` selects root's Codex identity and the unsandboxed root app-server unit. It permits system package,
+service, network and filesystem administration from an authenticated Codex turn. It does not make the Web API
+root: the API continues as `codex-web-ui-api`, communicates only through
+`/run/codex-web-ui/app-server.sock`, and cannot read the protected runner environment or `CODEX_HOME` directly.
+This mode is appropriate only when the operator accepts that login/session compromise, prompt injection and
+project tooling can obtain host-root execution.
+
+Both modes install a delimited global instruction in `CODEX_HOME/AGENTS.md` without replacing operator text.
+It identifies this machine as the local physical Web UI host and directs Codex to use local commands instead
+of SSH to loopback, the current hostname or any address of the same machine.
+
+## Migrating an existing runner to host-admin
+
+Do not change `--runner-user` or `--codex-home` on an ordinary upgrade. Use the explicit migration flag from a
+normal local checkout and repeat the installation's existing origin/TLS arguments:
+
+```sh
+./install.sh \
+  --upgrade \
+  --migrate-runner-mode host-admin \
+  --migration-codex-home /root/.codex-web-ui \
+  --public-origin https://codex.example.com \
+  --external-proxy
+```
+
+The destination must not exist. `/root/.codex-web-ui` is recommended when `/root/.codex` already belongs to a
+separate manual root CLI profile; the migration never merges profiles. It first blocks new work, waits for all
+turns and subagents to finish, stops the API and runner socket, copies the complete current Codex home, compares
+the copied file inventory and hashes, verifies the pinned CLI and copied login, installs the same-host global
+instruction, then switches the app-server unit to root and performs a health check. Web SQLite, attachments,
+projects, chat titles and thread mappings stay in place.
+
+The destination parent must be root-owned and not writable by group or other users. Migration cannot be
+combined with `--no-start`, because a successful health check of the new root runner is part of the state
+transition; use `--no-start` only on ordinary installs/upgrades.
+
+Migration is committed as its own transaction before the package upgrade continues. If migration fails, the
+old unit/configuration is restored and the incomplete target is removed. After a successful health check the
+old Codex home is retained at its original path but recursively changed to root ownership and mode `0700`, so
+the former runner cannot use the duplicated credential. Keep that rollback copy until chats and continued
+turns have been checked; a later package-upgrade failure does not undo an already healthy identity migration,
+and the upgrade can be retried normally without the migration flag.
 
 Release assembly uses pnpm's isolated deploy graph and loads every direct
 production dependency, including Argon2, before accepting the output. This
@@ -53,20 +101,22 @@ activation.
   `codex --version` exactly matches `CODEX_WEB_CODEX_VERSION_PIN` (initially
   `codex-cli 0.153.4`). `binutils` remains an additional prerequisite only for
   the optional scoped AppArmor profile.
-- The chosen service user already exists and is not root. The current server may
-  use `ai-chat-agent` with `CODEX_HOME=/opt/ai-chat-agents/home/.codex`.
+- Restricted mode requires an existing non-root service user. The current server may use `ai-chat-agent` with
+  `CODEX_HOME=/opt/ai-chat-agents/home/.codex`. Host-admin requires the root runner and defaults to root's
+  protected Codex home.
 - First-time authentication requires an interactive controlling terminal. The
   device code is displayed by Codex directly and must not be shared. For an
-  unattended host, authenticate beforehand as the runner with
-  `sudo -u USER -H /usr/local/bin/codex login --device-auth`; never log in as root.
+  unattended restricted host, authenticate beforehand as the runner with
+  `sudo -u USER -H /usr/local/bin/codex login --device-auth`. In host-admin mode run the same pinned Codex
+  device flow as root; the installer attaches it directly to the terminal and never captures the code.
 - A prepared release contains `apps/server/dist/index.js` and
   `apps/web/dist/index.html`. Nginx serves the web build directly and proxies
   only `/api/` to the loopback backend. Release directories are immutable and
   retained under `/opt/codex-web-ui/releases`; `current` selects the backend and
   `web-current` independently selects the static build through atomic symlinks.
-- Each allowed project root and `CODEX_HOME` is an existing canonical directory.
-  They cannot overlap. The generated systemd drop-in grants write access only to
-  those paths and application state.
+- Each allowed project root and `CODEX_HOME` is an existing canonical directory. Restricted mode rejects
+  overlap and broad protected roots, then grants write access only to those paths. Host-admin may register `/`
+  and intentionally has whole-host access.
 - `/api/health` returns a 2xx response on the configured loopback listener.
 - `/etc/codex-web-ui/codex-web-ui.env` is a regular, non-symlink file owned by
   `root:root` with mode `0600`. The systemd manager reads `EnvironmentFile=`
@@ -88,6 +138,9 @@ task use is enforced as one aggregate rather than as independent per-process all
 the slice and reconciles its persisted policy before the Web service starts. Automatic mode is the default: it
 uses the smallest live host/ancestor-cgroup capacity, then reserves one CPU core and
 `max(15% of RAM, 1 GiB)` for the operating system. It does not mean capacity beyond the machine.
+The host-admin runner remains assigned to this slice for normal accounting and operation. Because it is root,
+it can intentionally change systemd/cgroup policy; the slice is not containment against a hostile host-admin
+turn.
 
 Only `codex-web-ui-api` can connect to the mode-0600 resource socket. The socket-activated root broker accepts
 no command, path, systemd unit or property name from the client; it can change only the fixed workload slice.

@@ -65,6 +65,8 @@ required = (
     "scripts/rollback-web-ubuntu.sh",
     "scripts/graceful-drain.sh",
     "scripts/resource-broker.py",
+    "scripts/install-local-host-instructions.py",
+    "scripts/migrate-runner-host-admin.sh",
     "scripts/bootstrap-ubuntu.sh",
     "apps/server/dist/index.js",
     "apps/web/dist/index.html",
@@ -74,6 +76,7 @@ required = (
     "infra/systemd/codex-web-ui-resource-broker.socket",
     "infra/systemd/codex-web-ui-resource-broker@.service",
     "infra/systemd/codex-web-ui-workload.slice",
+    "infra/systemd/codex-web-ui-app-server-host-admin@.service",
     "release.json",
     "SHA256SUMS",
 )
