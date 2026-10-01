@@ -120,9 +120,21 @@ expected={'x86_64':'x64','aarch64':'arm64'}.get(platform.machine())
 if m.get('schemaVersion') != 1 or m.get('target') != {'platform':'linux','architecture':expected}:
     raise SystemExit('package manifest does not match this Linux architecture')
 PY
+version_pin=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["codex"]["versionPin"])' "$package/release.json")
 
 config=/etc/codex-web-ui/codex-web-ui.env
 runner_config=/etc/codex-web-ui/codex-runner.env
+legacy_single_service=false
+legacy_service_user=
+legacy_service_group=
+legacy_parent_owner=
+legacy_parent_group=
+legacy_parent_mode=
+legacy_service_was_active=false
+legacy_service_was_enabled=false
+legacy_storage_timer_was_enabled=false
+legacy_storage_timer_was_active=false
+legacy_storage_guard_was_active=false
 if [[ -e $config && $mode == install ]]; then
   if [[ -e $runner_config || -n $(sed -n 's/^CODEX_WEB_ADMIN_PASSWORD_HASH=//p' "$config") ]]; then
     die 'installation exists; rerun with --upgrade to preserve its administrator and configuration'
@@ -131,6 +143,92 @@ if [[ -e $config && $mode == install ]]; then
   resuming_bootstrap=true
 fi
 if [[ ! -e $config && $mode == upgrade ]]; then die '--upgrade requires an existing installation'; fi
+[[ ! -L $runner_config ]] || die 'installed runner configuration is a symlink'
+allow_existing_bare_ip=false
+if [[ $mode == upgrade || $resuming_bootstrap == true ]]; then
+  installed_origin=$(sed -n 's/^CODEX_WEB_PUBLIC_ORIGIN=//p' "$config")
+  [[ $public_origin == "$installed_origin" ]] || die 'changing the public origin requires an explicit reconfiguration workflow'
+  public_origin=$installed_origin
+  if [[ $mode == upgrade ]]; then allow_existing_bare_ip=true; fi
+fi
+
+PUBLIC_ORIGIN=$public_origin ALLOW_EXISTING_BARE_IP=$allow_existing_bare_ip python3 - <<'PY'
+import ipaddress, os, re
+from urllib.parse import urlsplit
+u = urlsplit(os.environ.get('PUBLIC_ORIGIN', ''))
+try: port = u.port
+except ValueError: raise SystemExit('--public-origin has an invalid port')
+host = u.hostname or ''
+if u.scheme != 'https' or u.username or u.password or u.path or u.query or u.fragment or not host:
+    raise SystemExit('--public-origin must be one HTTPS origin without credentials or a path')
+try:
+    ipaddress.ip_address(host)
+except ValueError:
+    labels = host.split('.')
+    if len(labels) < 2 or any(not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', x) for x in labels):
+        raise SystemExit('--public-origin must use a valid DNS hostname')
+else:
+    if os.environ.get('ALLOW_EXISTING_BARE_IP') != 'true':
+        raise SystemExit('--public-origin must use a DNS name, not a bare IP address')
+PY
+if [[ $mode == upgrade && ! -e $runner_config ]]; then
+  [[ -f $config && ! -L $config ]] || die 'legacy installed configuration is missing or unsafe'
+  $start_service || die 'legacy single-service adoption cannot be combined with --no-start'
+  if [[ -n $migrate_runner_mode ]]; then
+    die 'legacy single-service installations must complete one ordinary --upgrade before host-admin migration'
+  fi
+  read_legacy_value() {
+    local key=${1:?key required} values
+    values=$(sed -n "s/^${key}=//p" "$config")
+    [[ -n $values && $values != *$'\n'* ]] || die "legacy configuration has a missing or ambiguous $key"
+    printf '%s\n' "$values"
+  }
+  legacy_home=$(canonical_existing_dir "$(read_legacy_value CODEX_HOME)")
+  legacy_bin=$(canonical_existing_file "$(read_legacy_value CODEX_BIN)")
+  legacy_pin=$(read_legacy_value CODEX_WEB_CODEX_VERSION_PIN)
+  legacy_pin=${legacy_pin#\"}
+  legacy_pin=${legacy_pin%\"}
+  legacy_service_user=$(stat -c '%U' "$legacy_home")
+  validate_service_user "$legacy_service_user"
+  legacy_service_group=$(id -gn "$legacy_service_user")
+  [[ $(stat -c '%G' "$legacy_home") == "$legacy_service_group" ]] || \
+    die 'legacy CODEX_HOME group does not match its service user'
+  [[ $(systemctl is-active "codex-web-ui@${legacy_service_user}.service" 2>/dev/null || true) != active || \
+     $(systemctl is-active codex-web-ui@api.service 2>/dev/null || true) != active ]] || \
+    die 'legacy and split API services must not be active together'
+  if systemctl is-active --quiet "codex-web-ui@${legacy_service_user}.service"; then
+    legacy_service_was_active=true
+  fi
+  if systemctl is-enabled --quiet "codex-web-ui@${legacy_service_user}.service"; then
+    legacy_service_was_enabled=true
+  fi
+  if systemctl is-enabled --quiet "codex-web-ui-storage-guard@${legacy_service_user}.timer"; then
+    legacy_storage_timer_was_enabled=true
+  fi
+  if systemctl is-active --quiet "codex-web-ui-storage-guard@${legacy_service_user}.timer"; then
+    legacy_storage_timer_was_active=true
+  fi
+  if systemctl is-active --quiet "codex-web-ui-storage-guard@${legacy_service_user}.service"; then
+    legacy_storage_guard_was_active=true
+  fi
+  legacy_parent_owner=$(stat -c '%u' /var/lib/codex-web-ui)
+  legacy_parent_group=$(stat -c '%g' /var/lib/codex-web-ui)
+  legacy_parent_mode=$(stat -c '%a' /var/lib/codex-web-ui)
+  runner_mode=restricted
+  runner_user=$legacy_service_user
+  codex_home=$legacy_home
+  case "$legacy_bin" in
+    /opt/codex-web-ui/codex-runtime/bin/codex|\
+    /opt/codex-web-ui/runtime/toolchain-pnpm-*-codex-*-${target#linux-}/bin/codex|\
+    /opt/codex-web-ui/runtime/toolchain-pnpm-*-codex-*-${target#linux-}/lib/node_modules/@openai/codex/bin/codex.js)
+      codex_bin=$managed_codex_bin
+      ;;
+    *) codex_bin=$legacy_bin ;;
+  esac
+  [[ $legacy_pin == "$version_pin" || $codex_bin == "$managed_codex_bin" ]] || \
+    die 'legacy Codex version cannot be upgraded through an unmanaged executable'
+  legacy_single_service=true
+fi
 if [[ -n $migrate_runner_mode ]]; then
   [[ $mode == upgrade ]] || die '--migrate-runner-mode requires --upgrade'
   $start_service || die '--migrate-runner-mode cannot be combined with --no-start'
@@ -158,7 +256,7 @@ if [[ -n $migrate_runner_mode ]]; then
   runner_mode=host-admin
   runner_user=root
 fi
-if [[ $mode == upgrade ]]; then
+if [[ $mode == upgrade && $legacy_single_service == false ]]; then
   [[ -f $runner_config && ! -L $runner_config ]] || die 'installed runner configuration is missing or unsafe'
   persisted_home=$(sed -n 's/^CODEX_HOME=//p' "$runner_config")
   persisted_bin=$(sed -n 's/^CODEX_BIN=//p' "$runner_config")
@@ -206,7 +304,6 @@ codex_bin=$(canonical_existing_file "$codex_bin")
 [[ $(stat -c '%u' "$codex_bin") == 0 ]] || die 'Codex executable must be root-owned; install it system-wide'
 [[ $(stat -c '%u' "$codex_home") == $(id -u "$runner_user") ]] || die 'CODEX_HOME must be owned by the runner user'
 (( (8#$(stat -c '%a' "$codex_home") & 8#077) == 0 )) || die 'CODEX_HOME must have no group/other permissions'
-version_pin=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["codex"]["versionPin"])' "$package/release.json")
 [[ $(runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" --version) == "$version_pin" ]] || die "Codex must match package pin: $version_pin"
 protocol_stage=$(mktemp -d /tmp/codex-web-ui-protocol.XXXXXX)
 chown "$runner_user:$runner_group" "$protocol_stage"
@@ -251,30 +348,6 @@ if ! runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_hom
   runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login status >/dev/null 2>&1 || die 'Codex login did not produce an authenticated state'
 fi
 
-if [[ $mode == upgrade || $resuming_bootstrap == true ]]; then
-  installed_origin=$(sed -n 's/^CODEX_WEB_PUBLIC_ORIGIN=//p' "$config")
-  [[ -z $public_origin || $public_origin == "$installed_origin" ]] || die 'changing the public origin requires an explicit reconfiguration workflow'
-  public_origin=$installed_origin
-fi
-
-PUBLIC_ORIGIN=$public_origin python3 - <<'PY'
-import ipaddress, os, re
-from urllib.parse import urlsplit
-u = urlsplit(os.environ.get('PUBLIC_ORIGIN', ''))
-try: port = u.port
-except ValueError: raise SystemExit('--public-origin has an invalid port')
-host = u.hostname or ''
-if u.scheme != 'https' or u.username or u.password or u.path or u.query or u.fragment or not host:
-    raise SystemExit('--public-origin must be one HTTPS origin without credentials or a path')
-try:
-    ipaddress.ip_address(host)
-except ValueError:
-    labels = host.split('.')
-    if len(labels) < 2 or any(not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', x) for x in labels):
-        raise SystemExit('--public-origin must use a valid DNS hostname')
-else:
-    raise SystemExit('--public-origin must use a DNS name, not a bare IP address')
-PY
 if $external_proxy; then
   [[ -z $tls_cert && -z $tls_key ]] || die 'choose either --external-proxy or --tls-cert/--tls-key'
 else
@@ -301,16 +374,30 @@ done
 roots_csv=$(IFS=,; printf '%s' "${canonical_roots[*]}")
 if [[ $mode == upgrade || $resuming_bootstrap == true ]]; then
   installed_roots=$(sed -n 's/^CODEX_WEB_PROJECT_ROOTS=//p' "$config")
-  [[ $roots_csv == "$installed_roots" ]] || die 'changing project roots requires an explicit reconfiguration workflow'
+  if [[ $roots_csv != "$installed_roots" ]]; then
+    [[ $migrate_runner_mode == host-admin && $roots_csv == / ]] || \
+      die 'changing project roots requires an explicit host-admin migration to /'
+  fi
 fi
 
 getent group codex-web-ui >/dev/null || groupadd --system codex-web-ui
 getent passwd codex-web-ui-api >/dev/null || useradd --system --gid codex-web-ui --home-dir /var/lib/codex-web-ui --shell /usr/sbin/nologin codex-web-ui-api
-install -d -m 0750 -o root -g codex-web-ui /var/lib/codex-web-ui
-install -d -m 0750 -o codex-web-ui-api -g codex-web-ui /var/lib/codex-web-ui/data /var/lib/codex-web-ui/data/attachments
-chown -R codex-web-ui-api:codex-web-ui /var/lib/codex-web-ui/data
-find /var/lib/codex-web-ui/data/attachments -type d -exec chmod 0750 {} +
-find /var/lib/codex-web-ui/data/attachments -type f -exec chmod 0640 {} +
+if $legacy_single_service; then
+  [[ -d /var/lib/codex-web-ui/data && ! -L /var/lib/codex-web-ui/data ]] || \
+    die 'legacy application data directory is missing or unsafe'
+  [[ -d /var/lib/codex-web-ui/data/attachments && ! -L /var/lib/codex-web-ui/data/attachments ]] || \
+    die 'legacy attachment directory is missing or unsafe'
+else
+  application_parent_mode=0750
+  if [[ $runner_mode == restricted && $codex_home == /var/lib/codex-web-ui/* ]]; then
+    application_parent_mode=0751
+  fi
+  install -d -m "$application_parent_mode" -o root -g codex-web-ui /var/lib/codex-web-ui
+  install -d -m 0750 -o codex-web-ui-api -g codex-web-ui /var/lib/codex-web-ui/data /var/lib/codex-web-ui/data/attachments
+  chown -R codex-web-ui-api:codex-web-ui /var/lib/codex-web-ui/data
+  find /var/lib/codex-web-ui/data/attachments -type d -exec chmod 0750 {} +
+  find /var/lib/codex-web-ui/data/attachments -type f -exec chmod 0640 {} +
+fi
 install -d -m 0755 /opt/codex-web-ui/releases /etc/codex-web-ui /usr/local/libexec
 install -d -m 0755 /etc/systemd/system/codex-web-ui-workload.slice.d
 
@@ -320,7 +407,9 @@ release_dir="/opt/codex-web-ui/releases/$release_id"
 if [[ -e $config ]]; then python3 "$package/scripts/storage-guard.py" --config "$config" --check-releases --additional-releases 1; fi
 drain_engaged=false
 if [[ $mode == upgrade ]]; then
-  drain_args=(--begin --config "$config" --service-user api)
+  drain_service_user=api
+  if $legacy_single_service; then drain_service_user=$legacy_service_user; fi
+  drain_args=(--begin --config "$config" --service-user "$drain_service_user")
   bash "$package/scripts/graceful-drain.sh" "${drain_args[@]}"
   [[ -f $drain_marker ]] && drain_engaged=true
   clear_pre_activation_drain() {
@@ -334,14 +423,40 @@ if [[ $mode == upgrade ]]; then
         ;;
       *) printf 'Refusing unsafe incomplete release cleanup: %s\n' "$release_dir" >&2 ;;
     esac
-    if $drain_engaged && ! bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user api --timeout 45; then
+    if $drain_engaged && ! bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user "$drain_service_user" --timeout 45; then
       printf 'Failed to release the pre-activation drain cleanly.\n' >&2
+    fi
+    if $legacy_single_service && $legacy_service_was_active && \
+      ! systemctl is-active --quiet "codex-web-ui@${legacy_service_user}.service"; then
+      systemctl start "codex-web-ui@${legacy_service_user}.service" >/dev/null 2>&1 || \
+        printf 'Failed to restart the legacy API after pre-activation cleanup.\n' >&2
+    fi
+    if $legacy_single_service && $legacy_storage_timer_was_active && \
+      ! systemctl is-active --quiet "codex-web-ui-storage-guard@${legacy_service_user}.timer"; then
+      systemctl start "codex-web-ui-storage-guard@${legacy_service_user}.timer" >/dev/null 2>&1 || \
+        printf 'Failed to restart the legacy storage timer after pre-activation cleanup.\n' >&2
+    fi
+    if $legacy_single_service && $legacy_storage_guard_was_active && \
+      ! systemctl is-active --quiet "codex-web-ui-storage-guard@${legacy_service_user}.service"; then
+      systemctl start "codex-web-ui-storage-guard@${legacy_service_user}.service" >/dev/null 2>&1 || \
+        printf 'Failed to restart the legacy storage guard after pre-activation cleanup.\n' >&2
     fi
     exit "$status"
   }
   trap clear_pre_activation_drain EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
+fi
+if $legacy_single_service; then
+  systemctl stop "codex-web-ui-storage-guard@${legacy_service_user}.timer" \
+    "codex-web-ui-storage-guard@${legacy_service_user}.service" >/dev/null 2>&1 || true
+  if systemctl is-active --quiet "codex-web-ui-storage-guard@${legacy_service_user}.timer" || \
+    systemctl is-active --quiet "codex-web-ui-storage-guard@${legacy_service_user}.service"; then
+    die 'legacy storage guard did not quiesce before topology adoption'
+  fi
+  systemctl stop "codex-web-ui@${legacy_service_user}.service"
+  systemctl is-active --quiet "codex-web-ui@${legacy_service_user}.service" && \
+    die 'legacy API service did not stop after its idle drain'
 fi
 copy_release "$package" "$release_dir"
 previous=$(readlink -f /opt/codex-web-ui/current 2>/dev/null || true)
@@ -380,6 +495,13 @@ resource_rollback_keys=(
   broker-helper
   resource-policy
   resource-drop-in
+  app-server-socket-unit
+  storage-guard-service-unit
+  storage-guard-timer-unit
+  validate-config-helper
+  app-server-helper
+  storage-guard-helper
+  storage-enforce-helper
   runner-drop-in
   api-paths-drop-in
   update-broker-socket-unit
@@ -398,6 +520,13 @@ resource_rollback_paths=(
   /usr/local/libexec/codex-web-ui-resource-broker
   /etc/codex-web-ui/resource-limits.json
   /etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf
+  /etc/systemd/system/codex-web-ui-app-server.socket
+  /etc/systemd/system/codex-web-ui-storage-guard@.service
+  /etc/systemd/system/codex-web-ui-storage-guard@.timer
+  /usr/local/libexec/codex-web-ui-validate-config
+  /usr/local/libexec/codex-web-ui-run-app-server
+  /usr/local/libexec/codex-web-ui-storage-guard
+  /usr/local/libexec/codex-web-ui-storage-enforce
   /etc/systemd/system/codex-web-ui-app-server@.service.d/runner.conf
   /etc/systemd/system/codex-web-ui@api.service.d/paths.conf
   /etc/systemd/system/codex-web-ui-codex-update-broker.socket
@@ -494,6 +623,12 @@ rollback_activation() {
   trap - EXIT INT TERM
   if ! $activation_complete; then
     printf 'Activation failed; restoring the previous release.\n' >&2
+    if $legacy_single_service; then
+      systemctl stop codex-web-ui@api.service codex-web-ui-app-server.socket \
+        'codex-web-ui-app-server@*.service' codex-web-ui-storage-guard@api.timer >/dev/null 2>&1 || true
+      systemctl disable codex-web-ui@api.service codex-web-ui-app-server.socket \
+        codex-web-ui-storage-guard@api.timer >/dev/null 2>&1 || true
+    fi
     if $web_switched; then
       if [[ -n $previous_web ]]; then
         atomic_symlink "$previous_web" /opt/codex-web-ui/web-current
@@ -520,11 +655,59 @@ rollback_activation() {
       install -m 0600 -o root -g root "$config_backup" "$config"
     fi
     if [[ -n $config_temporary ]]; then rm -f -- "$config_temporary"; fi
+    if $legacy_single_service; then
+      chown "$legacy_parent_owner:$legacy_parent_group" /var/lib/codex-web-ui
+      chmod "$legacy_parent_mode" /var/lib/codex-web-ui
+      chown -R "$legacy_service_user:$legacy_service_group" /var/lib/codex-web-ui/data
+    fi
     systemctl daemon-reload >/dev/null 2>&1 || true
-    if systemctl restart codex-web-ui@api.service >/dev/null 2>&1 && \
-      "$package/scripts/health-check.sh" --service-user api --timeout 45 >/dev/null 2>&1; then
+    rollback_service_user=api
+    legacy_state_restored=true
+    if $legacy_single_service; then
+      rollback_service_user=$legacy_service_user
+      if $legacy_service_was_enabled; then
+        systemctl enable "codex-web-ui@${legacy_service_user}.service" >/dev/null 2>&1 || legacy_state_restored=false
+      else
+        systemctl disable "codex-web-ui@${legacy_service_user}.service" >/dev/null 2>&1 || legacy_state_restored=false
+      fi
+      if $legacy_storage_timer_was_enabled; then
+        systemctl enable "codex-web-ui-storage-guard@${legacy_service_user}.timer" >/dev/null 2>&1 || legacy_state_restored=false
+      else
+        systemctl disable "codex-web-ui-storage-guard@${legacy_service_user}.timer" >/dev/null 2>&1 || legacy_state_restored=false
+      fi
+      if $legacy_storage_timer_was_active; then
+        systemctl start "codex-web-ui-storage-guard@${legacy_service_user}.timer" >/dev/null 2>&1 || legacy_state_restored=false
+      else
+        systemctl stop "codex-web-ui-storage-guard@${legacy_service_user}.timer" >/dev/null 2>&1 || legacy_state_restored=false
+      fi
+      if $legacy_storage_guard_was_active; then
+        systemctl start "codex-web-ui-storage-guard@${legacy_service_user}.service" >/dev/null 2>&1 || legacy_state_restored=false
+      else
+        systemctl stop "codex-web-ui-storage-guard@${legacy_service_user}.service" >/dev/null 2>&1 || legacy_state_restored=false
+      fi
+      $legacy_service_was_enabled && ! systemctl is-enabled --quiet "codex-web-ui@${legacy_service_user}.service" && legacy_state_restored=false
+      ! $legacy_service_was_enabled && systemctl is-enabled --quiet "codex-web-ui@${legacy_service_user}.service" && legacy_state_restored=false
+      $legacy_storage_timer_was_enabled && ! systemctl is-enabled --quiet "codex-web-ui-storage-guard@${legacy_service_user}.timer" && legacy_state_restored=false
+      ! $legacy_storage_timer_was_enabled && systemctl is-enabled --quiet "codex-web-ui-storage-guard@${legacy_service_user}.timer" && legacy_state_restored=false
+      $legacy_storage_timer_was_active && ! systemctl is-active --quiet "codex-web-ui-storage-guard@${legacy_service_user}.timer" && legacy_state_restored=false
+      ! $legacy_storage_timer_was_active && systemctl is-active --quiet "codex-web-ui-storage-guard@${legacy_service_user}.timer" && legacy_state_restored=false
+      $legacy_storage_guard_was_active && ! systemctl is-active --quiet "codex-web-ui-storage-guard@${legacy_service_user}.service" && legacy_state_restored=false
+      ! $legacy_storage_guard_was_active && systemctl is-active --quiet "codex-web-ui-storage-guard@${legacy_service_user}.service" && legacy_state_restored=false
+    fi
+    rollback_healthy=false
+    if $legacy_single_service && ! $legacy_service_was_active; then
+      if systemctl stop "codex-web-ui@${rollback_service_user}.service" >/dev/null 2>&1 && \
+        ! systemctl is-active --quiet "codex-web-ui@${rollback_service_user}.service"; then
+        rollback_healthy=true
+      fi
+    elif systemctl restart "codex-web-ui@${rollback_service_user}.service" >/dev/null 2>&1 && \
+      "$package/scripts/health-check.sh" --service-user "$rollback_service_user" --timeout 45 >/dev/null 2>&1; then
+      rollback_healthy=true
+    fi
+    $legacy_state_restored || rollback_healthy=false
+    if $rollback_healthy; then
       if $drain_engaged; then
-        bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user api --timeout 45 || \
+        bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user "$rollback_service_user" --timeout 45 || \
           printf 'Rollback is healthy but the drain could not be released.\n' >&2
       fi
     else
@@ -540,6 +723,13 @@ rollback_activation() {
   exit "$status"
 }
 trap rollback_activation EXIT
+if $legacy_single_service; then
+  # The retained restricted runner may keep CODEX_HOME below this legacy
+  # parent. Group members may inspect the application directory; other users
+  # receive traverse-only access and CODEX_HOME itself remains mode 0700.
+  install -d -m 0751 -o root -g codex-web-ui /var/lib/codex-web-ui
+  chown -R codex-web-ui-api:codex-web-ui /var/lib/codex-web-ui/data
+fi
 atomic_symlink "$release_dir" /opt/codex-web-ui/current
 if [[ -n $previous_web ]]; then
   printf '%s\n' "$previous_web" >/var/lib/codex-web-ui/previous-web-release
@@ -603,17 +793,47 @@ umask 077
   printf 'CODEX_WEB_CODEX_VERSION_PIN="%s"\n' "$version_pin"
 } >"$runner_config"
 config_temporary=$(mktemp /etc/codex-web-ui/.codex-web-ui.env.XXXXXX)
-CONFIG_SOURCE=$config CONFIG_DESTINATION=$config_temporary VERSION_PIN=$version_pin python3 - <<'PY'
+CONFIG_SOURCE=$config CONFIG_DESTINATION=$config_temporary VERSION_PIN=$version_pin \
+  PROJECT_ROOTS=$roots_csv LEGACY_ADOPTION=$legacy_single_service python3 - <<'PY'
 import os
 from pathlib import Path
 
 source = Path(os.environ["CONFIG_SOURCE"]).read_text(encoding="utf-8")
 lines = source.splitlines()
-matches = [index for index, line in enumerate(lines) if line.startswith("CODEX_WEB_CODEX_VERSION_PIN=")]
-if len(matches) != 1:
-    raise SystemExit("installed Codex version pin is missing or ambiguous")
-lines[matches[0]] = f'CODEX_WEB_CODEX_VERSION_PIN="{os.environ["VERSION_PIN"]}"'
-Path(os.environ["CONFIG_DESTINATION"]).write_text("\n".join(lines) + "\n", encoding="utf-8")
+legacy = os.environ["LEGACY_ADOPTION"] == "true"
+updates = {
+    "CODEX_WEB_CODEX_VERSION_PIN": f'"{os.environ["VERSION_PIN"]}"',
+    "CODEX_WEB_PROJECT_ROOTS": os.environ["PROJECT_ROOTS"],
+}
+if legacy:
+    updates.update({
+        "CODEX_WEB_ATTACHMENT_STORAGE_PATH": "/var/lib/codex-web-ui/data/attachments",
+        "CODEX_WEB_APP_SERVER_SOCKET": "/run/codex-web-ui/app-server.sock",
+        "CODEX_WEB_CODEX_UPDATE_BROKER_SOCKET": "/run/codex-web-ui/codex-update-broker.sock",
+    })
+remove = {"CODEX_BIN", "CODEX_HOME"} if legacy else set()
+result = []
+seen = set()
+for line in lines:
+    key, separator, _value = line.partition("=")
+    if separator and key in remove:
+        if key in seen:
+            raise SystemExit(f"legacy configuration contains duplicate {key}")
+        seen.add(key)
+        continue
+    if separator and key in updates:
+        if key in seen:
+            raise SystemExit(f"installed configuration contains duplicate {key}")
+        result.append(f"{key}={updates[key]}")
+        seen.add(key)
+    else:
+        result.append(line)
+for key, value in updates.items():
+    if key not in seen:
+        result.append(f"{key}={value}")
+if not legacy and "CODEX_WEB_CODEX_VERSION_PIN" not in seen:
+    raise SystemExit("installed Codex version pin is missing")
+Path(os.environ["CONFIG_DESTINATION"]).write_text("\n".join(result) + "\n", encoding="utf-8")
 PY
 chmod 0600 "$config_temporary"
 chown root:root "$config_temporary"
@@ -641,6 +861,14 @@ if $start_service; then
   systemctl restart codex-web-ui-codex-update-broker.socket
   /usr/local/libexec/codex-web-ui-resource-broker --initialize >/dev/null
   "$package/scripts/health-check.sh" --service-user api --timeout 45
+  if $legacy_single_service; then
+    systemctl disable "codex-web-ui@${legacy_service_user}.service" \
+      "codex-web-ui-storage-guard@${legacy_service_user}.timer"
+    if systemctl is-enabled --quiet "codex-web-ui@${legacy_service_user}.service" || \
+      systemctl is-enabled --quiet "codex-web-ui-storage-guard@${legacy_service_user}.timer"; then
+      die 'legacy service instances remained enabled after split activation'
+    fi
+  fi
   if $drain_engaged; then
     bash "$package/scripts/graceful-drain.sh" --release --config "$config" --service-user api --timeout 45
   fi

@@ -57,14 +57,33 @@ of SSH to loopback, the current hostname or any address of the same machine.
 
 ## Migrating an existing runner to host-admin
 
-Do not change `--runner-user` or `--codex-home` on an ordinary upgrade. Use the explicit migration flag from a
-normal local checkout and repeat the installation's existing origin/TLS arguments:
+An installation without `/etc/codex-web-ui/codex-runner.env` still uses the retired single-service topology,
+where the API and Codex share one OS identity. Upgrade that installation once without a runner migration flag:
+
+```sh
+./install.sh \
+  --upgrade \
+  --public-origin https://codex.example.com \
+  --external-proxy
+```
+
+This adoption is a transaction of its own. It uses the owner of the legacy `CODEX_HOME` as the exact old
+systemd instance, drains and stops that instance, preserves the Web database in place, moves only API-owned
+data to `codex-web-ui-api`, removes `CODEX_HOME`/`CODEX_BIN` from the API environment, creates the protected
+runner environment and starts the split socket topology. The old instance is disabled only after the split API
+and app-server pass health checks. A failure restores the old release, configuration, data ownership, enabled
+state and old service identity before releasing the drain. Directly combining legacy adoption with
+`--migrate-runner-mode` is rejected so rollback never has to cross two security boundaries at once.
+
+After that first upgrade succeeds, do not change `--runner-user` or `--codex-home` on an ordinary upgrade. Use
+the explicit migration flag in a second invocation and repeat the installation's existing origin/TLS arguments:
 
 ```sh
 ./install.sh \
   --upgrade \
   --migrate-runner-mode host-admin \
   --migration-codex-home /root/.codex-web-ui \
+  --project-root / \
   --public-origin https://codex.example.com \
   --external-proxy
 ```
@@ -74,7 +93,8 @@ separate manual root CLI profile; the migration never merges profiles. It first 
 turns and subagents to finish, stops the API and runner socket, copies the complete current Codex home, compares
 the copied file inventory and hashes, verifies the pinned CLI and copied login, installs the same-host global
 instruction, then switches the app-server unit to root and performs a health check. Web SQLite, attachments,
-projects, chat titles and thread mappings stay in place.
+projects, chat titles and thread mappings stay in place. Only this explicit host-admin migration may widen the
+registered project roots to exactly `/`; ordinary upgrades continue to reject every project-root change.
 
 The destination parent must be root-owned and not writable by group or other users. Migration cannot be
 combined with `--no-start`, because a successful health check of the new root runner is part of the state

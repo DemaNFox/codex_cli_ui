@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -201,7 +205,10 @@ class InfraStaticTest(unittest.TestCase):
             self.assertIn(expected, installer)
         self.assertLess(
             installer.index('bash "$SCRIPT_DIR/migrate-runner-host-admin.sh"'),
-            installer.index('if [[ $mode == upgrade ]]', installer.index("runner_config=")),
+            installer.index(
+                'if [[ $mode == upgrade && $legacy_single_service == false ]]; then',
+                installer.index("runner_config="),
+            ),
         )
         self.assertLess(
             installer.index(
@@ -257,6 +264,163 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn(
             "--runner-mode|--migrate-runner-mode|--migration-codex-home|--runner-user",
             wrapper,
+        )
+
+    def test_installer_preserves_only_the_exact_legacy_bare_ip_before_migration(self) -> None:
+        installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        validation_start = installer.index(
+            "PUBLIC_ORIGIN=$public_origin ALLOW_EXISTING_BARE_IP=$allow_existing_bare_ip python3"
+        )
+        validation_body_start = installer.index("\n", validation_start) + 1
+        validation_end = installer.index("\nPY\n", validation_body_start)
+        validation = installer[validation_body_start:validation_end]
+        migration = installer.index('bash "$SCRIPT_DIR/migrate-runner-host-admin.sh"')
+
+        self.assertIn('[[ $public_origin == "$installed_origin" ]]', installer)
+        self.assertIn("if [[ $mode == upgrade ]]; then allow_existing_bare_ip=true; fi", installer)
+        self.assertLess(validation_start, migration)
+
+        def validate(origin: str, allow_existing_bare_ip: bool) -> subprocess.CompletedProcess[str]:
+            environment = os.environ.copy()
+            environment["PUBLIC_ORIGIN"] = origin
+            environment["ALLOW_EXISTING_BARE_IP"] = (
+                "true" if allow_existing_bare_ip else "false"
+            )
+            return subprocess.run(
+                [sys.executable, "-c", validation],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(validate("https://codex.example.test", False).returncode, 0)
+        fresh_ip = validate("https://192.0.2.10", False)
+        self.assertNotEqual(fresh_ip.returncode, 0)
+        self.assertIn("must use a DNS name", fresh_ip.stderr)
+        self.assertEqual(validate("https://192.0.2.10", True).returncode, 0)
+
+    def test_legacy_single_service_adoption_rewrites_only_runtime_boundary(self) -> None:
+        installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        command = installer.index(
+            "PROJECT_ROOTS=$roots_csv LEGACY_ADOPTION=$legacy_single_service python3"
+        )
+        body_start = installer.index("\n", command) + 1
+        body_end = installer.index("\nPY\n", body_start)
+        transformer = installer[body_start:body_end]
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "legacy.env"
+            destination = Path(directory) / "split.env"
+            source.write_text(
+                "\n".join(
+                    (
+                        "CODEX_WEB_PUBLIC_ORIGIN=https://192.0.2.10",
+                        "CODEX_WEB_PROJECT_ROOTS=/srv/codex-projects",
+                        'CODEX_WEB_CODEX_VERSION_PIN="codex-cli 0.153.4"',
+                        "CODEX_WEB_ADMIN_USERNAME=owner",
+                        "CODEX_WEB_ADMIN_PASSWORD_HASH=preserve-me",
+                        "CODEX_WEB_SESSION_SECRET=preserve-me-too",
+                        "CODEX_BIN=/opt/codex-web-ui/old/bin/codex",
+                        "CODEX_HOME=/var/lib/codex-web-ui/codex-home",
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "CONFIG_SOURCE": str(source),
+                    "CONFIG_DESTINATION": str(destination),
+                    "VERSION_PIN": "codex-cli 0.153.4",
+                    "PROJECT_ROOTS": "/srv/codex-projects",
+                    "LEGACY_ADOPTION": "true",
+                }
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", transformer],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            migrated = destination.read_text(encoding="utf-8")
+            self.assertNotIn("CODEX_BIN=", migrated)
+            self.assertNotIn("CODEX_HOME=", migrated)
+            self.assertIn(
+                "CODEX_WEB_APP_SERVER_SOCKET=/run/codex-web-ui/app-server.sock", migrated
+            )
+            self.assertIn(
+                "CODEX_WEB_CODEX_UPDATE_BROKER_SOCKET=/run/codex-web-ui/codex-update-broker.sock",
+                migrated,
+            )
+            self.assertIn("CODEX_WEB_ADMIN_PASSWORD_HASH=preserve-me", migrated)
+            self.assertIn("CODEX_WEB_SESSION_SECRET=preserve-me-too", migrated)
+
+            environment.update(
+                {
+                    "CONFIG_SOURCE": str(destination),
+                    "CONFIG_DESTINATION": str(source),
+                    "PROJECT_ROOTS": "/",
+                    "LEGACY_ADOPTION": "false",
+                }
+            )
+            result = subprocess.run(
+                [sys.executable, "-c", transformer],
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("CODEX_WEB_PROJECT_ROOTS=/\n", source.read_text(encoding="utf-8"))
+
+    def test_legacy_adoption_uses_old_identity_for_drain_and_rollback(self) -> None:
+        installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        rollback_trap = installer.index("trap rollback_activation EXIT")
+        ownership_change = installer.index(
+            "chown -R codex-web-ui-api:codex-web-ui /var/lib/codex-web-ui/data",
+            rollback_trap,
+        )
+        health = installer.index(
+            '"$package/scripts/health-check.sh" --service-user api --timeout 45',
+            ownership_change,
+        )
+        legacy_disable = installer.index(
+            'systemctl disable "codex-web-ui@${legacy_service_user}.service"', health
+        )
+
+        self.assertLess(rollback_trap, ownership_change)
+        self.assertLess(health, legacy_disable)
+        self.assertIn('drain_service_user=$legacy_service_user', installer)
+        self.assertIn('rollback_service_user=$legacy_service_user', installer)
+        self.assertIn(
+            'systemctl start "codex-web-ui-storage-guard@${legacy_service_user}.timer"',
+            installer,
+        )
+        self.assertIn("legacy storage guard did not quiesce before topology adoption", installer)
+        self.assertIn("legacy service instances remained enabled after split activation", installer)
+        self.assertIn("legacy_state_restored=false", installer)
+        self.assertIn('$legacy_state_restored || rollback_healthy=false', installer)
+        self.assertIn('/opt/codex-web-ui/codex-runtime/bin/codex', installer)
+        self.assertIn(
+            'chown -R "$legacy_service_user:$legacy_service_group" /var/lib/codex-web-ui/data',
+            installer,
+        )
+        self.assertIn(
+            "legacy single-service installations must complete one ordinary --upgrade",
+            installer,
+        )
+        self.assertIn(
+            "legacy single-service adoption cannot be combined with --no-start", installer
+        )
+        self.assertIn(
+            '[[ $migrate_runner_mode == host-admin && $roots_csv == / ]]', installer
+        )
+        self.assertIn(
+            "changing project roots requires an explicit host-admin migration to /", installer
         )
 
     def test_nginx_edge_is_tls_only_for_application_traffic_and_sse_unbuffered(self) -> None:
