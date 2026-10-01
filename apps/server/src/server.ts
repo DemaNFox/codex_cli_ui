@@ -1,6 +1,7 @@
 import {
   accountRateLimitSchema,
   accountUsageSchema,
+  applyCodexUpdateRequestSchema,
   attachmentSchema,
   capabilitySchema,
   codexAccountLoginSchema,
@@ -1928,9 +1929,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
 
   app.post('/api/system/codex-update/apply', async (request, reply) => {
     csrfGuard(auth, request);
-    z.object({})
-      .strict()
-      .parse(request.body ?? {});
+    applyCodexUpdateRequestSchema.parse(request.body ?? {});
     if (codexUpdateInterlocked) throw new HttpError(409, 'CODEX_UPDATE_PENDING');
     if (codexUpdateWorkActive() || upgradeDrainRequested())
       throw new HttpError(
@@ -1946,7 +1945,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     codexUpdateInterlocked = true;
     try {
       const before = await codexUpdateStatus();
-      if (before.state !== 'ready') {
+      if (!['ready', 'failed', 'unavailable'].includes(before.state)) {
         codexUpdateApplyPending = false;
         codexUpdateInterlocked = before.state === 'applying' || before.state === 'rollback_failed';
         throw new HttpError(

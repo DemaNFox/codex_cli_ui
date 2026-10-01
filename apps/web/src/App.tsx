@@ -2044,6 +2044,10 @@ function Diagnostics({
   accountSwitchButtonRef: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
 }) {
+  const canApplyCodexUpdate =
+    codexUpdate?.state === 'ready' ||
+    (codexUpdate?.state === 'unavailable' && codexUpdateDiscovery?.state === 'available');
+
   return (
     <aside id="codex-diagnostics" className="diagnostics" aria-label="Статус Codex">
       <header>
@@ -2096,7 +2100,7 @@ function Diagnostics({
                 </dl>
                 <p className={`codex-update-state ${codexUpdateDiscovery.state}`} role="status">
                   {codexUpdateDiscovery.state === 'available' &&
-                    'Доступна новая версия Codex. Для установки нужен подготовленный совместимый пакет.'}
+                    'Доступна новая версия Codex. Её можно безопасно скачать и установить.'}
                   {codexUpdateDiscovery.state === 'current' &&
                     'Установлена последняя версия Codex.'}
                   {codexUpdateDiscovery.state === 'failed' &&
@@ -2152,14 +2156,14 @@ function Diagnostics({
                       {codexUpdate.lastResult.message}
                     </p>
                   )}
-                  {codexUpdate.state === 'ready' && (
+                  {canApplyCodexUpdate && (
                     <button
                       className="primary codex-update-button"
                       type="button"
                       disabled={codexUpdateBusy}
                       onClick={onApplyCodexUpdate}
                     >
-                      {codexUpdateBusy ? 'Запускаем…' : 'Обновить Codex'}
+                      {codexUpdateBusy ? 'Запускаем…' : 'Скачать и установить'}
                     </button>
                   )}
                 </>
@@ -3704,7 +3708,10 @@ function Workspace({
   }
 
   async function applyCodexUpdate() {
-    if (codexUpdate?.state !== 'ready' || codexUpdateBusy) return;
+    const canApply =
+      codexUpdate?.state === 'ready' ||
+      (codexUpdate?.state === 'unavailable' && codexUpdateDiscovery?.state === 'available');
+    if (!canApply || codexUpdateBusy) return;
     setCodexUpdateBusy(true);
     setCodexUpdateError(null);
     try {

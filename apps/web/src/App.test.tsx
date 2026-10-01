@@ -2977,10 +2977,10 @@ describe('App', () => {
 
     await user.click(await screen.findByRole('button', { name: 'Статус' }));
     expect((await screen.findAllByText('1.2.4')).length).toBeGreaterThan(0);
-    await user.click(screen.getByRole('button', { name: 'Обновить Codex' }));
+    await user.click(screen.getByRole('button', { name: 'Скачать и установить' }));
 
     expect(await screen.findByText('Обновляем Codex…')).not.toBeNull();
-    expect(screen.queryByRole('button', { name: 'Обновить Codex' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Скачать и установить' })).toBeNull();
     expect(screen.getByText(/Обновление запускается только когда Codex свободен/)).not.toBeNull();
     expect(await screen.findByText('Установлена актуальная подготовленная версия.')).not.toBeNull();
     expect(await screen.findByText('Codex обновлён. Чаты и файлы сохранены.')).not.toBeNull();
@@ -2997,6 +2997,44 @@ describe('App', () => {
       ([input, init]) =>
         requestUrl(input) === '/api/system/codex-update/apply' && init?.method === 'POST',
     );
+    expect(new Headers(applyCall?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf-token');
+  });
+
+  it('offers to download and install a discovered update without a staged candidate', async () => {
+    const discoveredUpdate = {
+      state: 'available' as const,
+      currentVersion: 'codex-cli 1.2.3',
+      latestVersion: 'codex-cli 1.2.4',
+      checkedAt: '2026-10-01T16:00:00.000Z',
+    };
+    const unstagedUpdate = {
+      state: 'unavailable' as const,
+      currentVersion: 'codex-cli 1.2.3',
+      availableVersion: null,
+      candidateReleaseId: null,
+      lastResult: null,
+    };
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/system/codex-update/discovery')
+        return jsonResponse({ data: discoveredUpdate });
+      if (url === '/api/system/codex-update') return jsonResponse({ data: unstagedUpdate });
+      if (url === '/api/system/codex-update/apply' && init?.method === 'POST')
+        return jsonResponse({ data: { ...unstagedUpdate, state: 'applying' } }, 202);
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    const applyButton = await screen.findByRole('button', { name: 'Скачать и установить' });
+    await user.click(applyButton);
+
+    expect(await screen.findByText('Обновляем Codex…')).not.toBeNull();
+    const applyCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        requestUrl(input) === '/api/system/codex-update/apply' && init?.method === 'POST',
+    );
+    expect(applyCall?.[1]?.body).toBe('{}');
     expect(new Headers(applyCall?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf-token');
   });
 

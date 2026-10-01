@@ -111,6 +111,9 @@ export const codexUpdateSnapshotSchema = z.object({
 });
 export type CodexUpdateSnapshot = z.infer<typeof codexUpdateSnapshotSchema>;
 
+export const applyCodexUpdateRequestSchema = z.object({}).strict();
+export type ApplyCodexUpdateRequest = z.infer<typeof applyCodexUpdateRequestSchema>;
+
 export const codexVersionDiscoverySchema = z.object({
   state: z.enum(['current', 'available', 'failed']),
   currentVersion: z.string().regex(/^codex-cli \d+\.\d+\.\d+$/),

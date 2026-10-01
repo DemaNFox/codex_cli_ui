@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  applyCodexUpdateRequestSchema,
   createProjectRequestSchema,
   attachmentSchema,
   codexAccountLoginSchema,
@@ -76,6 +77,17 @@ describe('contracts', () => {
         availableVersion: 'latest',
         candidateReleaseId: '../../tmp',
         lastResult: { status: 'succeeded', message: '', completedAt: 'not-a-date' },
+      }).success,
+    ).toBe(false);
+  });
+
+  it('keeps Codex update apply requests empty', () => {
+    expect(applyCodexUpdateRequestSchema.safeParse({}).success).toBe(true);
+    expect(
+      applyCodexUpdateRequestSchema.safeParse({
+        version: 'codex-cli 0.159.3',
+        url: 'https://example.test/codex.tgz',
+        path: '/tmp/codex.tgz',
       }).success,
     ).toBe(false);
   });

@@ -1980,7 +1980,7 @@ describe('Codex routes', () => {
     expect(appServer.requests.filter((item) => item.method === 'thread/list')).toHaveLength(2);
   });
 
-  it('applies only a prepared Codex update while all execution work is idle', async () => {
+  it('applies a Codex update while all execution work is idle', async () => {
     const updateBroker = new FakeCodexUpdateBroker();
     const { app, appServer, projectPath } = await fixture(
       2,
@@ -2046,6 +2046,61 @@ describe('Codex routes', () => {
     });
     expect(blockedLogin.statusCode).toBe(409);
     expect(blockedLogin.json()).toMatchObject({ error: { code: 'CODEX_UPDATE_PENDING' } });
+  });
+
+  it('lets the root broker download an available Codex update without accepting a target', async () => {
+    const updateBroker = new FakeCodexUpdateBroker();
+    updateBroker.current = {
+      state: 'unavailable',
+      currentVersion: 'codex-cli 0.153.4',
+      availableVersion: null,
+      candidateReleaseId: null,
+      lastResult: null,
+    };
+    const { app } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      updateBroker,
+    );
+    const session = await login(app);
+    const statusReadsBeforeApply = updateBroker.statusReads;
+
+    const targeted = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-update/apply',
+      headers: session.headers,
+      payload: {
+        version: 'codex-cli 0.159.3',
+        url: 'https://example.test/codex.tgz',
+        path: '/tmp/codex.tgz',
+      },
+    });
+    expect(targeted.statusCode).toBe(400);
+    expect(updateBroker.statusReads).toBe(statusReadsBeforeApply);
+    expect(updateBroker.applyCalls).toBe(0);
+
+    const applied = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-update/apply',
+      headers: session.headers,
+      payload: {},
+    });
+    expect(applied.statusCode).toBe(202);
+    expect(applied.json()).toMatchObject({
+      data: {
+        state: 'applying',
+        currentVersion: 'codex-cli 0.153.4',
+        availableVersion: null,
+        candidateReleaseId: null,
+      },
+    });
+    expect(updateBroker.statusReads).toBe(statusReadsBeforeApply + 1);
+    expect(updateBroker.applyCalls).toBe(1);
   });
 
   it('checks the fixed upstream Codex version without accepting a caller target', async () => {
