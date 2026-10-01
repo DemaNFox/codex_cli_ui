@@ -882,6 +882,22 @@ def main() -> int:
         final_answer.wait_for()
         if final_answer.count() != 1 or "Итоговый ответ" not in final_answer.inner_text():
             raise AssertionError("completed Codex answer is not visually identified as final")
+        page.set_viewport_size({"width": 1048, "height": 1079})
+        transcript_shell_box = page.locator(".transcript-shell").bounding_box()
+        transcript_box = page.locator(".transcript").bounding_box()
+        final_answer_box = final_answer.bounding_box()
+        if (
+            not transcript_shell_box
+            or not transcript_box
+            or not final_answer_box
+            or transcript_box["width"] < transcript_shell_box["width"] * 0.85
+            or final_answer_box["width"] < min(600, transcript_box["width"] * 0.75)
+        ):
+            raise AssertionError(
+                "turn navigation collapsed the transcript column: "
+                f"shell={transcript_shell_box}, transcript={transcript_box}, final={final_answer_box}"
+            )
+        page.set_viewport_size({"width": 1440, "height": 900})
         generated_file = final_answer.get_by_role("link", name="Скачать отчёт")
         if generated_file.get_attribute("download") != "audit.md":
             raise AssertionError("generated project file is not marked as a download")
