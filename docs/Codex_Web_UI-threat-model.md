@@ -77,10 +77,11 @@ sessions, TLS, audit and an explicit fail-closed mode choice are mandatory; seco
   short-lived verification URL/code from the isolated runner to the current owner session. It never receives
   credential tokens or reads `CODEX_HOME`, and task admission is closed for the lifetime of the flow.
 - Browser -> attachment store: authenticated multipart uploads with per-file, per-turn and per-thread bounds; only opaque IDs and safe metadata return to the browser. Both new turns and active-turn steer may claim staged IDs.
-- Browser -> API -> OpenAI transcription: an explicit microphone action sends one authenticated, CSRF-protected
-  audio clip; the browser applies a duration stop, while the API enforces type, byte-size, concurrency, rate
-  and upstream-timeout bounds. It forwards the clip with a separate server-only key and returns text without
-  persisting audio or upstream response bodies.
+- Browser -> API -> local transcription model: an explicit microphone action converts one clip to canonical
+  PCM WAV and sends it through an authenticated, CSRF-protected request. The API enforces type, byte-size,
+  decoded duration, silence, concurrency and rate bounds, runs one warmed CPU-only model inside the workload
+  resource ceiling and returns text without persisting audio. Production inference has remote model access
+  disabled.
 - Browser -> API -> push service: an explicit per-chat action supplies a standard PushSubscription after
   browser permission. Exact Origin, session auth, CSRF and bounded schemas protect mapping changes. The API
   sends only an opaque chat identifier and generic terminal state using host-local VAPID credentials; chat
@@ -150,7 +151,7 @@ flowchart LR
 | JSON-RPC              | Local child stdio     | API to Codex                 | method/schema allowlist, IDs, size bounds                                             |
 | Attachment upload     | Authenticated browser | Browser to bounded storage   | multipart/type/signature/size limits, opaque IDs                                      |
 | Attachment content    | Authenticated browser | Storage to browser           | thread ownership, `nosniff`, download non-images                                      |
-| Voice transcription   | Authenticated browser | Browser/API to OpenAI        | CSRF/origin, MIME/size/time/rate bounds, idempotency, no persistence, server-only key |
+| Voice transcription   | Authenticated browser | Browser/API to local model   | CSRF/origin, canonical WAV/size/time/rate bounds, idempotency, no persistence         |
 | Push subscription     | Authenticated browser | Browser/API to push service  | Explicit permission; CSRF/origin; bounded HTTPS endpoint/keys; generic payload        |
 | Skills and rules      | Project/server files  | Filesystem to agent policy   | pinned bundle, checksums, visible loaded sources                                      |
 | Codex update          | Authenticated browser | API to narrow root broker    | staged fixed candidate, peer credentials, no caller path/command, checksums, rollback |
@@ -181,8 +182,8 @@ flowchart LR
 17. A limit update races a new turn or lowers memory below live usage, killing active root/subagent work.
 18. A tampered or API-incompatible web-only release is activated while Codex work continues, enabling browser
     compromise or sending requests the live backend cannot safely interpret.
-19. A stolen session repeatedly uploads audio to exhaust memory, hold request workers or create unbounded
-    transcription spend; an upstream error accidentally leaks the API key or private transcript into logs.
+19. A stolen session repeatedly uploads audio to exhaust memory or CPU, hold request workers or disrupt Codex;
+    a substituted model artifact executes unreviewed code/data or a failure leaks a private transcript to logs.
 20. A stolen session registers or removes another device endpoint, repeated terminal events amplify outbound
     delivery, or a detailed payload leaks project content through a push provider or lock screen.
 21. A compromised API abuses a broad updater as a root confused deputy, races candidate replacement, or
@@ -216,7 +217,7 @@ flowchart LR
 | TM-018 | Resource settings become a root confused deputy                               | Authenticated API may request resource changes                                               | Separate root-owned broker; mode-0600 socket and `SO_PEERCRED`; fixed target/properties; strict schema/capacity/floor checks; no shell; atomic policy and rollback; journald plus API audit                                                                                                                                                                   | low        | critical | high     |
 | TM-019 | Reconfiguration interrupts active work or races admission                     | Active root turns/subagents and concurrent Apply/start                                       | Serialize admission with a pending/applying gate; apply only after root turns, pending starts and active subagents reach zero; recheck current usage and read back kernel state                                                                                                                                                                               | medium     | high     | high     |
 | TM-020 | Web-only release is tampered, escapes storage or mismatches the live API      | Root operator invokes the static updater with a new package                                  | Verify with the installed checksummed package verifier; reject symlink/special-file inventory and `apiCompatibility` mismatch; copy root-owned immutable release; atomic bounded `web-current`; independent rollback; never restart Codex                                                                                                                     | low        | high     | high     |
-| TM-021 | Voice upload leaks private speech/key or causes resource and billing abuse    | Authenticated session and configured transcription key                                       | Allowlisted MIME and bounded in-memory multipart body; one active transcription plus request window; session/audio-bound TTL idempotency; upstream timeout; generic errors; never persist/log audio, key or upstream body; expose only availability/model/bounds                                                                                              | medium     | high     | high     |
+| TM-021 | Voice upload leaks speech, exhausts resources or loads a substituted model    | Authenticated session and shared workload resource ceiling                                   | Canonical PCM WAV and bounded in-memory multipart body; decoded duration/silence checks; one active transcription plus request window; session/audio-bound TTL idempotency; pinned revision and complete manifest/hash/symlink verification; runtime network disabled; generic errors; never persist/log audio; expose only availability/model/bounds         | medium     | high     | high     |
 | TM-022 | Push subscription abuse leaks metadata or amplifies outbound delivery         | Authenticated session, browser permission and VAPID keypair                                  | Exact Origin/CSRF; per-thread and global subscription limits; approved push-provider origins; bounded queue/retries; unique terminal delivery; stale-endpoint deletion; never list endpoints; generic payload without chat names/transcript/tool/file content; audit only safe hashes/IDs                                                                     | medium     | medium   | medium   |
 | TM-023 | Codex updater becomes a root confused deputy or activates incompatible code   | Operator-staged immutable full release                                                       | Dedicated mode-0600 socket and `SO_PEERCRED`; exact status/apply schema; no caller path/URL/version/command/unit; candidate lock and root-owned containment; installed inventory verifier; architecture/API checks; candidate-generated protocol byte comparison; idle interlock; fixed oneshot; health-gated transactional rollback                          | low        | critical | high     |
 | TM-024 | Host-admin turns session or prompt compromise into host-root execution        | Restricted is default; Web auth, CSRF/origin, audit and private app-server socket remain     | Require an explicit local install/migration flag; keep API non-root; never expose mode switching in Web UI; recommend a strong unique password and second factor; monitor host-admin/full-access starts                                                                                                                                                       | medium     | critical | critical |
@@ -239,7 +240,7 @@ flowchart LR
 | `apps/server/src/projects/`              | Filesystem containment                        | TM-003                         |
 | `apps/server/src/events/`                | Redaction, retention and reconnect            | TM-002, TM-004                 |
 | `apps/server/src/attachment-store.ts`    | Upload validation, containment and cleanup    | TM-010, TM-011, TM-012, TM-013 |
-| `apps/server/src/audio-transcription.ts` | Paid outbound request and ephemeral audio     | TM-021                         |
+| `apps/server/src/audio-transcription.ts` | Local model integrity and ephemeral audio     | TM-021                         |
 | `apps/server/src/push-notifications.ts`  | External delivery, retry and stale endpoints  | TM-022                         |
 | `apps/web/public/push-service-worker.js` | Background display and click navigation       | TM-002, TM-022                 |
 | `apps/web/src/`                          | Rendering of untrusted content                | TM-002, TM-005                 |

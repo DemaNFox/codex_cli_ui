@@ -72,6 +72,7 @@ required = (
     "scripts/bootstrap-ubuntu.sh",
     "apps/server/dist/index.js",
     "apps/web/dist/index.html",
+    "models/codex-web-ui-transcription-manifest.json",
     "infra/toolchain.env",
     "infra/release-manifest.schema.json",
     "protocol/manifest.json",
@@ -284,7 +285,7 @@ trap cleanup EXIT
 
 "$SCRIPT_DIR/prepare-release.sh" --output "$release_stage"
 mkdir -p "$package_stage"
-cp -a -- "$release_stage/apps" "$package_stage/apps"
+cp -a -- "$release_stage/apps" "$release_stage/models" "$package_stage/"
 
 tracked_roots=(infra protocol scripts skills)
 git cat-file -e HEAD:install.sh 2>/dev/null && tracked_roots+=(install.sh)

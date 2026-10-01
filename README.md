@@ -113,10 +113,12 @@ A new host needs only:
 
 Codex authentication, website passwords, `.env` values, databases, transcripts and project worktrees are
 host state and are never committed. The installer must validate the pinned CLI protocol before activation.
-Voice transcription is optional and independent from Codex device authentication: add an OpenAI API key as
-`OPENAI_API_KEY` to the protected root-owned Web environment file to enable it. The browser never receives
-that key. The browser stops long recordings, while the API enforces type, byte-size, request-rate,
-concurrency and upstream-timeout limits without storing the audio.
+Voice transcription is optional and independent from Codex device authentication. Each verified release
+ships a pinned, manifest-checked quantized Whisper model; production inference stays on-host and requires no
+transcription API key or runtime model download. The browser stops long recordings, while the API enforces
+canonical audio, byte-size, decoded-duration, silence, request-rate and single-inference limits without
+storing the audio. Upgrades treat the former `gpt-transcribe` setting as the bundled local model and ignore a
+legacy `OPENAI_API_KEY`, so existing installations do not need a manual secret migration.
 Browser notifications require a browser-supported secure context and permission granted separately on each
 device. Chat subscriptions and the bounded delivery queue are server state; VAPID private material remains
 only in the protected root-owned environment file.

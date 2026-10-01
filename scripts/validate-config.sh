@@ -132,6 +132,29 @@ validate_admin_hash(values["CODEX_WEB_ADMIN_PASSWORD_HASH"])
 if not re.fullmatch(r"[A-Za-z0-9_-]{43,256}", values["CODEX_WEB_SESSION_SECRET"]):
     fail("session secret must be 43-256 base64url characters")
 
+transcription_cache = values.get(
+    "CODEX_WEB_TRANSCRIPTION_MODEL_CACHE_PATH", "/opt/codex-web-ui/current/models"
+)
+if not transcription_cache.startswith("/") or any(
+    character.isspace() for character in transcription_cache
+):
+    fail("invalid CODEX_WEB_TRANSCRIPTION_MODEL_CACHE_PATH")
+transcription_model = values.get("CODEX_WEB_TRANSCRIPTION_MODEL", "onnx-community/whisper-base")
+if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,119}", transcription_model) or ".." in transcription_model:
+    fail("invalid CODEX_WEB_TRANSCRIPTION_MODEL")
+if not re.fullmatch(
+    r"[a-f0-9]{40}",
+    values.get(
+        "CODEX_WEB_TRANSCRIPTION_MODEL_REVISION",
+        "1846881b6b3a3024392c1eea3ad983695bc23925",
+    ),
+):
+    fail("invalid CODEX_WEB_TRANSCRIPTION_MODEL_REVISION")
+if not re.fullmatch(
+    r"[a-z][a-z-]{1,31}", values.get("CODEX_WEB_TRANSCRIPTION_LANGUAGE", "russian")
+):
+    fail("invalid CODEX_WEB_TRANSCRIPTION_LANGUAGE")
+
 push_names = (
     "CODEX_WEB_VAPID_PUBLIC_KEY",
     "CODEX_WEB_VAPID_PRIVATE_KEY",

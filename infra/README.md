@@ -304,10 +304,11 @@ alternative installation path:
    shared host until hard byte/inode storage bounds have been established.
 3. Populate `/etc/codex-web-ui/codex-web-ui.env` through a protected channel;
    keep it `root:root 0600`.
-   To enable optional voice input, set `OPENAI_API_KEY` in that file and keep
-   `CODEX_WEB_TRANSCRIPTION_MODEL=gpt-transcribe`. The key is used only by the
-   Web API for bounded ephemeral transcription and is not shared with the browser
-   or the isolated Codex runner. Leave the key empty to disable the feature.
+   Voice input uses the pinned quantized Whisper model shipped inside each verified
+   immutable release. No transcription API key is needed, and the production runtime
+   never downloads a model or sends recorded audio off-host. The default model path
+   follows `/opt/codex-web-ui/current/models`; override the model/cache settings only
+   when an equivalent manifest-verified model has been provisioned there.
    The supported installer also runs `setup-push.mjs` once to add a VAPID keypair
    and HTTPS subject to this file. It preserves existing keys on upgrades so active
    browser subscriptions remain valid and never prints either key. Removing or

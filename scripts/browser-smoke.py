@@ -178,7 +178,7 @@ def main() -> int:
                     },
                     "transcription": {
                         "available": True,
-                        "model": "gpt-transcribe",
+                        "model": "onnx-community/whisper-base",
                         "maxBytes": 10485760,
                         "maxDurationSeconds": 120,
                     },

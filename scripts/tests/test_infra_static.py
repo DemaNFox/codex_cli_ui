@@ -541,7 +541,6 @@ class InfraStaticTest(unittest.TestCase):
             "CODEX_WEB_ADMIN_USERNAME",
             "CODEX_WEB_ADMIN_PASSWORD_HASH",
             "CODEX_WEB_SESSION_SECRET",
-            "OPENAI_API_KEY",
             "CODEX_WEB_VAPID_PUBLIC_KEY",
             "CODEX_WEB_VAPID_PRIVATE_KEY",
             "CODEX_WEB_VAPID_SUBJECT",
@@ -552,6 +551,15 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("CODEX_WEB_MAX_DATABASE_BYTES=2147483648", environment)
         self.assertIn("CODEX_WEB_MAX_RELEASES=5", environment)
         self.assertIn("CODEX_WEB_APP_SERVER_SOCKET=/run/codex-web-ui/app-server.sock", environment)
+        self.assertIn(
+            "CODEX_WEB_TRANSCRIPTION_MODEL_CACHE_PATH=/opt/codex-web-ui/current/models",
+            environment,
+        )
+        self.assertIn("CODEX_WEB_TRANSCRIPTION_MODEL=onnx-community/whisper-base", environment)
+        self.assertIn(
+            "CODEX_WEB_TRANSCRIPTION_MODEL_REVISION=1846881b6b3a3024392c1eea3ad983695bc23925",
+            environment,
+        )
         self.assertNotIn("CODEX_HOME=", environment)
 
     def test_portable_installer_has_explicit_secure_bootstrap(self) -> None:
@@ -630,6 +638,8 @@ class InfraStaticTest(unittest.TestCase):
         self.assertNotIn("@alpha", bootstrap)
         package_builder = (ROOT / "scripts/prepare-package.sh").read_text(encoding="utf-8")
         self.assertIn("package build mode requires Linux", package_builder)
+        self.assertIn('"models/codex-web-ui-transcription-manifest.json"', package_builder)
+        self.assertIn('"$release_stage/models"', package_builder)
 
     def test_upgrade_drain_precedes_every_activation_side_effect(self) -> None:
         installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")

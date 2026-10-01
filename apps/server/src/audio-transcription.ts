@@ -1,20 +1,20 @@
-import { z } from 'zod';
+import { createHash } from 'node:crypto';
+import { lstat, readFile, readdir, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 
 import { HttpError } from './auth.js';
 
 export const MAX_TRANSCRIPTION_BYTES = 10 * 1_024 * 1_024;
 export const MAX_TRANSCRIPTION_DURATION_SECONDS = 120;
-export const DEFAULT_TRANSCRIPTION_MODEL = 'gpt-transcribe';
-const TRANSCRIPTION_TIMEOUT_MS = 30_000;
+export const DEFAULT_TRANSCRIPTION_MODEL = 'onnx-community/whisper-base';
+export const DEFAULT_TRANSCRIPTION_MODEL_REVISION = '1846881b6b3a3024392c1eea3ad983695bc23925';
+export const DEFAULT_TRANSCRIPTION_LANGUAGE = 'russian';
+const TRANSCRIPTION_SAMPLE_RATE = 16_000;
+const MINIMUM_AUDIO_RMS = 0.002;
+const LOCAL_MODEL_MANIFEST = 'codex-web-ui-transcription-manifest.json';
 
 const AUDIO_FORMATS: Readonly<Record<string, readonly string[]>> = {
-  'audio/flac': ['.flac'],
-  'audio/mp4': ['.m4a', '.mp4'],
-  'audio/mpeg': ['.mp3', '.mpga', '.mpeg'],
-  'audio/ogg': ['.ogg'],
   'audio/wav': ['.wav'],
-  'audio/webm': ['.webm'],
-  'audio/x-m4a': ['.m4a'],
   'audio/x-wav': ['.wav'],
 };
 
@@ -33,24 +33,11 @@ function quotedParameter(value: string, name: string): string | null {
   return match?.[1]?.replaceAll('\\"', '"') ?? null;
 }
 
-function hasExpectedSignature(mimeType: string, bytes: Buffer): boolean {
-  if (mimeType === 'audio/flac') return bytes.subarray(0, 4).toString('ascii') === 'fLaC';
-  if (mimeType === 'audio/wav' || mimeType === 'audio/x-wav')
-    return (
-      bytes.subarray(0, 4).toString('ascii') === 'RIFF' &&
-      bytes.subarray(8, 12).toString('ascii') === 'WAVE'
-    );
-  if (mimeType === 'audio/webm')
-    return bytes.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
-  if (mimeType === 'audio/mp4' || mimeType === 'audio/x-m4a')
-    return bytes.subarray(4, 8).toString('ascii') === 'ftyp';
-  if (mimeType === 'audio/mpeg')
-    return (
-      bytes.subarray(0, 3).toString('ascii') === 'ID3' ||
-      (bytes.length >= 2 && bytes[0] === 0xff && (bytes[1]! & 0xe0) === 0xe0)
-    );
-  if (mimeType === 'audio/ogg') return bytes.subarray(0, 4).toString('ascii') === 'OggS';
-  return false;
+function hasExpectedSignature(bytes: Buffer): boolean {
+  return (
+    bytes.subarray(0, 4).toString('ascii') === 'RIFF' &&
+    bytes.subarray(8, 12).toString('ascii') === 'WAVE'
+  );
 }
 
 export function parseAudioMultipart(contentType: string, body: Buffer): TranscriptionUpload {
@@ -103,57 +90,283 @@ export function parseAudioMultipart(contentType: string, body: Buffer): Transcri
   if (bytes.length === 0) throw new HttpError(400, 'AUDIO_EMPTY');
   if (bytes.length > MAX_TRANSCRIPTION_BYTES)
     throw new HttpError(413, 'AUDIO_TOO_LARGE', 'Request failed');
-  if (!hasExpectedSignature(mimeType, bytes)) throw new HttpError(415, 'AUDIO_SIGNATURE_INVALID');
+  if (!hasExpectedSignature(bytes)) throw new HttpError(415, 'AUDIO_SIGNATURE_INVALID');
   return { name, mimeType, bytes };
 }
 
-const responseSchema = z.object({ text: z.string().trim().min(1).max(100_000) });
+interface LocalAsrOutput {
+  readonly text: string;
+}
 
-export class OpenAIAudioTranscriptionClient implements AudioTranscriptionClient {
-  constructor(
-    private readonly apiKey: string,
-    readonly model: string = DEFAULT_TRANSCRIPTION_MODEL,
-    private readonly request: typeof fetch = fetch,
-    private readonly timeoutMs = TRANSCRIPTION_TIMEOUT_MS,
+interface LocalAsrPipeline {
+  (audio: Float32Array, options: Record<string, unknown>): Promise<LocalAsrOutput>;
+  dispose?(): Promise<void>;
+}
+
+export interface LocalTranscriptionOptions {
+  readonly cachePath: string;
+  readonly model?: string;
+  readonly revision?: string;
+  readonly language?: string;
+}
+
+type LocalAsrLoader = (options: Required<LocalTranscriptionOptions>) => Promise<LocalAsrPipeline>;
+
+interface LocalModelFile {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+interface LocalModelManifest {
+  readonly schemaVersion: 1;
+  readonly model: string;
+  readonly revision: string;
+  readonly dtype: 'q8';
+  readonly files: readonly LocalModelFile[];
+}
+
+function localModelFile(value: unknown): value is LocalModelFile {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const entry = value as Record<string, unknown>;
+  return (
+    typeof entry.path === 'string' &&
+    /^[A-Za-z0-9._/-]+$/u.test(entry.path) &&
+    !entry.path.includes('..') &&
+    !path.isAbsolute(entry.path) &&
+    typeof entry.bytes === 'number' &&
+    Number.isSafeInteger(entry.bytes) &&
+    entry.bytes > 0 &&
+    typeof entry.sha256 === 'string' &&
+    /^[a-f0-9]{64}$/u.test(entry.sha256)
+  );
+}
+
+function safeModelRoot(cachePath: string, model: string, revision: string): string {
+  const root = path.resolve(cachePath);
+  const candidate = path.resolve(root, ...model.split('/'), revision);
+  if (candidate === root || !candidate.startsWith(`${root}${path.sep}`))
+    throw new Error('Invalid local transcription model path');
+  return candidate;
+}
+
+async function hashFile(filePath: string): Promise<{ bytes: number; sha256: string }> {
+  const bytes = await readFile(filePath);
+  return { bytes: bytes.length, sha256: createHash('sha256').update(bytes).digest('hex') };
+}
+
+async function listModelFiles(root: string, current = root): Promise<string[]> {
+  const files: string[] = [];
+  for (const entry of await readdir(current, { withFileTypes: true })) {
+    const absolute = path.join(current, entry.name);
+    const info = await lstat(absolute);
+    if (info.isSymbolicLink()) throw new Error('Local transcription model contains a symlink');
+    if (entry.isDirectory()) files.push(...(await listModelFiles(root, absolute)));
+    else if (entry.isFile()) files.push(path.relative(root, absolute).split(path.sep).join('/'));
+    else throw new Error('Local transcription model contains an unsupported entry');
+  }
+  return files.sort();
+}
+
+export async function writeLocalModelManifest(options: {
+  readonly cachePath: string;
+  readonly model: string;
+  readonly revision: string;
+  readonly expectedFiles?: readonly LocalModelFile[];
+}): Promise<void> {
+  const root = safeModelRoot(options.cachePath, options.model, options.revision);
+  const files = await listModelFiles(root);
+  if (files.length === 0) throw new Error('Local transcription model is empty');
+  const entries = await Promise.all(
+    files.map(async (relativePath) => ({
+      path: relativePath,
+      ...(await hashFile(path.join(root, ...relativePath.split('/')))),
+    })),
+  );
+  if (
+    options.expectedFiles &&
+    JSON.stringify(entries) !==
+      JSON.stringify(
+        [...options.expectedFiles].sort((left, right) =>
+          left.path < right.path ? -1 : left.path > right.path ? 1 : 0,
+        ),
+      )
+  )
+    throw new Error('Downloaded transcription model does not match the trusted artifact inventory');
+  const manifest: LocalModelManifest = {
+    schemaVersion: 1,
+    model: options.model,
+    revision: options.revision,
+    dtype: 'q8',
+    files: entries,
+  };
+  await writeFile(
+    path.join(options.cachePath, LOCAL_MODEL_MANIFEST),
+    `${JSON.stringify(manifest, null, 2)}\n`,
+    { mode: 0o644 },
+  );
+}
+
+export async function verifyLocalModelManifest(
+  options: Required<LocalTranscriptionOptions>,
+): Promise<void> {
+  const manifestPath = path.join(options.cachePath, LOCAL_MODEL_MANIFEST);
+  const manifestInfo = await lstat(manifestPath);
+  if (!manifestInfo.isFile() || manifestInfo.isSymbolicLink())
+    throw new Error('Local transcription model manifest is not a regular file');
+  const parsed = JSON.parse(await readFile(manifestPath, 'utf8')) as Partial<LocalModelManifest>;
+  if (
+    parsed.schemaVersion !== 1 ||
+    parsed.model !== options.model ||
+    parsed.revision !== options.revision ||
+    parsed.dtype !== 'q8' ||
+    !Array.isArray(parsed.files) ||
+    parsed.files.length === 0
+  )
+    throw new Error('Local transcription model manifest does not match configuration');
+  const root = safeModelRoot(options.cachePath, options.model, options.revision);
+  const files: LocalModelFile[] = [];
+  for (const entry of parsed.files as readonly unknown[]) {
+    if (!localModelFile(entry)) throw new Error('Local transcription model manifest is invalid');
+    files.push(entry);
+  }
+  const actualPaths = await listModelFiles(root);
+  const manifestedPaths = files.map((entry) => entry.path).sort();
+  if (
+    actualPaths.length !== manifestedPaths.length ||
+    actualPaths.some((actualPath, index) => actualPath !== manifestedPaths[index])
+  )
+    throw new Error('Local transcription model file inventory does not match manifest');
+  for (const entry of files) {
+    const filePath = path.resolve(root, ...entry.path.split('/'));
+    if (!filePath.startsWith(`${root}${path.sep}`))
+      throw new Error('Local transcription model manifest escapes its root');
+    const info = await lstat(filePath);
+    if (!info.isFile() || info.isSymbolicLink())
+      throw new Error('Local transcription model artifact is not a regular file');
+    const actual = await hashFile(filePath);
+    if (actual.bytes !== entry.bytes || actual.sha256 !== entry.sha256)
+      throw new Error('Local transcription model artifact failed integrity verification');
+  }
+}
+
+function decodePcm16MonoWav(bytes: Buffer): Float32Array {
+  if (!hasExpectedSignature(bytes)) throw new HttpError(415, 'AUDIO_SIGNATURE_INVALID');
+  let format: {
+    audioFormat: number;
+    channels: number;
+    sampleRate: number;
+    byteRate: number;
+    blockAlign: number;
+    bitsPerSample: number;
+  } | null = null;
+  let pcm: Buffer | null = null;
+  for (let offset = 12; offset + 8 <= bytes.length;) {
+    const chunkId = bytes.subarray(offset, offset + 4).toString('ascii');
+    const chunkSize = bytes.readUInt32LE(offset + 4);
+    const dataStart = offset + 8;
+    const dataEnd = dataStart + chunkSize;
+    if (dataEnd > bytes.length) throw new HttpError(415, 'AUDIO_WAV_INVALID');
+    if (chunkId === 'fmt ') {
+      if (format || chunkSize < 16) throw new HttpError(415, 'AUDIO_WAV_INVALID');
+      format = {
+        audioFormat: bytes.readUInt16LE(dataStart),
+        channels: bytes.readUInt16LE(dataStart + 2),
+        sampleRate: bytes.readUInt32LE(dataStart + 4),
+        byteRate: bytes.readUInt32LE(dataStart + 8),
+        blockAlign: bytes.readUInt16LE(dataStart + 12),
+        bitsPerSample: bytes.readUInt16LE(dataStart + 14),
+      };
+    } else if (chunkId === 'data') {
+      if (pcm) throw new HttpError(415, 'AUDIO_WAV_INVALID');
+      pcm = bytes.subarray(dataStart, dataEnd);
+    }
+    offset = dataEnd + (chunkSize % 2);
+  }
+  if (
+    !format ||
+    !pcm ||
+    format.audioFormat !== 1 ||
+    format.channels !== 1 ||
+    format.sampleRate !== TRANSCRIPTION_SAMPLE_RATE ||
+    format.bitsPerSample !== 16 ||
+    format.blockAlign !== 2 ||
+    format.byteRate !== TRANSCRIPTION_SAMPLE_RATE * 2 ||
+    pcm.length === 0 ||
+    pcm.length % 2 !== 0
+  )
+    throw new HttpError(415, 'AUDIO_WAV_FORMAT_UNSUPPORTED');
+  const sampleCount = pcm.length / 2;
+  if (sampleCount > MAX_TRANSCRIPTION_DURATION_SECONDS * TRANSCRIPTION_SAMPLE_RATE)
+    throw new HttpError(413, 'AUDIO_TOO_LONG', 'Recording is too long');
+  const samples = new Float32Array(sampleCount);
+  let squareSum = 0;
+  for (let index = 0; index < sampleCount; index += 1) {
+    const sample = pcm.readInt16LE(index * 2) / 32_768;
+    samples[index] = sample;
+    squareSum += sample * sample;
+  }
+  if (Math.sqrt(squareSum / sampleCount) < MINIMUM_AUDIO_RMS)
+    throw new HttpError(422, 'AUDIO_SILENT', 'No speech was detected');
+  return samples;
+}
+
+async function loadLocalPipeline(
+  options: Required<LocalTranscriptionOptions>,
+): Promise<LocalAsrPipeline> {
+  await verifyLocalModelManifest(options);
+  const { env, pipeline } = await import('@huggingface/transformers');
+  env.allowRemoteModels = false;
+  env.allowLocalModels = true;
+  const loaded = await pipeline('automatic-speech-recognition', options.model, {
+    revision: options.revision,
+    cache_dir: options.cachePath,
+    local_files_only: true,
+    dtype: 'q8',
+    device: 'cpu',
+  });
+  return loaded as LocalAsrPipeline;
+}
+
+export class LocalAudioTranscriptionClient implements AudioTranscriptionClient {
+  private constructor(
+    readonly model: string,
+    private readonly language: string,
+    private readonly transcriber: LocalAsrPipeline,
   ) {}
 
-  async transcribe(upload: TranscriptionUpload, idempotencyKey: string): Promise<string> {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.timeoutMs);
-    timeout.unref();
+  static async create(
+    options: LocalTranscriptionOptions,
+    loader: LocalAsrLoader = loadLocalPipeline,
+  ): Promise<LocalAudioTranscriptionClient> {
+    const resolved: Required<LocalTranscriptionOptions> = {
+      cachePath: options.cachePath,
+      model: options.model ?? DEFAULT_TRANSCRIPTION_MODEL,
+      revision: options.revision ?? DEFAULT_TRANSCRIPTION_MODEL_REVISION,
+      language: options.language ?? DEFAULT_TRANSCRIPTION_LANGUAGE,
+    };
+    const transcriber = await loader(resolved);
+    return new LocalAudioTranscriptionClient(resolved.model, resolved.language, transcriber);
+  }
+
+  async transcribe(upload: TranscriptionUpload): Promise<string> {
+    if (upload.mimeType !== 'audio/wav' && upload.mimeType !== 'audio/x-wav')
+      throw new HttpError(415, 'AUDIO_TYPE_NOT_ALLOWED');
+    const audio = decodePcm16MonoWav(upload.bytes);
     try {
-      const form = new FormData();
-      form.set('model', this.model);
-      form.set(
-        'file',
-        new Blob([Uint8Array.from(upload.bytes)], { type: upload.mimeType }),
-        upload.name,
-      );
-      const response = await this.request('https://api.openai.com/v1/audio/transcriptions', {
-        method: 'POST',
-        headers: {
-          authorization: `Bearer ${this.apiKey}`,
-          'idempotency-key': idempotencyKey,
-        },
-        body: form,
-        signal: controller.signal,
+      const result = await this.transcriber(audio, {
+        language: this.language,
+        task: 'transcribe',
+        chunk_length_s: 30,
+        stride_length_s: 5,
       });
-      if (!response.ok) {
-        if (response.status === 429)
-          throw new HttpError(429, 'TRANSCRIPTION_RATE_LIMITED', 'Transcription is unavailable');
-        throw new HttpError(502, 'TRANSCRIPTION_UPSTREAM_ERROR', 'Transcription failed');
-      }
-      const parsed = responseSchema.safeParse(await response.json());
-      if (!parsed.success)
-        throw new HttpError(502, 'TRANSCRIPTION_UPSTREAM_INVALID', 'Transcription failed');
-      return parsed.data.text;
+      const text = result.text.trim();
+      if (!text || text.length > 100_000)
+        throw new HttpError(422, 'TRANSCRIPTION_EMPTY', 'No speech was detected');
+      return text;
     } catch (error) {
       if (error instanceof HttpError) throw error;
-      if (controller.signal.aborted)
-        throw new HttpError(504, 'TRANSCRIPTION_TIMEOUT', 'Transcription timed out');
-      throw new HttpError(502, 'TRANSCRIPTION_UPSTREAM_ERROR', 'Transcription failed');
-    } finally {
-      clearTimeout(timeout);
+      throw new HttpError(503, 'TRANSCRIPTION_LOCAL_ERROR', 'Transcription failed');
     }
   }
 }

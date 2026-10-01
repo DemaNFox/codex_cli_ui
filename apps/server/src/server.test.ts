@@ -534,7 +534,10 @@ async function fixture(
     maxConcurrentTurns,
     resourceBrokerSocket: path.join(temp, 'resource-broker.sock'),
     codexUpdateBrokerSocket: path.join(temp, 'codex-update-broker.sock'),
-    transcriptionModel: 'gpt-transcribe',
+    transcriptionModelCachePath: '/opt/codex-web-ui/current/models',
+    transcriptionModel: 'onnx-community/whisper-base',
+    transcriptionModelRevision: '1846881b6b3a3024392c1eea3ad983695bc23925',
+    transcriptionLanguage: 'russian',
     ...(pushSender
       ? {
           vapid: {
@@ -640,6 +643,25 @@ function multipartFile(
       Buffer.from(`\r\n--${boundary}--\r\n`),
     ]),
   };
+}
+
+function voiceWav(sample = 2_000): Buffer {
+  const bytes = Buffer.alloc(48);
+  bytes.write('RIFF', 0);
+  bytes.writeUInt32LE(40, 4);
+  bytes.write('WAVEfmt ', 8);
+  bytes.writeUInt32LE(16, 16);
+  bytes.writeUInt16LE(1, 20);
+  bytes.writeUInt16LE(1, 22);
+  bytes.writeUInt32LE(16_000, 24);
+  bytes.writeUInt32LE(32_000, 28);
+  bytes.writeUInt16LE(2, 32);
+  bytes.writeUInt16LE(16, 34);
+  bytes.write('data', 36);
+  bytes.writeUInt32LE(4, 40);
+  bytes.writeInt16LE(sample, 44);
+  bytes.writeInt16LE(-sample, 46);
+  return bytes;
 }
 
 describe('security and repository boundary', () => {
@@ -771,11 +793,19 @@ describe('security and repository boundary', () => {
     expect(loadConfig(environment)).toMatchObject({
       eventRetentionPerThread: 1_000,
       maxEventBytes: 32_768,
-      transcriptionModel: 'gpt-transcribe',
+      transcriptionModel: 'onnx-community/whisper-base',
+      transcriptionModelCachePath: '/opt/codex-web-ui/current/models',
+      transcriptionModelRevision: '1846881b6b3a3024392c1eea3ad983695bc23925',
+      transcriptionLanguage: 'russian',
     });
-    expect(loadConfig(environment)).not.toHaveProperty('openAiApiKey');
-    expect(loadConfig({ ...environment, OPENAI_API_KEY: '' })).not.toHaveProperty('openAiApiKey');
     expect(loadConfig(environment)).not.toHaveProperty('vapid');
+    expect(
+      loadConfig({
+        ...environment,
+        OPENAI_API_KEY: 'legacy-unused-key',
+        CODEX_WEB_TRANSCRIPTION_MODEL: 'gpt-transcribe',
+      }),
+    ).toMatchObject({ transcriptionModel: 'onnx-community/whisper-base' });
     expect(
       loadConfig({
         ...environment,
@@ -804,12 +834,16 @@ describe('security and repository boundary', () => {
     expect(
       loadConfig({
         ...environment,
-        OPENAI_API_KEY: 'server-secret',
-        CODEX_WEB_TRANSCRIPTION_MODEL: 'custom-transcribe',
+        CODEX_WEB_TRANSCRIPTION_MODEL_CACHE_PATH: '/var/lib/codex-web-ui/models',
+        CODEX_WEB_TRANSCRIPTION_MODEL: 'local/custom-transcribe',
+        CODEX_WEB_TRANSCRIPTION_MODEL_REVISION: 'a'.repeat(40),
+        CODEX_WEB_TRANSCRIPTION_LANGUAGE: 'ukrainian',
       }),
     ).toMatchObject({
-      openAiApiKey: 'server-secret',
-      transcriptionModel: 'custom-transcribe',
+      transcriptionModelCachePath: '/var/lib/codex-web-ui/models',
+      transcriptionModel: 'local/custom-transcribe',
+      transcriptionModelRevision: 'a'.repeat(40),
+      transcriptionLanguage: 'ukrainian',
     });
     expect(() =>
       loadConfig({ ...environment, CODEX_WEB_TRANSCRIPTION_MODEL: '../unsafe model' }),
@@ -952,11 +986,7 @@ describe('Codex routes', () => {
       undefined,
       client,
     );
-    const audio = multipartFile(
-      'voice.webm',
-      'audio/webm',
-      Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x01]),
-    );
+    const audio = multipartFile('voice.wav', 'audio/wav', voiceWav());
     const anonymous = await app.inject({
       method: 'POST',
       url: '/api/audio/transcriptions',
@@ -1017,7 +1047,7 @@ describe('Codex routes', () => {
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({ text: 'Распознанный текст' });
     expect(client.uploads).toHaveLength(1);
-    expect(client.uploads[0]).toMatchObject({ name: 'voice.webm', mimeType: 'audio/webm' });
+    expect(client.uploads[0]).toMatchObject({ name: 'voice.wav', mimeType: 'audio/wav' });
 
     const replay = await app.inject({
       method: 'POST',
@@ -1033,11 +1063,7 @@ describe('Codex routes', () => {
     expect(replay.json()).toEqual({ text: 'Распознанный текст' });
     expect(client.uploads).toHaveLength(1);
 
-    const changedAudio = multipartFile(
-      'voice.webm',
-      'audio/webm',
-      Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x02]),
-    );
+    const changedAudio = multipartFile('voice.wav', 'audio/wav', voiceWav(3_000));
     const conflict = await app.inject({
       method: 'POST',
       url: '/api/audio/transcriptions',
@@ -1060,7 +1086,7 @@ describe('Codex routes', () => {
     expect(capabilities.json()).toMatchObject({
       transcription: {
         available: true,
-        model: 'gpt-transcribe',
+        model: 'onnx-community/whisper-base',
         maxBytes: 10 * 1_024 * 1_024,
         maxDurationSeconds: 120,
       },
@@ -1076,7 +1102,7 @@ describe('Codex routes', () => {
       headers: { cookie: session.cookie },
     });
     expect(capabilities.json()).toMatchObject({ transcription: { available: false } });
-    const audio = multipartFile('voice.webm', 'audio/webm', Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+    const audio = multipartFile('voice.wav', 'audio/wav', voiceWav());
     const response = await app.inject({
       method: 'POST',
       url: '/api/audio/transcriptions',
@@ -1111,7 +1137,7 @@ describe('Codex routes', () => {
       blockingClient,
     );
     const session = await login(app);
-    const audio = multipartFile('voice.webm', 'audio/webm', Buffer.from([0x1a, 0x45, 0xdf, 0xa3]));
+    const audio = multipartFile('voice.wav', 'audio/wav', voiceWav());
     let requestIndex = 0;
     const request = () => {
       requestIndex += 1;

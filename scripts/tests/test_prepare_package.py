@@ -59,6 +59,7 @@ class PreparePackageTest(unittest.TestCase):
             "scripts/bootstrap-ubuntu.sh": "#!/usr/bin/env bash\n",
             "apps/server/dist/index.js": "console.log('server');\n",
             "apps/web/dist/index.html": "<!doctype html>\n",
+            "models/codex-web-ui-transcription-manifest.json": '{"schemaVersion":1}\n',
             "infra/toolchain.env": (
                 "NODE_VERSION=22.23.3\n"
                 "PNPM_VERSION=10.33.2\n"
@@ -171,6 +172,16 @@ class PreparePackageTest(unittest.TestCase):
         result = self._verify()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("package is missing scripts/install-local-host-instructions.py", result.stderr)
+
+    def test_local_transcription_model_manifest_is_required(self) -> None:
+        (self.root / "models/codex-web-ui-transcription-manifest.json").unlink()
+        self._write_checksums()
+        result = self._verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "package is missing models/codex-web-ui-transcription-manifest.json",
+            result.stderr,
+        )
 
     def test_host_admin_migration_assets_are_required(self) -> None:
         for relative in (

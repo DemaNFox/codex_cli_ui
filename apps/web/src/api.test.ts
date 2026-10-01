@@ -319,7 +319,7 @@ describe('api response envelopes', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await expect(
-      api.transcribeAudio('csrf', new File(['voice'], 'voice.webm', { type: 'audio/webm' })),
+      api.transcribeAudio('csrf', new File(['voice'], 'voice.wav', { type: 'audio/wav' })),
     ).resolves.toEqual({ text: 'Готовый текст' });
 
     expect(fetchMock).toHaveBeenCalledTimes(2);

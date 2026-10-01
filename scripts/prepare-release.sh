@@ -35,6 +35,7 @@ const require = createRequire(path.join(root, 'package.json'));
 for (const dependency of [
   '@codex-web/contracts',
   '@fastify/cookie',
+  '@huggingface/transformers',
   'argon2',
   'fastify',
   'web-push',
@@ -43,6 +44,9 @@ for (const dependency of [
   require(dependency);
 }
 JS
+mkdir -p "$output/models"
+/usr/local/bin/node "$output/apps/server/dist/provision-transcription-model.js" \
+  --cache "$output/models"
 mkdir -p "$output/apps/web"
 cp -a apps/web/dist "$output/apps/web/dist"
 mkdir -p "$output/infra/systemd" "$output/scripts"
@@ -64,6 +68,7 @@ cp -a scripts/codex-update-worker.sh "$output/scripts/codex-update-worker.sh"
 cp -a scripts/stage-codex-update.sh "$output/scripts/stage-codex-update.sh"
 
 [[ -f $output/apps/server/dist/index.js ]]
+[[ -f $output/models/codex-web-ui-transcription-manifest.json ]]
 [[ -f $output/apps/web/dist/index.html ]]
 [[ -f $output/infra/systemd/codex-web-ui-workload.slice ]]
 [[ -x $output/scripts/resource-broker.py ]]

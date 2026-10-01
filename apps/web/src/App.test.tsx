@@ -57,7 +57,7 @@ const capabilities = {
   appServerReady: true,
   transcription: {
     available: true,
-    model: 'gpt-transcribe',
+    model: 'onnx-community/whisper-base',
     maxBytes: 10 * 1024 * 1024,
     maxDurationSeconds: 300,
   },
@@ -562,7 +562,7 @@ describe('App', () => {
     render(<App />);
     await screen.findByLabelText('Сообщение Codex');
     expect(screen.getByRole('button', { name: 'Голосовой ввод' }).getAttribute('title')).toBe(
-      'Голосовой ввод не настроен на сервере',
+      'Локальная модель голоса не установлена на сервере',
     );
   });
 

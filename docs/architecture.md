@@ -77,22 +77,26 @@ Browser
 
 ## Voice transcription
 
-- The browser records a short audio clip only after an explicit microphone action, then sends one
-  authenticated multipart request to the Web API. Stopping a recording never sends a Codex turn: the returned
-  transcript is inserted into the composer for operator review and editing.
-- The browser stops a recording at the advertised duration. The API independently accepts only an allowlisted
-  audio media type within a hard byte bound, permits only bounded transcription concurrency/rate and applies
-  an upstream timeout before forwarding the in-memory file to the configured OpenAI transcription model.
-  Audio bytes are never written to SQLite, attachment storage or logs. Container duration is not decoded
-  server-side; the byte limit remains the hostile-client availability boundary.
+- The browser records a short audio clip only after an explicit microphone action, decodes it locally and
+  converts it to 16 kHz mono PCM16 WAV before sending one authenticated multipart request to the Web API.
+  Stopping a recording never sends a Codex turn: only the final transcript is inserted into the composer for
+  operator review and editing. Partial streaming is intentionally outside this first local-ASR slice.
+- The browser stops a recording at the advertised duration. The API independently accepts only the canonical
+  WAV shape within hard byte and decoded-duration bounds, rejects silent clips, and permits only bounded
+  transcription concurrency/rate. Audio bytes are held only in memory and are never written to SQLite,
+  attachment storage or logs.
 - One recording receives one UUID idempotency key. A bounded ten-minute in-memory cache binds that key to the
   authenticated session and audio hash, shares an in-flight result and rejects conflicting replay; the same
-  key is forwarded upstream and reused for the client's single network-error retry. The cache intentionally
-  does not make transcription text durable.
-- `OPENAI_API_KEY` lives only in the root-owned Web service environment. It is separate from the isolated
-  runner's Codex device credential and is never returned through capabilities, errors or browser assets.
-- When the key is absent, capabilities report transcription unavailable and the microphone control explains
-  that server setup is required. The rest of Codex Web UI continues to work normally.
+  key is reused for the client's single network-error retry. The cache intentionally does not make
+  transcription text durable.
+- The Web API warms one CPU-only quantized Whisper pipeline before serving requests. The model and exact Git
+  revision are pinned in configuration; a release-time provisioning step downloads the artifacts into the
+  immutable release, records their byte lengths and SHA-256 hashes, and runtime verifies the complete file
+  inventory before loading with remote models disabled. Production transcription therefore makes no external
+  request and cannot download or substitute model files at runtime.
+- The local pipeline runs inside the same host workload resource ceiling as the Web service and Codex runner;
+  only one transcription may execute at a time. If the model is absent, corrupt or cannot be warmed,
+  capabilities report transcription unavailable and the rest of Codex Web UI continues to work normally.
 
 ## Attachments
 

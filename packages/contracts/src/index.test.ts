@@ -272,7 +272,7 @@ describe('contracts', () => {
       },
       transcription: {
         available: true,
-        model: 'gpt-transcribe',
+        model: 'onnx-community/whisper-base',
         maxBytes: 10 * 1_024 * 1_024,
         maxDurationSeconds: 120,
       },
@@ -291,7 +291,7 @@ describe('contracts', () => {
     expect(parsed.usage?.summary).not.toHaveProperty('email');
     expect(parsed.transcription).toEqual({
       available: true,
-      model: 'gpt-transcribe',
+      model: 'onnx-community/whisper-base',
       maxBytes: 10 * 1_024 * 1_024,
       maxDurationSeconds: 120,
     });

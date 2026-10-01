@@ -83,6 +83,8 @@ validate_release_source() {
   paths_overlap "$source" "$codex_home" && die 'release source and CODEX_HOME must not overlap'
   [[ -f "$source/apps/server/dist/index.js" ]] || die 'prepared release is missing apps/server/dist/index.js'
   [[ -f "$source/apps/web/dist/index.html" ]] || die 'prepared release is missing apps/web/dist/index.html'
+  [[ -f "$source/models/codex-web-ui-transcription-manifest.json" ]] || \
+    die 'prepared release is missing the pinned local transcription model'
 
   while IFS= read -r -d '' entry; do
     case "${entry##*/}" in

@@ -1,6 +1,6 @@
 import { CodexAppServerSocketClient, CodexAppServerSupervisor } from './app-server.js';
 import { AttachmentStore } from './attachment-store.js';
-import { OpenAIAudioTranscriptionClient } from './audio-transcription.js';
+import { LocalAudioTranscriptionClient } from './audio-transcription.js';
 import { UnixCodexUpdateBrokerClient } from './codex-update-broker.js';
 import { NpmCodexVersionChecker } from './codex-version-checker.js';
 import { loadConfig } from './config.js';
@@ -31,9 +31,17 @@ const resourceBroker = new UnixResourceBrokerClient(config.resourceBrokerSocket)
 const codexUpdateBroker = new UnixCodexUpdateBrokerClient(config.codexUpdateBrokerSocket);
 const codexVersionChecker = new NpmCodexVersionChecker();
 const stopCodexVersionChecks = codexVersionChecker.startPeriodic(config.codexVersionPin);
-const transcriptionClient = config.openAiApiKey
-  ? new OpenAIAudioTranscriptionClient(config.openAiApiKey, config.transcriptionModel)
-  : undefined;
+let transcriptionClient: LocalAudioTranscriptionClient | undefined;
+try {
+  transcriptionClient = await LocalAudioTranscriptionClient.create({
+    cachePath: config.transcriptionModelCachePath,
+    model: config.transcriptionModel,
+    revision: config.transcriptionModelRevision,
+    language: config.transcriptionLanguage,
+  });
+} catch {
+  console.error('Local voice transcription is unavailable because the model could not be loaded.');
+}
 const pushSender = config.vapid
   ? new WebPushSender(config.vapid.publicKey, config.vapid.privateKey, config.vapid.subject)
   : undefined;

@@ -29,14 +29,26 @@ const envSchema = z.object({
   CODEX_WEB_EVENT_RETENTION_PER_THREAD: z.coerce.number().int().min(100).max(1_000).default(1_000),
   CODEX_WEB_MAX_EVENT_BYTES: z.coerce.number().int().min(1_024).max(32_768).default(32_768),
   CODEX_WEB_MAX_CONCURRENT_TURNS: z.coerce.number().int().min(1).max(5).default(2),
-  OPENAI_API_KEY: z.preprocess(
-    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
-    z.string().min(1).optional(),
-  ),
-  CODEX_WEB_TRANSCRIPTION_MODEL: z
+  CODEX_WEB_TRANSCRIPTION_MODEL_CACHE_PATH: z
     .string()
-    .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/)
-    .default('gpt-transcribe'),
+    .startsWith('/')
+    .default('/opt/codex-web-ui/current/models'),
+  CODEX_WEB_TRANSCRIPTION_MODEL: z.preprocess(
+    (value) => (value === 'gpt-transcribe' ? undefined : value),
+    z
+      .string()
+      .regex(/^[A-Za-z0-9][A-Za-z0-9._/-]{0,119}$/)
+      .refine((value) => !value.includes('..') && !value.startsWith('/') && !value.endsWith('/'))
+      .default('onnx-community/whisper-base'),
+  ),
+  CODEX_WEB_TRANSCRIPTION_MODEL_REVISION: z
+    .string()
+    .regex(/^[a-f0-9]{40}$/)
+    .default('1846881b6b3a3024392c1eea3ad983695bc23925'),
+  CODEX_WEB_TRANSCRIPTION_LANGUAGE: z
+    .string()
+    .regex(/^[a-z][a-z-]{1,31}$/)
+    .default('russian'),
   CODEX_WEB_VAPID_PUBLIC_KEY: z.preprocess(
     (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
     z
@@ -88,8 +100,10 @@ export interface ServerConfig {
   readonly eventRetentionPerThread: number;
   readonly maxEventBytes: number;
   readonly maxConcurrentTurns: number;
-  readonly openAiApiKey?: string;
+  readonly transcriptionModelCachePath: string;
   readonly transcriptionModel: string;
+  readonly transcriptionModelRevision: string;
+  readonly transcriptionLanguage: string;
   readonly vapid?: {
     readonly publicKey: string;
     readonly privateKey: string;
@@ -148,8 +162,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     eventRetentionPerThread: parsed.CODEX_WEB_EVENT_RETENTION_PER_THREAD,
     maxEventBytes: parsed.CODEX_WEB_MAX_EVENT_BYTES,
     maxConcurrentTurns: parsed.CODEX_WEB_MAX_CONCURRENT_TURNS,
-    ...(parsed.OPENAI_API_KEY === undefined ? {} : { openAiApiKey: parsed.OPENAI_API_KEY }),
+    transcriptionModelCachePath: parsed.CODEX_WEB_TRANSCRIPTION_MODEL_CACHE_PATH,
     transcriptionModel: parsed.CODEX_WEB_TRANSCRIPTION_MODEL,
+    transcriptionModelRevision: parsed.CODEX_WEB_TRANSCRIPTION_MODEL_REVISION,
+    transcriptionLanguage: parsed.CODEX_WEB_TRANSCRIPTION_LANGUAGE,
     ...(parsed.CODEX_WEB_VAPID_PUBLIC_KEY === undefined
       ? {}
       : {

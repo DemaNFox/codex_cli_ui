@@ -1,11 +1,39 @@
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+
 import { describe, expect, it, vi } from 'vitest';
 
 import { HttpError } from './auth.js';
 import {
+  LocalAudioTranscriptionClient,
   MAX_TRANSCRIPTION_BYTES,
-  OpenAIAudioTranscriptionClient,
   parseAudioMultipart,
+  verifyLocalModelManifest,
+  writeLocalModelManifest,
 } from './audio-transcription.js';
+
+const MODEL = 'onnx-community/whisper-base';
+const REVISION = '1846881b6b3a3024392c1eea3ad983695bc23925';
+
+function wav(samples: readonly number[], sampleRate = 16_000): Buffer {
+  const bytes = Buffer.alloc(44 + samples.length * 2);
+  bytes.write('RIFF', 0);
+  bytes.writeUInt32LE(bytes.length - 8, 4);
+  bytes.write('WAVE', 8);
+  bytes.write('fmt ', 12);
+  bytes.writeUInt32LE(16, 16);
+  bytes.writeUInt16LE(1, 20);
+  bytes.writeUInt16LE(1, 22);
+  bytes.writeUInt32LE(sampleRate, 24);
+  bytes.writeUInt32LE(sampleRate * 2, 28);
+  bytes.writeUInt16LE(2, 32);
+  bytes.writeUInt16LE(16, 34);
+  bytes.write('data', 36);
+  bytes.writeUInt32LE(samples.length * 2, 40);
+  samples.forEach((sample, index) => bytes.writeInt16LE(sample, 44 + index * 2));
+  return bytes;
+}
 
 function multipart(name: string, mimeType: string, bytes: Buffer, boundary = 'audio-test'): Buffer {
   return Buffer.concat([
@@ -29,23 +57,17 @@ function captureHttpError(action: () => void): HttpError {
 
 describe('audio transcription boundary', () => {
   it('accepts only one allowlisted audio file with a matching signature', () => {
-    const bytes = Buffer.from([0x1a, 0x45, 0xdf, 0xa3, 0x01]);
+    const bytes = wav([1000, -1000]);
     expect(
       parseAudioMultipart(
         'multipart/form-data; boundary=audio-test',
-        multipart('voice.webm', 'audio/webm', bytes),
+        multipart('voice.wav', 'audio/wav', bytes),
       ),
     ).toEqual({
-      name: 'voice.webm',
-      mimeType: 'audio/webm',
+      name: 'voice.wav',
+      mimeType: 'audio/wav',
       bytes,
     });
-    expect(
-      parseAudioMultipart(
-        'multipart/form-data; boundary=audio-test',
-        multipart('voice.ogg', 'audio/ogg; codecs=opus', Buffer.from('OggS\0')),
-      ),
-    ).toMatchObject({ name: 'voice.ogg', mimeType: 'audio/ogg' });
     expect(
       captureHttpError(() =>
         parseAudioMultipart(
@@ -58,7 +80,7 @@ describe('audio transcription boundary', () => {
       captureHttpError(() =>
         parseAudioMultipart(
           'multipart/form-data; boundary=audio-test',
-          multipart('voice.webm', 'audio/webm', Buffer.from('spoofed')),
+          multipart('voice.wav', 'audio/wav', Buffer.from('spoofed')),
         ),
       ),
     ).toMatchObject({ code: 'AUDIO_SIGNATURE_INVALID' });
@@ -70,91 +92,102 @@ describe('audio transcription boundary', () => {
         parseAudioMultipart(
           'multipart/form-data; boundary=audio-test',
           multipart(
-            'voice.webm',
-            'audio/webm',
-            Buffer.concat([
-              Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
-              Buffer.alloc(MAX_TRANSCRIPTION_BYTES - 3),
-            ]),
+            'voice.wav',
+            'audio/wav',
+            Buffer.concat([wav([1000]), Buffer.alloc(MAX_TRANSCRIPTION_BYTES - 3)]),
           ),
         ),
       ),
     ).toMatchObject({ statusCode: 413, code: 'AUDIO_TOO_LARGE' });
   });
 
-  it('sends the server credential and fixed model while returning only bounded text', async () => {
-    const request = vi.fn<typeof fetch>().mockResolvedValue(
-      new Response(JSON.stringify({ text: 'hello' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      }),
+  it('loads one offline local model and transcribes normalized PCM without an external request', async () => {
+    const transcriber = vi.fn().mockResolvedValue({ text: ' Проверить сервер ' });
+    const loader = vi.fn().mockResolvedValue(transcriber);
+    const client = await LocalAudioTranscriptionClient.create(
+      {
+        cachePath: '/var/lib/codex-web-ui/models',
+        model: 'onnx-community/whisper-base',
+        revision: '1846881b6b3a3024392c1eea3ad983695bc23925',
+        language: 'russian',
+      },
+      loader,
     );
-    const client = new OpenAIAudioTranscriptionClient('server-secret', 'gpt-transcribe', request);
     await expect(
-      client.transcribe(
-        {
-          name: 'voice.webm',
-          mimeType: 'audio/webm',
-          bytes: Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
-        },
-        '00000000-0000-4000-8000-000000000001',
-      ),
-    ).resolves.toBe('hello');
-    const [url, init] = request.mock.calls[0]!;
-    expect(url).toBe('https://api.openai.com/v1/audio/transcriptions');
-    expect(init?.headers).toEqual({
-      authorization: 'Bearer server-secret',
-      'idempotency-key': '00000000-0000-4000-8000-000000000001',
+      client.transcribe({
+        name: 'voice.wav',
+        mimeType: 'audio/wav',
+        bytes: wav([2000, -2000, 3000, -3000]),
+      }),
+    ).resolves.toBe('Проверить сервер');
+    expect(loader).toHaveBeenCalledOnce();
+    expect(transcriber).toHaveBeenCalledWith(expect.any(Float32Array), {
+      language: 'russian',
+      task: 'transcribe',
+      chunk_length_s: 30,
+      stride_length_s: 5,
     });
-    const form = init?.body as FormData;
-    expect(form.get('model')).toBe('gpt-transcribe');
-    expect(form.get('file')).toBeInstanceOf(File);
   });
 
-  it('maps timeout and upstream failures without exposing credentials or response bodies', async () => {
-    const timeoutRequest = vi.fn<typeof fetch>(
-      (_input, init) =>
-        new Promise((_resolve, reject) => {
-          init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
-        }),
+  it('rejects malformed, unsupported and silent WAV before local inference', async () => {
+    const transcriber = vi.fn().mockResolvedValue({ text: 'unused' });
+    const client = await LocalAudioTranscriptionClient.create({ cachePath: '/models' }, () =>
+      Promise.resolve(transcriber),
     );
-    const timeoutClient = new OpenAIAudioTranscriptionClient(
-      'timeout-secret',
-      'gpt-transcribe',
-      timeoutRequest,
-      1,
-    );
-    const upload = {
-      name: 'voice.webm',
-      mimeType: 'audio/webm',
-      bytes: Buffer.from([0x1a, 0x45, 0xdf, 0xa3]),
-    };
     await expect(
-      timeoutClient.transcribe(upload, '00000000-0000-4000-8000-000000000002'),
-    ).rejects.toMatchObject({
-      statusCode: 504,
-      code: 'TRANSCRIPTION_TIMEOUT',
-    });
+      client.transcribe({
+        name: 'voice.wav',
+        mimeType: 'audio/wav',
+        bytes: wav([2000], 48_000),
+      }),
+    ).rejects.toMatchObject({ code: 'AUDIO_WAV_FORMAT_UNSUPPORTED' });
+    await expect(
+      client.transcribe({
+        name: 'voice.wav',
+        mimeType: 'audio/wav',
+        bytes: wav([0, 0, 0]),
+      }),
+    ).rejects.toMatchObject({ code: 'AUDIO_SILENT' });
+    expect(transcriber).not.toHaveBeenCalled();
+  });
 
-    const failedClient = new OpenAIAudioTranscriptionClient(
-      'private-key',
-      'gpt-transcribe',
-      vi
-        .fn<typeof fetch>()
-        .mockResolvedValue(new Response('upstream says private-key is invalid', { status: 401 })),
-    );
-    let error: unknown;
+  it('verifies the complete pinned local model inventory and rejects unmanifested files', async () => {
+    const cachePath = await mkdtemp(path.join(tmpdir(), 'codex-web-ui-model-'));
+    const modelRoot = path.join(cachePath, ...MODEL.split('/'), REVISION);
     try {
-      await failedClient.transcribe(upload, '00000000-0000-4000-8000-000000000003');
-    } catch (caught) {
-      error = caught;
+      await mkdir(path.join(modelRoot, 'onnx'), { recursive: true });
+      await writeFile(path.join(modelRoot, 'config.json'), '{"model_type":"whisper"}\n');
+      await writeFile(path.join(modelRoot, 'onnx', 'encoder_model_quantized.onnx'), 'fixture');
+      await expect(
+        writeLocalModelManifest({
+          cachePath,
+          model: MODEL,
+          revision: REVISION,
+          expectedFiles: [{ path: 'config.json', bytes: 1, sha256: '0'.repeat(64) }],
+        }),
+      ).rejects.toThrow('trusted artifact inventory');
+      await writeLocalModelManifest({ cachePath, model: MODEL, revision: REVISION });
+
+      await expect(
+        verifyLocalModelManifest({
+          cachePath,
+          model: MODEL,
+          revision: REVISION,
+          language: 'russian',
+        }),
+      ).resolves.toBeUndefined();
+
+      await writeFile(path.join(modelRoot, 'unmanifested.bin'), 'tampered');
+      await expect(
+        verifyLocalModelManifest({
+          cachePath,
+          model: MODEL,
+          revision: REVISION,
+          language: 'russian',
+        }),
+      ).rejects.toThrow('file inventory does not match manifest');
+    } finally {
+      await rm(cachePath, { recursive: true, force: true });
     }
-    expect(error).toBeInstanceOf(HttpError);
-    expect(error).toMatchObject({
-      statusCode: 502,
-      code: 'TRANSCRIPTION_UPSTREAM_ERROR',
-      message: 'Transcription failed',
-    });
-    expect(String(error)).not.toContain('private-key');
   });
 });
