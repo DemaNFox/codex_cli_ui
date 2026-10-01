@@ -465,6 +465,9 @@ class InfraStaticTest(unittest.TestCase):
             '[[ $migrate_runner_mode == host-admin && $roots_csv == / ]]', installer
         )
         self.assertIn(
+            '[[ $root =~ ^/[A-Za-z0-9_./@+-]*$ ]]', installer
+        )
+        self.assertIn(
             "changing project roots requires an explicit host-admin migration to /", installer
         )
 

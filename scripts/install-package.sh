@@ -365,7 +365,7 @@ fi
 canonical_roots=()
 for root in "${project_roots[@]}"; do
   root=$(validate_project_root "$root" "$runner_mode")
-  [[ $root =~ ^/[A-Za-z0-9_./@+-]+$ ]] || die "project root contains characters unsafe for systemd units: $root"
+  [[ $root =~ ^/[A-Za-z0-9_./@+-]*$ ]] || die "project root contains characters unsafe for systemd units: $root"
   if [[ ! ( $runner_mode == host-admin && $root == / ) ]]; then
     paths_overlap "$root" "$codex_home" && die "project root overlaps CODEX_HOME: $root"
   fi
