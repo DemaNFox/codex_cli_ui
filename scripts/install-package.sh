@@ -107,7 +107,7 @@ bootstrap_args=()
 $external_proxy || bootstrap_args+=(--install-nginx)
 "$SCRIPT_DIR/bootstrap-ubuntu.sh" "${bootstrap_args[@]}"
 export PATH="/usr/local/bin:$PATH"
-for command in getent install realpath sha256sum systemctl runuser python3 node stat groupadd useradd cut date readlink find chown chmod sed rm curl mktemp sleep; do require_command "$command"; done
+for command in getent install realpath sha256sum systemctl runuser python3 node stat groupadd useradd cut date readlink find chown chmod sed rm curl mktemp sleep awk; do require_command "$command"; done
 [[ -x /usr/local/bin/node && $(/usr/local/bin/node -p 'process.versions.node.split(".")[0]') == 22 ]] || die 'managed Node.js 22 is required at /usr/local/bin/node'
 package=$(canonical_existing_dir "$package")
 case "$(uname -m)" in x86_64) target=linux-x64 ;; aarch64) target=linux-arm64 ;; *) die 'unsupported CPU architecture' ;; esac
@@ -583,6 +583,10 @@ broker_socket_was_active=false
 if systemctl is-active --quiet codex-web-ui-resource-broker.socket; then broker_socket_was_active=true; fi
 broker_socket_was_enabled=false
 if systemctl is-enabled --quiet codex-web-ui-resource-broker.socket; then broker_socket_was_enabled=true; fi
+app_server_socket_was_active=false
+if systemctl is-active --quiet codex-web-ui-app-server.socket; then app_server_socket_was_active=true; fi
+app_server_socket_was_enabled=false
+if systemctl is-enabled --quiet codex-web-ui-app-server.socket; then app_server_socket_was_enabled=true; fi
 path_broker_socket_was_active=false
 if systemctl is-active --quiet codex-web-ui-project-path-broker.socket; then path_broker_socket_was_active=true; fi
 path_broker_socket_was_enabled=false
@@ -595,6 +599,10 @@ workload_slice_was_active=false
 if systemctl is-active --quiet codex-web-ui-workload.slice; then workload_slice_was_active=true; fi
 
 restore_resource_boundary() {
+  if systemctl is-active --quiet codex-web-ui-app-server.socket; then
+    systemctl stop codex-web-ui-app-server.socket || return 1
+  fi
+  systemctl stop 'codex-web-ui-app-server@*.service' >/dev/null 2>&1 || true
   if systemctl is-active --quiet codex-web-ui-resource-broker.socket; then
     systemctl stop codex-web-ui-resource-broker.socket || return 1
   fi
@@ -613,6 +621,9 @@ restore_resource_boundary() {
   if ! $broker_socket_was_enabled && systemctl is-enabled --quiet codex-web-ui-resource-broker.socket; then
     systemctl disable codex-web-ui-resource-broker.socket || return 1
   fi
+  if ! $app_server_socket_was_enabled && systemctl is-enabled --quiet codex-web-ui-app-server.socket; then
+    systemctl disable codex-web-ui-app-server.socket || return 1
+  fi
   if ! $path_broker_socket_was_enabled && systemctl is-enabled --quiet codex-web-ui-project-path-broker.socket; then
     systemctl disable codex-web-ui-project-path-broker.socket || return 1
   fi
@@ -626,6 +637,12 @@ restore_resource_boundary() {
   done
   systemctl daemon-reload || return 1
   if $workload_slice_was_active; then systemctl start codex-web-ui-workload.slice || return 1; fi
+  if $app_server_socket_was_enabled; then systemctl enable codex-web-ui-app-server.socket || return 1; fi
+  if $app_server_socket_was_active; then
+    systemctl restart codex-web-ui-app-server.socket || return 1
+  else
+    systemctl stop codex-web-ui-app-server.socket >/dev/null 2>&1 || true
+  fi
   if $broker_socket_was_enabled; then systemctl enable codex-web-ui-resource-broker.socket || return 1; fi
   if $broker_socket_was_active; then
     systemctl restart codex-web-ui-resource-broker.socket || return 1
@@ -905,6 +922,22 @@ if ! $external_proxy; then
   domain=${public_origin#https://}
   "$package/scripts/install-nginx.sh" --domain "$domain" --tls-cert "$tls_cert" --tls-key "$tls_key" --reload
 fi
+systemctl stop codex-web-ui-app-server.socket
+mapfile -t active_app_servers < <(
+  systemctl list-units --state=active --plain --no-legend 'codex-web-ui-app-server@*.service' |
+    awk '{print $1}'
+)
+if ((${#active_app_servers[@]})); then systemctl stop "${active_app_servers[@]}"; fi
+systemctl is-active --quiet codex-web-ui-app-server.socket && \
+  die 'app-server socket remained active before Codex state repair'
+if systemctl list-units --state=active --plain --no-legend 'codex-web-ui-app-server@*.service' | grep -q .; then
+  die 'an app-server runner remained active before Codex state repair'
+fi
+rebase_args=(--profile-root "$codex_home" --target-home "$codex_home")
+if [[ $runner_mode == host-admin ]]; then
+  rebase_args+=(--source-home /var/lib/codex-web-ui/codex-home)
+fi
+runuser -u "$runner_user" -- python3 "$package/scripts/rebase-codex-home.py" "${rebase_args[@]}"
 if $start_service; then
   systemctl enable codex-web-ui-resource-broker.socket codex-web-ui-app-server.socket codex-web-ui@api.service codex-web-ui-storage-guard@api.timer
   systemctl enable codex-web-ui-codex-update-broker.socket
@@ -913,7 +946,6 @@ if $start_service; then
   else
     systemctl disable --now codex-web-ui-project-path-broker.socket >/dev/null 2>&1 || true
   fi
-  systemctl stop 'codex-web-ui-app-server@*.service' >/dev/null 2>&1 || true
   if [[ $runner_mode == host-admin ]]; then
     systemctl restart codex-web-ui-project-path-broker.socket
   fi

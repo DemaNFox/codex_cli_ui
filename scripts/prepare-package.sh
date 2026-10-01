@@ -68,6 +68,7 @@ required = (
     "scripts/project-path-broker.py",
     "scripts/install-local-host-instructions.py",
     "scripts/migrate-runner-host-admin.sh",
+    "scripts/rebase-codex-home.py",
     "scripts/bootstrap-ubuntu.sh",
     "apps/server/dist/index.js",
     "apps/web/dist/index.html",

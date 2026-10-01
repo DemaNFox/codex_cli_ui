@@ -151,6 +151,10 @@ content. It tells Codex that the Web UI runner is already executing on the physi
 local commands instead of SSHing to a loopback, current-hostname or same-host address. An explicit migration to
 host-admin drains work, preserves SQLite, copies the complete Codex home without merging profiles, keeps a
 root-only rollback source until health succeeds and then changes only the app-server runner identity/unit.
+Because Codex persists absolute rollout paths in `state_5.sqlite`, migration and subsequent package activation
+transactionally rebase stale `sessions/` and `archived_sessions/` rows to the configured `CODEX_HOME` only
+when the corresponding copied rollout exists. An unrecognized or missing rollout fails activation instead of
+silently orphaning chat history.
 Host-admin installation stores the canonical project allowlist separately for the path broker and enables that
 broker before the API starts; restricted mode continues validating paths directly as its own runner-visible
 roots.

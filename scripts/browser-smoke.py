@@ -1070,6 +1070,8 @@ def main() -> int:
         page.get_by_label("Меню чата проекта Релиз без обрыва").click()
         page.get_by_role("menuitem", name="Архивировать чат").click()
         page.get_by_text("Здесь пока нет чатов.").wait_for()
+        if not page.get_by_label("Сообщение Codex").is_disabled():
+            raise AssertionError("archiving the selected chat left its composer active")
         page.get_by_label("Меню проекта Demo").click()
         page.get_by_role("menuitem", name="Архивированные чаты").click()
         page.get_by_text("Архив", exact=True).wait_for()
@@ -1077,6 +1079,8 @@ def main() -> int:
         page.get_by_label("Меню чата проекта Релиз без обрыва").click()
         page.get_by_role("menuitem", name="Восстановить чат").click()
         page.get_by_text("Архив пуст.").wait_for()
+        page.get_by_role("button", name="Назад").click()
+        page.get_by_role("heading", name="Релиз без обрыва").wait_for()
 
         page.set_viewport_size({"width": 390, "height": 600})
         overflow = page.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth")
