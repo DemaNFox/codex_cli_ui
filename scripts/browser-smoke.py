@@ -861,6 +861,15 @@ def main() -> int:
         turn_navigation.wait_for()
         if turn_navigation.get_by_role("button").count() != 2:
             raise AssertionError("turn navigation does not expose every user call")
+        navigation_box = turn_navigation.bounding_box()
+        if navigation_box is None:
+            raise AssertionError("turn navigation geometry is unavailable")
+        navigation_center = navigation_box["y"] + navigation_box["height"] / 2
+        viewport_center = page.viewport_size["height"] / 2
+        if abs(navigation_center - viewport_center) > 12:
+            raise AssertionError(
+                f"turn navigation is not centered in the window: navigation={navigation_box}, viewport={page.viewport_size}"
+            )
         turn_navigation.get_by_role("button").first.click()
         if page.get_by_role("button", name="Перейти к новым сообщениям").count() != 1:
             raise AssertionError("turn navigation did not leave follow-latest mode")
@@ -875,9 +884,14 @@ def main() -> int:
         activity_toggle.click()
         if activity_group.locator(".activity-row").count() != 6:
             raise AssertionError("expanded activity group does not expose the full action history")
-        command_row = page.locator("details.activity-row").filter(has_text="Выполнил команду")
-        command_row.get_by_text("pnpm test").wait_for()
-        command_row.get_by_text("Выполнил команду").click()
+        command_row = page.locator("details.activity-row:visible").filter(
+            has_text="Выполнил команду"
+        )
+        command_row.locator("summary").click()
+        if not command_row.evaluate("element => element.open"):
+            raise AssertionError("command activity disclosure did not open")
+        if command_row.get_by_text("pnpm test").count() != 1:
+            raise AssertionError("command activity preview is missing")
         command_row.get_by_text("All tests passed").wait_for()
 
         conversation_scroll = page.locator(".conversation-scroll")

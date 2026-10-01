@@ -687,8 +687,8 @@ button:disabled {
   gap: 0.65rem;
 }
 .turn-navigation {
-  position: sticky;
-  top: 0.75rem;
+  position: fixed;
+  top: 50dvh;
   z-index: 4;
   display: grid;
   align-content: start;
@@ -696,6 +696,12 @@ button:disabled {
   gap: 0.18rem;
   max-height: calc(100dvh - 10rem);
   padding: 0.35rem 0;
+  overflow-y: auto;
+  scrollbar-width: none;
+  transform: translateY(-50%);
+}
+.turn-navigation::-webkit-scrollbar {
+  display: none;
 }
 .turn-jump {
   position: relative;
@@ -2075,6 +2081,7 @@ button:disabled {
     display: block;
   }
   .turn-navigation {
+    position: sticky;
     top: 0;
     display: flex;
     width: 100%;
@@ -2085,7 +2092,9 @@ button:disabled {
     border: 1px solid var(--border-soft);
     border-radius: 0.65rem;
     background: rgba(15, 18, 21, 0.94);
+    overflow-y: hidden;
     scrollbar-width: none;
+    transform: none;
   }
   .turn-navigation::-webkit-scrollbar {
     display: none;
