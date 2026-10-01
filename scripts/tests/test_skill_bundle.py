@@ -76,6 +76,11 @@ class SkillBundleTest(unittest.TestCase):
         self.assertIn("name: vercel-react-best-practices", react_entrypoint)
         self.assertIn("react-best-practices", required)
 
+    def test_root_is_a_valid_host_admin_service_user(self) -> None:
+        skill_bundle.validate_service_user("root")
+        with self.assertRaisesRegex(skill_bundle.BundleError, "invalid service user"):
+            skill_bundle.validate_service_user("bad,user")
+
 
 if __name__ == "__main__":
     unittest.main()

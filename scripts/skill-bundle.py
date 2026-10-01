@@ -25,6 +25,7 @@ except ImportError:  # pragma: no cover - verification/build remain portable on 
 
 NAME = re.compile(r"^[a-z][a-z0-9-]{0,63}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
+SERVICE_USER = re.compile(r"^[a-z_][a-z0-9_-]{0,30}$")
 MAX_FILES_PER_SKILL = 256
 MAX_FILE_BYTES = 2 * 1024 * 1024
 FORBIDDEN_NAMES = {
@@ -206,13 +207,17 @@ def contained(child: Path, parent: Path) -> bool:
     return child == parent or parent in child.parents
 
 
+def validate_service_user(user: str) -> None:
+    if not SERVICE_USER.fullmatch(user):
+        raise BundleError("invalid service user")
+
+
 def install(bundle: Path, codex_home: Path, user: str, required: tuple[str, ...]) -> None:
     if pwd is None:
         raise BundleError("skill installation requires a POSIX host")
     if os.geteuid() != 0:
         raise BundleError("skill installation must run as root")
-    if user == "root" or not re.fullmatch(r"[a-z_][a-z0-9_-]{0,30}", user):
-        raise BundleError("invalid non-root service user")
+    validate_service_user(user)
     try:
         account = pwd.getpwnam(user)
     except KeyError as error:
