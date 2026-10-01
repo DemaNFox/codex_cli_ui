@@ -16,6 +16,7 @@ import type {
   Session,
   Subagent,
   Thread,
+  TurnNavigationEntry,
 } from '@codex-web/contracts';
 
 export class ApiError extends Error {
@@ -100,6 +101,7 @@ export interface ThreadHistory {
   events: SafeEvent[];
   eventCursor?: number;
   subagents?: Subagent[];
+  turnNavigation?: TurnNavigationEntry[];
 }
 
 export interface AttachmentUpload {
@@ -480,4 +482,5 @@ export type {
   Session,
   Subagent,
   Thread,
+  TurnNavigationEntry,
 };

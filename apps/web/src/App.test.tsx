@@ -814,6 +814,157 @@ describe('App', () => {
     expect(document.activeElement).toBe(document.getElementById('turn-message-1'));
   });
 
+  it('restores server-owned turn navigation after reload when old user messages were pruned', async () => {
+    const retainedEvents = [
+      {
+        id: 101,
+        threadId: 'thread-1',
+        turnId: 'partially-retained-turn',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Сохранившийся ответ старой задачи', messagePhase: 'commentary' },
+        createdAt: '2026-09-27T11:00:00.000Z',
+      },
+      {
+        id: 102,
+        threadId: 'thread-1',
+        turnId: 'retained-turn',
+        kind: 'user-message',
+        phase: 'completed',
+        payload: { text: 'Сохранившийся запрос' },
+        createdAt: '2026-09-27T11:01:00.000Z',
+      },
+    ];
+    const turnNavigation = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'fully-pruned-turn',
+        label: 'Полностью старая задача',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'partially-retained-turn',
+        label: 'Частично сохранённая задача',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'retained-turn',
+        label: 'Сохранившийся запрос',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') {
+        return jsonResponse({ data: thread, events: retainedEvents, turnNavigation });
+      }
+      return undefined;
+    });
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: scrollIntoView,
+    });
+
+    const firstLoad = render(<App />);
+    const firstNavigation = await screen.findByRole('navigation', {
+      name: 'Переходы по задачам',
+    });
+    expect(within(firstNavigation).getAllByRole('button')).toHaveLength(3);
+    firstLoad.unmount();
+
+    const user = userEvent.setup();
+    render(<App />);
+    const navigation = await screen.findByRole('navigation', { name: 'Переходы по задачам' });
+    expect(within(navigation).getAllByRole('button')).toHaveLength(3);
+
+    await user.click(
+      within(navigation).getByRole('button', {
+        name: 'Перейти к задаче 2: Частично сохранённая задача',
+      }),
+    );
+    expect(scrollIntoView).toHaveBeenLastCalledWith({ behavior: 'smooth', block: 'start' });
+    expect(document.activeElement).toBe(document.getElementById('turn-retained-101'));
+
+    await user.click(
+      within(navigation).getByRole('button', {
+        name: 'Перейти к задаче 1: Полностью старая задача',
+      }),
+    );
+    expect(document.activeElement).toBe(document.getElementById('transcript-start'));
+
+    await user.click(
+      within(navigation).getByRole('button', {
+        name: 'Перейти к задаче 3: Сохранившийся запрос',
+      }),
+    );
+    expect(document.activeElement).toBe(document.getElementById('turn-message-102'));
+  });
+
+  it('matches multiple truncated server navigation labels to their exact retained prompts', async () => {
+    const firstPrompt = 'А'.repeat(2_100);
+    const secondPrompt = 'Б'.repeat(2_100);
+    const navigationLabel = (value: string) => `${value.slice(0, 1_987)}…[truncated]`;
+    const retainedEvents = [
+      {
+        id: 201,
+        threadId: 'thread-1',
+        turnId: 'shared-turn',
+        kind: 'user-message',
+        phase: 'completed',
+        payload: { text: firstPrompt },
+        createdAt: '2026-09-27T12:00:00.000Z',
+      },
+      {
+        id: 202,
+        threadId: 'thread-1',
+        turnId: 'shared-turn',
+        kind: 'user-message',
+        phase: 'completed',
+        payload: { text: secondPrompt },
+        createdAt: '2026-09-27T12:01:00.000Z',
+      },
+    ];
+    const turnNavigation = [
+      {
+        id: 10,
+        threadId: 'thread-1',
+        turnId: 'shared-turn',
+        label: navigationLabel(firstPrompt),
+      },
+      {
+        id: 11,
+        threadId: 'thread-1',
+        turnId: 'shared-turn',
+        label: navigationLabel(secondPrompt),
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') {
+        return jsonResponse({ data: thread, events: retainedEvents, turnNavigation });
+      }
+      return undefined;
+    });
+    const scrollIntoView = vi.fn();
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: scrollIntoView,
+    });
+    const user = userEvent.setup();
+
+    render(<App />);
+    const navigation = await screen.findByRole('navigation', { name: 'Переходы по задачам' });
+    const buttons = within(navigation).getAllByRole('button');
+    expect(buttons).toHaveLength(2);
+
+    await user.click(buttons[0]!);
+    expect(document.activeElement).toBe(document.getElementById('turn-message-201'));
+    await user.click(buttons[1]!);
+    expect(document.activeElement).toBe(document.getElementById('turn-message-202'));
+    expect(scrollIntoView).toHaveBeenCalledTimes(2);
+  });
+
   it('offers a scroll-to-latest control when new events arrive below the viewport', async () => {
     const initialEvent = {
       id: 1,

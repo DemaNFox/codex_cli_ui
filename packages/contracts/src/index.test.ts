@@ -13,6 +13,7 @@ import {
   subagentSchema,
   updateRuntimePreferencesRequestSchema,
   startTurnRequestSchema,
+  turnNavigationEntrySchema,
 } from './index.js';
 
 describe('contracts', () => {
@@ -22,6 +23,19 @@ describe('contracts', () => {
 
   it('requires an idempotency key for a turn', () => {
     expect(startTurnRequestSchema.safeParse({ text: 'test' }).success).toBe(false);
+  });
+
+  it('bounds persisted turn-navigation labels', () => {
+    const entry = {
+      id: 1,
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      label: 'Проверить сохранение переходов',
+    };
+    expect(turnNavigationEntrySchema.safeParse(entry).success).toBe(true);
+    expect(
+      turnNavigationEntrySchema.safeParse({ ...entry, label: 'x'.repeat(2_001) }).success,
+    ).toBe(false);
   });
 
   it('validates the complete account runtime preference tuple', () => {

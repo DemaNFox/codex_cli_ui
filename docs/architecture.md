@@ -40,7 +40,7 @@ Browser
 - The single administrator's last model, reasoning effort, permission preset and approval policy are stored as
   one atomic server-side preference tuple. They follow the account between devices and are not reset when the
   operator switches projects.
-- Codex rollout files remain the source of truth for Codex conversation history. SQLite stores the local project registry, thread-to-project mapping, UI metadata, sessions, audit records and a bounded reconnect journal.
+- Codex rollout files remain the source of truth for Codex conversation history. SQLite stores the local project registry, thread-to-project mapping, UI metadata, sessions, audit records and a bounded reconnect journal. The journal keeps the newest configured event window plus a separately bounded window of user prompts so command/subagent noise cannot evict every transcript anchor. A bounded per-thread turn-navigation index is rebuilt from authoritative Codex history once per app-server generation and updated with every accepted local prompt; it restores navigation after reload without making the activity journal unbounded.
 - A project is a display name plus a canonical existing directory under an allowlisted root. Codex has no separate project entity; thread `cwd` binds execution to a project.
 - Models and reasoning efforts come from `model/list`; the UI never hard-codes account availability.
 - `instructionSources` from thread start/resume and `skills/list` are visible in the status drawer so the operator can verify that `AGENTS.md` and required skills loaded.
@@ -66,8 +66,10 @@ Browser
   a successfully completed turn is treated as the compatibility final; explicit commentary is never promoted.
 - Once a successfully completed turn has a final answer, its transcript projection keeps the operator prompt
   and final answer but hides commentary and execution activity. Active, failed, interrupted or final-less
-  turns retain their progress and diagnostic events. A compact prompt-derived turn rail navigates between
-  calls without changing server state; on narrow screens the same rail becomes horizontally scrollable.
+  turns retain their progress and diagnostic events. A compact server-persisted prompt rail navigates between
+  calls without changing server state. When an older prompt predates the retained activity window, its rail
+  entry targets the first retained event from that turn, or the transcript start if the entire turn has aged
+  out. On narrow screens the same rail becomes horizontally scrollable.
 - Relative Markdown links emitted by Codex are presented as generated project-file downloads. The authenticated
   download route resolves the requested file against the thread's registered canonical project directory,
   rejects absolute paths, traversal, symlink escape, directories and files above 100 MiB, and always serves an

@@ -2732,7 +2732,11 @@ describe('Codex routes', () => {
       headers: { cookie: session.cookie },
     });
     expect(first.statusCode).toBe(200);
-    const firstEvents = first.json<{ events: { id: number; kind: string }[] }>().events;
+    const firstBody = first.json<{
+      events: { id: number; kind: string }[];
+      turnNavigation: { turnId: string; label: string }[];
+    }>();
+    const firstEvents = firstBody.events;
     expect(firstEvents.map((event) => event.kind)).toEqual([
       'user-message',
       'agent-message',
@@ -2754,6 +2758,12 @@ describe('Codex routes', () => {
     expect(first.body).not.toContain('supersecret');
     expect(first.body).not.toContain(attachmentStore.root);
     expect(first.body).toContain('[attachment-storage]/private-file.txt');
+    expect(firstBody.turnNavigation).toEqual([
+      expect.objectContaining({
+        turnId: 'historical-turn',
+        label: 'hello token[REDACTED]',
+      }),
+    ]);
 
     const second = await app.inject({
       method: 'GET',
@@ -2814,6 +2824,156 @@ describe('Codex routes', () => {
     expect(repository.isThreadHistoryHydrated(thread.id)).toBe(true);
   });
 
+  it('does not let a stale initial hydration erase navigation appended while its read is pending', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = appServer.addExternalThread(projectPath);
+    await app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
+    appServer.setThreadTurns(threadId, [
+      {
+        id: 'stale-turn',
+        status: 'completed',
+        items: [{ type: 'userMessage', content: [{ type: 'text', text: 'stale task' }] }],
+      },
+    ]);
+    const blockedRead = appServer.blockThreadReads();
+    const hydration = app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    await blockedRead.entered;
+
+    const steered = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/steer`,
+      headers: session.headers,
+      payload: { text: 'live instruction', expectedTurnId: 'live-turn' },
+    });
+    expect(steered.statusCode).toBe(202);
+    expect(repository.listTurnNavigation(threadId)).toEqual([
+      expect.objectContaining({ turnId: 'live-turn', label: 'live instruction' }),
+    ]);
+
+    blockedRead.release();
+    const first = await hydration;
+    expect(first.statusCode).toBe(200);
+    expect(first.json<{ turnNavigation: { label: string }[] }>().turnNavigation).toEqual([
+      expect.objectContaining({ label: 'live instruction' }),
+    ]);
+
+    appServer.setThreadTurns(threadId, [
+      {
+        id: 'live-turn',
+        status: 'completed',
+        items: [{ type: 'userMessage', content: [{ type: 'text', text: 'live instruction' }] }],
+      },
+    ]);
+    const repaired = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(repaired.statusCode).toBe(200);
+    expect(
+      repaired.json<{ turnNavigation: { turnId: string; label: string }[] }>().turnNavigation,
+    ).toEqual([expect.objectContaining({ turnId: 'live-turn', label: 'live instruction' })]);
+    expect(repository.listTurnNavigation(threadId)).toHaveLength(1);
+  });
+
+  it('repairs the bounded turn navigation index once per app-server generation', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    repository.appendTurnNavigation({
+      threadId,
+      turnId: 'stale-turn',
+      label: 'stale label',
+    });
+    appServer.setThreadTurns(threadId, [
+      {
+        id: 'turn-one',
+        status: 'completed',
+        items: [
+          {
+            type: 'userMessage',
+            content: [{ type: 'text', text: 'first token=private' }],
+          },
+        ],
+      },
+      {
+        id: 'turn-two',
+        status: 'completed',
+        items: [{ type: 'userMessage', content: [{ type: 'text', text: 'second task' }] }],
+      },
+    ]);
+    appServer.restart();
+
+    const first = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(
+      first.json<{ turnNavigation: { turnId: string; label: string }[] }>().turnNavigation,
+    ).toEqual([
+      expect.objectContaining({ turnId: 'turn-one', label: 'first token[REDACTED]' }),
+      expect.objectContaining({ turnId: 'turn-two', label: 'second task' }),
+    ]);
+    expect(repository.listTurnNavigation(threadId)).toHaveLength(2);
+
+    const second = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json<{ turnNavigation: unknown[] }>().turnNavigation).toHaveLength(2);
+    expect(
+      appServer.requests.filter(
+        (request) =>
+          request.method === 'thread/read' &&
+          (request.params as { includeTurns?: boolean }).includeTurns === true,
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('persists separate live turn and steer navigation entries for the same turn id', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const started = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'first task',
+        idempotencyKey: '12121212-1212-4212-8212-121212121212',
+      },
+    });
+    expect(started.statusCode).toBe(202);
+    const turnId = started.json<{ data: { turnId: string } }>().data.turnId;
+    const steered = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/steer`,
+      headers: session.headers,
+      payload: { text: 'second instruction', expectedTurnId: turnId },
+    });
+    expect(steered.statusCode).toBe(202);
+    expect(repository.listTurnNavigation(threadId)).toEqual([
+      expect.objectContaining({ turnId, label: 'first task' }),
+      expect.objectContaining({ turnId, label: 'second instruction' }),
+    ]);
+  });
+
   it('replays the full retained cap with bounded high-water pages and cursor-safe pending state', async () => {
     const { app, repository, projectPath } = await fixture();
     const session = await login(app);
@@ -2869,6 +3029,63 @@ describe('Codex routes', () => {
       kind: 'user-input',
       payload: { request: { id: 'pending-request', status: 'pending' } },
     });
+
+    const boundedRepository = new SqliteRepository(':memory:', 3);
+    try {
+      const boundedProject = boundedRepository.createProject({
+        name: 'Bounded',
+        path: projectPath,
+        defaultModel: null,
+        defaultReasoningEffort: null,
+        defaultPermissionPreset: 'workspace-write',
+      });
+      const now = new Date().toISOString();
+      boundedRepository.upsertThread({
+        id: 'bounded-thread',
+        projectId: boundedProject.id,
+        name: null,
+        preview: '',
+        model: null,
+        status: 'idle',
+        activeTurnId: null,
+        archived: false,
+        instructionSources: [],
+        createdAt: now,
+        updatedAt: now,
+      });
+      const anchor = boundedRepository.appendEvent({
+        threadId: 'bounded-thread',
+        turnId: 'retained-anchor',
+        kind: 'user-message',
+        phase: 'completed',
+        payload: { text: 'retained task' },
+      });
+      for (let index = 0; index < 4; index += 1) {
+        boundedRepository.appendEvent({
+          threadId: 'bounded-thread',
+          turnId: null,
+          kind: 'warning',
+          phase: 'state',
+          payload: { afterAnchor: index },
+        });
+        boundedRepository.appendTurnNavigation({
+          threadId: 'bounded-thread',
+          turnId: `navigation-${index}`,
+          label: `Navigation ${index}`,
+        });
+      }
+      const retainedEvents = boundedRepository.listEvents('bounded-thread', 0);
+      expect(retainedEvents).toHaveLength(4);
+      expect(retainedEvents).toContainEqual(anchor);
+      const retainedNavigation = boundedRepository.listTurnNavigation('bounded-thread');
+      expect(retainedNavigation).toHaveLength(3);
+      expect(retainedNavigation[0]).toMatchObject({
+        turnId: 'navigation-1',
+        label: 'Navigation 1',
+      });
+    } finally {
+      boundedRepository.database.close();
+    }
 
     const invalidCursor = await app.inject({
       method: 'GET',
@@ -3028,12 +3245,9 @@ describe('Codex routes', () => {
     expect(
       appServer.requests
         .filter((request) => request.method === 'thread/read')
-        .slice(-2)
+        .slice(-1)
         .map((request) => request.params),
-    ).toEqual([
-      { threadId, includeTurns: false },
-      { threadId, includeTurns: true },
-    ]);
+    ).toEqual([{ threadId, includeTurns: true }]);
   });
 
   it('clears a stale native active status when every retained turn is terminal', async () => {

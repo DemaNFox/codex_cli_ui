@@ -7,6 +7,7 @@ import type {
   SafeEvent,
   Subagent,
   Thread,
+  TurnNavigationEntry,
   PushSubscriptionInput,
 } from '@codex-web/contracts';
 import { DatabaseSync } from 'node:sqlite';
@@ -56,6 +57,13 @@ interface EventRow {
   phase: SafeEvent['phase'];
   payload_json: string;
   created_at: string;
+}
+
+interface TurnNavigationRow {
+  id: number;
+  thread_id: string;
+  turn_id: string;
+  label: string;
 }
 
 interface AttachmentRow {
@@ -361,6 +369,14 @@ export class SqliteRepository {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS events_thread_idx ON events(thread_id, id);
+
+      CREATE TABLE IF NOT EXISTS turn_navigation (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        turn_id TEXT NOT NULL,
+        label TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS turn_navigation_thread_idx ON turn_navigation(thread_id, id);
 
       CREATE TABLE IF NOT EXISTS approvals (
         id TEXT PRIMARY KEY,
@@ -1467,12 +1483,76 @@ export class SqliteRepository {
     const id = Number(result.lastInsertRowid);
     this.database
       .prepare(
-        `DELETE FROM events WHERE thread_id=? AND id NOT IN (
-      SELECT id FROM events WHERE thread_id=? ORDER BY id DESC LIMIT ?
-    )`,
+        `DELETE FROM events
+         WHERE thread_id=?
+           AND id NOT IN (
+             SELECT id FROM events WHERE thread_id=? ORDER BY id DESC LIMIT ?
+           )
+           AND id NOT IN (
+             SELECT id FROM events
+             WHERE thread_id=? AND kind='user-message'
+             ORDER BY id DESC LIMIT ?
+           )`,
       )
-      .run(event.threadId, event.threadId, this.eventRetentionPerThread);
+      .run(
+        event.threadId,
+        event.threadId,
+        this.eventRetentionPerThread,
+        event.threadId,
+        this.eventRetentionPerThread,
+      );
     return { ...event, id, createdAt };
+  }
+
+  private turnNavigationFromRow(row: TurnNavigationRow): TurnNavigationEntry {
+    return {
+      id: row.id,
+      threadId: row.thread_id,
+      turnId: row.turn_id,
+      label: row.label,
+    };
+  }
+
+  appendTurnNavigation(entry: Omit<TurnNavigationEntry, 'id'>): TurnNavigationEntry {
+    const result = this.database
+      .prepare('INSERT INTO turn_navigation(thread_id,turn_id,label) VALUES(?,?,?)')
+      .run(entry.threadId, entry.turnId, entry.label);
+    this.database
+      .prepare(
+        `DELETE FROM turn_navigation WHERE thread_id=? AND id NOT IN (
+           SELECT id FROM turn_navigation WHERE thread_id=? ORDER BY id DESC LIMIT ?
+         )`,
+      )
+      .run(entry.threadId, entry.threadId, this.eventRetentionPerThread);
+    return { ...entry, id: Number(result.lastInsertRowid) };
+  }
+
+  listTurnNavigation(threadId: string): TurnNavigationEntry[] {
+    return (
+      this.database
+        .prepare('SELECT * FROM turn_navigation WHERE thread_id=? ORDER BY id')
+        .all(threadId) as unknown as TurnNavigationRow[]
+    ).map((row) => this.turnNavigationFromRow(row));
+  }
+
+  replaceTurnNavigation(
+    threadId: string,
+    entries: readonly Omit<TurnNavigationEntry, 'id'>[],
+  ): TurnNavigationEntry[] {
+    const retained = entries.slice(-this.eventRetentionPerThread);
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      this.database.prepare('DELETE FROM turn_navigation WHERE thread_id=?').run(threadId);
+      const insert = this.database.prepare(
+        'INSERT INTO turn_navigation(thread_id,turn_id,label) VALUES(?,?,?)',
+      );
+      for (const entry of retained) insert.run(threadId, entry.turnId, entry.label);
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+    return this.listTurnNavigation(threadId);
   }
 
   eventHighWater(threadId: string): number {

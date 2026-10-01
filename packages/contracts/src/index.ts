@@ -202,6 +202,14 @@ export const threadSchema = z.object({
 });
 export type Thread = z.infer<typeof threadSchema>;
 
+export const turnNavigationEntrySchema = z.object({
+  id: z.number().int().positive(),
+  threadId: z.string().min(1).max(200),
+  turnId: z.string().min(1).max(200),
+  label: z.string().min(1).max(2_000),
+});
+export type TurnNavigationEntry = z.infer<typeof turnNavigationEntrySchema>;
+
 export const threadListQuerySchema = z.object({
   projectId: z.string().uuid(),
   archived: z.coerce.boolean().default(false),

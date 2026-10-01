@@ -1,12 +1,14 @@
-import type { SafeEvent } from '@codex-web/contracts';
+import type { SafeEvent, TurnNavigationEntry } from '@codex-web/contracts';
 import path from 'node:path';
 
-import { sanitizeEventPayload } from './event-normalizer.js';
+import { sanitizeEventPayload, sanitizePublicText } from './event-normalizer.js';
 import { publicSubagentItem } from './subagents.js';
 
 type JournalEvent = Omit<SafeEvent, 'id' | 'createdAt'>;
+export type TurnNavigationInput = Omit<TurnNavigationEntry, 'id'>;
 const ATTACHMENT_REFERENCE_MARKER =
   '\n\n[Codex Web attachment references (server-local; do not repeat paths):\n';
+const MAX_TURN_NAVIGATION_LABEL_LENGTH = 2_000;
 
 function stripServerAttachmentSuffix(value: string): string {
   const marker = value.lastIndexOf(ATTACHMENT_REFERENCE_MARKER);
@@ -57,6 +59,48 @@ function textEvent(
     phase: 'completed',
     payload: sanitizeEventPayload({ [field]: text }, maxBytes),
   };
+}
+
+export function normalizeTurnNavigationLabel(text: string, maxBytes: number): string {
+  const visible = sanitizePublicText(
+    stripServerAttachmentSuffix(text),
+    Math.min(MAX_TURN_NAVIGATION_LABEL_LENGTH, maxBytes),
+  );
+  return (
+    visible.replace(/\s+/gu, ' ').trim().slice(0, MAX_TURN_NAVIGATION_LABEL_LENGTH) ||
+    'Задача без текста'
+  );
+}
+
+export function normalizeTurnNavigation(
+  threadId: string,
+  turns: unknown,
+  maxBytes: number,
+): TurnNavigationInput[] {
+  if (!Array.isArray(turns)) return [];
+  const entries: TurnNavigationInput[] = [];
+  for (const value of turns) {
+    const turn = record(value);
+    if (!turn || typeof turn.id !== 'string' || !Array.isArray(turn.items)) continue;
+    for (const valueItem of turn.items) {
+      const item = record(valueItem);
+      if (!item || item.type !== 'userMessage' || !Array.isArray(item.content)) continue;
+      const text = item.content
+        .map(record)
+        .filter(
+          (input): input is Record<string, unknown> =>
+            input !== null && input.type === 'text' && typeof input.text === 'string',
+        )
+        .map((input) => input.text as string)
+        .join('\n');
+      entries.push({
+        threadId,
+        turnId: turn.id,
+        label: normalizeTurnNavigationLabel(text, maxBytes),
+      });
+    }
+  }
+  return entries;
 }
 
 function normalizeItem(

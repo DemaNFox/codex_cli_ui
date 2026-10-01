@@ -34,6 +34,7 @@ import {
   type SafeEvent,
   type Subagent,
   type Thread,
+  type TurnNavigationEntry,
   type PushSubscriptionInput,
 } from '@codex-web/contracts';
 import cookie from '@fastify/cookie';
@@ -66,7 +67,11 @@ import {
   normalizeNotification,
   sanitizeEventPayload,
 } from './event-normalizer.js';
-import { normalizeThreadHistory } from './history-normalizer.js';
+import {
+  normalizeThreadHistory,
+  normalizeTurnNavigation,
+  normalizeTurnNavigationLabel,
+} from './history-normalizer.js';
 import {
   normalizePermissionRequest,
   normalizeUserInputRequest,
@@ -676,6 +681,20 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const approvalGenerations = new Map<string, number>();
   const loadedThreadGenerations = new Map<string, number>();
   const historyHydrations = new Map<string, Promise<Thread>>();
+  const turnNavigationGenerations = new Map<string, number>();
+  const turnNavigationMutationVersions = new Map<string, number>();
+  const turnNavigationRefreshes = new Map<
+    string,
+    { generation: number; result: Promise<Thread> }
+  >();
+  const appendTurnNavigation = (entry: Omit<TurnNavigationEntry, 'id'>): TurnNavigationEntry => {
+    const persisted = repository.appendTurnNavigation(entry);
+    turnNavigationMutationVersions.set(
+      entry.threadId,
+      (turnNavigationMutationVersions.get(entry.threadId) ?? 0) + 1,
+    );
+    return persisted;
+  };
   repository.markPendingIdempotencyUnknown();
   repository.resetActiveThreadRuntime();
   repository.resetActiveSubagentRuntime();
@@ -1225,10 +1244,20 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const hydration = (async () => {
       if (repository.isThreadHistoryHydrated(existing.id))
         return repository.getThread(existing.id) ?? existing;
+      const generation = appServer.generation;
+      const navigationMutationVersion = turnNavigationMutationVersions.get(existing.id) ?? 0;
       const result = await readThreadFromAppServer(existing, true);
       const safeTurns = redactAttachmentStorage(result.turns, attachmentStore.root);
       for (const event of normalizeThreadHistory(existing.id, safeTurns, config.maxEventBytes)) {
         publish(repository.appendEvent(event));
+      }
+      if ((turnNavigationMutationVersions.get(existing.id) ?? 0) === navigationMutationVersion) {
+        repository.replaceTurnNavigation(
+          existing.id,
+          normalizeTurnNavigation(existing.id, safeTurns, config.maxEventBytes),
+        );
+        if (appServer.generation === generation)
+          turnNavigationGenerations.set(existing.id, generation);
       }
       repository.markThreadHistoryHydrated(existing.id);
       return result.thread;
@@ -1238,6 +1267,34 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       return await hydration;
     } finally {
       if (historyHydrations.get(existing.id) === hydration) historyHydrations.delete(existing.id);
+    }
+  };
+
+  const refreshTurnNavigation = async (existing: Thread): Promise<Thread> => {
+    const generation = appServer.generation;
+    if (turnNavigationGenerations.get(existing.id) === generation) return existing;
+    const activeRefresh = turnNavigationRefreshes.get(existing.id);
+    if (activeRefresh?.generation === generation) return activeRefresh.result;
+    const result = (async () => {
+      const mutationVersion = turnNavigationMutationVersions.get(existing.id) ?? 0;
+      const read = await readThreadFromAppServer(existing, true);
+      const safeTurns = redactAttachmentStorage(read.turns, attachmentStore.root);
+      if ((turnNavigationMutationVersions.get(existing.id) ?? 0) !== mutationVersion)
+        return read.thread;
+      repository.replaceTurnNavigation(
+        existing.id,
+        normalizeTurnNavigation(existing.id, safeTurns, config.maxEventBytes),
+      );
+      if (appServer.generation === generation)
+        turnNavigationGenerations.set(existing.id, generation);
+      return read.thread;
+    })();
+    turnNavigationRefreshes.set(existing.id, { generation, result });
+    try {
+      return await result;
+    } finally {
+      if (turnNavigationRefreshes.get(existing.id)?.result === result)
+        turnNavigationRefreshes.delete(existing.id);
     }
   };
 
@@ -2120,6 +2177,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         mapThread(result.thread, project.id, false, result.instructionSources, result.model),
       );
       repository.markThreadHistoryHydrated(thread.id);
+      turnNavigationGenerations.set(thread.id, appServer.generation);
       loadedThreadGenerations.set(thread.id, appServer.generation);
       repository.audit('thread.start', 'succeeded', {
         projectId: project.id,
@@ -2140,12 +2198,15 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     let thread = existing;
     if (!repository.isThreadHistoryHydrated(id)) {
       thread = await hydrateThreadHistory(existing);
-    } else if (
-      loadedThreadGenerations.get(id) !== appServer.generation ||
-      (existing.status === 'active' && existing.activeTurnId === null)
-    ) {
+    } else {
       try {
-        thread = (await readThreadFromAppServer(existing, false)).thread;
+        if (turnNavigationGenerations.get(id) !== appServer.generation)
+          thread = await refreshTurnNavigation(existing);
+        else if (
+          loadedThreadGenerations.get(id) !== appServer.generation ||
+          (existing.status === 'active' && existing.activeTurnId === null)
+        )
+          thread = (await readThreadFromAppServer(existing, false)).thread;
       } catch (error) {
         if (error instanceof HttpError) throw error;
         repository.audit('thread.refresh', 'failed', { threadId: id });
@@ -2157,6 +2218,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       data,
       events,
       eventCursor: events.at(-1)?.id ?? 0,
+      turnNavigation: repository.listTurnNavigation(id),
       subagents: repository.listSubagents(id),
     };
   });
@@ -2594,6 +2656,11 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         config.maxEventBytes,
       ),
     });
+    appendTurnNavigation({
+      threadId: id,
+      turnId: result.turn.id,
+      label: normalizeTurnNavigationLabel(input.text, config.maxEventBytes),
+    });
     publish(userEvent);
     repository.audit('turn.start', 'succeeded', {
       threadId: id,
@@ -2640,6 +2707,11 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       kind: 'user-message',
       phase: 'completed',
       payload: sanitizeEventPayload({ text: input.text }, config.maxEventBytes),
+    });
+    appendTurnNavigation({
+      threadId: id,
+      turnId: result.turnId,
+      label: normalizeTurnNavigationLabel(input.text, config.maxEventBytes),
     });
     publish(userEvent);
     repository.audit('turn.steer', 'succeeded', { threadId: id, turnId: result.turnId });

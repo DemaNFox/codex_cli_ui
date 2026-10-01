@@ -36,6 +36,7 @@ import type {
   Session,
   Subagent,
   Thread,
+  TurnNavigationEntry,
 } from './api.js';
 import { useThreadEvents } from './useThreadEvents.js';
 import { VoiceInputButton } from './VoiceInputButton.js';
@@ -398,6 +399,19 @@ function eventText(event: SafeEvent): string {
     return '';
   }
   return `${event.kind}: ${event.phase}`;
+}
+
+const MAX_TURN_NAVIGATION_LABEL_LENGTH = 2_000;
+
+function turnNavigationLabel(text: string): string {
+  const bounded =
+    text.length <= MAX_TURN_NAVIGATION_LABEL_LENGTH
+      ? text
+      : `${text.slice(0, MAX_TURN_NAVIGATION_LABEL_LENGTH - 13)}…[truncated]`;
+  return (
+    bounded.replace(/\s+/gu, ' ').trim().slice(0, MAX_TURN_NAVIGATION_LABEL_LENGTH) ||
+    'Задача без текста'
+  );
 }
 
 function agentMessagePhase(event: SafeEvent): 'commentary' | 'final_answer' | null {
@@ -1394,7 +1408,13 @@ function ActivityEvent({ event }: { event: SafeEvent }) {
   );
 }
 
-function ActivityGroup({ events }: { events: SafeEvent[] }) {
+function ActivityGroup({
+  events,
+  anchorId,
+}: {
+  events: SafeEvent[];
+  anchorId: string | undefined;
+}) {
   const [expanded, setExpanded] = useState(false);
   const firstEvent = events[0];
   if (!firstEvent) return null;
@@ -1402,7 +1422,12 @@ function ActivityGroup({ events }: { events: SafeEvent[] }) {
   const duration = formatDuration(firstEvent.createdAt, events.at(-1)?.createdAt ?? null);
 
   return (
-    <section className="activity-group" aria-label={`Ход работы: ${events.length} действий`}>
+    <section
+      className="activity-group"
+      aria-label={`Ход работы: ${events.length} действий`}
+      id={anchorId}
+      tabIndex={anchorId ? -1 : undefined}
+    >
       <button
         className="activity-group-toggle"
         type="button"
@@ -1429,9 +1454,11 @@ function ActivityGroup({ events }: { events: SafeEvent[] }) {
 
 function Transcript({
   events,
+  serverTurnNavigation,
   onNavigateTurn,
 }: {
   events: SafeEvent[];
+  serverTurnNavigation: TurnNavigationEntry[] | null;
   onNavigateTurn: (anchorId: string) => void;
 }) {
   const displayEvents = useMemo(() => {
@@ -1520,12 +1547,60 @@ function Transcript({
     [displayEvents, finalAgentMessageIds, summarizedTurnIds],
   );
   const turnNavigation = useMemo(() => {
-    return visibleEvents.flatMap((event) => {
-      if (event.kind !== 'user-message' || !event.turnId) return [];
-      const label = eventText(event).replace(/\s+/g, ' ').trim() || 'Задача без текста';
-      return [{ anchorId: `turn-message-${event.id}`, label }];
+    const retainedUserMessages: SafeEvent[] = [];
+    const firstVisibleByTurn = new Map<string, SafeEvent>();
+    for (const event of visibleEvents) {
+      if (event.turnId && !firstVisibleByTurn.has(event.turnId)) {
+        firstVisibleByTurn.set(event.turnId, event);
+      }
+      if (event.kind === 'user-message') retainedUserMessages.push(event);
+    }
+    const messageLabel = (event: SafeEvent) => turnNavigationLabel(eventText(event));
+    if (!serverTurnNavigation) {
+      return retainedUserMessages.map((event) => ({
+        key: `event-turn-${event.id}`,
+        anchorId: `turn-message-${event.id}`,
+        label: messageLabel(event),
+      }));
+    }
+    const claimedMessageIds = new Set<number>();
+    const navigation = serverTurnNavigation.map((entry) => {
+      const exactMessage = retainedUserMessages.find(
+        (event) =>
+          !claimedMessageIds.has(event.id) &&
+          event.turnId === entry.turnId &&
+          messageLabel(event) === entry.label,
+      );
+      if (exactMessage) {
+        claimedMessageIds.add(exactMessage.id);
+        return {
+          key: `server-turn-${entry.id}`,
+          anchorId: `turn-message-${exactMessage.id}`,
+          label: entry.label,
+        };
+      }
+      const firstVisible = firstVisibleByTurn.get(entry.turnId);
+      const anchorId = firstVisible
+        ? firstVisible.kind === 'user-message'
+          ? `turn-message-${firstVisible.id}`
+          : `turn-retained-${firstVisible.id}`
+        : 'transcript-start';
+      return { key: `server-turn-${entry.id}`, anchorId, label: entry.label };
     });
-  }, [visibleEvents]);
+    for (const event of retainedUserMessages) {
+      if (claimedMessageIds.has(event.id)) continue;
+      navigation.push({
+        key: `event-turn-${event.id}`,
+        anchorId: `turn-message-${event.id}`,
+        label: messageLabel(event),
+      });
+    }
+    return navigation;
+  }, [serverTurnNavigation, visibleEvents]);
+  const retainedTurnAnchorIds = useMemo(
+    () => new Set(turnNavigation.map((turn) => turn.anchorId)),
+    [turnNavigation],
+  );
   const blocks = useMemo(() => {
     const output: Array<
       { type: 'message'; event: SafeEvent } | { type: 'activities'; events: SafeEvent[] }
@@ -1545,7 +1620,7 @@ function Transcript({
     return output;
   }, [visibleEvents]);
 
-  if (!visibleEvents.length) {
+  if (!visibleEvents.length && !turnNavigation.length) {
     return (
       <div className="welcome-state">
         <div className="welcome-orb">C</div>
@@ -1563,7 +1638,7 @@ function Transcript({
             <button
               className="turn-jump"
               type="button"
-              key={turn.anchorId}
+              key={turn.key}
               aria-label={`Перейти к задаче ${index + 1}: ${turn.label}`}
               title={turn.label}
               data-preview={turn.label}
@@ -1574,7 +1649,7 @@ function Transcript({
           ))}
         </nav>
       )}
-      <div className="transcript" aria-live="polite">
+      <div id="transcript-start" className="transcript" aria-live="polite" tabIndex={-1}>
         {blocks.map((block) => {
           if (block.type === 'message') {
             const attachments = attachmentsFrom(block.event);
@@ -1583,7 +1658,9 @@ function Transcript({
             const turnAnchorId =
               block.event.kind === 'user-message' && block.event.turnId
                 ? `turn-message-${block.event.id}`
-                : undefined;
+                : retainedTurnAnchorIds.has(`turn-retained-${block.event.id}`)
+                  ? `turn-retained-${block.event.id}`
+                  : undefined;
             return (
               <article
                 className={`message ${block.event.kind === 'user-message' ? 'user' : 'agent'}${finalAnswer ? ' final-answer' : ''}`}
@@ -1615,10 +1692,15 @@ function Transcript({
               </article>
             );
           }
+          const firstEvent = block.events[0]!;
+          const anchorId = retainedTurnAnchorIds.has(`turn-retained-${firstEvent.id}`)
+            ? `turn-retained-${firstEvent.id}`
+            : undefined;
           return (
             <ActivityGroup
               events={block.events}
-              key={`activities-${block.events[0]?.id ?? 'empty'}`}
+              anchorId={anchorId}
+              key={`activities-${firstEvent.id}`}
             />
           );
         })}
@@ -2289,6 +2371,9 @@ function Workspace({
   const [resourceBusy, setResourceBusy] = useState(false);
   const [resourceError, setResourceError] = useState<string | null>(null);
   const [subagents, setSubagents] = useState<Subagent[]>([]);
+  const [serverTurnNavigation, setServerTurnNavigation] = useState<TurnNavigationEntry[] | null>(
+    null,
+  );
   const [projectId, setProjectId] = useState<string | null>(null);
   const [threadId, setThreadId] = useState<string | null>(null);
   const [archiveView, setArchiveView] = useState(false);
@@ -3078,6 +3163,7 @@ function Workspace({
     setAttachmentNotice(null);
     setThreadAttachmentBytes(0);
     setSubagents([]);
+    setServerTurnNavigation(null);
     runtimeSnapshotCursorRef.current = 0;
     if (!threadId) return;
     const requestedThreadId = threadId;
@@ -3093,6 +3179,7 @@ function Workspace({
           current.map((item) => (item.id === requestedThreadId ? history.data : item)),
         );
         mergeEvents(history.events, requestedThreadId);
+        setServerTurnNavigation(history.turnNavigation ?? null);
         const historySubagents = history.subagents;
         if (historySubagents) setSubagents((current) => mergeSubagents(current, historySubagents));
         setThreadAttachmentBytes(
@@ -3353,6 +3440,7 @@ function Workspace({
           current.map((item) => (item.id === threadId ? reconciledThread : item)),
         );
         mergeEvents(refreshed.events, threadId);
+        setServerTurnNavigation(refreshed.turnNavigation ?? null);
         setSubagents(reconciledSubagents);
         targetActiveTurnId = reconciledThread.activeTurnId;
         targetActiveRootTurn =
@@ -3738,7 +3826,11 @@ function Workspace({
           onKeyDown={markConversationKeyboardScrollIntent}
         >
           <div className="conversation-content" ref={conversationContentRef}>
-            <Transcript events={events} onNavigateTurn={navigateToTurn} />
+            <Transcript
+              events={events}
+              serverTurnNavigation={serverTurnNavigation}
+              onNavigateTurn={navigateToTurn}
+            />
             {approvals.map((approval) => (
               <ApprovalCard
                 key={approval.id}
