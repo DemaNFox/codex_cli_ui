@@ -29,6 +29,8 @@ def main() -> int:
     console_errors: list[str] = []
     resolved_user_input: dict[str, object] | None = None
     resolved_permission: dict[str, object] | None = None
+    active_turn_attachment_uploaded = False
+    active_turn_steer: dict[str, object] | None = None
     push_subscribed = False
     push_endpoint = "https://push.example/smoke-device"
     account_login_pending = False
@@ -63,6 +65,7 @@ def main() -> int:
 
     def api(route: Route) -> None:
         nonlocal signed_in, archived, thread_name, resolved_user_input, resolved_permission
+        nonlocal active_turn_attachment_uploaded, active_turn_steer
         nonlocal push_subscribed
         nonlocal account_login_pending
         nonlocal codex_update_state
@@ -484,6 +487,99 @@ def main() -> int:
                     ],
                 },
             )
+        elif path == "/api/threads/t2" and request.method == "GET":
+            payload(
+                route,
+                200,
+                {
+                    "data": {
+                        "id": "t2",
+                        "projectId": "p1",
+                        "name": "Фоновая задача",
+                        "preview": "Проверка индикатора",
+                        "archived": False,
+                        "status": "active",
+                        "activeTurnId": "turn-background",
+                        "model": "gpt-6-astra",
+                        "reasoningEffort": "high",
+                        "permissionPreset": "workspace-write",
+                        "approvalPolicy": "on-request",
+                        "instructionSources": ["/srv/projects/demo/AGENTS.md"],
+                        "createdAt": "2026-09-27T12:01:00.000Z",
+                        "updatedAt": "2026-09-27T12:01:00.000Z",
+                    },
+                    "events": [
+                        {
+                            "id": 1,
+                            "threadId": "t2",
+                            "turnId": "turn-background",
+                            "kind": "user-message",
+                            "phase": "completed",
+                            "payload": {"text": "Продолжай фоновую проверку"},
+                            "createdAt": "2026-09-27T12:01:00.000Z",
+                        },
+                        {
+                            "id": 2,
+                            "threadId": "t2",
+                            "turnId": "turn-background",
+                            "kind": "turn",
+                            "phase": "started",
+                            "payload": {"status": "inProgress"},
+                            "createdAt": "2026-09-27T12:01:01.000Z",
+                        },
+                    ],
+                },
+            )
+        elif path == "/api/threads/t2/attachments" and request.method == "GET":
+            payload(route, 200, {"data": []})
+        elif path == "/api/threads/t2/attachments" and request.method == "POST":
+            if request.headers.get("x-csrf-token") != "csrf-smoke":
+                raise AssertionError("active-turn attachment upload did not carry CSRF protection")
+            if "active-turn-note.txt" not in (request.post_data or ""):
+                raise AssertionError("active-turn attachment upload did not contain the selected file")
+            active_turn_attachment_uploaded = True
+            payload(
+                route,
+                201,
+                {
+                    "data": {
+                        "id": "00000000-0000-4000-8000-000000000099",
+                        "threadId": "t2",
+                        "name": "active-turn-note.txt",
+                        "mediaType": "text/plain",
+                        "kind": "file",
+                        "sizeBytes": 23,
+                        "createdAt": "2026-09-27T12:02:00.000Z",
+                        "url": "/api/threads/t2/attachments/00000000-0000-4000-8000-000000000099",
+                    }
+                },
+            )
+        elif path == "/api/threads/t2/subagents" and request.method == "GET":
+            payload(route, 200, {"data": []})
+        elif path == "/api/threads/t2/push-subscriptions/status":
+            payload(route, 200, {"data": {"subscribed": False}})
+        elif path == "/api/threads/t2/steer" and request.method == "POST":
+            active_turn_steer = request.post_data_json
+            payload(route, 202, {"data": {"turnId": "turn-background"}})
+        elif path == "/api/threads/t2/events":
+            event = {
+                "id": 3,
+                "threadId": "t2",
+                "turnId": "turn-background",
+                "kind": "thread",
+                "phase": "state",
+                "payload": {"status": "active", "activeTurnId": "turn-background"},
+                "createdAt": "2026-09-27T12:01:02.000Z",
+            }
+            route.fulfill(
+                status=200,
+                content_type="text/event-stream",
+                body=(
+                    "retry: 60000\n"
+                    f"id: {event['id']}\nevent: {event['kind']}\n"
+                    f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                ),
+            )
         elif path == "/api/threads/t1" and request.method == "PATCH":
             thread_name = request.post_data_json["name"]
             payload(
@@ -834,6 +930,39 @@ def main() -> int:
         ).wait_for()
         if page.locator(".thread-running-dot").count() != 2:
             raise AssertionError("active chat indicator must appear in project and recent lists")
+        page.get_by_role(
+            "button", name="Открыть чат проекта Фоновая задача — в работе"
+        ).click()
+        page.get_by_role("heading", name="Фоновая задача").wait_for()
+        active_file_picker = page.get_by_label("Выбрать вложения")
+        if not active_file_picker.is_enabled():
+            raise AssertionError("file picker is disabled while the root turn is active")
+        active_file_picker.set_input_files(
+            {
+                "name": "active-turn-note.txt",
+                "mimeType": "text/plain",
+                "buffer": b"active turn attachment\n",
+            }
+        )
+        page.get_by_text("active-turn-note.txt", exact=True).wait_for()
+        active_composer = page.get_by_label("Уточнение для активной задачи")
+        active_composer.fill("Учти приложенный файл")
+        page.get_by_role("button", name="Направить задачу").click()
+        page.get_by_text("Уточнение принято активной задачей.", exact=True).wait_for()
+        if not active_turn_attachment_uploaded:
+            raise AssertionError("active-turn attachment was not uploaded before steer")
+        if active_turn_steer != {
+            "text": "Учти приложенный файл",
+            "expectedTurnId": "turn-background",
+            "attachmentIds": ["00000000-0000-4000-8000-000000000099"],
+        }:
+            raise AssertionError(
+                f"active-turn steer did not carry its turn and attachment ids: {active_turn_steer}"
+            )
+        if page.get_by_label("Вложения к отправке").count():
+            raise AssertionError("active-turn attachment queue was not cleared after accepted steer")
+        page.get_by_role("button", name="Открыть чат проекта Переносимый чат").click()
+        page.get_by_role("heading", name="Переносимый чат").wait_for()
         page.get_by_role("table").get_by_role("cell", name="Готово").wait_for()
         if page.get_by_role("button", name="Голосовой ввод").count() != 1:
             raise AssertionError("voice input control is not available in the composer")
@@ -1276,7 +1405,8 @@ def main() -> int:
         browser.close()
 
     print(
-        "browser-smoke: account switching, resources, subagents, status, archive/restore and responsive layout passed"
+        "browser-smoke: active-turn attachments, account switching, resources, subagents, "
+        "status, archive/restore and responsive layout passed"
     )
     return 0
 
