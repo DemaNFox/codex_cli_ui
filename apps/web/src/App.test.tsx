@@ -53,6 +53,7 @@ const models = [
 const capabilities = {
   codexVersion: '1.2.3',
   authenticated: true,
+  account: { type: 'chatgpt' as const, email: 'old@example.com', planType: 'plus' },
   appServerReady: true,
   transcription: {
     available: true,
@@ -2595,5 +2596,271 @@ describe('App', () => {
     expect(await screen.findByText('/srv/projects/ai-chat-bot/AGENTS.md')).not.toBeNull();
     expect(screen.getByText('multi-agent-orchestrator')).not.toBeNull();
     expect(screen.getByText('1.2.3')).not.toBeNull();
+  });
+
+  it('starts Codex account login and presents the device code without accepting credentials', async () => {
+    const pendingLogin = {
+      state: 'pending',
+      loginId: 'login-1',
+      userCode: 'ABCD-EFGH',
+      verificationUrl: 'https://auth.openai.com/device',
+      expiresAt: '2027-01-01T00:10:00.000Z',
+      message: null,
+    };
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/system/codex-account/login' && init?.method === 'POST')
+        return jsonResponse({ data: pendingLogin });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    expect(await screen.findByText('old@example.com')).not.toBeNull();
+    await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
+
+    expect(await screen.findByRole('dialog', { name: 'Смена аккаунта Codex' })).not.toBeNull();
+    expect(screen.getByLabelText('Одноразовый код').textContent).toContain('ABCD-EFGH');
+    expect(screen.getByRole('button', { name: 'Копировать код' })).not.toBeNull();
+    expect(screen.getByRole('link', { name: 'Открыть страницу входа' }).getAttribute('href')).toBe(
+      'https://auth.openai.com/device',
+    );
+    expect(screen.getByText(/Никому не сообщайте этот код/)).not.toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/system/codex-account/login',
+      expect.objectContaining({
+        method: 'POST',
+      }),
+    );
+    const startCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        requestUrl(input) === '/api/system/codex-account/login' && init?.method === 'POST',
+    );
+    expect((startCall?.[1]?.headers as Headers).get('X-CSRF-Token')).toBe('csrf-token');
+    const startBody = startCall?.[1]?.body;
+    expect(typeof startBody).toBe('string');
+    if (typeof startBody !== 'string') throw new Error('Expected a JSON request body');
+    expect(JSON.parse(startBody) as unknown).toEqual({ type: 'chatgptDeviceCode' });
+  });
+
+  it('polls a pending Codex account login through the safe status endpoint', async () => {
+    let statusReads = 0;
+    installAuthenticatedApi((url, init) => {
+      if (url !== '/api/system/codex-account/login') return undefined;
+      const pending = {
+        state: 'pending',
+        loginId: 'login-2',
+        userCode: 'PEND-ING',
+        verificationUrl: 'https://auth.openai.com/device',
+        expiresAt: '2027-01-01T00:10:00.000Z',
+        message: null,
+      };
+      if (init?.method === 'POST') return jsonResponse({ data: pending });
+      statusReads += 1;
+      return jsonResponse({ data: pending });
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
+    expect(await screen.findByText('Ожидаем подтверждение входа…')).not.toBeNull();
+    await waitFor(() => expect(statusReads).toBeGreaterThan(0), { timeout: 1_500 });
+  });
+
+  it('refreshes capabilities and reports completion after account login succeeds', async () => {
+    let statusReads = 0;
+    let capabilityReads = 0;
+    installAuthenticatedApi((url, init) => {
+      if (url === '/api/system/capabilities') {
+        capabilityReads += 1;
+        return jsonResponse(
+          capabilityReads > 1
+            ? {
+                ...capabilities,
+                account: { type: 'chatgpt', email: 'new@example.com', planType: 'pro' },
+              }
+            : capabilities,
+        );
+      }
+      if (url !== '/api/system/codex-account/login') return undefined;
+      if (init?.method === 'POST')
+        return jsonResponse({
+          data: {
+            state: 'pending',
+            loginId: 'login-3',
+            userCode: 'SUCC-EEDS',
+            verificationUrl: 'https://auth.openai.com/device',
+            expiresAt: '2027-01-01T00:10:00.000Z',
+            message: null,
+          },
+        });
+      statusReads += 1;
+      return jsonResponse({
+        data: {
+          state: 'succeeded',
+          loginId: null,
+          userCode: null,
+          verificationUrl: null,
+          expiresAt: null,
+          message: null,
+        },
+      });
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
+
+    expect(await screen.findByText(/Аккаунт Codex успешно сменён/)).not.toBeNull();
+    expect(statusReads).toBeGreaterThan(0);
+    expect(await screen.findByText('new@example.com')).not.toBeNull();
+  });
+
+  it('cancels a pending Codex account login and keeps the current account', async () => {
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url !== '/api/system/codex-account/login') return undefined;
+      if (init?.method === 'POST')
+        return jsonResponse({
+          data: {
+            state: 'pending',
+            loginId: 'login-4',
+            userCode: 'CANC-ELME',
+            verificationUrl: 'https://auth.openai.com/device',
+            expiresAt: '2027-01-01T00:10:00.000Z',
+            message: null,
+          },
+        });
+      if (init?.method === 'DELETE')
+        return jsonResponse({
+          data: {
+            state: 'idle',
+            loginId: null,
+            userCode: null,
+            verificationUrl: null,
+            expiresAt: null,
+            message: null,
+          },
+        });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
+    expect(await screen.findByRole('button', { name: 'Отменить вход' })).not.toBeNull();
+    await user.keyboard('{Escape}');
+
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog', { name: 'Смена аккаунта Codex' })).toBeNull(),
+    );
+    expect(await screen.findByText(/Текущий аккаунт сохранён/)).not.toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/system/codex-account/login',
+      expect.objectContaining({ method: 'DELETE' }),
+    );
+  });
+
+  it('treats a successful login returned by cancel as completion instead of cancellation', async () => {
+    let capabilityReads = 0;
+    installAuthenticatedApi((url, init) => {
+      if (url === '/api/system/capabilities') {
+        capabilityReads += 1;
+        return jsonResponse(
+          capabilityReads > 1
+            ? {
+                ...capabilities,
+                account: { type: 'chatgpt', email: 'race-winner@example.com', planType: 'pro' },
+              }
+            : capabilities,
+        );
+      }
+      if (url !== '/api/system/codex-account/login') return undefined;
+      if (init?.method === 'POST')
+        return jsonResponse({
+          data: {
+            state: 'pending',
+            loginId: 'login-race',
+            userCode: 'RACE-WINS',
+            verificationUrl: 'https://auth.openai.com/device',
+            expiresAt: '2027-01-01T00:10:00.000Z',
+            message: null,
+          },
+        });
+      if (init?.method === 'DELETE')
+        return jsonResponse({
+          data: {
+            state: 'succeeded',
+            loginId: null,
+            userCode: null,
+            verificationUrl: null,
+            expiresAt: null,
+            message: null,
+          },
+        });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
+    await user.click(await screen.findByRole('button', { name: 'Отменить вход' }));
+
+    expect(await screen.findByText(/Аккаунт Codex успешно сменён/)).not.toBeNull();
+    expect(await screen.findByText('race-winner@example.com')).not.toBeNull();
+    expect(screen.queryByText(/Текущий аккаунт сохранён/)).toBeNull();
+  });
+
+  it('shows a Russian busy message when another account login is active', async () => {
+    installAuthenticatedApi((url, init) => {
+      if (url === '/api/system/codex-account/login' && init?.method === 'POST')
+        return jsonResponse(
+          { error: { code: 'CODEX_ACCOUNT_LOGIN_BUSY', message: 'Login already in progress' } },
+          409,
+        );
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
+
+    expect((await screen.findByRole('alert')).textContent).toContain(
+      'Сейчас Codex занят задачей или субагентом. Дождитесь их завершения и повторите попытку.',
+    );
+  });
+
+  it('recovers an already-pending login separately from a busy runner', async () => {
+    installAuthenticatedApi((url, init) => {
+      if (url !== '/api/system/codex-account/login') return undefined;
+      if (init?.method === 'POST')
+        return jsonResponse(
+          { error: { code: 'CODEX_ACCOUNT_LOGIN_PENDING', message: 'Login already pending' } },
+          409,
+        );
+      return jsonResponse({
+        data: {
+          state: 'pending',
+          loginId: 'login-existing',
+          userCode: 'EXIS-TING',
+          verificationUrl: 'https://auth.openai.com/device',
+          expiresAt: '2027-01-01T00:10:00.000Z',
+          message: null,
+        },
+      });
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
+
+    expect(await screen.findByLabelText('Одноразовый код')).not.toBeNull();
+    expect(screen.getByText(/Смена аккаунта уже запущена/)).not.toBeNull();
+    expect(screen.queryByText(/Codex занят задачей/)).toBeNull();
   });
 });

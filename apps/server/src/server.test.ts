@@ -47,10 +47,29 @@ class FakeAppServer implements AppServerClient {
   private signalTurnStart: (() => void) | null = null;
   private threadReadGate: Promise<void> | null = null;
   private signalThreadRead: (() => void) | null = null;
+  private accountLoginStartGate: Promise<void> | null = null;
+  private signalAccountLoginStart: (() => void) | null = null;
+  private threadStartGate: Promise<void> | null = null;
+  private signalThreadStart: (() => void) | null = null;
   failNextRequestWith: Error | null = null;
   failTurnStartWith: Error | null = null;
   failNextResponseWith: Error | null = null;
   failAccountStatusReads = false;
+  failAccountLoginCancels = false;
+  accountLoginCancelStatus: 'canceled' | 'notFound' = 'canceled';
+  beforeThreadReadReturn: (() => Promise<void>) | null = null;
+  account: Record<string, unknown> | null = {
+    type: 'chatgpt',
+    email: 'owner@example.test',
+    planType: 'plus',
+    accessToken: 'must-not-leak',
+  };
+  accountLoginResponse: Record<string, unknown> = {
+    type: 'chatgptDeviceCode',
+    loginId: 'login-1',
+    userCode: 'ABCD-EFGH',
+    verificationUrl: 'https://auth.openai.com/codex/device',
+  };
 
   blockTurnStarts(): { entered: Promise<void>; release: () => void } {
     let releaseGate!: () => void;
@@ -75,6 +94,32 @@ class FakeAppServer implements AppServerClient {
       signalEntered = resolve;
     });
     this.signalThreadRead = signalEntered;
+    return { entered, release: releaseGate };
+  }
+
+  blockAccountLoginStarts(): { entered: Promise<void>; release: () => void } {
+    let releaseGate!: () => void;
+    let signalEntered!: () => void;
+    this.accountLoginStartGate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve;
+    });
+    this.signalAccountLoginStart = signalEntered;
+    return { entered, release: releaseGate };
+  }
+
+  blockThreadStarts(): { entered: Promise<void>; release: () => void } {
+    let releaseGate!: () => void;
+    let signalEntered!: () => void;
+    this.threadStartGate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve;
+    });
+    this.signalThreadStart = signalEntered;
     return { entered, release: releaseGate };
   }
 
@@ -173,6 +218,10 @@ class FakeAppServer implements AppServerClient {
     }
     const values = params as Record<string, unknown>;
     if (method === 'thread/start') {
+      this.signalThreadStart?.();
+      this.signalThreadStart = null;
+      if (this.threadStartGate) await this.threadStartGate;
+      this.threadStartGate = null;
       const id = `thread-${++this.threadCounter}`;
       const now = Math.floor(Date.now() / 1_000);
       const thread = {
@@ -208,6 +257,11 @@ class FakeAppServer implements AppServerClient {
       if (this.threadReadGate) await this.threadReadGate;
       this.threadReadGate = null;
       const thread = this.threads.get(String(values.threadId));
+      if (this.beforeThreadReadReturn) {
+        const beforeReturn = this.beforeThreadReadReturn;
+        this.beforeThreadReadReturn = null;
+        await beforeReturn();
+      }
       return {
         thread: thread && values.includeTurns === false ? { ...thread, turns: undefined } : thread,
         model: thread?.model ?? 'gpt-test',
@@ -260,7 +314,18 @@ class FakeAppServer implements AppServerClient {
           errors: [],
         })),
       };
-    if (method === 'account/read') return { account: {}, requiresOpenaiAuth: true };
+    if (method === 'account/login/start') {
+      this.signalAccountLoginStart?.();
+      this.signalAccountLoginStart = null;
+      if (this.accountLoginStartGate) await this.accountLoginStartGate;
+      this.accountLoginStartGate = null;
+      return this.accountLoginResponse;
+    }
+    if (method === 'account/login/cancel') {
+      if (this.failAccountLoginCancels) throw new Error('APP_SERVER_REQUEST_FAILED');
+      return { status: this.accountLoginCancelStatus };
+    }
+    if (method === 'account/read') return { account: this.account, requiresOpenaiAuth: true };
     if (method === 'account/rateLimits/read') {
       if (this.failAccountStatusReads) throw new Error('unsupported status method');
       return {
@@ -412,6 +477,7 @@ async function fixture(
   resourceBroker?: ResourceBroker,
   transcriptionClient?: AudioTranscriptionClient,
   pushSender?: PushSender,
+  accountLoginTimeoutMs?: number,
 ) {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-server-'));
   const root = path.join(temp, 'projects');
@@ -462,6 +528,7 @@ async function fixture(
     ...(resourceBroker ? { resourceBroker } : {}),
     ...(transcriptionClient ? { transcriptionClient } : {}),
     ...(pushSender ? { pushSender } : {}),
+    ...(accountLoginTimeoutMs === undefined ? {} : { accountLoginTimeoutMs }),
   });
   openApps.push(app);
   await app.ready();
@@ -542,7 +609,7 @@ function multipartFile(
 }
 
 describe('security and repository boundary', () => {
-  it('allowlists only the exact read-only account status methods', async () => {
+  it('allowlists only the exact account status and device-code login methods', async () => {
     const supervisor = new CodexAppServerSupervisor({
       executable: 'codex',
       expectedVersion: 'codex-cli 0.153.4',
@@ -553,6 +620,12 @@ describe('security and repository boundary', () => {
     await expect(supervisor.request('account/usage/read', null)).rejects.toThrow(
       'APP_SERVER_UNAVAILABLE',
     );
+    await expect(
+      supervisor.request('account/login/start', { type: 'chatgptDeviceCode' }),
+    ).rejects.toThrow('APP_SERVER_UNAVAILABLE');
+    await expect(
+      supervisor.request('account/login/cancel', { loginId: 'login-1' }),
+    ).rejects.toThrow('APP_SERVER_UNAVAILABLE');
     await expect(supervisor.request('account/credentials/read', {})).rejects.toThrow(
       'APP_SERVER_METHOD_NOT_ALLOWED',
     );
@@ -1515,7 +1588,6 @@ describe('Codex routes', () => {
       payload: { status: 'idle' },
     });
 
-    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_FAILED');
     const archived = await app.inject({
       method: 'POST',
       url: `/api/threads/${threadId}/archive`,
@@ -1589,6 +1661,7 @@ describe('Codex routes', () => {
     expect(capabilities.statusCode).toBe(200);
     expect(capabilities.json()).toMatchObject({
       authenticated: true,
+      account: { type: 'chatgpt', email: 'owner@example.test', planType: 'plus' },
       codexVersion: 'codex-cli 0.153.4',
       rateLimits: [
         {
@@ -1607,6 +1680,7 @@ describe('Codex routes', () => {
     expect(capabilities.body).not.toContain('private-account-id');
     expect(capabilities.body).not.toContain('private@example.test');
     expect(capabilities.body).not.toContain('balance');
+    expect(capabilities.body).not.toContain('must-not-leak');
     appServer.failAccountStatusReads = true;
     const degraded = await app.inject({
       method: 'GET',
@@ -1631,6 +1705,602 @@ describe('Codex routes', () => {
       sourceKinds: ['cli', 'vscode', 'appServer', 'exec'],
     });
     expect(appServer.requests.filter((item) => item.method === 'thread/list')).toHaveLength(2);
+  });
+
+  it('runs a bounded device-code login and accepts only its matching completion', async () => {
+    const { app, appServer } = await fixture();
+    const session = await login(app);
+    const started = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(started.statusCode).toBe(202);
+    const startedBody = started.json<{
+      data: {
+        state: string;
+        loginId: string | null;
+        userCode: string | null;
+        verificationUrl: string | null;
+        expiresAt: string | null;
+        message: string | null;
+      };
+    }>();
+    expect(startedBody).toMatchObject({
+      data: {
+        state: 'pending',
+        loginId: 'login-1',
+        userCode: 'ABCD-EFGH',
+        verificationUrl: 'https://auth.openai.com/codex/device',
+        message: null,
+      },
+    });
+    expect(startedBody.data.expiresAt).not.toBeNull();
+    expect(Number.isNaN(Date.parse(startedBody.data.expiresAt!))).toBe(false);
+    appServer.emit({
+      method: 'account/login/completed',
+      params: { loginId: 'different-login', success: true },
+    });
+    const stillPending = await app.inject({
+      method: 'GET',
+      url: '/api/system/codex-account/login',
+      headers: { cookie: session.cookie },
+    });
+    expect(stillPending.json()).toMatchObject({ data: { state: 'pending', loginId: 'login-1' } });
+
+    appServer.emit({
+      method: 'account/login/completed',
+      params: { loginId: 'login-1', success: false, error: 'secret upstream detail' },
+    });
+    const failed = await app.inject({
+      method: 'GET',
+      url: '/api/system/codex-account/login',
+      headers: { cookie: session.cookie },
+    });
+    expect(failed.json()).toEqual({
+      data: {
+        state: 'failed',
+        loginId: 'login-1',
+        userCode: null,
+        verificationUrl: null,
+        expiresAt: null,
+        message: 'Account login failed.',
+      },
+    });
+    expect(failed.body).not.toContain('secret upstream detail');
+    const capabilities = await app.inject({
+      method: 'GET',
+      url: '/api/system/capabilities',
+      headers: { cookie: session.cookie },
+    });
+    expect(capabilities.json()).toMatchObject({
+      account: { type: 'chatgpt', email: 'owner@example.test', planType: 'plus' },
+    });
+  });
+
+  it('rejects unsafe device-code responses without exposing their URL', async () => {
+    const { app, appServer } = await fixture();
+    const session = await login(app);
+    const unsupported = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgpt', accessToken: 'must-not-leak' },
+    });
+    expect(unsupported.statusCode).toBe(400);
+    expect(
+      appServer.requests.filter((request) => request.method === 'account/login/start'),
+    ).toHaveLength(0);
+    expect(unsupported.body).not.toContain('must-not-leak');
+    appServer.accountLoginResponse = {
+      type: 'chatgptDeviceCode',
+      loginId: 'login-unsafe',
+      userCode: 'SAFE-CODE',
+      verificationUrl: 'https://evil.example/device?token=must-not-leak',
+    };
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({
+      error: { code: 'CODEX_ACCOUNT_LOGIN_INVALID_RESPONSE' },
+    });
+    expect(response.body).not.toContain('evil.example');
+    expect(response.body).not.toContain('must-not-leak');
+    expect(
+      appServer.requests.filter((request) => request.method === 'account/login/cancel'),
+    ).toContainEqual({ method: 'account/login/cancel', params: { loginId: 'login-unsafe' } });
+  });
+
+  it('keeps unsafe device-code responses fail-closed until cancellation is confirmed', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.accountLoginCancelStatus = 'notFound';
+    appServer.accountLoginResponse = {
+      type: 'chatgptDeviceCode',
+      loginId: 'login-unsafe',
+      userCode: 'SAFE-CODE',
+      verificationUrl: 'https://evil.example/device',
+    };
+    const response = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(response.statusCode).toBe(502);
+    const status = await app.inject({
+      method: 'GET',
+      url: '/api/system/codex-account/login',
+      headers: { cookie: session.cookie },
+    });
+    expect(status.json()).toMatchObject({
+      data: { state: 'pending', loginId: 'login-unsafe', userCode: null, verificationUrl: null },
+    });
+    const idempotencyKey = '00000000-0000-4000-8000-000000000108';
+    const turn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'blocked after unsafe response', idempotencyKey },
+    });
+    expect(turn.statusCode).toBe(409);
+    expect(repository.getIdempotent(`turn:${threadId}`, idempotencyKey)).toBeUndefined();
+  });
+
+  it('interlocks login with turn admission before an idempotency reservation is created', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const gate = appServer.blockAccountLoginStarts();
+    const startingLogin = app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    await gate.entered;
+    const idempotencyKey = '00000000-0000-4000-8000-000000000099';
+    const rejectedTurn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'must wait', idempotencyKey },
+    });
+    expect(rejectedTurn.statusCode).toBe(409);
+    expect(rejectedTurn.json()).toMatchObject({
+      error: { code: 'CODEX_ACCOUNT_LOGIN_PENDING' },
+    });
+    expect(repository.getIdempotent(`turn:${threadId}`, idempotencyKey)).toBeUndefined();
+    gate.release();
+    expect((await startingLogin).statusCode).toBe(202);
+    const canceled = await app.inject({
+      method: 'DELETE',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+    });
+    expect(canceled.statusCode).toBe(200);
+    expect(canceled.json()).toMatchObject({ data: { state: 'idle' } });
+    const acceptedTurn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'continue', idempotencyKey },
+    });
+    expect(acceptedTurn.statusCode).toBe(202);
+  });
+
+  it('interlocks account login with in-flight and newly requested chat creation', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadGate = appServer.blockThreadStarts();
+    const startingThread = app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    await threadGate.entered;
+    const busyLogin = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(busyLogin.statusCode).toBe(409);
+    expect(busyLogin.json()).toMatchObject({ error: { code: 'CODEX_ACCOUNT_LOGIN_BUSY' } });
+    threadGate.release();
+    expect((await startingThread).statusCode).toBe(201);
+
+    const loginGate = appServer.blockAccountLoginStarts();
+    const startingLogin = app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    await loginGate.entered;
+    const threadStartsBefore = appServer.requests.filter(
+      (request) => request.method === 'thread/start',
+    ).length;
+    const blockedThread = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(blockedThread.statusCode).toBe(409);
+    expect(blockedThread.json()).toMatchObject({
+      error: { code: 'CODEX_ACCOUNT_LOGIN_PENDING' },
+    });
+    expect(appServer.requests.filter((request) => request.method === 'thread/start')).toHaveLength(
+      threadStartsBefore,
+    );
+    loginGate.release();
+    expect((await startingLogin).statusCode).toBe(202);
+  });
+
+  it('lets login win an admission race while stale turn capacity is being reconciled', async () => {
+    const { app, appServer, repository, projectPath } = await fixture(1);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const staleThreadId = await createThread(app, project.id, session.headers);
+    const startingThreadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'thread/status/changed',
+      params: { threadId: staleThreadId, status: { type: 'active' } },
+    });
+    appServer.setThreadStatus(staleThreadId, 'idle');
+    let loginStatus: number | null = null;
+    appServer.beforeThreadReadReturn = async () => {
+      appServer.emit({
+        method: 'thread/status/changed',
+        params: { threadId: staleThreadId, status: { type: 'idle' } },
+      });
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/system/codex-account/login',
+        headers: session.headers,
+        payload: { type: 'chatgptDeviceCode' },
+      });
+      loginStatus = response.statusCode;
+    };
+    const idempotencyKey = '00000000-0000-4000-8000-000000000101';
+    const turn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${startingThreadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'race', idempotencyKey },
+    });
+    expect(loginStatus).toBe(202);
+    expect(turn.statusCode).toBe(409);
+    expect(turn.json()).toMatchObject({ error: { code: 'CODEX_ACCOUNT_LOGIN_PENDING' } });
+    expect(repository.getIdempotent(`turn:${startingThreadId}`, idempotencyKey)).toBeUndefined();
+  });
+
+  it('keeps the login interlock fail-closed when upstream cancellation fails', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.failAccountLoginCancels = true;
+    const started = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(started.statusCode).toBe(202);
+    const cancel = await app.inject({
+      method: 'DELETE',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+    });
+    expect(cancel.statusCode).toBe(500);
+    const idempotencyKey = '00000000-0000-4000-8000-000000000102';
+    const turn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'still blocked', idempotencyKey },
+    });
+    expect(turn.json()).toMatchObject({ error: { code: 'CODEX_ACCOUNT_LOGIN_PENDING' } });
+    expect(repository.getIdempotent(`turn:${threadId}`, idempotencyKey)).toBeUndefined();
+  });
+
+  it('keeps the login interlock fail-closed when Codex cannot find the login to cancel', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.accountLoginCancelStatus = 'notFound';
+    const started = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(started.statusCode).toBe(202);
+    const cancel = await app.inject({
+      method: 'DELETE',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+    });
+    expect(cancel.statusCode).toBe(409);
+    expect(cancel.json()).toMatchObject({
+      error: { code: 'CODEX_ACCOUNT_LOGIN_CANCEL_UNCONFIRMED' },
+    });
+    const idempotencyKey = '00000000-0000-4000-8000-000000000106';
+    const turn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'still blocked after not found', idempotencyKey },
+    });
+    expect(turn.statusCode).toBe(409);
+    expect(turn.json()).toMatchObject({ error: { code: 'CODEX_ACCOUNT_LOGIN_PENDING' } });
+    expect(repository.getIdempotent(`turn:${threadId}`, idempotencyKey)).toBeUndefined();
+  });
+
+  it('keeps admission fail-closed after an ambiguous account login start failure', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_TIMEOUT');
+    const start = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(start.statusCode).toBe(500);
+    const status = await app.inject({
+      method: 'GET',
+      url: '/api/system/codex-account/login',
+      headers: { cookie: session.cookie },
+    });
+    expect(status.json()).toMatchObject({ data: { state: 'pending', loginId: null } });
+    const idempotencyKey = '00000000-0000-4000-8000-000000000107';
+    const turn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'blocked after ambiguous start', idempotencyKey },
+    });
+    expect(turn.statusCode).toBe(409);
+    expect(turn.json()).toMatchObject({ error: { code: 'CODEX_ACCOUNT_LOGIN_PENDING' } });
+    expect(repository.getIdempotent(`turn:${threadId}`, idempotencyKey)).toBeUndefined();
+
+    appServer.emit({
+      method: 'account/login/completed',
+      params: { loginId: 'unrelated-login', success: true },
+    });
+    const afterUnrelatedCompletion = await app.inject({
+      method: 'GET',
+      url: '/api/system/codex-account/login',
+      headers: { cookie: session.cookie },
+    });
+    expect(afterUnrelatedCompletion.json()).toMatchObject({
+      data: { state: 'pending', loginId: null },
+    });
+    const secondTurn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'still blocked after unrelated completion',
+        idempotencyKey: '00000000-0000-4000-8000-000000000109',
+      },
+    });
+    expect(secondTurn.statusCode).toBe(409);
+  });
+
+  it('releases timed-out login admission only after Codex confirms cancellation', async () => {
+    const { app, appServer, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      5,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const started = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(started.statusCode).toBe(202);
+    await expect
+      .poll(
+        () =>
+          appServer.requests.filter((request) => request.method === 'account/login/cancel').length,
+      )
+      .toBe(1);
+    expect(
+      appServer.requests.filter((request) => request.method === 'account/login/cancel'),
+    ).toContainEqual({ method: 'account/login/cancel', params: { loginId: 'login-1' } });
+    const status = await app.inject({
+      method: 'GET',
+      url: '/api/system/codex-account/login',
+      headers: { cookie: session.cookie },
+    });
+    expect(status.json()).toMatchObject({
+      data: { state: 'failed', message: 'Account login expired.' },
+    });
+    const turn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'continue after timeout',
+        idempotencyKey: '00000000-0000-4000-8000-000000000103',
+      },
+    });
+    expect(turn.statusCode).toBe(202);
+  });
+
+  it('keeps timed-out login admission blocked when Codex cancellation fails', async () => {
+    const { app, appServer, repository, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      5,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.failAccountLoginCancels = true;
+    const started = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(started.statusCode).toBe(202);
+    await expect
+      .poll(
+        () =>
+          appServer.requests.filter((request) => request.method === 'account/login/cancel').length,
+      )
+      .toBe(1);
+    const status = await app.inject({
+      method: 'GET',
+      url: '/api/system/codex-account/login',
+      headers: { cookie: session.cookie },
+    });
+    expect(status.json()).toMatchObject({ data: { state: 'pending', loginId: 'login-1' } });
+    const idempotencyKey = '00000000-0000-4000-8000-000000000104';
+    const turn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'still blocked after timeout', idempotencyKey },
+    });
+    expect(turn.statusCode).toBe(409);
+    expect(turn.json()).toMatchObject({ error: { code: 'CODEX_ACCOUNT_LOGIN_PENDING' } });
+    expect(repository.getIdempotent(`turn:${threadId}`, idempotencyKey)).toBeUndefined();
+  });
+
+  it('keeps admission fail-closed while the login start RPC has not returned an id', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const gate = appServer.blockAccountLoginStarts();
+    const starting = app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    await gate.entered;
+    const canceled = await app.inject({
+      method: 'DELETE',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+    });
+    expect(canceled.statusCode).toBe(409);
+    expect(canceled.json()).toMatchObject({
+      error: { code: 'CODEX_ACCOUNT_LOGIN_STARTING' },
+    });
+    const idempotencyKey = '00000000-0000-4000-8000-000000000105';
+    const turn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'blocked while login starts', idempotencyKey },
+    });
+    expect(turn.statusCode).toBe(409);
+    expect(repository.getIdempotent(`turn:${threadId}`, idempotencyKey)).toBeUndefined();
+    gate.release();
+    expect((await starting).statusCode).toBe(202);
+    const finalCancel = await app.inject({
+      method: 'DELETE',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+    });
+    expect(finalCancel.statusCode).toBe(200);
+    expect(finalCancel.json()).toMatchObject({ data: { state: 'idle' } });
+  });
+
+  it('rejects account login while a root turn, pending start, or subagent is active', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnGate = appServer.blockTurnStarts();
+    const pendingTurn = app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'running',
+        idempotencyKey: '00000000-0000-4000-8000-000000000100',
+      },
+    });
+    await turnGate.entered;
+    const pendingBusy = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(pendingBusy.json()).toMatchObject({ error: { code: 'CODEX_ACCOUNT_LOGIN_BUSY' } });
+    turnGate.release();
+    expect((await pendingTurn).statusCode).toBe(202);
+    const activeBusy = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(activeBusy.json()).toMatchObject({ error: { code: 'CODEX_ACCOUNT_LOGIN_BUSY' } });
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: 'turn-1', status: 'completed' } },
+    });
+    repository.upsertSubagent({
+      id: 'login-blocking-child',
+      rootThreadId: threadId,
+      parentThreadId: threadId,
+      agentPath: '/root/login-blocking-child',
+      nickname: null,
+      role: null,
+      model: 'gpt-test',
+      reasoningEffort: 'medium',
+      status: 'running',
+      message: null,
+      startedAt: new Date().toISOString(),
+      lastActivityAt: new Date().toISOString(),
+      completedAt: null,
+    });
+    const subagentBusy = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(subagentBusy.json()).toMatchObject({ error: { code: 'CODEX_ACCOUNT_LOGIN_BUSY' } });
+    expect(
+      appServer.requests.filter((request) => request.method === 'account/login/start'),
+    ).toHaveLength(0);
   });
 
   it('rejects a stored project path after a symlink swap before app-server access', async () => {

@@ -4,6 +4,7 @@ import {
   FormEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
+  type RefObject,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -23,6 +24,7 @@ import { AgentMessageContent } from './AgentMessageContent.js';
 import type {
   Attachment,
   Capability,
+  CodexAccountLogin,
   ModelOption,
   PendingApproval,
   Project,
@@ -51,6 +53,8 @@ type PushNotificationState =
 const MAX_ATTACHMENTS_PER_TURN = 8;
 const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_THREAD_ATTACHMENT_BYTES = 50 * 1024 * 1024;
+const ACCOUNT_LOGIN_POLL_INTERVAL_MS = 500;
+const ACCOUNT_LOGIN_MAX_POLLS = 1_800;
 const EVENT_TIME_FORMATTER = new Intl.DateTimeFormat('ru-RU', {
   dateStyle: 'short',
   timeStyle: 'medium',
@@ -1923,6 +1927,8 @@ function Diagnostics({
   onRefreshResources,
   onSaveResources,
   onApplyResources,
+  onStartAccountLogin,
+  accountSwitchButtonRef,
   onClose,
 }: {
   capability: Capability | null;
@@ -1933,6 +1939,8 @@ function Diagnostics({
   onRefreshResources: () => void;
   onSaveResources: (desired: ResourceLimitPolicy) => Promise<void>;
   onApplyResources: () => Promise<void>;
+  onStartAccountLogin: () => void;
+  accountSwitchButtonRef: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
 }) {
   return (
@@ -1962,7 +1970,19 @@ function Diagnostics({
             <dd>{capability.authenticated ? 'активна' : 'нет'}</dd>
             <dt>App Server</dt>
             <dd>{capability.appServerReady ? 'готов' : 'недоступен'}</dd>
+            <dt>Аккаунт</dt>
+            <dd>{capability.account?.email ?? 'не указан'}</dd>
+            <dt>План</dt>
+            <dd>{capability.account?.planType ?? 'нет данных'}</dd>
           </dl>
+          <button
+            ref={accountSwitchButtonRef}
+            className="secondary account-switch-button"
+            type="button"
+            onClick={onStartAccountLogin}
+          >
+            Сменить аккаунт
+          </button>
           <ResourceSettings
             snapshot={resourceLimits}
             busy={resourceBusy}
@@ -2046,6 +2066,145 @@ function Diagnostics({
   );
 }
 
+function AccountLoginDialog({
+  login,
+  busy,
+  error,
+  copyNotice,
+  onCopy,
+  onCancel,
+  onClose,
+}: {
+  login: CodexAccountLogin | null;
+  busy: boolean;
+  error: string | null;
+  copyNotice: string | null;
+  onCopy: () => void;
+  onCancel: () => void;
+  onClose: () => void;
+}) {
+  const pending = login?.state === 'pending';
+  const succeeded = login?.state === 'succeeded';
+  const dialogRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    if (busy) return;
+    dialogRef.current
+      ?.querySelector<HTMLElement>(
+        'button:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])',
+      )
+      ?.focus();
+  }, [busy, pending]);
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !busy) {
+        event.preventDefault();
+        if (pending) onCancel();
+        else onClose();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const controls = [
+        ...(dialogRef.current?.querySelectorAll<HTMLElement>(
+          'button:not(:disabled), a[href], [tabindex]:not([tabindex="-1"])',
+        ) ?? []),
+      ].filter((element) => element.offsetParent !== null);
+      const first = controls[0];
+      const last = controls.at(-1);
+      if (!first || !last) return;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [busy, onCancel, onClose, pending]);
+  return createPortal(
+    <div className="dialog-backdrop account-login-backdrop">
+      <section
+        ref={dialogRef}
+        className="account-login-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="account-login-title"
+      >
+        <h2 id="account-login-title">Смена аккаунта Codex</h2>
+        {busy && !login ? <p role="status">Запрашиваем код входа…</p> : null}
+        {pending ? (
+          <>
+            <p>Откройте страницу входа и введите одноразовый код.</p>
+            <div className="account-login-code" aria-label="Одноразовый код">
+              {login.userCode}
+            </div>
+            <div className="account-login-actions">
+              <button
+                className="secondary"
+                type="button"
+                onClick={onCopy}
+                disabled={!login.userCode}
+                autoFocus
+              >
+                Копировать код
+              </button>
+              {login.verificationUrl ? (
+                <a
+                  className="button-link primary"
+                  href={login.verificationUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                >
+                  Открыть страницу входа
+                </a>
+              ) : null}
+            </div>
+            <p className="notice warning">
+              Никому не сообщайте этот код — он даёт доступ к вашему аккаунту.
+            </p>
+            <p className="account-login-progress" role="status">
+              Ожидаем подтверждение входа…
+            </p>
+          </>
+        ) : null}
+        {succeeded ? (
+          <div className="notice success" role="status">
+            Аккаунт Codex успешно сменён. Новые задачи будут использовать его.
+          </div>
+        ) : null}
+        {login?.state === 'failed' && !error ? (
+          <div className="notice error" role="alert">
+            {login.message ?? 'Не удалось завершить вход. Попробуйте ещё раз.'}
+          </div>
+        ) : null}
+        {copyNotice ? (
+          <p className="account-login-copy-note" role="status">
+            {copyNotice}
+          </p>
+        ) : null}
+        {error ? (
+          <div className="notice error" role="alert">
+            {error}
+          </div>
+        ) : null}
+        <div className="button-row account-login-footer">
+          {pending ? (
+            <button className="danger" type="button" onClick={onCancel} disabled={busy}>
+              {busy ? 'Отменяем…' : 'Отменить вход'}
+            </button>
+          ) : (
+            <button className="secondary" type="button" onClick={onClose} disabled={busy} autoFocus>
+              Закрыть
+            </button>
+          )}
+        </div>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
 function Workspace({
   session,
   onSessionRefresh,
@@ -2068,6 +2227,11 @@ function Workspace({
   const [threadId, setThreadId] = useState<string | null>(null);
   const [archiveView, setArchiveView] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [accountLoginOpen, setAccountLoginOpen] = useState(false);
+  const [accountLogin, setAccountLogin] = useState<CodexAccountLogin | null>(null);
+  const [accountLoginBusy, setAccountLoginBusy] = useState(false);
+  const [accountLoginError, setAccountLoginError] = useState<string | null>(null);
+  const [accountLoginCopyNotice, setAccountLoginCopyNotice] = useState<string | null>(null);
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const [mobileRuntimeOpen, setMobileRuntimeOpen] = useState(false);
   const [statusRefreshing, setStatusRefreshing] = useState(false);
@@ -2098,6 +2262,7 @@ function Workspace({
   const positionedThreadRef = useRef<string | null>(null);
   const mobileNavigationToggleRef = useRef<HTMLButtonElement>(null);
   const statusToggleRef = useRef<HTMLButtonElement>(null);
+  const accountSwitchButtonRef = useRef<HTMLButtonElement>(null);
   const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
   const attachmentThreadRef = useRef<string | null>(null);
   const activeUploadsRef = useRef(new Map<string, { threadId: string; abort: () => void }>());
@@ -2422,7 +2587,7 @@ function Workspace({
   }
 
   useEffect(() => {
-    if (!showDiagnostics) return;
+    if (!showDiagnostics || accountLoginOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key !== 'Escape') return;
       event.preventDefault();
@@ -2431,12 +2596,161 @@ function Workspace({
     };
     document.addEventListener('keydown', onKeyDown);
     return () => document.removeEventListener('keydown', onKeyDown);
-  }, [showDiagnostics]);
+  }, [accountLoginOpen, showDiagnostics]);
 
   function closeDiagnostics() {
     setShowDiagnostics(false);
     window.setTimeout(() => statusToggleRef.current?.focus());
   }
+
+  function closeAccountLoginDialog() {
+    setAccountLoginOpen(false);
+    setAccountLogin(null);
+    setAccountLoginError(null);
+    setAccountLoginCopyNotice(null);
+    window.setTimeout(() => accountSwitchButtonRef.current?.focus());
+  }
+
+  async function refreshCapabilitiesAfterLogin() {
+    try {
+      setCapability(await api.capabilities());
+    } catch (cause) {
+      setAccountLoginError(
+        `Вход завершён, но статус аккаунта не обновился: ${errorMessage(cause)}`,
+      );
+    }
+  }
+
+  async function startAccountLogin() {
+    setAccountLoginOpen(true);
+    setAccountLogin(null);
+    setAccountLoginError(null);
+    setAccountLoginCopyNotice(null);
+    setAccountLoginBusy(true);
+    try {
+      const next = await api.startCodexAccountLogin(session.csrfToken);
+      setAccountLogin(next);
+      if (next.state === 'succeeded') await refreshCapabilitiesAfterLogin();
+    } catch (cause) {
+      if (
+        cause instanceof ApiError &&
+        cause.status === 409 &&
+        cause.code === 'CODEX_ACCOUNT_LOGIN_PENDING'
+      ) {
+        try {
+          setAccountLogin(await api.codexAccountLogin());
+          setAccountLoginError(
+            'Смена аккаунта уже запущена. Продолжаем ожидать подтверждение входа.',
+          );
+        } catch (statusCause) {
+          setAccountLoginError(
+            `Смена аккаунта уже запущена, но её статус недоступен: ${errorMessage(statusCause)}`,
+          );
+        }
+      } else {
+        const message =
+          cause instanceof ApiError &&
+          cause.status === 409 &&
+          cause.code === 'CODEX_ACCOUNT_LOGIN_BUSY'
+            ? 'Сейчас Codex занят задачей или субагентом. Дождитесь их завершения и повторите попытку.'
+            : `Не удалось начать смену аккаунта: ${errorMessage(cause)}`;
+        setAccountLoginError(message);
+      }
+    } finally {
+      setAccountLoginBusy(false);
+    }
+  }
+
+  async function cancelAccountLogin() {
+    if (accountLoginBusy) return;
+    setAccountLoginBusy(true);
+    setAccountLoginError(null);
+    try {
+      const next = await api.cancelCodexAccountLogin(session.csrfToken);
+      setAccountLogin(next);
+      if (next.state === 'succeeded') {
+        await refreshCapabilitiesAfterLogin();
+      } else if (next.state === 'failed') {
+        setAccountLoginError(next.message ?? 'Не удалось завершить вход. Попробуйте ещё раз.');
+      } else if (next.state === 'idle') {
+        setAccountLogin(null);
+        setAccountLoginOpen(false);
+        setActionNotice('Смена аккаунта отменена. Текущий аккаунт сохранён.');
+        window.setTimeout(() => accountSwitchButtonRef.current?.focus());
+      } else {
+        setAccountLoginError('Отмена ещё выполняется. Ожидаем подтверждение сервера.');
+      }
+    } catch (cause) {
+      setAccountLoginError(`Не удалось отменить вход: ${errorMessage(cause)}`);
+    } finally {
+      setAccountLoginBusy(false);
+    }
+  }
+
+  async function copyAccountLoginCode() {
+    if (!accountLogin?.userCode) return;
+    try {
+      await navigator.clipboard.writeText(accountLogin.userCode);
+      setAccountLoginCopyNotice('Код скопирован.');
+    } catch {
+      setAccountLoginCopyNotice('Не удалось скопировать код. Выделите и скопируйте его вручную.');
+    }
+  }
+
+  useEffect(() => {
+    if (!accountLoginOpen || accountLogin?.state !== 'pending') return;
+    let disposed = false;
+    let checking = false;
+    let attempts = 0;
+    let timer = 0;
+    const poll = async () => {
+      if (disposed || checking) return;
+      if (attempts >= ACCOUNT_LOGIN_MAX_POLLS) {
+        setAccountLoginError('Время ожидания входа истекло. Отмените вход и попробуйте снова.');
+        window.clearInterval(timer);
+        return;
+      }
+      if (accountLogin.expiresAt && Date.parse(accountLogin.expiresAt) <= Date.now()) {
+        setAccountLoginError('Одноразовый код истёк. Отмените вход и запросите новый код.');
+        window.clearInterval(timer);
+        return;
+      }
+      attempts += 1;
+      checking = true;
+      try {
+        const next = await api.codexAccountLogin();
+        if (disposed) return;
+        setAccountLogin(next);
+        if (next.state === 'succeeded') {
+          window.clearInterval(timer);
+          setAccountLoginError(null);
+          try {
+            setCapability(await api.capabilities());
+          } catch (cause) {
+            if (!disposed)
+              setAccountLoginError(
+                `Вход завершён, но статус аккаунта не обновился: ${errorMessage(cause)}`,
+              );
+          }
+        } else if (next.state === 'failed') {
+          window.clearInterval(timer);
+          setAccountLoginError(next.message ?? 'Не удалось завершить вход. Попробуйте ещё раз.');
+        } else {
+          setAccountLoginError(null);
+        }
+      } catch (cause) {
+        if (!disposed)
+          setAccountLoginError(`Не удалось проверить состояние входа: ${errorMessage(cause)}`);
+      } finally {
+        checking = false;
+      }
+    };
+    timer = window.setInterval(() => void poll(), ACCOUNT_LOGIN_POLL_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [accountLogin?.expiresAt, accountLogin?.state, accountLoginOpen]);
 
   async function togglePushNotifications(): Promise<void> {
     if (!threadId || pushNotificationBusy) return;
@@ -3614,7 +3928,20 @@ function Workspace({
           onRefreshResources={() => void refreshResourceLimits()}
           onSaveResources={saveResourceLimits}
           onApplyResources={applyResourceLimits}
+          onStartAccountLogin={() => void startAccountLogin()}
+          accountSwitchButtonRef={accountSwitchButtonRef}
           onClose={closeDiagnostics}
+        />
+      )}
+      {accountLoginOpen && (
+        <AccountLoginDialog
+          login={accountLogin}
+          busy={accountLoginBusy}
+          error={accountLoginError}
+          copyNotice={accountLoginCopyNotice}
+          onCopy={() => void copyAccountLoginCode()}
+          onCancel={() => void cancelAccountLogin()}
+          onClose={closeAccountLoginDialog}
         />
       )}
     </main>

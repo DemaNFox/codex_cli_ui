@@ -42,7 +42,18 @@ Browser
 - A project is a display name plus a canonical existing directory under an allowlisted root. Codex has no separate project entity; thread `cwd` binds execution to a project.
 - Models and reasoning efforts come from `model/list`; the UI never hard-codes account availability.
 - `instructionSources` from thread start/resume and `skills/list` are visible in the status drawer so the operator can verify that `AGENTS.md` and required skills loaded.
-- The backend reads account rate limits and aggregate usage through the app-server read-only account methods. Its public projection omits account identity, email, credits, authentication material and unknown upstream fields; an unsupported optional method degrades to `null` plus a static warning.
+- The backend reads account identity, rate limits and aggregate usage through bounded app-server methods. The
+  public projection exposes only the authenticated account type, email and plan label; it omits account IDs,
+  credits, authentication material and unknown upstream fields. An unsupported optional usage method degrades
+  to `null` plus a static warning.
+- The authenticated owner can replace the runner's Codex account through the official app-server device-code
+  flow. The API exposes the short-lived verification URL and one-time code only in process memory, never reads
+  `CODEX_HOME`, and never receives an access or refresh token. Starting the flow atomically closes task
+  admission and is allowed only with no root turn, pending start or active subagent; cancellation, failure or
+  confirmed timeout cancellation restores admission while preserving the previous account. An indeterminate
+  cancellation stays fail-closed until Codex reports a terminal login result or the API process is restarted.
+  Completion refreshes the bounded account projection without deleting Web sessions, SQLite chat history or
+  Codex rollout files.
 - The browser handles `/status` and `/skills` locally instead of sending them as model turns. Other text, including unknown slash-prefixed text, remains an ordinary Codex prompt.
 - Completed agent messages are rendered as sanitized GitHub-flavored Markdown. Raw HTML is disabled, links
   receive safe navigation attributes and wide tables scroll inside their own mobile-safe container; model

@@ -63,6 +63,8 @@ export interface AppServerClient {
 }
 
 const ALLOWED_REQUESTS = new Set([
+  'account/login/cancel',
+  'account/login/start',
   'account/read',
   'account/rateLimits/read',
   'account/usage/read',

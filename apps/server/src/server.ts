@@ -3,6 +3,8 @@ import {
   accountUsageSchema,
   attachmentSchema,
   capabilitySchema,
+  codexAccountLoginSchema,
+  codexAccountSchema,
   createProjectRequestSchema,
   loginRequestSchema,
   modelOptionSchema,
@@ -22,6 +24,8 @@ import {
   userInputQuestionSchema,
   type PermissionPreset,
   type Attachment,
+  type CodexAccount,
+  type CodexAccountLogin,
   type PendingApproval,
   type Project,
   type ResourceLimitSnapshot,
@@ -114,6 +118,62 @@ const TRANSCRIPTION_RATE_WINDOW_MS = 10 * 60 * 1_000;
 const TRANSCRIPTION_IDEMPOTENCY_TTL_MS = 10 * 60 * 1_000;
 const MAX_TRANSCRIPTION_IDEMPOTENCY_ENTRIES = 200;
 const transcriptionIdempotencyKeySchema = z.string().uuid();
+const CODEX_ACCOUNT_LOGIN_TTL_MS = 15 * 60 * 1_000;
+const codexAccountLoginRequestSchema = z.object({ type: z.literal('chatgptDeviceCode') }).strict();
+const accountLoginIdSchema = z
+  .string()
+  .min(1)
+  .max(200)
+  .refine((value) => value === value.trim());
+const upstreamAccountLoginResponseSchema = z
+  .object({
+    type: z.literal('chatgptDeviceCode'),
+    loginId: accountLoginIdSchema,
+    userCode: z
+      .string()
+      .min(1)
+      .max(64)
+      .regex(/^[A-Za-z0-9-]+$/),
+    verificationUrl: z
+      .string()
+      .url()
+      .max(2_048)
+      .refine((value) => {
+        try {
+          const url = new URL(value);
+          return (
+            url.origin === 'https://auth.openai.com' &&
+            url.username.length === 0 &&
+            url.password.length === 0 &&
+            url.pathname === '/codex/device' &&
+            url.search.length === 0 &&
+            url.hash.length === 0
+          );
+        } catch {
+          return false;
+        }
+      }),
+  })
+  .passthrough();
+const accountLoginCompletedSchema = z
+  .object({
+    loginId: accountLoginIdSchema.nullable().optional(),
+    success: z.boolean(),
+  })
+  .passthrough();
+const accountLoginCancelResponseSchema = z
+  .object({ status: z.enum(['canceled', 'notFound']) })
+  .passthrough();
+
+const requireConfirmedAccountLoginCancellation = (response: unknown): void => {
+  const parsed = accountLoginCancelResponseSchema.parse(response);
+  if (parsed.status !== 'canceled')
+    throw new HttpError(
+      409,
+      'CODEX_ACCOUNT_LOGIN_CANCEL_UNCONFIRMED',
+      'Codex did not confirm account login cancellation',
+    );
+};
 
 interface TranscriptionIdempotencyEntry {
   readonly requestHash: string;
@@ -271,6 +331,7 @@ export interface ServerDependencies {
   readonly transcriptionClient?: AudioTranscriptionClient;
   readonly pushSender?: PushSender;
   readonly upgradeDrainPath?: string;
+  readonly accountLoginTimeoutMs?: number;
 }
 
 function publicAttachment(record: AttachmentRecord): Attachment {
@@ -290,6 +351,19 @@ function inputRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function publicCodexAccount(value: unknown): CodexAccount | null {
+  const account = inputRecord(value);
+  if (!account) return null;
+  const knownType = z.enum(['chatgpt', 'apiKey', 'amazonBedrock']).safeParse(account.type);
+  const email = z.string().email().max(320).safeParse(account.email);
+  const planType = z.string().trim().min(1).max(80).safeParse(account.planType);
+  return codexAccountSchema.parse({
+    type: knownType.success ? knownType.data : 'unknown',
+    email: email.success ? email.data : null,
+    planType: planType.success ? planType.data : null,
+  });
 }
 
 function isUserMessageLifecycle(message: AppServerInbound): boolean {
@@ -602,6 +676,75 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   repository.resetActiveThreadRuntime();
   repository.resetActiveSubagentRuntime();
   let pendingTurnStarts = 0;
+  let pendingThreadStarts = 0;
+  let accountLogin: CodexAccountLogin = codexAccountLoginSchema.parse({
+    state: 'idle',
+    loginId: null,
+    userCode: null,
+    verificationUrl: null,
+    expiresAt: null,
+    message: null,
+  });
+  let accountLoginTimer: NodeJS.Timeout | null = null;
+  let accountLoginInterlocked = false;
+  let accountLoginStartInFlight = false;
+  let accountLoginAttempt = 0;
+  let earlyAccountLoginCompletion: { loginId: string; success: boolean } | null = null;
+  const takeEarlyAccountLoginCompletion = (): {
+    loginId: string;
+    success: boolean;
+  } | null => {
+    const completion = earlyAccountLoginCompletion;
+    earlyAccountLoginCompletion = null;
+    return completion;
+  };
+  const clearAccountLoginTimer = (): void => {
+    if (accountLoginTimer) clearTimeout(accountLoginTimer);
+    accountLoginTimer = null;
+  };
+  const setTerminalAccountLogin = (
+    state: 'succeeded' | 'failed',
+    message: string,
+    expectedLoginId?: string,
+  ): boolean => {
+    if (
+      expectedLoginId !== undefined &&
+      (accountLogin.state !== 'pending' ||
+        (accountLogin.loginId !== null && accountLogin.loginId !== expectedLoginId))
+    )
+      return false;
+    clearAccountLoginTimer();
+    accountLoginInterlocked = false;
+    earlyAccountLoginCompletion = null;
+    accountLogin = codexAccountLoginSchema.parse({
+      state,
+      loginId: expectedLoginId ?? accountLogin.loginId,
+      userCode: null,
+      verificationUrl: null,
+      expiresAt: null,
+      message,
+    });
+    return true;
+  };
+  const resetAccountLogin = (expectedLoginId?: string): boolean => {
+    if (
+      expectedLoginId !== undefined &&
+      (accountLogin.state !== 'pending' || accountLogin.loginId !== expectedLoginId)
+    )
+      return false;
+    clearAccountLoginTimer();
+    accountLoginInterlocked = false;
+    earlyAccountLoginCompletion = null;
+    accountLogin = codexAccountLoginSchema.parse({
+      state: 'idle',
+      loginId: null,
+      userCode: null,
+      verificationUrl: null,
+      expiresAt: null,
+      message: null,
+    });
+    return true;
+  };
   let activeTranscriptions = 0;
   const transcriptionAttempts = new Map<string, number[]>();
   const transcriptionIdempotency = new Map<string, TranscriptionIdempotencyEntry>();
@@ -611,6 +754,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   let serverClosing = false;
   const upgradeDrainPath =
     dependencies.upgradeDrainPath ?? '/var/lib/codex-web-ui/data/upgrade-drain';
+  const accountLoginTimeoutMs = dependencies.accountLoginTimeoutMs ?? CODEX_ACCOUNT_LOGIN_TTL_MS;
   const upgradeDrainRequested = (): boolean => {
     try {
       return lstatSync(upgradeDrainPath).isFile();
@@ -1170,6 +1314,28 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   };
 
   const onAppServerMessage = (message: AppServerInbound): void => {
+    if (message.id === undefined && message.method === 'account/login/completed') {
+      const completed = accountLoginCompletedSchema.safeParse(message.params);
+      if (!completed.success || completed.data.loginId == null) return;
+      if (
+        accountLoginInterlocked &&
+        accountLogin.state === 'pending' &&
+        accountLogin.loginId === null
+      ) {
+        if (accountLoginStartInFlight)
+          earlyAccountLoginCompletion = {
+            loginId: completed.data.loginId,
+            success: completed.data.success,
+          };
+        return;
+      }
+      setTerminalAccountLogin(
+        completed.data.success ? 'succeeded' : 'failed',
+        completed.data.success ? 'Account connected.' : 'Account login failed.',
+        completed.data.loginId,
+      );
+      return;
+    }
     if (message.id !== undefined) {
       if (message.method === 'item/tool/requestUserInput') {
         const request = normalizeUserInputRequest(message.params);
@@ -1441,6 +1607,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   app.addHook('onClose', async () => {
     serverClosing = true;
     if (resourceStartupRetry) clearTimeout(resourceStartupRetry);
+    clearAccountLoginTimer();
     unsubscribe();
     await pushDispatcher?.close();
     await appServer.stop();
@@ -1808,48 +1975,54 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const input = startThreadRequestSchema.parse(request.body);
     const project = repository.getProject(input.projectId);
     if (!project) throw new HttpError(404, 'PROJECT_NOT_FOUND');
-    const cwd = await canonicalProjectPath(pathPolicy, project);
-    const preset = input.permissionPreset ?? project.defaultPermissionPreset;
-    const reasoningEffort = input.reasoningEffort ?? project.defaultReasoningEffort;
-    const storedAgentLimit = repository.getResourceLimits().desired.maxParallelAgents;
-    const configuredAgentLimit =
-      storedAgentLimit ??
-      (dependencies.resourceBroker ? autoParallelAgents(await brokerSnapshot()) : null);
-    const result = threadResponseSchema.parse(
-      await appServer.request('thread/start', {
-        cwd,
-        model: input.model ?? project.defaultModel,
-        approvalPolicy: input.approvalPolicy,
-        approvalsReviewer: 'user',
-        sandbox: preset === 'full-access' ? 'danger-full-access' : preset,
-        config:
-          (reasoningEffort === null || reasoningEffort === undefined) &&
-          configuredAgentLimit === null
-            ? null
-            : {
-                ...(reasoningEffort === null || reasoningEffort === undefined
-                  ? {}
-                  : { model_reasoning_effort: reasoningEffort }),
-                ...(configuredAgentLimit === null
-                  ? {}
-                  : { agents: { max_threads: configuredAgentLimit } }),
-              },
-        ephemeral: false,
-        serviceName: 'codex-web-ui',
-      }),
-    );
-    if (result.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
-    const thread = repository.upsertThread(
-      mapThread(result.thread, project.id, false, result.instructionSources, result.model),
-    );
-    repository.markThreadHistoryHydrated(thread.id);
-    loadedThreadGenerations.set(thread.id, appServer.generation);
-    repository.audit('thread.start', 'succeeded', {
-      projectId: project.id,
-      threadId: thread.id,
-      permissionPreset: preset,
-    });
-    return reply.code(201).send({ data: thread });
+    if (accountLoginInterlocked) throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
+    pendingThreadStarts += 1;
+    try {
+      const cwd = await canonicalProjectPath(pathPolicy, project);
+      const preset = input.permissionPreset ?? project.defaultPermissionPreset;
+      const reasoningEffort = input.reasoningEffort ?? project.defaultReasoningEffort;
+      const storedAgentLimit = repository.getResourceLimits().desired.maxParallelAgents;
+      const configuredAgentLimit =
+        storedAgentLimit ??
+        (dependencies.resourceBroker ? autoParallelAgents(await brokerSnapshot()) : null);
+      const result = threadResponseSchema.parse(
+        await appServer.request('thread/start', {
+          cwd,
+          model: input.model ?? project.defaultModel,
+          approvalPolicy: input.approvalPolicy,
+          approvalsReviewer: 'user',
+          sandbox: preset === 'full-access' ? 'danger-full-access' : preset,
+          config:
+            (reasoningEffort === null || reasoningEffort === undefined) &&
+            configuredAgentLimit === null
+              ? null
+              : {
+                  ...(reasoningEffort === null || reasoningEffort === undefined
+                    ? {}
+                    : { model_reasoning_effort: reasoningEffort }),
+                  ...(configuredAgentLimit === null
+                    ? {}
+                    : { agents: { max_threads: configuredAgentLimit } }),
+                },
+          ephemeral: false,
+          serviceName: 'codex-web-ui',
+        }),
+      );
+      if (result.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
+      const thread = repository.upsertThread(
+        mapThread(result.thread, project.id, false, result.instructionSources, result.model),
+      );
+      repository.markThreadHistoryHydrated(thread.id);
+      loadedThreadGenerations.set(thread.id, appServer.generation);
+      repository.audit('thread.start', 'succeeded', {
+        projectId: project.id,
+        threadId: thread.id,
+        permissionPreset: preset,
+      });
+      return reply.code(201).send({ data: thread });
+    } finally {
+      pendingThreadStarts -= 1;
+    }
   });
 
   app.get('/api/threads/:id', async (request) => {
@@ -2122,6 +2295,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       return attachment;
     });
     const hash = requestHash(input);
+    if (accountLoginInterlocked) throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
     const operation = `turn:${id}`;
     const reservation = repository.reserveIdempotent(operation, input.idempotencyKey, hash);
     if (!reservation.reserved) {
@@ -2166,6 +2340,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           'Resource policy must be applied before a new task can start',
         );
       }
+    }
+    if (accountLoginInterlocked) {
+      repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
+      throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
     }
     pendingTurnStarts += 1;
     let executionAgentLimit: number | undefined;
@@ -2549,6 +2727,150 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     connectionTimers.keepalive = setInterval(() => delivery.deliverComment('keepalive'), 15_000);
   });
 
+  app.get('/api/system/codex-account/login', (request) => {
+    auth.authenticate(request);
+    return { data: codexAccountLoginSchema.parse(accountLogin) };
+  });
+
+  app.post('/api/system/codex-account/login', async (request, reply) => {
+    csrfGuard(auth, request);
+    const input = codexAccountLoginRequestSchema.parse(request.body);
+    if (accountLoginInterlocked) throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
+    if (resourceWorkActive() || pendingThreadStarts > 0)
+      throw new HttpError(
+        409,
+        'CODEX_ACCOUNT_LOGIN_BUSY',
+        'Account login requires all tasks and subagents to be idle',
+      );
+
+    accountLoginInterlocked = true;
+    accountLoginStartInFlight = true;
+    const loginAttempt = ++accountLoginAttempt;
+    earlyAccountLoginCompletion = null;
+    accountLogin = codexAccountLoginSchema.parse({
+      state: 'pending',
+      loginId: null,
+      userCode: null,
+      verificationUrl: null,
+      expiresAt: null,
+      message: null,
+    });
+    let loginResponse: unknown;
+    try {
+      loginResponse = await appServer.request('account/login/start', input);
+      accountLoginStartInFlight = false;
+    } catch (error) {
+      accountLoginStartInFlight = false;
+      takeEarlyAccountLoginCompletion();
+      // A rejected or timed-out start RPC is ambiguous: Codex may have accepted the
+      // login before the transport failed. Without a returned id, no completion
+      // can be correlated safely, so keep admission fail-closed until restart.
+      throw error;
+    }
+    const parsed = upstreamAccountLoginResponseSchema.safeParse(loginResponse);
+    if (loginAttempt !== accountLoginAttempt || !accountLoginInterlocked) {
+      if (parsed.success)
+        void appServer
+          .request('account/login/cancel', { loginId: parsed.data.loginId })
+          .catch(() => undefined);
+      throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_CANCELLED');
+    }
+    if (!parsed.success) {
+      const safeLoginId = accountLoginIdSchema.safeParse(
+        typeof loginResponse === 'object' && loginResponse !== null
+          ? (loginResponse as { loginId?: unknown }).loginId
+          : undefined,
+      );
+      const earlyCompletion = takeEarlyAccountLoginCompletion();
+      if (safeLoginId.success) {
+        accountLogin = codexAccountLoginSchema.parse({
+          state: 'pending',
+          loginId: safeLoginId.data,
+          userCode: null,
+          verificationUrl: null,
+          expiresAt: null,
+          message: 'Account login response was invalid; cancellation is required.',
+        });
+        if (earlyCompletion?.loginId === safeLoginId.data) {
+          setTerminalAccountLogin(
+            earlyCompletion.success ? 'succeeded' : 'failed',
+            earlyCompletion.success ? 'Account connected.' : 'Account login failed.',
+            safeLoginId.data,
+          );
+        } else {
+          try {
+            requireConfirmedAccountLoginCancellation(
+              await appServer.request('account/login/cancel', { loginId: safeLoginId.data }),
+            );
+            setTerminalAccountLogin(
+              'failed',
+              'Account login could not be started.',
+              safeLoginId.data,
+            );
+          } catch {
+            // Keep admission fail-closed until a matching completion or process restart.
+          }
+        }
+      }
+      throw new HttpError(502, 'CODEX_ACCOUNT_LOGIN_INVALID_RESPONSE');
+    }
+    const expiresAt = new Date(Date.now() + accountLoginTimeoutMs).toISOString();
+    accountLogin = codexAccountLoginSchema.parse({
+      state: 'pending',
+      loginId: parsed.data.loginId,
+      userCode: parsed.data.userCode,
+      verificationUrl: parsed.data.verificationUrl,
+      expiresAt,
+      message: null,
+    });
+    const earlyCompletion = takeEarlyAccountLoginCompletion();
+    if (earlyCompletion?.loginId === parsed.data.loginId) {
+      setTerminalAccountLogin(
+        earlyCompletion.success ? 'succeeded' : 'failed',
+        earlyCompletion.success ? 'Account connected.' : 'Account login failed.',
+        parsed.data.loginId,
+      );
+    } else {
+      accountLoginTimer = setTimeout(() => {
+        if (accountLogin.state !== 'pending' || accountLogin.loginId !== parsed.data.loginId)
+          return;
+        void (async () => {
+          try {
+            requireConfirmedAccountLoginCancellation(
+              await appServer.request('account/login/cancel', {
+                loginId: parsed.data.loginId,
+              }),
+            );
+            setTerminalAccountLogin('failed', 'Account login expired.', parsed.data.loginId);
+          } catch {
+            // Keep admission fail-closed until Codex reports this login complete or the process restarts.
+          }
+        })();
+      }, accountLoginTimeoutMs);
+      accountLoginTimer.unref();
+    }
+    return reply.code(202).send({ data: codexAccountLoginSchema.parse(accountLogin) });
+  });
+
+  app.delete('/api/system/codex-account/login', async (request) => {
+    csrfGuard(auth, request);
+    if (accountLogin.state === 'pending' && accountLogin.loginId === null)
+      throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_STARTING');
+    if (accountLogin.state !== 'pending') {
+      accountLoginAttempt += 1;
+      resetAccountLogin();
+      return { data: codexAccountLoginSchema.parse(accountLogin) };
+    }
+    const loginId = accountLogin.loginId;
+    if (loginId === null) throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_STARTING');
+    requireConfirmedAccountLoginCancellation(
+      await appServer.request('account/login/cancel', { loginId }),
+    );
+    accountLoginAttempt += 1;
+    resetAccountLogin(loginId);
+    return { data: codexAccountLoginSchema.parse(accountLogin) };
+  });
+
   app.get('/api/system/capabilities', async (request) => {
     auth.authenticate(request);
     const projectPaths = await Promise.all(
@@ -2608,7 +2930,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
     return capabilitySchema.parse({
       codexVersion: config.codexVersionPin,
-      authenticated: account.account !== null,
+      authenticated: account.account != null,
+      account: publicCodexAccount(account.account),
       appServerReady: appServer.ready,
       projectRoots: pathPolicy.roots,
       skills: skills.data.flatMap((entry) =>

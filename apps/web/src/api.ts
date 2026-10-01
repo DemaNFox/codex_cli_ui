@@ -2,6 +2,7 @@ import type {
   Attachment,
   ApprovalPolicy,
   Capability,
+  CodexAccountLogin,
   ModelOption,
   PendingApproval,
   PermissionPreset,
@@ -428,11 +429,32 @@ export const api = {
       body: { decision, scope: 'turn' },
     }),
   capabilities: () => request<Capability>('/api/system/capabilities'),
+  codexAccountLogin: async () =>
+    unwrapData(
+      await request<CodexAccountLogin | { data: CodexAccountLogin }>(
+        '/api/system/codex-account/login',
+      ),
+    ),
+  startCodexAccountLogin: async (csrfToken: string) =>
+    unwrapData(
+      await request<CodexAccountLogin | { data: CodexAccountLogin }>(
+        '/api/system/codex-account/login',
+        { method: 'POST', csrfToken, body: { type: 'chatgptDeviceCode' } },
+      ),
+    ),
+  cancelCodexAccountLogin: async (csrfToken: string) =>
+    unwrapData(
+      await request<CodexAccountLogin | { data: CodexAccountLogin }>(
+        '/api/system/codex-account/login',
+        { method: 'DELETE', csrfToken },
+      ),
+    ),
 };
 
 export type {
   Attachment,
   Capability,
+  CodexAccountLogin,
   ModelOption,
   PendingApproval,
   Project,

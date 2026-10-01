@@ -17,6 +17,9 @@ The workspace uses one navigation sidebar: projects expand to their chats, each 
 action and archived chats remain recoverable from the project menu. The composer stays pinned while a long
 transcript scrolls independently. `/status` opens safe Codex account limits and aggregate usage; `/skills`
 opens the same status surface at the loaded skills and instruction-source inventory.
+The same Status drawer can replace the runner's Codex account through the official device-code flow when no
+task or subagent is running. The short-lived code is shown only to the authenticated owner; access and refresh
+tokens never pass through the Web application.
 On narrow screens the same navigation becomes a keyboard-accessible drawer, long titles remain on one line,
 and model/access controls collapse into a compact settings row so the transcript and composer keep the
 viewport.

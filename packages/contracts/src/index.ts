@@ -357,9 +357,27 @@ export const accountUsageSchema = z.object({
     .nullable(),
 });
 
+export const codexAccountSchema = z.object({
+  type: z.enum(['chatgpt', 'apiKey', 'amazonBedrock', 'unknown']),
+  email: z.string().email().max(320).nullable(),
+  planType: z.string().min(1).max(80).nullable(),
+});
+export type CodexAccount = z.infer<typeof codexAccountSchema>;
+
+export const codexAccountLoginSchema = z.object({
+  state: z.enum(['idle', 'pending', 'succeeded', 'failed']),
+  loginId: z.string().min(1).max(200).nullable(),
+  userCode: z.string().min(1).max(64).nullable(),
+  verificationUrl: z.string().url().startsWith('https://').max(2_048).nullable(),
+  expiresAt: z.string().datetime().nullable(),
+  message: z.string().min(1).max(240).nullable(),
+});
+export type CodexAccountLogin = z.infer<typeof codexAccountLoginSchema>;
+
 export const capabilitySchema = z.object({
   codexVersion: z.string(),
   authenticated: z.boolean(),
+  account: codexAccountSchema.nullable(),
   appServerReady: z.boolean(),
   projectRoots: z.array(z.string()),
   skills: z.array(z.object({ name: z.string(), path: z.string(), enabled: z.boolean() })),

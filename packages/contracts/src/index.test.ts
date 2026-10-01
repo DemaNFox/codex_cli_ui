@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
   createProjectRequestSchema,
   attachmentSchema,
+  codexAccountLoginSchema,
   capabilitySchema,
   pushSubscriptionSchema,
   resolvePermissionRequestSchema,
@@ -166,6 +167,7 @@ describe('contracts', () => {
     const parsed = capabilitySchema.parse({
       codexVersion: 'codex-cli 0.153.4',
       authenticated: true,
+      account: { type: 'chatgpt', email: 'owner@example.test', planType: 'plus' },
       appServerReady: true,
       projectRoots: ['/srv/projects'],
       skills: [],
@@ -203,6 +205,11 @@ describe('contracts', () => {
       warnings: [],
     });
     expect(parsed.rateLimits?.[0]).not.toHaveProperty('accountId');
+    expect(parsed.account).toEqual({
+      type: 'chatgpt',
+      email: 'owner@example.test',
+      planType: 'plus',
+    });
     expect(parsed.usage?.summary).not.toHaveProperty('email');
     expect(parsed.transcription).toEqual({
       available: true,
@@ -219,6 +226,29 @@ describe('contracts', () => {
       capabilitySchema.safeParse({
         ...parsed,
         rateLimits: [{ ...parsed.rateLimits?.[0], primary: { usedPercent: 101 } }],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('bounds the transient Codex device-login projection', () => {
+    expect(
+      codexAccountLoginSchema.safeParse({
+        state: 'pending',
+        loginId: 'login-1',
+        userCode: 'ABCD-EFGH',
+        verificationUrl: 'https://auth.openai.com/device',
+        expiresAt: '2026-10-01T12:15:00.000Z',
+        message: null,
+      }).success,
+    ).toBe(true);
+    expect(
+      codexAccountLoginSchema.safeParse({
+        state: 'pending',
+        loginId: 'login-1',
+        userCode: 'ABCD-EFGH',
+        verificationUrl: 'javascript:alert(1)',
+        expiresAt: null,
+        message: null,
       }).success,
     ).toBe(false);
   });

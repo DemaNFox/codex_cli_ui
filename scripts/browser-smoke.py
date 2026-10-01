@@ -31,6 +31,7 @@ def main() -> int:
     resolved_permission: dict[str, object] | None = None
     push_subscribed = False
     push_endpoint = "https://push.example/smoke-device"
+    account_login_pending = False
     resource_snapshot = {
         "capacity": {
             "cpuCores": 8,
@@ -62,6 +63,7 @@ def main() -> int:
     def api(route: Route) -> None:
         nonlocal signed_in, archived, thread_name, resolved_user_input, resolved_permission
         nonlocal push_subscribed
+        nonlocal account_login_pending
         nonlocal resource_snapshot
         request = route.request
         parsed = urlparse(request.url)
@@ -133,6 +135,11 @@ def main() -> int:
                     "codexVersion": "codex-cli 0.153.4",
                     "appServerReady": True,
                     "authenticated": True,
+                    "account": {
+                        "type": "chatgpt",
+                        "email": "owner@example.test",
+                        "planType": "plus",
+                    },
                     "projectRoots": ["/srv/projects"],
                     "skills": [
                         {
@@ -175,6 +182,55 @@ def main() -> int:
                         "vapidPublicKey": "BEl62iUYgUivxIkv69yViEuiBIa40HI4o2TjDqFr6BkDHRMYitVCCfZwzVQHBGEY",
                     },
                     "warnings": [],
+                },
+            )
+        elif path == "/api/system/codex-account/login" and request.method == "POST":
+            if request.post_data_json != {"type": "chatgptDeviceCode"}:
+                raise AssertionError("account login did not use the bounded device-code request")
+            account_login_pending = True
+            payload(
+                route,
+                202,
+                {
+                    "data": {
+                        "state": "pending",
+                        "loginId": "smoke-login",
+                        "userCode": "SMOK-TEST",
+                        "verificationUrl": "https://auth.openai.com/device",
+                        "expiresAt": "2027-01-01T00:15:00.000Z",
+                        "message": None,
+                    }
+                },
+            )
+        elif path == "/api/system/codex-account/login" and request.method == "GET":
+            payload(
+                route,
+                200,
+                {
+                    "data": {
+                        "state": "pending" if account_login_pending else "idle",
+                        "loginId": "smoke-login" if account_login_pending else None,
+                        "userCode": "SMOK-TEST" if account_login_pending else None,
+                        "verificationUrl": "https://auth.openai.com/device" if account_login_pending else None,
+                        "expiresAt": "2027-01-01T00:15:00.000Z" if account_login_pending else None,
+                        "message": None,
+                    }
+                },
+            )
+        elif path == "/api/system/codex-account/login" and request.method == "DELETE":
+            account_login_pending = False
+            payload(
+                route,
+                200,
+                {
+                    "data": {
+                        "state": "idle",
+                        "loginId": None,
+                        "userCode": None,
+                        "verificationUrl": None,
+                        "expiresAt": None,
+                        "message": None,
+                    }
                 },
             )
         elif path == "/api/threads/t1/push-subscriptions/status":
@@ -828,6 +884,19 @@ def main() -> int:
         page.get_by_text("31% использовано · 300 мин.").wait_for()
         page.get_by_text("multi-agent-orchestrator", exact=True).wait_for()
         diagnostics = page.get_by_label("Статус Codex")
+        diagnostics.get_by_text("owner@example.test", exact=True).wait_for()
+        diagnostics.get_by_role("button", name="Сменить аккаунт").click()
+        account_dialog = page.get_by_role("dialog", name="Смена аккаунта Codex")
+        account_dialog.wait_for()
+        account_dialog.get_by_label("Одноразовый код").get_by_text("SMOK-TEST").wait_for()
+        if account_dialog.get_by_role("link", name="Открыть страницу входа").get_attribute("href") != "https://auth.openai.com/device":
+            raise AssertionError("device login link is not the bounded OpenAI verification URL")
+        account_box = account_dialog.bounding_box()
+        if not account_box or account_box["x"] < 0 or account_box["x"] + account_box["width"] > 1440:
+            raise AssertionError("account login dialog is outside the desktop viewport")
+        page.keyboard.press("Escape")
+        account_dialog.wait_for(state="detached")
+        page.get_by_text("Смена аккаунта отменена. Текущий аккаунт сохранён.").wait_for()
         diagnostics.get_by_label("Настроить вручную").click()
         diagnostics.get_by_label("Лимит CPU, ядер").fill("4")
         diagnostics.get_by_role("button", name="Сохранить").click()
@@ -1039,6 +1108,20 @@ def main() -> int:
             field_box = page.get_by_label(label).bounding_box()
             if not field_box or field_box["x"] < 0 or field_box["x"] + field_box["width"] > 390:
                 raise AssertionError(f"mobile resource control is outside the viewport: {label}")
+        page.get_by_label("Статус Codex").get_by_role("button", name="Сменить аккаунт").click()
+        mobile_account_dialog = page.get_by_role("dialog", name="Смена аккаунта Codex")
+        mobile_account_dialog.wait_for()
+        mobile_account_box = mobile_account_dialog.bounding_box()
+        if (
+            not mobile_account_box
+            or mobile_account_box["x"] < 0
+            or mobile_account_box["x"] + mobile_account_box["width"] > 390
+        ):
+            raise AssertionError("mobile account login dialog is outside the viewport")
+        if page.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth"):
+            raise AssertionError("account login dialog creates horizontal mobile overflow")
+        mobile_account_dialog.get_by_role("button", name="Отменить вход").click()
+        mobile_account_dialog.wait_for(state="detached")
         page.get_by_label("Закрыть диагностику").click()
 
         page.set_viewport_size({"width": 390, "height": 780})
@@ -1062,7 +1145,7 @@ def main() -> int:
         browser.close()
 
     print(
-        "browser-smoke: resources, subagents, status, archive/restore and responsive layout passed"
+        "browser-smoke: account switching, resources, subagents, status, archive/restore and responsive layout passed"
     )
     return 0
 

@@ -9,7 +9,7 @@ This repository is a standalone, portable Codex server package. Its supported Ub
 - Codex runs with the permissions of the configured non-root Linux service user. The web UI never grants root, sudo, Docker socket, or implicit deployment credentials.
 - Projects are existing directories beneath configured real-path allowlisted roots. Reject traversal, symlink escape, and unregistered working directories.
 - OpenAI credentials remain in the server-side `CODEX_HOME`; never return, log, persist, or accept them through the browser API.
-- Bootstrap Codex authentication only as the selected non-root runner through its direct terminal. Never authenticate Codex as root, capture a device code, or accept an OpenAI token through installer arguments, logs, or the Web UI.
+- Bootstrap Codex authentication only as the selected non-root runner through its direct terminal. After bootstrap, an authenticated owner may start the pinned app-server device flow in the Web UI only while all root turns, pending starts and subagents are idle. Never authenticate Codex as root, persist or log a device code, or accept an OpenAI token through installer arguments, logs, or the Web UI.
 - Do not persist chain-of-thought. Persist only user-visible messages, concise reasoning summaries when explicitly emitted, plans, diffs, bounded/redacted command output, approvals, and lifecycle events.
 
 ## Security
