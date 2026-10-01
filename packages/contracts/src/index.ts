@@ -266,10 +266,15 @@ export const attachmentSchema = z.object({
 });
 export type Attachment = z.infer<typeof attachmentSchema>;
 
-export const steerTurnRequestSchema = z.object({
-  text: z.string().trim().min(1).max(100_000),
-  expectedTurnId: z.string().min(1),
-});
+export const steerTurnRequestSchema = z
+  .object({
+    text: z.string().trim().max(100_000),
+    attachmentIds: z.array(z.string().uuid()).max(8).default([]),
+    expectedTurnId: z.string().min(1),
+  })
+  .refine((value) => value.text.length > 0 || value.attachmentIds.length > 0, {
+    message: 'A steer requires text or at least one attachment',
+  });
 
 export const eventKindSchema = z.enum([
   'thread',

@@ -40,7 +40,7 @@ import {
 } from '@codex-web/contracts';
 import cookie from '@fastify/cookie';
 import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, lstatSync } from 'node:fs';
 import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
@@ -358,6 +358,30 @@ function publicAttachment(record: AttachmentRecord): Attachment {
     createdAt: record.createdAt,
     url: `/api/threads/${encodeURIComponent(record.threadId)}/attachments/${record.id}/content`,
   });
+}
+
+function attachmentUserInput(
+  text: string,
+  attachments: readonly AttachmentRecord[],
+  localPath: (attachment: AttachmentRecord) => string,
+): Record<string, unknown>[] {
+  const input: Record<string, unknown>[] = [];
+  const fileReferences = attachments
+    .filter((attachment) => attachment.kind === 'file')
+    .map((attachment) => `${attachment.name}: ${localPath(attachment)}`);
+  const appText =
+    fileReferences.length === 0
+      ? text
+      : `${text}${text.length > 0 ? '\n\n' : ''}[Codex Web attachment references (server-local; do not repeat paths):\n${fileReferences.join('\n')}\n]`;
+  if (appText.length > 0) input.push({ type: 'text', text: appText, text_elements: [] });
+  for (const attachment of attachments) {
+    if (attachment.kind === 'image')
+      input.push({
+        type: 'localImage',
+        path: localPath(attachment),
+      });
+  }
+  return input;
 }
 
 function inputRecord(value: unknown): Record<string, unknown> | null {
@@ -1308,6 +1332,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     error: unknown,
     expectedTurnId: string,
     onOutcomeUnknown?: () => void,
+    onConfirmedInactive?: () => void,
   ): Promise<never> => {
     if (error instanceof Error && error.message === 'APP_SERVER_UNAVAILABLE') throw error;
     let confirmedInactive = false;
@@ -1321,6 +1346,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       // An unavailable reread cannot safely classify the command as rejected.
     }
     if (confirmedInactive) {
+      onConfirmedInactive?.();
       throw new HttpError(
         409,
         'TURN_NOT_ACTIVE',
@@ -2635,25 +2661,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         loadedThreadGenerations.set(id, appServer.generation);
       }
       const turnCwd = await canonicalProjectPath(pathPolicy, project);
-      const appInput: Record<string, unknown>[] = [];
-      const fileReferences = attachments
-        .filter((attachment) => attachment.kind === 'file')
-        .map(
-          (attachment) =>
-            `${attachment.name}: ${attachmentStore.localPath(project.id, id, attachment.storageName)}`,
-        );
-      const appText =
-        fileReferences.length === 0
-          ? input.text
-          : `${input.text}${input.text.length > 0 ? '\n\n' : ''}[Codex Web attachment references (server-local; do not repeat paths):\n${fileReferences.join('\n')}\n]`;
-      if (appText.length > 0) appInput.push({ type: 'text', text: appText, text_elements: [] });
-      for (const attachment of attachments) {
-        if (attachment.kind === 'image')
-          appInput.push({
-            type: 'localImage',
-            path: attachmentStore.localPath(project.id, id, attachment.storageName),
-          });
-      }
+      const appInput = attachmentUserInput(input.text, attachments, (attachment) =>
+        attachmentStore.localPath(project.id, id, attachment.storageName),
+      );
       turnStartIssued = true;
       result = turnResponseSchema.parse(
         await appServer.request('turn/start', {
@@ -2715,37 +2725,76 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const thread = repository.getThread(id);
     if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
     const input = steerTurnRequestSchema.parse(request.body);
+    if (new Set(input.attachmentIds).size !== input.attachmentIds.length)
+      throw new HttpError(400, 'ATTACHMENT_IDS_DUPLICATED');
+    const attachments = input.attachmentIds.map((attachmentId) => {
+      const attachment = repository.getAttachment(attachmentId);
+      if (!attachment || attachment.threadId !== id)
+        throw new HttpError(400, 'ATTACHMENT_NOT_AVAILABLE');
+      if (attachment.turnId !== null) throw new HttpError(409, 'ATTACHMENT_ALREADY_SENT');
+      return attachment;
+    });
+    const project =
+      attachments.length === 0 ? undefined : repository.getProject(thread.projectId);
+    if (attachments.length > 0 && !project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+    const attachmentClaim = `pending:steer:${randomUUID()}`;
+    if (!repository.claimAttachments(id, input.attachmentIds, attachmentClaim))
+      throw new HttpError(409, 'ATTACHMENT_NOT_AVAILABLE');
     let result: { turnId: string };
+    let steerIssued = false;
     try {
+      const appInput = attachmentUserInput(input.text, attachments, (attachment) =>
+        attachmentStore.localPath(project!.id, id, attachment.storageName),
+      );
+      steerIssued = true;
       result = z.object({ turnId: z.string() }).parse(
         await appServer.request('turn/steer', {
           threadId: id,
           expectedTurnId: input.expectedTurnId,
-          input: [{ type: 'text', text: input.text, text_elements: [] }],
+          input: appInput,
         }),
       );
     } catch (error) {
-      return throwTurnCommandFailure(thread, error, input.expectedTurnId, () => {
-        publish(
-          repository.appendEvent({
-            threadId: id,
-            turnId: input.expectedTurnId,
-            kind: 'user-message',
-            phase: 'state',
-            payload: {
-              ...sanitizeEventPayload({ text: input.text }, config.maxEventBytes),
-              outcomeUnknown: true,
-            },
-          }),
-        );
-      });
+      if (
+        !steerIssued ||
+        (error instanceof Error && error.message === 'APP_SERVER_UNAVAILABLE')
+      )
+        repository.releaseAttachmentClaims(id, attachmentClaim);
+      return throwTurnCommandFailure(
+        thread,
+        error,
+        input.expectedTurnId,
+        () => {
+          publish(
+            repository.appendEvent({
+              threadId: id,
+              turnId: input.expectedTurnId,
+              kind: 'user-message',
+              phase: 'state',
+              payload: {
+                ...sanitizeEventPayload(
+                  { text: input.text, attachments: attachments.map(publicAttachment) },
+                  config.maxEventBytes,
+                ),
+                outcomeUnknown: true,
+              },
+            }),
+          );
+        },
+        () => repository.releaseAttachmentClaims(id, attachmentClaim),
+      );
     }
+    if (attachments.length > 0)
+      repository.finalizeAttachmentClaims(id, attachmentClaim, result.turnId);
     const userEvent = repository.appendEvent({
       threadId: id,
       turnId: result.turnId,
       kind: 'user-message',
       phase: 'completed',
-      payload: sanitizeEventPayload({ text: input.text }, config.maxEventBytes),
+      payload: sanitizeEventPayload(
+        { text: input.text, attachments: attachments.map(publicAttachment) },
+        config.maxEventBytes,
+      ),
     });
     appendTurnNavigation({
       threadId: id,

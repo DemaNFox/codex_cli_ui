@@ -1513,6 +1513,196 @@ describe('Codex routes', () => {
     expect(reused.statusCode).toBe(409);
   });
 
+  it('steers an active turn with attachment-only input and journals public metadata', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const attachments: Attachment[] = [];
+    for (const upload of [
+      multipartFile('active.png', 'image/png', Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 1])),
+      multipartFile('context.txt', 'text/plain', Buffer.from('additional context')),
+    ]) {
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/threads/${threadId}/attachments`,
+        headers: { ...session.headers, 'content-type': upload.contentType },
+        payload: upload.body,
+      });
+      expect(response.statusCode).toBe(201);
+      attachments.push(response.json<{ data: Attachment }>().data);
+    }
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-active', status: 'inProgress', items: [] } },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/steer`,
+      headers: session.headers,
+      payload: {
+        text: '',
+        attachmentIds: attachments.map((attachment) => attachment.id),
+        expectedTurnId: 'turn-active',
+      },
+    });
+
+    expect(response.statusCode).toBe(202);
+    const request = [...appServer.requests]
+      .reverse()
+      .find((entry) => entry.method === 'turn/steer')!;
+    const input = (request.params as { input: Record<string, unknown>[] }).input;
+    expect(String(input.find((item) => item.type === 'text')?.text)).toContain('context.txt:');
+    const localImage = input.find((item) => item.type === 'localImage')!;
+    expect(String(localImage.path)).toContain(attachments[0]!.id);
+    expect(repository.getAttachment(attachments[0]!.id)?.turnId).toBe('turn-active');
+    expect(repository.getAttachment(attachments[1]!.id)?.turnId).toBe('turn-active');
+    const event = repository.listEvents(threadId, 0).at(-1)!;
+    expect(event).toMatchObject({
+      turnId: 'turn-active',
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: '', attachments },
+    });
+    expect(JSON.stringify(event)).not.toContain(String(localImage.path));
+  });
+
+  it('rejects duplicate, cross-thread and already-bound steer attachments', async () => {
+    const { app, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const firstThread = await createThread(app, project.id, session.headers);
+    const secondThread = await createThread(app, project.id, session.headers);
+    const upload = multipartFile('steer.txt', 'text/plain', Buffer.from('active context'));
+    const uploaded = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${firstThread}/attachments`,
+      headers: { ...session.headers, 'content-type': upload.contentType },
+      payload: upload.body,
+    });
+    const attachment = uploaded.json<{ data: Attachment }>().data;
+    const payload = {
+      text: 'continue',
+      expectedTurnId: 'turn-active',
+      attachmentIds: [attachment.id],
+    };
+    const crossThread = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${secondThread}/steer`,
+      headers: session.headers,
+      payload,
+    });
+    expect(crossThread.statusCode).toBe(400);
+    const duplicate = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${firstThread}/steer`,
+      headers: session.headers,
+      payload: { ...payload, attachmentIds: [attachment.id, attachment.id] },
+    });
+    expect(duplicate.statusCode).toBe(400);
+    const sent = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${firstThread}/steer`,
+      headers: session.headers,
+      payload,
+    });
+    expect(sent.statusCode).toBe(202);
+    const reused = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${firstThread}/steer`,
+      headers: session.headers,
+      payload,
+    });
+    expect(reused.statusCode).toBe(409);
+    expect(reused.json()).toMatchObject({ error: { code: 'ATTACHMENT_ALREADY_SENT' } });
+  });
+
+  it('releases rejected steer attachments but preserves ambiguous claims', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const uploadAttachment = async (name: string): Promise<Attachment> => {
+      const upload = multipartFile(name, 'text/plain', Buffer.from(name));
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/threads/${threadId}/attachments`,
+        headers: { ...session.headers, 'content-type': upload.contentType },
+        payload: upload.body,
+      });
+      expect(response.statusCode).toBe(201);
+      return response.json<{ data: Attachment }>().data;
+    };
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-active', status: 'inProgress', items: [] } },
+    });
+
+    const unavailableAttachment = await uploadAttachment('unavailable.txt');
+    appServer.failNextRequestWith = new Error('APP_SERVER_UNAVAILABLE');
+    const unavailable = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/steer`,
+      headers: session.headers,
+      payload: {
+        text: 'retry later',
+        attachmentIds: [unavailableAttachment.id],
+        expectedTurnId: 'turn-active',
+      },
+    });
+    expect(unavailable.statusCode).toBeGreaterThanOrEqual(500);
+    expect(repository.getAttachment(unavailableAttachment.id)?.turnId).toBeNull();
+
+    const rejectedAttachment = await uploadAttachment('rejected.txt');
+    appServer.setThreadStatus(threadId, 'idle');
+    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_FAILED');
+    const rejected = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/steer`,
+      headers: session.headers,
+      payload: {
+        text: 'rejected context',
+        attachmentIds: [rejectedAttachment.id],
+        expectedTurnId: 'turn-active',
+      },
+    });
+    expect(rejected.statusCode).toBe(409);
+    expect(repository.getAttachment(rejectedAttachment.id)?.turnId).toBeNull();
+
+    const ambiguousAttachment = await uploadAttachment('ambiguous.txt');
+    appServer.setThreadStatus(threadId, 'active');
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-active', status: 'inProgress', items: [] } },
+    });
+    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_TIMEOUT');
+    const ambiguous = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/steer`,
+      headers: session.headers,
+      payload: {
+        text: '',
+        attachmentIds: [ambiguousAttachment.id],
+        expectedTurnId: 'turn-active',
+      },
+    });
+    expect(ambiguous.statusCode).toBe(502);
+    expect(repository.getAttachment(ambiguousAttachment.id)?.turnId).toMatch(
+      /^pending:steer:/,
+    );
+    expect(repository.listEvents(threadId, 0).at(-1)).toMatchObject({
+      turnId: 'turn-active',
+      kind: 'user-message',
+      phase: 'state',
+      payload: {
+        text: '',
+        attachments: [ambiguousAttachment],
+        outcomeUnknown: true,
+      },
+    });
+  });
+
   it('allows inert Office documents but rejects generic zip uploads', async () => {
     const { app, projectPath } = await fixture();
     const session = await login(app);

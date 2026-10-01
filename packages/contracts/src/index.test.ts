@@ -11,6 +11,7 @@ import {
   resolvePermissionRequestSchema,
   resolveUserInputRequestSchema,
   resourceLimitPolicySchema,
+  steerTurnRequestSchema,
   subagentSchema,
   updateRuntimePreferencesRequestSchema,
   startTurnRequestSchema,
@@ -185,6 +186,27 @@ describe('contracts', () => {
         localPath: '/private/path',
       }).success,
     ).toBe(true);
+  });
+
+  it('allows attachment-only steering and bounds attachment identifiers', () => {
+    const base = {
+      text: '',
+      expectedTurnId: 'turn-active',
+      attachmentIds: ['00000000-0000-4000-8000-000000000001'],
+    };
+    expect(steerTurnRequestSchema.safeParse(base).success).toBe(true);
+    expect(
+      steerTurnRequestSchema.safeParse({ text: '', expectedTurnId: 'turn-active' }).success,
+    ).toBe(false);
+    expect(
+      steerTurnRequestSchema.safeParse({
+        ...base,
+        attachmentIds: Array.from(
+          { length: 9 },
+          (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`,
+        ),
+      }).success,
+    ).toBe(false);
   });
 
   it('bounds typed user-input answers and one-turn permission decisions', () => {
