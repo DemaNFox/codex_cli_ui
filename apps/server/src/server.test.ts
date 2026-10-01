@@ -1,4 +1,4 @@
-import type { Attachment, SafeEvent, Thread } from '@codex-web/contracts';
+import type { Attachment, CodexUpdateSnapshot, SafeEvent, Thread } from '@codex-web/contracts';
 import { hash } from 'argon2';
 import { EventEmitter } from 'node:events';
 import { mkdtemp, mkdir, rename, symlink, unlink, writeFile } from 'node:fs/promises';
@@ -19,6 +19,7 @@ import {
 } from './app-server.js';
 import { AttachmentStore } from './attachment-store.js';
 import type { AudioTranscriptionClient, TranscriptionUpload } from './audio-transcription.js';
+import type { CodexUpdateBroker } from './codex-update-broker.js';
 import { loadConfig, type ServerConfig } from './config.js';
 import { SqliteRepository } from './database.js';
 import { normalizeNotification, sanitizeEventPayload } from './event-normalizer.js';
@@ -428,6 +429,33 @@ class FakeResourceBroker implements ResourceBroker {
   }
 }
 
+class FakeCodexUpdateBroker implements CodexUpdateBroker {
+  statusReads = 0;
+  applyCalls = 0;
+  failStatus = false;
+  failApply = false;
+  current: CodexUpdateSnapshot = {
+    state: 'ready',
+    currentVersion: 'codex-cli 0.153.4',
+    availableVersion: 'codex-cli 0.154.0',
+    candidateReleaseId: '20261001-update-a1b2c3d4',
+    lastResult: null,
+  };
+
+  async status(): Promise<CodexUpdateSnapshot> {
+    this.statusReads += 1;
+    if (this.failStatus) throw new Error('ambiguous update broker status');
+    return this.current;
+  }
+
+  async apply(): Promise<CodexUpdateSnapshot> {
+    this.applyCalls += 1;
+    if (this.failApply) throw new Error('ambiguous update broker failure');
+    this.current = { ...this.current, state: 'applying' };
+    return this.current;
+  }
+}
+
 class FailingRemoveAttachmentStore extends AttachmentStore {
   failRemove = true;
 
@@ -478,6 +506,7 @@ async function fixture(
   transcriptionClient?: AudioTranscriptionClient,
   pushSender?: PushSender,
   accountLoginTimeoutMs?: number,
+  codexUpdateBroker?: CodexUpdateBroker,
 ) {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-server-'));
   const root = path.join(temp, 'projects');
@@ -502,6 +531,7 @@ async function fixture(
     maxEventBytes: 4_096,
     maxConcurrentTurns,
     resourceBrokerSocket: path.join(temp, 'resource-broker.sock'),
+    codexUpdateBrokerSocket: path.join(temp, 'codex-update-broker.sock'),
     transcriptionModel: 'gpt-transcribe',
     ...(pushSender
       ? {
@@ -526,6 +556,7 @@ async function fixture(
     attachmentStore,
     upgradeDrainPath,
     ...(resourceBroker ? { resourceBroker } : {}),
+    ...(codexUpdateBroker ? { codexUpdateBroker } : {}),
     ...(transcriptionClient ? { transcriptionClient } : {}),
     ...(pushSender ? { pushSender } : {}),
     ...(accountLoginTimeoutMs === undefined ? {} : { accountLoginTimeoutMs }),
@@ -1705,6 +1736,270 @@ describe('Codex routes', () => {
       sourceKinds: ['cli', 'vscode', 'appServer', 'exec'],
     });
     expect(appServer.requests.filter((item) => item.method === 'thread/list')).toHaveLength(2);
+  });
+
+  it('applies only a prepared Codex update while all execution work is idle', async () => {
+    const updateBroker = new FakeCodexUpdateBroker();
+    const { app, appServer, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      updateBroker,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-busy', status: 'inProgress' } },
+    });
+
+    const busy = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-update/apply',
+      headers: session.headers,
+      payload: {},
+    });
+    expect(busy.statusCode).toBe(409);
+    expect(busy.json()).toMatchObject({ error: { code: 'CODEX_UPDATE_BUSY' } });
+    expect(updateBroker.applyCalls).toBe(0);
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: 'turn-busy', status: 'completed' } },
+    });
+    const applied = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-update/apply',
+      headers: session.headers,
+      payload: {},
+    });
+    expect(applied.statusCode).toBe(202);
+    expect(applied.json()).toMatchObject({
+      data: {
+        state: 'applying',
+        currentVersion: 'codex-cli 0.153.4',
+        availableVersion: 'codex-cli 0.154.0',
+      },
+    });
+    expect(updateBroker.applyCalls).toBe(1);
+
+    const blockedThread = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(blockedThread.statusCode).toBe(503);
+    expect(blockedThread.json()).toMatchObject({ error: { code: 'SERVICE_DRAINING' } });
+    const blockedLogin = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(blockedLogin.statusCode).toBe(409);
+    expect(blockedLogin.json()).toMatchObject({ error: { code: 'CODEX_UPDATE_PENDING' } });
+  });
+
+  it('keeps update admission fail-closed after an ambiguous broker apply failure', async () => {
+    const updateBroker = new FakeCodexUpdateBroker();
+    updateBroker.failApply = true;
+    const { app, repository, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      updateBroker,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const failed = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-update/apply',
+      headers: session.headers,
+      payload: {},
+    });
+    expect(failed.statusCode).toBe(500);
+
+    const key = '00000000-0000-4000-8000-000000000110';
+    const blocked = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'must remain blocked', idempotencyKey: key },
+    });
+    expect(blocked.statusCode).toBe(503);
+    expect(repository.getIdempotent(`turn:${threadId}`, key)).toBeUndefined();
+
+    updateBroker.failApply = false;
+    updateBroker.current = { ...updateBroker.current, state: 'ready' };
+    const reconciled = await app.inject({
+      method: 'GET',
+      url: '/api/system/codex-update',
+      headers: { cookie: session.cookie },
+    });
+    expect(reconciled.statusCode).toBe(200);
+    expect(reconciled.json()).toMatchObject({ data: { state: 'ready' } });
+    const accepted = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'continue after reconciliation', idempotencyKey: key },
+    });
+    expect(accepted.statusCode).toBe(202);
+  });
+
+  it('does not let a concurrent ready status clear a pending update apply fence', async () => {
+    const ready: CodexUpdateSnapshot = {
+      state: 'ready',
+      currentVersion: 'codex-cli 0.153.4',
+      availableVersion: 'codex-cli 0.154.0',
+      candidateReleaseId: '20261001-update-a1b2c3d4',
+      lastResult: null,
+    };
+    let releaseApply!: () => void;
+    let signalApplyStarted!: () => void;
+    let releaseLateStatus!: () => void;
+    let signalLateStatusStarted!: () => void;
+    let statusCalls = 0;
+    const applyStarted = new Promise<void>((resolve) => {
+      signalApplyStarted = resolve;
+    });
+    const applyReleased = new Promise<void>((resolve) => {
+      releaseApply = resolve;
+    });
+    const lateStatusStarted = new Promise<void>((resolve) => {
+      signalLateStatusStarted = resolve;
+    });
+    const lateStatusReleased = new Promise<void>((resolve) => {
+      releaseLateStatus = resolve;
+    });
+    const updateBroker: CodexUpdateBroker = {
+      status: async () => {
+        statusCalls += 1;
+        if (statusCalls === 3) {
+          signalLateStatusStarted();
+          await lateStatusReleased;
+        }
+        return ready;
+      },
+      apply: async () => {
+        signalApplyStarted();
+        await applyReleased;
+        return { ...ready, state: 'applying' };
+      },
+    };
+    const { app, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      updateBroker,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const applying = app.inject({
+      method: 'POST',
+      url: '/api/system/codex-update/apply',
+      headers: session.headers,
+      payload: {},
+    });
+    await applyStarted;
+
+    const statusRequest = app.inject({
+      method: 'GET',
+      url: '/api/system/codex-update',
+      headers: { cookie: session.cookie },
+    });
+    await lateStatusStarted;
+    releaseApply();
+    expect((await applying).statusCode).toBe(202);
+    releaseLateStatus();
+    const status = await statusRequest;
+    expect(status.statusCode).toBe(200);
+    expect(status.json()).toMatchObject({ data: { state: 'ready' } });
+    const blocked = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(blocked.statusCode).toBe(503);
+  });
+
+  it('starts fail-closed until update state is reconciled and preserves the fence after rollback failure', async () => {
+    const updateBroker = new FakeCodexUpdateBroker();
+    updateBroker.failStatus = true;
+    const { app, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      updateBroker,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const blocked = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(blocked.statusCode).toBe(503);
+
+    updateBroker.failStatus = false;
+    updateBroker.current = {
+      ...updateBroker.current,
+      state: 'rollback_failed',
+      lastResult: {
+        status: 'rollback_failed',
+        message: 'Rollback requires operator recovery.',
+        completedAt: '2026-10-01T10:00:00.000Z',
+      },
+    };
+    const failedRollback = await app.inject({
+      method: 'GET',
+      url: '/api/system/codex-update',
+      headers: { cookie: session.cookie },
+    });
+    expect(failedRollback.statusCode).toBe(200);
+    expect(failedRollback.json()).toMatchObject({ data: { state: 'rollback_failed' } });
+    const stillBlocked = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(stillBlocked.statusCode).toBe(503);
+
+    updateBroker.current = { ...updateBroker.current, state: 'ready', lastResult: null };
+    await app.inject({
+      method: 'GET',
+      url: '/api/system/codex-update',
+      headers: { cookie: session.cookie },
+    });
+    const accepted = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(accepted.statusCode).toBe(201);
   });
 
   it('runs a bounded device-code login and accepts only its matching completion', async () => {

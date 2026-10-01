@@ -4,6 +4,7 @@ import {
   createProjectRequestSchema,
   attachmentSchema,
   codexAccountLoginSchema,
+  codexUpdateSnapshotSchema,
   capabilitySchema,
   pushSubscriptionSchema,
   resolvePermissionRequestSchema,
@@ -38,6 +39,27 @@ describe('contracts', () => {
         reasoningEffort: 'high',
         permissionPreset: 'root',
         approvalPolicy: 'never',
+      }).success,
+    ).toBe(false);
+  });
+
+  it('accepts only bounded Codex update projections', () => {
+    expect(
+      codexUpdateSnapshotSchema.safeParse({
+        state: 'ready',
+        currentVersion: 'codex-cli 0.153.4',
+        availableVersion: 'codex-cli 0.154.0',
+        candidateReleaseId: '20261001-update-a1b2c3d4',
+        lastResult: null,
+      }).success,
+    ).toBe(true);
+    expect(
+      codexUpdateSnapshotSchema.safeParse({
+        state: 'ready',
+        currentVersion: '0.153.4',
+        availableVersion: 'latest',
+        candidateReleaseId: '../../tmp',
+        lastResult: { status: 'succeeded', message: '', completedAt: 'not-a-date' },
       }).success,
     ).toBe(false);
   });

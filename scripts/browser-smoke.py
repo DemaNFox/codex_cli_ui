@@ -32,6 +32,7 @@ def main() -> int:
     push_subscribed = False
     push_endpoint = "https://push.example/smoke-device"
     account_login_pending = False
+    codex_update_state = "ready"
     resource_snapshot = {
         "capacity": {
             "cpuCores": 8,
@@ -64,6 +65,7 @@ def main() -> int:
         nonlocal signed_in, archived, thread_name, resolved_user_input, resolved_permission
         nonlocal push_subscribed
         nonlocal account_login_pending
+        nonlocal codex_update_state
         nonlocal resource_snapshot
         request = route.request
         parsed = urlparse(request.url)
@@ -199,6 +201,59 @@ def main() -> int:
                         "verificationUrl": "https://auth.openai.com/device",
                         "expiresAt": "2027-01-01T00:15:00.000Z",
                         "message": None,
+                    }
+                },
+            )
+        elif path == "/api/system/codex-update" and request.method == "GET":
+            if codex_update_state == "applying":
+                codex_update_state = "current"
+            payload(
+                route,
+                200,
+                {
+                    "data": {
+                        "state": codex_update_state,
+                        "currentVersion": (
+                            "codex-cli 0.154.0"
+                            if codex_update_state == "current"
+                            else "codex-cli 0.153.4"
+                        ),
+                        "availableVersion": (
+                            "codex-cli 0.154.0"
+                            if codex_update_state in {"ready", "applying"}
+                            else None
+                        ),
+                        "candidateReleaseId": (
+                            "release-154" if codex_update_state in {"ready", "applying"} else None
+                        ),
+                        "lastResult": (
+                            {
+                                "status": "succeeded",
+                                "message": "Codex updated",
+                                "completedAt": "2026-10-01T10:00:00.000Z",
+                            }
+                            if codex_update_state == "current"
+                            else None
+                        ),
+                    }
+                },
+            )
+        elif path == "/api/system/codex-update/apply" and request.method == "POST":
+            if request.post_data_json != {}:
+                raise AssertionError("Codex update request must not accept client options")
+            if request.headers.get("x-csrf-token") != "csrf-smoke":
+                raise AssertionError("Codex update request did not carry CSRF protection")
+            codex_update_state = "applying"
+            payload(
+                route,
+                202,
+                {
+                    "data": {
+                        "state": "applying",
+                        "currentVersion": "codex-cli 0.153.4",
+                        "availableVersion": "codex-cli 0.154.0",
+                        "candidateReleaseId": "release-154",
+                        "lastResult": None,
                     }
                 },
             )
@@ -885,6 +940,13 @@ def main() -> int:
         page.get_by_text("multi-agent-orchestrator", exact=True).wait_for()
         diagnostics = page.get_by_label("Статус Codex")
         diagnostics.get_by_text("owner@example.test", exact=True).wait_for()
+        diagnostics.get_by_text("Обновление готово к установке.").wait_for()
+        diagnostics.get_by_role("button", name="Обновить Codex").click()
+        diagnostics.get_by_text("Обновляем Codex…").wait_for()
+        diagnostics.get_by_text("Установлена актуальная подготовленная версия.").wait_for()
+        diagnostics.get_by_text("codex-cli 0.154.0", exact=True).wait_for()
+        if diagnostics.get_by_role("button", name="Обновить Codex").count():
+            raise AssertionError("Codex update button remains after the prepared update completed")
         diagnostics.get_by_role("button", name="Сменить аккаунт").click()
         account_dialog = page.get_by_role("dialog", name="Смена аккаунта Codex")
         account_dialog.wait_for()

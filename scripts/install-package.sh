@@ -41,7 +41,7 @@ external_proxy=false
 mode=install
 start_service=true
 resuming_bootstrap=false
-drain_marker=/var/lib/codex-web-ui/data/upgrade-drain
+drain_marker=/run/codex-web-ui/upgrade-drain
 
 usage() {
   cat <<'EOF'
@@ -132,6 +132,7 @@ if [[ $mode == upgrade ]]; then
   else
     case "$persisted_bin" in
       /opt/codex-web-ui/runtime/toolchain-pnpm-*-codex-*-${target#linux-}/bin/codex) codex_bin=$managed_codex_bin ;;
+      /opt/codex-web-ui/runtime/toolchain-pnpm-*-codex-*-${target#linux-}/lib/node_modules/@openai/codex/bin/codex.js) codex_bin=$managed_codex_bin ;;
       *) codex_bin=$persisted_bin ;;
     esac
   fi
@@ -160,6 +161,40 @@ codex_bin=$(canonical_existing_file "$codex_bin")
 (( (8#$(stat -c '%a' "$codex_home") & 8#077) == 0 )) || die 'CODEX_HOME must have no group/other permissions'
 version_pin=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["codex"]["versionPin"])' "$package/release.json")
 [[ $(runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" --version) == "$version_pin" ]] || die "Codex must match package pin: $version_pin"
+protocol_stage=$(mktemp -d /tmp/codex-web-ui-protocol.XXXXXX)
+chown "$runner_user:$runner_group" "$protocol_stage"
+chmod 0700 "$protocol_stage"
+if ! runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" \
+  "$codex_bin" app-server generate-json-schema --out "$protocol_stage" >/dev/null; then
+  rm -rf --one-file-system -- "$protocol_stage"
+  die 'candidate Codex protocol generation failed'
+fi
+if ! PROTOCOL_STAGE=$protocol_stage PACKAGE_ROOT=$package python3 - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+
+package = Path(os.environ["PACKAGE_ROOT"])
+generated = Path(os.environ["PROTOCOL_STAGE"])
+manifest = json.loads((package / "protocol/manifest.json").read_text(encoding="utf-8"))
+files = manifest.get("files")
+if not isinstance(files, dict):
+    raise SystemExit("candidate protocol manifest is invalid")
+expected_names = {Path(relative).name for relative in files}
+actual_names = {path.name for path in generated.iterdir() if path.is_file()}
+if actual_names != expected_names:
+    raise SystemExit("candidate Codex protocol output is incomplete")
+for relative, expected in files.items():
+    output = generated / Path(relative).name
+    if hashlib.sha256(output.read_bytes()).hexdigest() != expected:
+        raise SystemExit(f"candidate Codex protocol differs from reviewed snapshot: {output.name}")
+PY
+then
+  rm -rf --one-file-system -- "$protocol_stage"
+  die 'candidate Codex protocol does not match the reviewed package snapshot'
+fi
+rm -rf --one-file-system -- "$protocol_stage"
 if ! runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login status >/dev/null 2>&1; then
   exec {tty_fd}<>/dev/tty || die "Codex login is required; rerun interactively or run: sudo -u $runner_user -H $codex_bin login --device-auth"
   printf 'Codex is not authenticated for %s; starting device login. Never share the displayed device code.\n' "$runner_user" >&${tty_fd}
@@ -275,9 +310,15 @@ if [[ -n $previous ]]; then
   chmod 0640 /var/lib/codex-web-ui/previous-release
 fi
 runner_config_backup=
+config_backup=
+config_temporary=
 if [[ -f $runner_config ]]; then
   runner_config_backup=$(mktemp /etc/codex-web-ui/.runner-config.rollback.XXXXXX)
   install -m 0600 -o root -g root "$runner_config" "$runner_config_backup"
+fi
+if [[ -f $config ]]; then
+  config_backup=$(mktemp /etc/codex-web-ui/.config.rollback.XXXXXX)
+  install -m 0600 -o root -g root "$config" "$config_backup"
 fi
 resource_rollback_keys=(
   api-unit
@@ -288,6 +329,12 @@ resource_rollback_keys=(
   broker-helper
   resource-policy
   resource-drop-in
+  update-broker-socket-unit
+  update-broker-service-unit
+  update-worker-unit
+  update-broker-helper
+  update-worker-helper
+  update-stage-helper
 )
 resource_rollback_paths=(
   /etc/systemd/system/codex-web-ui@.service
@@ -298,6 +345,12 @@ resource_rollback_paths=(
   /usr/local/libexec/codex-web-ui-resource-broker
   /etc/codex-web-ui/resource-limits.json
   /etc/systemd/system/codex-web-ui-workload.slice.d/50-resource-limits.conf
+  /etc/systemd/system/codex-web-ui-codex-update-broker.socket
+  /etc/systemd/system/codex-web-ui-codex-update-broker@.service
+  /etc/systemd/system/codex-web-ui-codex-update.service
+  /usr/local/libexec/codex-web-ui-codex-update-broker
+  /usr/local/libexec/codex-web-ui-codex-update-worker
+  /usr/local/sbin/codex-web-ui-stage-codex-update
 )
 resource_rollback_dir=
 cleanup_resource_snapshot() {
@@ -305,6 +358,9 @@ cleanup_resource_snapshot() {
   trap - EXIT INT TERM
   remove_activation_backup "$resource_rollback_dir" || \
     printf 'Incomplete resource snapshot could not be removed: %s\n' "$resource_rollback_dir" >&2
+  if [[ -n $runner_config_backup ]]; then rm -f -- "$runner_config_backup"; fi
+  if [[ -n $config_backup ]]; then rm -f -- "$config_backup"; fi
+  if [[ -n $config_temporary ]]; then rm -f -- "$config_temporary"; fi
   if [[ $mode == upgrade ]]; then
     clear_pre_activation_drain "$status"
   else
@@ -331,6 +387,10 @@ broker_socket_was_active=false
 if systemctl is-active --quiet codex-web-ui-resource-broker.socket; then broker_socket_was_active=true; fi
 broker_socket_was_enabled=false
 if systemctl is-enabled --quiet codex-web-ui-resource-broker.socket; then broker_socket_was_enabled=true; fi
+update_broker_socket_was_active=false
+if systemctl is-active --quiet codex-web-ui-codex-update-broker.socket; then update_broker_socket_was_active=true; fi
+update_broker_socket_was_enabled=false
+if systemctl is-enabled --quiet codex-web-ui-codex-update-broker.socket; then update_broker_socket_was_enabled=true; fi
 workload_slice_was_active=false
 if systemctl is-active --quiet codex-web-ui-workload.slice; then workload_slice_was_active=true; fi
 
@@ -339,11 +399,18 @@ restore_resource_boundary() {
     systemctl stop codex-web-ui-resource-broker.socket || return 1
   fi
   systemctl stop 'codex-web-ui-resource-broker@*.service' >/dev/null 2>&1 || true
+  if systemctl is-active --quiet codex-web-ui-codex-update-broker.socket; then
+    systemctl stop codex-web-ui-codex-update-broker.socket || return 1
+  fi
+  systemctl stop 'codex-web-ui-codex-update-broker@*.service' >/dev/null 2>&1 || true
   if systemctl is-active --quiet codex-web-ui-workload.slice; then
     systemctl stop codex-web-ui-workload.slice || return 1
   fi
   if ! $broker_socket_was_enabled && systemctl is-enabled --quiet codex-web-ui-resource-broker.socket; then
     systemctl disable codex-web-ui-resource-broker.socket || return 1
+  fi
+  if ! $update_broker_socket_was_enabled && systemctl is-enabled --quiet codex-web-ui-codex-update-broker.socket; then
+    systemctl disable codex-web-ui-codex-update-broker.socket || return 1
   fi
   local index
   for index in "${!resource_rollback_paths[@]}"; do
@@ -357,6 +424,12 @@ restore_resource_boundary() {
     systemctl restart codex-web-ui-resource-broker.socket || return 1
   else
     systemctl stop codex-web-ui-resource-broker.socket >/dev/null 2>&1 || true
+  fi
+  if $update_broker_socket_was_enabled; then systemctl enable codex-web-ui-codex-update-broker.socket || return 1; fi
+  if $update_broker_socket_was_active; then
+    systemctl restart codex-web-ui-codex-update-broker.socket || return 1
+  else
+    systemctl stop codex-web-ui-codex-update-broker.socket >/dev/null 2>&1 || true
   fi
 }
 activation_complete=false
@@ -388,6 +461,10 @@ rollback_activation() {
     else
       rm -f -- "$runner_config"
     fi
+    if [[ -n $config_backup ]]; then
+      install -m 0600 -o root -g root "$config_backup" "$config"
+    fi
+    if [[ -n $config_temporary ]]; then rm -f -- "$config_temporary"; fi
     systemctl daemon-reload >/dev/null 2>&1 || true
     if systemctl restart codex-web-ui@api.service >/dev/null 2>&1 && \
       "$package/scripts/health-check.sh" --service-user api --timeout 45 >/dev/null 2>&1; then
@@ -417,12 +494,15 @@ fi
 atomic_symlink "$release_dir/apps/web/dist" /opt/codex-web-ui/web-current
 web_switched=true
 
-for unit in codex-web-ui@.service codex-web-ui-app-server.socket codex-web-ui-app-server@.service codex-web-ui-resource-broker.socket codex-web-ui-resource-broker@.service codex-web-ui-workload.slice codex-web-ui-storage-guard@.service codex-web-ui-storage-guard@.timer; do
+for unit in codex-web-ui@.service codex-web-ui-app-server.socket codex-web-ui-app-server@.service codex-web-ui-resource-broker.socket codex-web-ui-resource-broker@.service codex-web-ui-codex-update-broker.socket codex-web-ui-codex-update-broker@.service codex-web-ui-codex-update.service codex-web-ui-workload.slice codex-web-ui-storage-guard@.service codex-web-ui-storage-guard@.timer; do
   install -m 0644 "$package/infra/systemd/$unit" "/etc/systemd/system/$unit"
 done
 install -m 0755 "$package/scripts/validate-config.sh" /usr/local/libexec/codex-web-ui-validate-config
 install -m 0755 "$package/scripts/run-app-server.sh" /usr/local/libexec/codex-web-ui-run-app-server
 install -m 0755 "$package/scripts/resource-broker.py" /usr/local/libexec/codex-web-ui-resource-broker
+install -m 0755 "$package/scripts/codex-update-broker.py" /usr/local/libexec/codex-web-ui-codex-update-broker
+install -m 0755 "$package/scripts/codex-update-worker.sh" /usr/local/libexec/codex-web-ui-codex-update-worker
+install -m 0755 "$package/scripts/stage-codex-update.sh" /usr/local/sbin/codex-web-ui-stage-codex-update
 install -m 0755 "$package/scripts/storage-guard.py" /usr/local/libexec/codex-web-ui-storage-guard
 install -m 0755 "$package/scripts/storage-enforce.sh" /usr/local/libexec/codex-web-ui-storage-enforce
 
@@ -455,6 +535,23 @@ umask 077
   printf 'CODEX_BIN=%s\nCODEX_HOME=%s\n' "$codex_bin" "$codex_home"
   printf 'CODEX_WEB_CODEX_VERSION_PIN="%s"\n' "$version_pin"
 } >"$runner_config"
+config_temporary=$(mktemp /etc/codex-web-ui/.codex-web-ui.env.XXXXXX)
+CONFIG_SOURCE=$config CONFIG_DESTINATION=$config_temporary VERSION_PIN=$version_pin python3 - <<'PY'
+import os
+from pathlib import Path
+
+source = Path(os.environ["CONFIG_SOURCE"]).read_text(encoding="utf-8")
+lines = source.splitlines()
+matches = [index for index, line in enumerate(lines) if line.startswith("CODEX_WEB_CODEX_VERSION_PIN=")]
+if len(matches) != 1:
+    raise SystemExit("installed Codex version pin is missing or ambiguous")
+lines[matches[0]] = f'CODEX_WEB_CODEX_VERSION_PIN="{os.environ["VERSION_PIN"]}"'
+Path(os.environ["CONFIG_DESTINATION"]).write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+chmod 0600 "$config_temporary"
+chown root:root "$config_temporary"
+mv -f -- "$config_temporary" "$config"
+config_temporary=
 chmod 0600 "$runner_config"
 chown root:root "$config" "$runner_config"
 
@@ -469,8 +566,10 @@ if ! $external_proxy; then
 fi
 if $start_service; then
   systemctl enable codex-web-ui-resource-broker.socket codex-web-ui-app-server.socket codex-web-ui@api.service codex-web-ui-storage-guard@api.timer
+  systemctl enable codex-web-ui-codex-update-broker.socket
   systemctl stop 'codex-web-ui-app-server@*.service' >/dev/null 2>&1 || true
   systemctl restart codex-web-ui-resource-broker.socket codex-web-ui-app-server.socket codex-web-ui@api.service codex-web-ui-storage-guard@api.timer
+  systemctl restart codex-web-ui-codex-update-broker.socket
   /usr/local/libexec/codex-web-ui-resource-broker --initialize >/dev/null
   "$package/scripts/health-check.sh" --service-user api --timeout 45
   if $drain_engaged; then
@@ -483,6 +582,7 @@ else
 fi
 activation_complete=true
 if [[ -n $runner_config_backup ]]; then rm -f -- "$runner_config_backup"; fi
+if [[ -n $config_backup ]]; then rm -f -- "$config_backup"; fi
 remove_activation_backup "$resource_rollback_dir" || \
   printf 'Activation backup could not be removed: %s\n' "$resource_rollback_dir" >&2
 trap - EXIT INT TERM

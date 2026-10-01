@@ -1,6 +1,7 @@
 import { CodexAppServerSocketClient, CodexAppServerSupervisor } from './app-server.js';
 import { AttachmentStore } from './attachment-store.js';
 import { OpenAIAudioTranscriptionClient } from './audio-transcription.js';
+import { UnixCodexUpdateBrokerClient } from './codex-update-broker.js';
 import { loadConfig } from './config.js';
 import { SqliteRepository } from './database.js';
 import { ProjectPathPolicy } from './path-policy.js';
@@ -20,6 +21,7 @@ const appServer = config.appServerSocket
     });
 const attachmentStore = new AttachmentStore(config.attachmentStoragePath);
 const resourceBroker = new UnixResourceBrokerClient(config.resourceBrokerSocket);
+const codexUpdateBroker = new UnixCodexUpdateBrokerClient(config.codexUpdateBrokerSocket);
 const transcriptionClient = config.openAiApiKey
   ? new OpenAIAudioTranscriptionClient(config.openAiApiKey, config.transcriptionModel)
   : undefined;
@@ -33,6 +35,7 @@ const server = await buildServer({
   appServer,
   attachmentStore,
   resourceBroker,
+  codexUpdateBroker,
   ...(transcriptionClient ? { transcriptionClient } : {}),
   ...(pushSender ? { pushSender } : {}),
 });

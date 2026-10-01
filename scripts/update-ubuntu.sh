@@ -39,7 +39,7 @@ codex_home=$(canonical_existing_dir "$codex_home")
 source_dir=$(validate_release_source "${source_dir:?--source is required}" "$codex_home")
 
 release_dir="/opt/codex-web-ui/releases/$release_id"
-drain_marker=/var/lib/codex-web-ui/data/upgrade-drain
+drain_marker=/run/codex-web-ui/upgrade-drain
 bash "$SCRIPT_DIR/graceful-drain.sh" \
   --begin --config "$config" --service-user "$service_user" --timeout "$health_timeout"
 drain_engaged=false

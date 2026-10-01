@@ -50,6 +50,14 @@ const resourceLimits = {
   warning: null,
 };
 
+const codexUpdate = {
+  state: 'ready' as const,
+  currentVersion: 'codex-cli 0.153.4',
+  availableVersion: 'codex-cli 0.154.0',
+  candidateReleaseId: 'release-154',
+  lastResult: null,
+};
+
 function response(data: unknown): Response {
   return new Response(JSON.stringify(data), {
     status: 200,
@@ -174,6 +182,31 @@ describe('api response envelopes', () => {
         }),
       }),
     );
+  });
+
+  it('reads and starts the prepared Codex update with CSRF protection', async () => {
+    const fetchMock = vi.fn<typeof fetch>(() =>
+      Promise.resolve(response({ data: { ...codexUpdate, state: 'applying' } })),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.codexUpdate()).resolves.toMatchObject({ state: 'applying' });
+    await expect(api.applyCodexUpdate('csrf')).resolves.toMatchObject({ state: 'applying' });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/system/codex-update',
+      expect.objectContaining({ credentials: 'same-origin' }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/system/codex-update/apply',
+      expect.objectContaining({
+        method: 'POST',
+        body: '{}',
+      }),
+    );
+    expect(new Headers(fetchMock.mock.calls[1]?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf');
   });
 
   it('checks, saves and removes the current device push mapping for one thread', async () => {

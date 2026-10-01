@@ -20,6 +20,11 @@ opens the same status surface at the loaded skills and instruction-source invent
 The same Status drawer can replace the runner's Codex account through the official device-code flow when no
 task or subagent is running. The short-lived code is shown only to the authenticated owner; access and refresh
 tokens never pass through the Web application.
+It also shows the installed and prepared Codex versions. An update can be started there only after an operator
+has staged a complete checksummed release and all turns, pending starts, subagents and other exclusive work are
+idle. The browser cannot choose a package, path, command or version. Codex and the Web API remain non-root; a
+narrow root broker activates the fixed prepared release and rolls back automatically if health verification
+fails.
 On narrow screens the same navigation becomes a keyboard-accessible drawer, long titles remain on one line,
 and model/access controls collapse into a compact settings row so the transcript and composer keep the
 viewport.
@@ -132,3 +137,16 @@ The command verifies the checksummed package with the currently installed verifi
 `apiCompatibility`, copies an immutable release into the bounded release store, and atomically switches only
 `web-current`. Use `rollback-web-ubuntu.sh` to reverse only that static switch. Backend, protocol, migration,
 systemd or resource-control changes still require the normal drained full upgrade.
+
+To expose a previously installed and reviewed full release in the Status drawer, stage its release identifier
+on the server:
+
+```bash
+sudo /usr/local/sbin/codex-web-ui-stage-codex-update \
+  --source /absolute/path/to/verified/package \
+  --release-id 20261001-codex-update
+```
+
+The root-only staging helper verifies and copies one complete package into the immutable release store. It can
+also reselect an existing managed package with `--release-id EXISTING_RELEASE_ID`. Neither form publishes a
+path, release selector or general root/package-install capability to the Web UI.

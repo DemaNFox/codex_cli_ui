@@ -148,11 +148,20 @@ if all(push_values):
     if not re.fullmatch(r"(?:mailto:.+@.+|https://[^\s]+)", push_values[2]):
         fail("invalid VAPID subject")
 
-for name in ("CODEX_WEB_DATABASE_PATH", "CODEX_WEB_ATTACHMENT_STORAGE_PATH", "CODEX_WEB_APP_SERVER_SOCKET"):
+for name in (
+    "CODEX_WEB_DATABASE_PATH",
+    "CODEX_WEB_ATTACHMENT_STORAGE_PATH",
+    "CODEX_WEB_APP_SERVER_SOCKET",
+):
     if not pathlib.Path(values[name]).is_absolute():
         fail(f"{name} must be absolute")
 if values["CODEX_WEB_APP_SERVER_SOCKET"] != "/run/codex-web-ui/app-server.sock":
     fail("CODEX_WEB_APP_SERVER_SOCKET must use the protected systemd socket")
+if values.get(
+    "CODEX_WEB_CODEX_UPDATE_BROKER_SOCKET",
+    "/run/codex-web-ui/codex-update-broker.sock",
+) != "/run/codex-web-ui/codex-update-broker.sock":
+    fail("CODEX_WEB_CODEX_UPDATE_BROKER_SOCKET must use the protected systemd socket")
 
 
 def positive_integer(name: str) -> int:

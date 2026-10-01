@@ -3,6 +3,7 @@ import type {
   ApprovalPolicy,
   Capability,
   CodexAccountLogin,
+  CodexUpdateSnapshot,
   ModelOption,
   PendingApproval,
   PermissionPreset,
@@ -429,6 +430,19 @@ export const api = {
       body: { decision, scope: 'turn' },
     }),
   capabilities: () => request<Capability>('/api/system/capabilities'),
+  codexUpdate: async () =>
+    unwrapData(
+      await request<CodexUpdateSnapshot | { data: CodexUpdateSnapshot }>(
+        '/api/system/codex-update',
+      ),
+    ),
+  applyCodexUpdate: async (csrfToken: string) =>
+    unwrapData(
+      await request<CodexUpdateSnapshot | { data: CodexUpdateSnapshot }>(
+        '/api/system/codex-update/apply',
+        { method: 'POST', csrfToken, body: {} },
+      ),
+    ),
   codexAccountLogin: async () =>
     unwrapData(
       await request<CodexAccountLogin | { data: CodexAccountLogin }>(
@@ -455,6 +469,7 @@ export type {
   Attachment,
   Capability,
   CodexAccountLogin,
+  CodexUpdateSnapshot,
   ModelOption,
   PendingApproval,
   Project,

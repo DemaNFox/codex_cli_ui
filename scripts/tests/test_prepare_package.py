@@ -82,6 +82,31 @@ class PreparePackageTest(unittest.TestCase):
             path = self.root / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8", newline="\n")
+        protocol_files = {
+            "0.153.4/codex_app_server_protocol.schemas.json": "{\"v\":1}\n",
+            "0.153.4/codex_app_server_protocol.v2.schemas.json": "{\"v\":2}\n",
+        }
+        for relative, content in protocol_files.items():
+            path = self.root / "protocol" / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8", newline="\n")
+        (self.root / "protocol/manifest.json").write_text(
+            json.dumps(
+                {
+                    "codexCliVersion": "0.153.4",
+                    "generatedAt": "2026-09-27",
+                    "files": {
+                        relative: hashlib.sha256(content.encode()).hexdigest()
+                        for relative, content in protocol_files.items()
+                    },
+                },
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
         manifest = {
             "schemaVersion": 1,
             "name": "codex-web-ui",
@@ -163,6 +188,20 @@ class PreparePackageTest(unittest.TestCase):
         result = self._verify()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("manifest and toolchain pins differ", result.stderr)
+
+    def test_protocol_snapshot_and_codex_pin_must_match(self) -> None:
+        protocol_path = self.root / "protocol/manifest.json"
+        protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+        protocol["codexCliVersion"] = "0.153.3"
+        protocol_path.write_text(
+            json.dumps(protocol, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        self._write_checksums()
+        result = self._verify()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("protocol snapshot and Codex pins differ", result.stderr)
 
     def test_unknown_api_compatibility_is_rejected(self) -> None:
         manifest_path = self.root / "release.json"

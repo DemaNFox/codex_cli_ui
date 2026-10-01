@@ -70,6 +70,7 @@ required = (
     "apps/web/dist/index.html",
     "infra/toolchain.env",
     "infra/release-manifest.schema.json",
+    "protocol/manifest.json",
     "infra/systemd/codex-web-ui-resource-broker.socket",
     "infra/systemd/codex-web-ui-resource-broker@.service",
     "infra/systemd/codex-web-ui-workload.slice",
@@ -159,6 +160,29 @@ if not re.fullmatch(r"codex-cli \d+\.\d+\.\d+", codex_pin):
     raise SystemExit("prepare-package: invalid Codex version pin")
 if codex_pin != f"codex-cli {toolchain['CODEX_CLI_VERSION']}":
     raise SystemExit("prepare-package: Codex manifest and toolchain pins differ")
+
+try:
+    protocol = json.loads((root / "protocol/manifest.json").read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"prepare-package: invalid protocol manifest: {error}")
+if not isinstance(protocol, dict) or set(protocol) != {"codexCliVersion", "generatedAt", "files"}:
+    raise SystemExit("prepare-package: protocol manifest fields do not match the supported contract")
+if protocol.get("codexCliVersion") != toolchain["CODEX_CLI_VERSION"]:
+    raise SystemExit("prepare-package: protocol snapshot and Codex pins differ")
+protocol_files = protocol.get("files")
+protocol_version = toolchain["CODEX_CLI_VERSION"]
+expected_protocol_files = {
+    f"{protocol_version}/codex_app_server_protocol.schemas.json",
+    f"{protocol_version}/codex_app_server_protocol.v2.schemas.json",
+}
+if not isinstance(protocol_files, dict) or set(protocol_files) != expected_protocol_files:
+    raise SystemExit("prepare-package: protocol snapshot inventory is incomplete")
+for relative, expected_digest in protocol_files.items():
+    if not isinstance(expected_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        raise SystemExit("prepare-package: protocol snapshot digest is invalid")
+    snapshot = root / "protocol" / relative
+    if not snapshot.is_file() or hashlib.sha256(snapshot.read_bytes()).hexdigest() != expected_digest:
+        raise SystemExit(f"prepare-package: protocol snapshot checksum mismatch: {relative}")
 
 native_modules = runtime.get("nativeModules")
 if not isinstance(native_modules, dict) or set(native_modules) != {"argon2"}:
@@ -255,7 +279,7 @@ trap cleanup EXIT
 mkdir -p "$package_stage"
 cp -a -- "$release_stage/apps" "$package_stage/apps"
 
-tracked_roots=(infra scripts skills)
+tracked_roots=(infra protocol scripts skills)
 git cat-file -e HEAD:install.sh 2>/dev/null && tracked_roots+=(install.sh)
 git archive --format=tar HEAD -- "${tracked_roots[@]}" | tar -xf - -C "$package_stage"
 [[ -f $package_stage/install.sh ]] || die 'committed root install.sh is required for a self-contained package'

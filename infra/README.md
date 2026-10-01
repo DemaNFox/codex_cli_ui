@@ -106,6 +106,39 @@ sudo cat /etc/codex-web-ui/resource-limits.json
 Do not edit the generated slice drop-in or policy file while the service is running. Use the authenticated Web
 UI so updates are serialized against active work and audited.
 
+## Staged Codex updates
+
+The Status drawer can activate a newer Codex version only from a complete immutable release that a trusted host
+operator has already installed beneath `/opt/codex-web-ui/releases`. After reviewing and preparing that release,
+stage exactly its identifier:
+
+```sh
+sudo /usr/local/sbin/codex-web-ui-stage-codex-update \
+  --source /absolute/path/to/verified/package \
+  --release-id 20261001-codex-update
+```
+
+The helper verifies the package with the installed root-owned verifier, enforces the release-store limit,
+copies and re-verifies it as an immutable root-owned release, then atomically updates
+`/opt/codex-web-ui/codex-update-candidate`. Use `--release-id EXISTING_RELEASE_ID` without `--source` to reselect
+an existing managed package. It never downloads packages. The browser can then invoke only a strict `apply`
+operation; it cannot provide a URL, path, version, command, unit or package name. The root broker authenticates
+the API peer, repeats inventory/ownership/architecture/API checks and starts the fixed
+`codex-web-ui-codex-update.service` oneshot. Candidate Codex schemas are generated as the non-root runner and
+must match the reviewed protocol snapshot before any drain begins.
+
+Activation waits for all Codex work and other exclusive operations to become idle, then uses the supported
+full installer. It atomically updates both protected version-pin files, restarts the compatible application,
+checks health and rolls back on failure. Inspect it with:
+
+```sh
+systemctl status codex-web-ui-codex-update-broker.socket codex-web-ui-codex-update.service
+sudo cat /var/lib/codex-web-ui/codex-update-result.json
+```
+
+Codex and the API remain non-root. Only the small broker/worker boundary has root authority; do not add the
+runner to sudoers or give it write access to the release store.
+
 ## Codex sandbox prerequisites
 
 Codex `workspace-write` uses Bubblewrap on Linux. Keep `ProtectProc=invisible`,
@@ -225,7 +258,7 @@ restore the prior release if health fails. Rollback accepts only an existing
 release beneath `/opt/codex-web-ui/releases`; neither path deletes releases.
 
 Before an upgrade changes `current` or stops a service, the installer creates
-`/var/lib/codex-web-ui/data/upgrade-drain`. A drain-aware API keeps reads, SSE,
+`/run/codex-web-ui/upgrade-drain`. A drain-aware API keeps reads, SSE,
 steering, interruption and pending approval/input resolution available, rejects
 new turn starts, and reports the drain state from `/api/health`. Activation
 begins only after health proves both `activeTurns` and `pendingTurnStarts` are

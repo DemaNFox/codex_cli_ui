@@ -1,0 +1,29 @@
+[Unit]
+Description=Codex Web UI prepared Codex update worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/libexec/codex-web-ui-codex-update-worker
+TimeoutStartSec=20min
+TimeoutStopSec=2min
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=codex-web-ui-codex-update
+
+NoNewPrivileges=no
+PrivateTmp=yes
+PrivateDevices=no
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6

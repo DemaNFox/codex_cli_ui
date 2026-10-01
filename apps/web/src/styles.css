@@ -1550,6 +1550,37 @@ button:disabled {
   width: 100%;
   margin-top: 0.65rem;
 }
+.codex-update {
+  display: grid;
+  gap: 0.65rem;
+  margin-top: 1rem;
+  padding: 0.8rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 0.7rem;
+  background: #0d1114;
+}
+.diagnostics .codex-update h3 {
+  margin: 0;
+}
+.codex-update-versions,
+.codex-update-state,
+.codex-update-note,
+.codex-update .notice {
+  margin: 0;
+}
+.codex-update-state {
+  color: #dce2e6;
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+.codex-update-note {
+  color: var(--muted);
+  font-size: 0.7rem;
+  line-height: 1.45;
+}
+.codex-update-button {
+  width: 100%;
+}
 .account-login-dialog {
   width: min(30rem, 100%);
   min-width: 0;

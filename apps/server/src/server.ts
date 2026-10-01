@@ -5,6 +5,7 @@ import {
   capabilitySchema,
   codexAccountLoginSchema,
   codexAccountSchema,
+  codexUpdateSnapshotSchema,
   createProjectRequestSchema,
   loginRequestSchema,
   modelOptionSchema,
@@ -26,6 +27,7 @@ import {
   type Attachment,
   type CodexAccount,
   type CodexAccountLogin,
+  type CodexUpdateSnapshot,
   type PendingApproval,
   type Project,
   type ResourceLimitSnapshot,
@@ -43,6 +45,7 @@ import path from 'node:path';
 import { z } from 'zod';
 
 import type { AppServerClient, AppServerInbound } from './app-server.js';
+import { CodexUpdateBrokerError, type CodexUpdateBroker } from './codex-update-broker.js';
 import {
   MAX_TRANSCRIPTION_BYTES,
   MAX_TRANSCRIPTION_DURATION_SECONDS,
@@ -328,6 +331,7 @@ export interface ServerDependencies {
   readonly appServer: AppServerClient;
   readonly attachmentStore: AttachmentStore;
   readonly resourceBroker?: ResourceBroker;
+  readonly codexUpdateBroker?: CodexUpdateBroker;
   readonly transcriptionClient?: AudioTranscriptionClient;
   readonly pushSender?: PushSender;
   readonly upgradeDrainPath?: string;
@@ -750,10 +754,14 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const transcriptionIdempotency = new Map<string, TranscriptionIdempotencyEntry>();
   let resourceApplyPromise: Promise<ResourceLimitSnapshot> | null = null;
   let resourceApplyVersion: number | null = null;
+  // When the privileged broker is configured, admission starts fail-closed
+  // until its durable worker state has been reconciled below.
+  let codexUpdateInterlocked = dependencies.codexUpdateBroker !== undefined;
+  let codexUpdateApplyPending = false;
+  let codexUpdateGeneration = 0;
   let resourceStartupRetry: NodeJS.Timeout | null = null;
   let serverClosing = false;
-  const upgradeDrainPath =
-    dependencies.upgradeDrainPath ?? '/var/lib/codex-web-ui/data/upgrade-drain';
+  const upgradeDrainPath = dependencies.upgradeDrainPath ?? '/run/codex-web-ui/upgrade-drain';
   const accountLoginTimeoutMs = dependencies.accountLoginTimeoutMs ?? CODEX_ACCOUNT_LOGIN_TTL_MS;
   const upgradeDrainRequested = (): boolean => {
     try {
@@ -812,8 +820,42 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
   };
 
+  const codexUpdateStatus = async (): Promise<CodexUpdateSnapshot> => {
+    if (!dependencies.codexUpdateBroker)
+      throw new HttpError(503, 'CODEX_UPDATE_UNAVAILABLE', 'Codex update broker is unavailable');
+    try {
+      const observedGeneration = codexUpdateGeneration;
+      const mayClearInterlock = !codexUpdateApplyPending;
+      const snapshot = codexUpdateSnapshotSchema.parse(
+        await dependencies.codexUpdateBroker.status(),
+      );
+      if (
+        observedGeneration === codexUpdateGeneration &&
+        mayClearInterlock &&
+        !codexUpdateApplyPending
+      ) {
+        codexUpdateInterlocked =
+          snapshot.state === 'applying' || snapshot.state === 'rollback_failed';
+      } else if (snapshot.state === 'applying' || snapshot.state === 'rollback_failed') {
+        codexUpdateInterlocked = true;
+      }
+      return snapshot;
+    } catch (error) {
+      if (error instanceof CodexUpdateBrokerError)
+        throw new HttpError(503, error.code, error.message);
+      throw error;
+    }
+  };
+
   const resourceWorkActive = (): boolean =>
     activeRootCount() > 0 || pendingTurnStarts > 0 || repository.countActiveSubagents() > 0;
+
+  const codexUpdateWorkActive = (): boolean =>
+    resourceWorkActive() ||
+    pendingThreadStarts > 0 ||
+    resourceApplyPromise !== null ||
+    activeTranscriptions > 0 ||
+    accountLoginInterlocked;
 
   const applyPendingResources = async (): Promise<ResourceLimitSnapshot> => {
     if (resourceApplyPromise) {
@@ -1677,6 +1719,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     { bodyLimit: MAX_TRANSCRIPTION_BYTES + 16_384 },
     async (request) => {
       const context = csrfGuard(auth, request);
+      if (codexUpdateInterlocked || upgradeDrainRequested())
+        throw new HttpError(409, 'CODEX_UPDATE_PENDING');
       const transcriptionClient = dependencies.transcriptionClient;
       if (!transcriptionClient)
         throw new HttpError(503, 'TRANSCRIPTION_UNAVAILABLE', 'Transcription is unavailable');
@@ -1755,6 +1799,63 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return { data: preferences };
   });
 
+  app.get('/api/system/codex-update', async (request) => {
+    auth.authenticate(request);
+    return { data: await codexUpdateStatus() };
+  });
+
+  app.post('/api/system/codex-update/apply', async (request, reply) => {
+    csrfGuard(auth, request);
+    z.object({})
+      .strict()
+      .parse(request.body ?? {});
+    if (codexUpdateInterlocked) throw new HttpError(409, 'CODEX_UPDATE_PENDING');
+    if (codexUpdateWorkActive() || upgradeDrainRequested())
+      throw new HttpError(
+        409,
+        'CODEX_UPDATE_BUSY',
+        'Codex update requires all work and account login to be idle',
+      );
+    if (!dependencies.codexUpdateBroker)
+      throw new HttpError(503, 'CODEX_UPDATE_UNAVAILABLE', 'Codex update broker is unavailable');
+
+    codexUpdateApplyPending = true;
+    codexUpdateGeneration += 1;
+    codexUpdateInterlocked = true;
+    try {
+      const before = await codexUpdateStatus();
+      if (before.state !== 'ready') {
+        codexUpdateApplyPending = false;
+        codexUpdateInterlocked = before.state === 'applying' || before.state === 'rollback_failed';
+        throw new HttpError(
+          409,
+          before.state === 'applying' ? 'CODEX_UPDATE_PENDING' : 'CODEX_UPDATE_NOT_READY',
+        );
+      }
+      codexUpdateInterlocked = true;
+      const snapshot = codexUpdateSnapshotSchema.parse(
+        await dependencies.codexUpdateBroker.apply(),
+      );
+      codexUpdateApplyPending = false;
+      if (snapshot.state !== 'applying') {
+        codexUpdateInterlocked = true;
+        throw new HttpError(502, 'CODEX_UPDATE_NOT_STARTED');
+      }
+      codexUpdateInterlocked = true;
+      repository.audit('codex_update.apply', 'accepted', {
+        currentVersion: snapshot.currentVersion,
+        availableVersion: snapshot.availableVersion,
+        candidateReleaseId: snapshot.candidateReleaseId,
+      });
+      return reply.code(202).send({ data: snapshot });
+    } catch (error) {
+      codexUpdateApplyPending = false;
+      if (error instanceof CodexUpdateBrokerError)
+        throw new HttpError(503, error.code, error.message);
+      throw error;
+    }
+  });
+
   app.get('/api/system/resource-limits', async (request) => {
     auth.authenticate(request);
     const snapshot = await brokerSnapshot();
@@ -1763,6 +1864,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
 
   app.put('/api/system/resource-limits', async (request, reply) => {
     csrfGuard(auth, request);
+    if (codexUpdateInterlocked || upgradeDrainRequested())
+      throw new HttpError(409, 'CODEX_UPDATE_PENDING');
     const input = updateResourceLimitsRequestSchema.parse(request.body);
     const capacity = await brokerSnapshot();
     if (input.desired.mode === 'custom') {
@@ -1805,6 +1908,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
 
   app.post('/api/system/resource-limits/apply', async (request, reply) => {
     csrfGuard(auth, request);
+    if (codexUpdateInterlocked || upgradeDrainRequested())
+      throw new HttpError(409, 'CODEX_UPDATE_PENDING');
     const input = applyResourceLimitsRequestSchema.parse(request.body);
     const stored = repository.getResourceLimits();
     if (stored.version !== input.expectedVersion)
@@ -1975,6 +2080,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const input = startThreadRequestSchema.parse(request.body);
     const project = repository.getProject(input.projectId);
     if (!project) throw new HttpError(404, 'PROJECT_NOT_FOUND');
+    if (codexUpdateInterlocked || upgradeDrainRequested())
+      throw new HttpError(503, 'SERVICE_DRAINING');
     if (accountLoginInterlocked) throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
     pendingThreadStarts += 1;
     try {
@@ -2295,6 +2402,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       return attachment;
     });
     const hash = requestHash(input);
+    if (codexUpdateInterlocked || upgradeDrainRequested())
+      throw new HttpError(503, 'SERVICE_DRAINING');
     if (accountLoginInterlocked) throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
     const operation = `turn:${id}`;
     const reservation = repository.reserveIdempotent(operation, input.idempotencyKey, hash);
@@ -2340,6 +2449,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           'Resource policy must be applied before a new task can start',
         );
       }
+    }
+    if (codexUpdateInterlocked || upgradeDrainRequested()) {
+      repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
+      throw new HttpError(503, 'SERVICE_DRAINING');
     }
     if (accountLoginInterlocked) {
       repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
@@ -2735,6 +2848,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   app.post('/api/system/codex-account/login', async (request, reply) => {
     csrfGuard(auth, request);
     const input = codexAccountLoginRequestSchema.parse(request.body);
+    if (codexUpdateInterlocked || upgradeDrainRequested())
+      throw new HttpError(409, 'CODEX_UPDATE_PENDING');
     if (accountLoginInterlocked) throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
     if (resourceWorkActive() || pendingThreadStarts > 0)
       throw new HttpError(
@@ -2956,6 +3071,16 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       warnings,
     });
   });
+
+  if (dependencies.codexUpdateBroker) {
+    try {
+      await codexUpdateStatus();
+    } catch {
+      // Keep admission closed. A later authenticated status request may
+      // reconcile a healthy, non-applying broker snapshot.
+      codexUpdateInterlocked = true;
+    }
+  }
 
   return app;
 }

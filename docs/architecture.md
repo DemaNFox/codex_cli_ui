@@ -110,7 +110,11 @@ Browser
 - `workspace-write`: normal development inside the registered project.
 - `full-access`: Codex `danger-full-access` semantics within the privileges of the non-root service account.
 
-The service does not add sudo, root, Docker socket, product secrets, or deployment credentials. A future deployment broker is a separate typed and audited boundary.
+The service does not add sudo, root, Docker socket, product secrets, or deployment credentials. The installed
+update broker is not part of a Codex permission preset: it is a separate root-owned, socket-activated boundary
+that accepts only `status` and `apply` for one fixed, operator-staged release. Neither the browser nor the API
+can supply a URL, filesystem path, package name, version, systemd unit or shell command. Codex and the Web API
+continue to run under their existing non-root identities.
 
 ## Portability
 
@@ -223,6 +227,22 @@ This drain prevents planned upgrades from destroying work; it is not crash recov
 runner process failure can still terminate an in-flight Codex turn because the private app-server process is
 bound to that connection. Preserving computation across such a crash would require a durable broker outside
 the API lifecycle.
+
+## Status-drawer Codex updates
+
+An operator first places a complete reviewed application package in the immutable release store and stages its
+release identifier through the root-only host helper. The authenticated Status drawer can then request only
+activation of that fixed candidate. The API keeps an admission interlock while the request is uncertain or the
+worker is applying, and rejects activation unless root turns, pending starts, subagents, account login, resource
+changes and voice transcription are idle.
+
+The root broker authenticates the API peer from the Unix socket, validates root ownership and containment,
+checks the installed package inventory, architecture and `apiCompatibility`, and starts one fixed systemd
+oneshot. Before drain or activation, the installer runs the candidate Codex binary as the non-root runner to
+generate its app-server schemas and byte-compares their SHA-256 values with the reviewed protocol snapshot in
+that same package. The worker performs the normal full-release activation, health check and transactional
+rollback; therefore a Codex CLI change may also switch the compatible backend and UI rather than replacing the
+CLI in isolation. The browser polls the broker result across the API restart.
 
 ## Independent Web UI releases
 

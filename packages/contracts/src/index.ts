@@ -90,6 +90,27 @@ export const applyResourceLimitsRequestSchema = z.object({
   expectedVersion: z.number().int().nonnegative(),
 });
 
+export const codexUpdateResultSchema = z.object({
+  status: z.enum(['succeeded', 'failed', 'rollback_failed']),
+  message: z.string().min(1).max(2_000),
+  completedAt: z.string().datetime(),
+});
+
+export const codexUpdateSnapshotSchema = z.object({
+  state: z.enum(['unavailable', 'ready', 'applying', 'current', 'failed', 'rollback_failed']),
+  currentVersion: z.string().regex(/^codex-cli \d+\.\d+\.\d+$/),
+  availableVersion: z
+    .string()
+    .regex(/^codex-cli \d+\.\d+\.\d+$/)
+    .nullable(),
+  candidateReleaseId: z
+    .string()
+    .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/)
+    .nullable(),
+  lastResult: codexUpdateResultSchema.nullable(),
+});
+export type CodexUpdateSnapshot = z.infer<typeof codexUpdateSnapshotSchema>;
+
 export const subagentStatusSchema = z.enum([
   'pendingInit',
   'running',

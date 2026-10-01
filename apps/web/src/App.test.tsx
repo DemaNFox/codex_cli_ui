@@ -114,6 +114,14 @@ const resourceLimits = {
   warning: null,
 };
 
+const unavailableCodexUpdate = {
+  state: 'unavailable' as const,
+  currentVersion: 'codex-cli 1.2.3',
+  availableVersion: null,
+  candidateReleaseId: null,
+  lastResult: null,
+};
+
 const subagents = [
   {
     id: 'agent-1',
@@ -265,6 +273,8 @@ function installAuthenticatedApi(
       );
     if (url === '/api/models') return Promise.resolve(jsonResponse(models));
     if (url === '/api/system/capabilities') return Promise.resolve(jsonResponse(capabilities));
+    if (url === '/api/system/codex-update')
+      return Promise.resolve(jsonResponse({ data: unavailableCodexUpdate }));
     if (url === '/api/system/resource-limits')
       return Promise.resolve(jsonResponse({ data: resourceLimits }));
     if (url.includes('/api/threads?')) return Promise.resolve(jsonResponse([thread]));
@@ -2595,7 +2605,78 @@ describe('App', () => {
     expect(screen.getByText((content) => content.replace(/\s/g, '') === '123456')).not.toBeNull();
     expect(await screen.findByText('/srv/projects/ai-chat-bot/AGENTS.md')).not.toBeNull();
     expect(screen.getByText('multi-agent-orchestrator')).not.toBeNull();
-    expect(screen.getByText('1.2.3')).not.toBeNull();
+    expect(screen.getAllByText('1.2.3').length).toBeGreaterThan(0);
+    expect(screen.getByText('Подготовленное обновление отсутствует.')).not.toBeNull();
+    expect(screen.queryByRole('button', { name: 'Обновить Codex' })).toBeNull();
+  });
+
+  it('starts a prepared Codex update and refreshes its version after completion', async () => {
+    let updateReads = 0;
+    let capabilityReads = 0;
+    const readyUpdate = {
+      state: 'ready' as const,
+      currentVersion: 'codex-cli 1.2.3',
+      availableVersion: 'codex-cli 1.2.4',
+      candidateReleaseId: 'release-124',
+      lastResult: null,
+    };
+    const completedUpdate = {
+      state: 'current' as const,
+      currentVersion: 'codex-cli 1.2.4',
+      availableVersion: null,
+      candidateReleaseId: null,
+      lastResult: {
+        status: 'succeeded' as const,
+        message: 'Codex updated',
+        completedAt: '2026-10-01T10:00:00.000Z',
+      },
+    };
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/system/capabilities') {
+        capabilityReads += 1;
+        return jsonResponse({
+          ...capabilities,
+          codexVersion: capabilityReads > 1 ? '1.2.4' : '1.2.3',
+        });
+      }
+      if (url === '/api/system/codex-update/apply' && init?.method === 'POST') {
+        return jsonResponse(
+          {
+            data: {
+              ...readyUpdate,
+              state: 'applying',
+            },
+          },
+          202,
+        );
+      }
+      if (url === '/api/system/codex-update') {
+        updateReads += 1;
+        return jsonResponse({ data: updateReads > 1 ? completedUpdate : readyUpdate });
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    expect((await screen.findAllByText('1.2.4')).length).toBeGreaterThan(0);
+    await user.click(screen.getByRole('button', { name: 'Обновить Codex' }));
+
+    expect(await screen.findByText('Обновляем Codex…')).not.toBeNull();
+    expect(screen.queryByRole('button', { name: 'Обновить Codex' })).toBeNull();
+    expect(screen.getByText(/Обновление запускается только когда Codex свободен/)).not.toBeNull();
+    expect(await screen.findByText('Установлена актуальная подготовленная версия.')).not.toBeNull();
+    expect(await screen.findByText('Codex обновлён. Чаты и файлы сохранены.')).not.toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/system/codex-update/apply',
+      expect.objectContaining({ method: 'POST', body: '{}' }),
+    );
+    const applyCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        requestUrl(input) === '/api/system/codex-update/apply' && init?.method === 'POST',
+    );
+    expect(new Headers(applyCall?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf-token');
   });
 
   it('starts Codex account login and presents the device code without accepting credentials', async () => {

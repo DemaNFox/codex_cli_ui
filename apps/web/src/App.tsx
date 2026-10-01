@@ -25,6 +25,7 @@ import type {
   Attachment,
   Capability,
   CodexAccountLogin,
+  CodexUpdateSnapshot,
   ModelOption,
   PendingApproval,
   Project,
@@ -55,6 +56,7 @@ const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const MAX_THREAD_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const ACCOUNT_LOGIN_POLL_INTERVAL_MS = 500;
 const ACCOUNT_LOGIN_MAX_POLLS = 1_800;
+const CODEX_UPDATE_POLL_INTERVAL_MS = 1_000;
 const EVENT_TIME_FORMATTER = new Intl.DateTimeFormat('ru-RU', {
   dateStyle: 'short',
   timeStyle: 'medium',
@@ -1920,6 +1922,9 @@ function SubagentMenu({ subagents }: { subagents: Subagent[] }) {
 
 function Diagnostics({
   capability,
+  codexUpdate,
+  codexUpdateBusy,
+  codexUpdateError,
   resourceLimits,
   resourceBusy,
   resourceError,
@@ -1928,10 +1933,14 @@ function Diagnostics({
   onSaveResources,
   onApplyResources,
   onStartAccountLogin,
+  onApplyCodexUpdate,
   accountSwitchButtonRef,
   onClose,
 }: {
   capability: Capability | null;
+  codexUpdate: CodexUpdateSnapshot | null;
+  codexUpdateBusy: boolean;
+  codexUpdateError: string | null;
   resourceLimits: ResourceLimitSnapshot | null;
   resourceBusy: boolean;
   resourceError: string | null;
@@ -1940,6 +1949,7 @@ function Diagnostics({
   onSaveResources: (desired: ResourceLimitPolicy) => Promise<void>;
   onApplyResources: () => Promise<void>;
   onStartAccountLogin: () => void;
+  onApplyCodexUpdate: () => void;
   accountSwitchButtonRef: RefObject<HTMLButtonElement | null>;
   onClose: () => void;
 }) {
@@ -1983,6 +1993,59 @@ function Diagnostics({
           >
             Сменить аккаунт
           </button>
+          <section className="codex-update" aria-labelledby="codex-update-title">
+            <h3 id="codex-update-title">Обновление Codex</h3>
+            {codexUpdate ? (
+              <>
+                <dl className="status-grid codex-update-versions">
+                  <dt>Текущая версия</dt>
+                  <dd>{codexUpdate.currentVersion}</dd>
+                  {codexUpdate.availableVersion && (
+                    <>
+                      <dt>Подготовлена</dt>
+                      <dd>{codexUpdate.availableVersion}</dd>
+                    </>
+                  )}
+                </dl>
+                <p className="codex-update-state" role="status">
+                  {codexUpdate.state === 'ready' && 'Обновление готово к установке.'}
+                  {codexUpdate.state === 'applying' && 'Обновляем Codex…'}
+                  {codexUpdate.state === 'current' &&
+                    'Установлена актуальная подготовленная версия.'}
+                  {codexUpdate.state === 'unavailable' && 'Подготовленное обновление отсутствует.'}
+                  {codexUpdate.state === 'failed' && 'Обновление не установлено.'}
+                  {codexUpdate.state === 'rollback_failed' &&
+                    'Обновление не установлено, автоматический откат не завершён.'}
+                </p>
+                {codexUpdate.lastResult && codexUpdate.lastResult.status !== 'succeeded' && (
+                  <p className="notice error" role="alert">
+                    {codexUpdate.lastResult.message}
+                  </p>
+                )}
+                {codexUpdate.state === 'ready' && (
+                  <button
+                    className="primary codex-update-button"
+                    type="button"
+                    disabled={codexUpdateBusy}
+                    onClick={onApplyCodexUpdate}
+                  >
+                    {codexUpdateBusy ? 'Запускаем…' : 'Обновить Codex'}
+                  </button>
+                )}
+              </>
+            ) : (
+              <p className="empty-hint compact">Проверяем подготовленные обновления…</p>
+            )}
+            <p className="codex-update-note">
+              Обновление запускается только когда Codex свободен и ненадолго перезапускает его. Чаты
+              и файлы сохраняются.
+            </p>
+            {codexUpdateError && (
+              <p className="notice error" role="alert">
+                {codexUpdateError}
+              </p>
+            )}
+          </section>
           <ResourceSettings
             snapshot={resourceLimits}
             busy={resourceBusy}
@@ -2219,6 +2282,9 @@ function Workspace({
   const [recentThreads, setRecentThreads] = useState<Thread[]>([]);
   const [models, setModels] = useState<ModelOption[]>([]);
   const [capability, setCapability] = useState<Capability | null>(null);
+  const [codexUpdate, setCodexUpdate] = useState<CodexUpdateSnapshot | null>(null);
+  const [codexUpdateBusy, setCodexUpdateBusy] = useState(false);
+  const [codexUpdateError, setCodexUpdateError] = useState<string | null>(null);
   const [resourceLimits, setResourceLimits] = useState<ResourceLimitSnapshot | null>(null);
   const [resourceBusy, setResourceBusy] = useState(false);
   const [resourceError, setResourceError] = useState<string | null>(null);
@@ -2263,6 +2329,7 @@ function Workspace({
   const mobileNavigationToggleRef = useRef<HTMLButtonElement>(null);
   const statusToggleRef = useRef<HTMLButtonElement>(null);
   const accountSwitchButtonRef = useRef<HTMLButtonElement>(null);
+  const refreshedCodexUpdateRef = useRef<string | null>(null);
   const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
   const attachmentThreadRef = useRef<string | null>(null);
   const activeUploadsRef = useRef(new Map<string, { threadId: string; abort: () => void }>());
@@ -2751,6 +2818,55 @@ function Workspace({
       window.clearInterval(timer);
     };
   }, [accountLogin?.expiresAt, accountLogin?.state, accountLoginOpen]);
+
+  useEffect(() => {
+    if (codexUpdate?.state !== 'applying') return;
+    let disposed = false;
+    let checking = false;
+    const poll = async () => {
+      if (disposed || checking) return;
+      checking = true;
+      try {
+        const next = await api.codexUpdate();
+        if (!disposed) {
+          setCodexUpdate(next);
+          setCodexUpdateError(null);
+        }
+      } catch (cause) {
+        if (!disposed)
+          setCodexUpdateError(`Не удалось проверить обновление: ${errorMessage(cause)}`);
+      } finally {
+        checking = false;
+      }
+    };
+    const timer = window.setInterval(() => void poll(), CODEX_UPDATE_POLL_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [codexUpdate?.state]);
+
+  useEffect(() => {
+    if (
+      codexUpdate?.state !== 'current' ||
+      codexUpdate.lastResult?.status !== 'succeeded' ||
+      !codexUpdate.lastResult.completedAt ||
+      refreshedCodexUpdateRef.current === codexUpdate.lastResult.completedAt
+    )
+      return;
+    refreshedCodexUpdateRef.current = codexUpdate.lastResult.completedAt;
+    void api
+      .capabilities()
+      .then((next) => {
+        setCapability(next);
+        setActionNotice('Codex обновлён. Чаты и файлы сохранены.');
+      })
+      .catch((cause: unknown) => {
+        setCodexUpdateError(
+          `Codex обновлён, но его статус пока недоступен: ${errorMessage(cause)}`,
+        );
+      });
+  }, [codexUpdate]);
 
   async function togglePushNotifications(): Promise<void> {
     if (!threadId || pushNotificationBusy) return;
@@ -3350,9 +3466,10 @@ function Workspace({
     setStatusRefreshing(true);
     setError(null);
     try {
-      const [capabilityResult, resourceResult] = await Promise.allSettled([
+      const [capabilityResult, resourceResult, codexUpdateResult] = await Promise.allSettled([
         api.capabilities(),
         api.resourceLimits(),
+        api.codexUpdate(),
       ]);
       if (capabilityResult.status === 'rejected') throw capabilityResult.reason;
       setCapability(capabilityResult.value);
@@ -3362,10 +3479,35 @@ function Workspace({
       } else {
         setResourceError(errorMessage(resourceResult.reason));
       }
+      if (codexUpdateResult.status === 'fulfilled') {
+        setCodexUpdate(codexUpdateResult.value);
+        setCodexUpdateError(null);
+      } else {
+        setCodexUpdateError(errorMessage(codexUpdateResult.reason));
+      }
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
       setStatusRefreshing(false);
+    }
+  }
+
+  async function applyCodexUpdate() {
+    if (codexUpdate?.state !== 'ready' || codexUpdateBusy) return;
+    setCodexUpdateBusy(true);
+    setCodexUpdateError(null);
+    try {
+      const next = await api.applyCodexUpdate(session.csrfToken);
+      setCodexUpdate(next);
+      setActionNotice(
+        next.state === 'applying'
+          ? 'Обновление Codex началось. Оно завершится автоматически.'
+          : 'Состояние обновления Codex изменилось.',
+      );
+    } catch (cause) {
+      setCodexUpdateError(`Не удалось начать обновление: ${errorMessage(cause)}`);
+    } finally {
+      setCodexUpdateBusy(false);
     }
   }
 
@@ -3921,6 +4063,9 @@ function Workspace({
       {showDiagnostics && (
         <Diagnostics
           capability={capability}
+          codexUpdate={codexUpdate}
+          codexUpdateBusy={codexUpdateBusy}
+          codexUpdateError={codexUpdateError}
           resourceLimits={resourceLimits}
           resourceBusy={resourceBusy}
           resourceError={resourceError}
@@ -3929,6 +4074,7 @@ function Workspace({
           onSaveResources={saveResourceLimits}
           onApplyResources={applyResourceLimits}
           onStartAccountLogin={() => void startAccountLogin()}
+          onApplyCodexUpdate={() => void applyCodexUpdate()}
           accountSwitchButtonRef={accountSwitchButtonRef}
           onClose={closeDiagnostics}
         />

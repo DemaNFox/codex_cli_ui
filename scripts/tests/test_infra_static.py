@@ -7,6 +7,73 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class InfraStaticTest(unittest.TestCase):
+    def test_codex_update_boundary_is_packaged_and_installed_as_fixed_helpers(self) -> None:
+        release = (ROOT / "scripts/prepare-release.sh").read_text(encoding="utf-8")
+        installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        worker = (ROOT / "scripts/codex-update-worker.sh").read_text(encoding="utf-8")
+        for artifact in (
+            "codex-web-ui-codex-update-broker.socket",
+            "codex-web-ui-codex-update-broker@.service",
+            "codex-web-ui-codex-update.service",
+            "scripts/codex-update-broker.py",
+            "scripts/codex-update-worker.sh",
+            "scripts/stage-codex-update.sh",
+        ):
+            self.assertIn(artifact, release)
+            self.assertIn(artifact.split("/")[-1], installer)
+        self.assertIn("/usr/local/libexec/codex-web-ui-codex-update-broker", installer)
+        self.assertIn("/usr/local/libexec/codex-web-ui-codex-update-worker", installer)
+        self.assertIn("/usr/local/sbin/codex-web-ui-stage-codex-update", installer)
+        self.assertIn("config_backup=", installer)
+        self.assertIn('CODEX_WEB_CODEX_VERSION_PIN=', installer)
+        self.assertIn(
+            "/lib/node_modules/@openai/codex/bin/codex.js) codex_bin=$managed_codex_bin",
+            installer,
+        )
+        self.assertIn('install -m 0600 -o root -g root "$config_backup" "$config"', installer)
+        self.assertIn("app-server generate-json-schema", installer)
+        self.assertIn("candidate Codex protocol differs from reviewed snapshot", installer)
+        self.assertLess(
+            installer.index("app-server generate-json-schema"),
+            installer.index('bash "$package/scripts/graceful-drain.sh" "${drain_args[@]}"'),
+        )
+        self.assertIn('exec bash "$relocated" --relocated', worker)
+        self.assertIn('--package "$candidate"', worker)
+        self.assertIn("--upgrade", worker)
+        self.assertNotIn("curl", worker)
+        stage = (ROOT / "scripts/stage-codex-update.sh").read_text(encoding="utf-8")
+        broker = (ROOT / "scripts/codex-update-broker.py").read_text(encoding="utf-8")
+        self.assertIn("codex-update-candidate.lock", stage)
+        self.assertIn("codex-update.lock", stage)
+        self.assertIn("codex-update-candidate.lock", worker)
+        self.assertIn("codex-update-candidate.lock", broker)
+        for expected in (
+            "--source",
+            "--release-id",
+            '"$verifier" --verify "$source_dir" --arch "$target_arch"',
+            "--check-releases",
+            "--additional-releases 1",
+            'install -d -m 0700 -o root -g root "$stage"',
+            'cp -a --no-preserve=ownership -- "$source_dir/." "$stage/"',
+            'chown -R root:root "$stage"',
+            'chmod -R go-w "$stage"',
+            'mv -- "$stage" "$target"',
+            '"$verifier" --verify "$stage" --arch "$target_arch"',
+        ):
+            self.assertIn(expected, stage)
+        self.assertNotIn("curl", stage)
+        source_verify = stage.index('"$verifier" --verify "$source_dir" --arch "$target_arch"')
+        capacity = stage.index("--additional-releases 1", source_verify)
+        copy = stage.index('cp -a --no-preserve=ownership -- "$source_dir/." "$stage/"')
+        copied_verify = stage.index('"$verifier" --verify "$stage" --arch "$target_arch"')
+        activate = stage.index('mv -- "$stage" "$target"')
+        link = stage.index('mv -Tf -- "$link_temporary" "$candidate_link"', activate)
+        self.assertLess(source_verify, capacity)
+        self.assertLess(capacity, copy)
+        self.assertLess(copy, copied_verify)
+        self.assertLess(copied_verify, activate)
+        self.assertLess(activate, link)
+
     def test_systemd_unit_keeps_non_root_shared_host_boundary(self) -> None:
         unit = (ROOT / "infra/systemd/codex-web-ui@.service").read_text(encoding="utf-8")
         for expected in (
@@ -51,6 +118,15 @@ class InfraStaticTest(unittest.TestCase):
         broker_service = (
             ROOT / "infra/systemd/codex-web-ui-resource-broker@.service"
         ).read_text(encoding="utf-8")
+        update_broker_socket = (
+            ROOT / "infra/systemd/codex-web-ui-codex-update-broker.socket"
+        ).read_text(encoding="utf-8")
+        update_broker_service = (
+            ROOT / "infra/systemd/codex-web-ui-codex-update-broker@.service"
+        ).read_text(encoding="utf-8")
+        update_worker = (
+            ROOT / "infra/systemd/codex-web-ui-codex-update.service"
+        ).read_text(encoding="utf-8")
         self.assertIn("MemorySwapMax=0", workload_slice)
         self.assertNotIn("MemoryMax=4G", unit + runner + workload_slice)
         self.assertIn("Accept=yes", broker_socket)
@@ -62,6 +138,16 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("ProtectSystem=strict", broker_service)
         self.assertIn("InaccessiblePaths=-/etc/codex-web-ui/codex-web-ui.env", broker_service)
         self.assertIn("RestrictAddressFamilies=AF_UNIX", broker_service)
+        self.assertIn("SocketUser=codex-web-ui-api", update_broker_socket)
+        self.assertIn("SocketMode=0600", update_broker_socket)
+        self.assertIn("User=root", update_broker_service)
+        self.assertIn("CapabilityBoundingSet=", update_broker_service)
+        self.assertIn("ProtectSystem=strict", update_broker_service)
+        self.assertIn("ReadWritePaths=/run/codex-web-ui", update_broker_service)
+        self.assertIn("RestrictAddressFamilies=AF_UNIX", update_broker_service)
+        self.assertIn("ExecStart=/usr/local/libexec/codex-web-ui-codex-update-worker", update_worker)
+        self.assertIn("User=root", update_worker)
+        self.assertNotIn("/bin/sh -c", update_broker_service + update_worker)
 
         guard_unit = (ROOT / "infra/systemd/codex-web-ui-storage-guard@.service").read_text(
             encoding="utf-8"
@@ -168,7 +254,12 @@ class InfraStaticTest(unittest.TestCase):
         self.assertNotIn('source "$REPO_ROOT/infra/toolchain.env"', bootstrap)
         self.assertNotIn("--confirm-legacy-idle", wrapper)
         for expected in (
-            "marker=/var/lib/codex-web-ui/data/upgrade-drain",
+            "marker=/run/codex-web-ui/upgrade-drain",
+            "legacy_marker=/var/lib/codex-web-ui/data/upgrade-drain",
+            "os.O_EXCL | os.O_NOFOLLOW",
+            "mktemp /tmp/codex-web-ui-upgrade-drain-health",
+            'systemctl stop "codex-web-ui@${service_user}.service"',
+            "legacy-upgrade-api-stopped",
             "activeTurns",
             "pendingTurnStarts",
             'drain.get("acceptingNewTurns") is False',
