@@ -146,24 +146,37 @@ function useActiveTurnDuration(
   activeTurnId: string | null,
   active: boolean,
 ): string | null {
-  const startedAt = useMemo(() => {
+  const timing = useMemo(() => {
     if (!active || !activeTurnId) return null;
     const timestamps = events
       .filter((event) => event.turnId === activeTurnId)
       .map((event) => Date.parse(event.createdAt))
       .filter(Number.isFinite);
-    return timestamps.length ? new Date(Math.min(...timestamps)).toISOString() : null;
+    return timestamps.length
+      ? { startedAt: Math.min(...timestamps), latestAt: Math.max(...timestamps) }
+      : null;
   }, [active, activeTurnId, events]);
-  const [now, setNow] = useState(() => new Date().toISOString());
+  const [now, setNow] = useState(() => Date.now());
+  const observationRef = useRef({ key: '', observedAt: now });
+  const observationKey = timing ? `${activeTurnId}:${timing.latestAt}` : '';
+  if (observationRef.current.key !== observationKey) {
+    observationRef.current = { key: observationKey, observedAt: Date.now() };
+  }
 
   useEffect(() => {
-    if (!active || !startedAt) return undefined;
-    setNow(new Date().toISOString());
-    const timer = window.setInterval(() => setNow(new Date().toISOString()), 1000);
+    if (!active || !timing) return undefined;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
-  }, [active, startedAt]);
+  }, [active, timing]);
 
-  return startedAt ? formatDuration(startedAt, now) : null;
+  if (!timing) return null;
+  const sinceLatestObserved = Math.max(0, now - observationRef.current.observedAt);
+  const effectiveNow = Math.max(now, timing.latestAt + sinceLatestObserved);
+  return formatDuration(
+    new Date(timing.startedAt).toISOString(),
+    new Date(effectiveNow).toISOString(),
+  );
 }
 
 function formatResetTime(value: number | null): string {

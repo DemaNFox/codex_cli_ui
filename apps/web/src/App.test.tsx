@@ -2003,6 +2003,48 @@ describe('App', () => {
     expect(await screen.findByText(/Codex работает уже [5-9] сек\./)).not.toBeNull();
   });
 
+  it('uses server event deltas when the browser clock is behind', async () => {
+    const startedAt = new Date(Date.now() + 60_000).toISOString();
+    const progressedAt = new Date(Date.parse(startedAt) + 7_000).toISOString();
+    const activeThread = {
+      ...thread,
+      status: 'active',
+      activeTurnId: 'turn-skewed-clock',
+    };
+    installAuthenticatedApi((url) => {
+      if (url.includes('/api/threads?')) return jsonResponse([activeThread]);
+      if (url === '/api/threads/thread-1') {
+        return jsonResponse({
+          data: activeThread,
+          events: [
+            {
+              id: 1,
+              threadId: 'thread-1',
+              turnId: 'turn-skewed-clock',
+              kind: 'turn',
+              phase: 'started',
+              payload: { status: 'inProgress' },
+              createdAt: startedAt,
+            },
+            {
+              id: 2,
+              threadId: 'thread-1',
+              turnId: 'turn-skewed-clock',
+              kind: 'command',
+              phase: 'completed',
+              payload: { command: 'git status' },
+              createdAt: progressedAt,
+            },
+          ],
+        });
+      }
+      return undefined;
+    });
+    render(<App />);
+
+    expect(await screen.findByText(/Codex работает уже 7 сек\./)).not.toBeNull();
+  });
+
   it('steers an active turn and can interrupt it', async () => {
     const fetchMock = installAuthenticatedApi();
     const user = userEvent.setup();
