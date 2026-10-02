@@ -183,16 +183,23 @@ sudo cat /etc/codex-web-ui/resource-limits.json
 Do not edit the generated slice drop-in or policy file while the service is running. Use the authenticated Web
 UI so updates are serialized against active work and audited.
 
-## Staged Codex updates
+## Codex updates from Status
 
-The API also performs a read-only check of the fixed official npm metadata endpoint at startup and every six
-hours. Opening Status reads the cached result; “Проверить обновления” forces the same bounded check. This may
-report a newer upstream CLI before a compatible full application release has been prepared. It never downloads
-or stages executable content and does not replace the operator staging procedure below.
+The API performs a read-only check of the fixed official npm metadata endpoint at startup and every six hours.
+Opening Status reads the cached result; “Проверить обновления” forces the same bounded check. Discovery never
+selects executable content. The root broker separately exposes either a staged full application package or the
+single reviewed runtime target shipped in `infra/codex-update-target.json`.
 
-The Status drawer can activate a newer Codex version only from a complete immutable release that a trusted host
-operator has already installed beneath `/opt/codex-web-ui/releases`. After reviewing and preparing that release,
-stage exactly its identifier:
+When that reviewed target is newer than the installed runtime, Status shows “Скачать и установить”. Its empty
+request carries no URL, path, version, package or command. The fixed worker independently requires the official
+registry latest version to equal the reviewed target, verifies npm and committed SHA-512 digests, performs
+bounded safe extraction, regenerates app-server schemas as an unprivileged identity and requires exact reviewed
+protocol hashes. A mismatch fails closed and requires a compatible full application package. Activation drains
+work, switches protected runtime/version pins, health-checks the service and restores the previous configuration
+on failure.
+
+The staged full-release path remains authoritative for protocol or application changes. After reviewing and
+preparing a complete release, stage exactly its identifier:
 
 ```sh
 sudo /usr/local/sbin/codex-web-ui-stage-codex-update \

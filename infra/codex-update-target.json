@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "package": "@openai/codex",
+  "version": "0.160.0",
+  "tarballs": {
+    "main": {
+      "sha512": "904b551b38d101800c3b0271377f5b19c9daecb4f7203420abae0d349fdd0d37eee0ecd96a870973235be7f80627f21517f563ee82bb1369b79e64da9fb9698e"
+    },
+    "linux-x64": {
+      "sha512": "288ffbdcea86ac7991d7cb3bc9aec4d4da95eab4f4cb7971af4b3c4b5a91da6eb353a41117f1e5479dbd8c02cb879be37549ec453e00868c6dd1ac5be2463df6"
+    },
+    "linux-arm64": {
+      "sha512": "56755db12d3a6250ec2fc3b06898d0df176a749346e22f9e049055dcbcad75d927cd2685feeae28cbcd5837a6d930be88fc0bb1a7ee25a9544fb2f1611a3e20a"
+    }
+  },
+  "protocolFiles": {
+    "codex_app_server_protocol.schemas.json": "8683f6fd9fbb994fa2bfb704ab5b02c9890238fa507a4c0ff33ff45884cd0a2e",
+    "codex_app_server_protocol.v2.schemas.json": "81a88c04ae4984b16d73080f4109d0477682bc76c8adbe483e371175ce54c054"
+  }
+}

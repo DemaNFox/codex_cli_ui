@@ -2283,6 +2283,7 @@ function AccountLoginDialog({
 }) {
   const pending = login?.state === 'pending';
   const succeeded = login?.state === 'succeeded';
+  const verificationHost = login?.verificationUrl ? new URL(login.verificationUrl).hostname : null;
   const dialogRef = useRef<HTMLElement>(null);
   useEffect(() => {
     if (busy) return;
@@ -2354,10 +2355,15 @@ function AccountLoginDialog({
                   target="_blank"
                   rel="noopener noreferrer"
                 >
-                  Открыть страницу входа
+                  Открыть {verificationHost}
                 </a>
               ) : null}
             </div>
+            {verificationHost ? (
+              <p className="account-login-site">
+                Сайт входа: <strong>{verificationHost}</strong>
+              </p>
+            ) : null}
             <p className="notice warning">
               Никому не сообщайте этот код — он даёт доступ к вашему аккаунту.
             </p>

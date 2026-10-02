@@ -3100,9 +3100,10 @@ describe('App', () => {
     expect(await screen.findByRole('dialog', { name: 'Смена аккаунта Codex' })).not.toBeNull();
     expect(screen.getByLabelText('Одноразовый код').textContent).toContain('ABCD-EFGH');
     expect(screen.getByRole('button', { name: 'Копировать код' })).not.toBeNull();
-    expect(screen.getByRole('link', { name: 'Открыть страницу входа' }).getAttribute('href')).toBe(
+    expect(screen.getByRole('link', { name: 'Открыть auth.openai.com' }).getAttribute('href')).toBe(
       'https://auth.openai.com/device',
     );
+    expect(screen.getByText('auth.openai.com', { selector: 'strong' })).not.toBeNull();
     expect(screen.getByText(/Никому не сообщайте этот код/)).not.toBeNull();
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/system/codex-account/login',

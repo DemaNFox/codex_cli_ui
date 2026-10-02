@@ -47,17 +47,24 @@ admitted only while every root turn, pending start and subagent is idle; new wor
 flow completes, fails or cancellation is confirmed. A cancellation whose outcome cannot be verified remains
 fail-closed until Codex reports a terminal result or the API process is restarted.
 
-After installation, the Web owner may also activate a newer pinned Codex version from the Status drawer, but
-only when a trusted host operator has already placed and staged a complete immutable release. The browser and
-API never select or download a version, URL, path or package. A root-owned broker exposes only fixed `status`
-and `apply` operations, authenticates the API socket peer, and delegates activation to one fixed systemd
-oneshot. The API remains non-root; Codex and app-server retain the explicitly installed runner mode.
+After installation, the Web owner may also activate a newer reviewed Codex version from the Status drawer.
+The preferred path remains a complete immutable release staged by a trusted host operator. For a CLI release
+whose generated app-server protocol is byte-identical to the reviewed backend boundary, the installed package
+may additionally carry one exact runtime-update target: version, both architecture archives, their SHA-512
+digests and the expected protocol hashes. The browser and API never select or download a version, URL, path or
+package. A root-owned broker exposes only fixed `status` and `apply` operations, authenticates the API socket
+peer, and delegates activation to one fixed systemd oneshot. The API remains non-root; Codex and app-server
+retain the explicitly installed runner mode.
 
 The staged package is accepted only when its inventory, architecture and API compatibility match the installed
 boundary. Before drain, the candidate Codex binary generates its schemas as the runner and those bytes must
-match the reviewed checksummed protocol snapshot in the package. Activation uses the normal health-checked
-full upgrade and restores the prior release and both version-pin environment files on failure. A CLI-only
-floating update is deliberately unsupported because the backend and protocol pin form one compatibility unit.
+match the reviewed checksummed protocol snapshot in the package. A reviewed runtime-only target is downloaded
+only from the fixed official npm origin with redirects disabled and bounded responses; both npm's published
+integrity and the repository-committed digest must match. Archive extraction rejects traversal, links, special
+files and bounded-size violations. The candidate binary then generates schemas as an unprivileged identity and
+must reproduce the committed hashes before the protected runtime path and version pins are switched. Both
+paths use idle drain, health checks and transactional rollback. An arbitrary or merely latest CLI remains
+unsupported because the backend and protocol pin form one compatibility unit.
 
 The application package remains architecture-specific because of native server
 dependencies, but it is not an air-gapped toolchain bundle: first installation
@@ -67,13 +74,14 @@ requires access to Ubuntu package repositories, nodejs.org and registry.npmjs.or
 
 - A clean supported server needs only Git, internet access, a sudo-capable operator, HTTPS configuration and
   project storage. Restricted remains the default; host-admin is never selected implicitly.
-- Runtime upgrades are deliberate source changes: update versions and digests,
-  verify both supported architectures, and release the matching protocol pin.
+- Runtime upgrades are deliberate source changes: update versions and digests, verify both supported
+  architectures, and release the matching protocol pin. The six-hour registry check discovers availability;
+  it does not make an unreviewed newer version installable.
 - The non-root API performs a bounded, read-only check of the fixed official `@openai/codex/latest` registry
-  endpoint at startup, every six hours and on an authenticated empty-body refresh request. This check is
-  informational only: it cannot select, download, stage or activate a package. The Status drawer can activate
-  only an operator-staged compatible full release and cannot change the installed runner mode or grant root
-  to the API.
+  endpoint at startup, every six hours and on an authenticated empty-body refresh request. This check cannot
+  select an update target. The Status drawer can activate only an operator-staged compatible full release or
+  the one repository-reviewed runtime target and cannot change the installed runner mode or grant root to the
+  API.
 - An explicit application `--upgrade` moves an existing managed Codex path to
   the newly pinned managed version. A custom Codex path remains fixed and must
   use a separate explicit migration workflow.

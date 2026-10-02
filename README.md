@@ -160,6 +160,12 @@ The command verifies the checksummed package with the currently installed verifi
 `web-current`. Use `rollback-web-ubuntu.sh` to reverse only that static switch. Backend, protocol, migration,
 systemd or resource-control changes still require the normal drained full upgrade.
 
+The Status drawer can install the single repository-reviewed compatible Codex runtime target without a server
+terminal command. The browser sends only an empty request; the root worker verifies fixed official npm URLs,
+committed archive digests and an exact generated-protocol match before switching the immutable runtime, and
+rolls back protected configuration if health fails. An arbitrary newer CLI or a protocol-changing release still
+requires a reviewed full application package.
+
 To expose a previously installed and reviewed full release in the Status drawer, stage its release identifier
 on the server:
 

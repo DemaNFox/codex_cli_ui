@@ -1660,7 +1660,8 @@ button:disabled {
   text-decoration: none;
 }
 .account-login-progress,
-.account-login-copy-note {
+.account-login-copy-note,
+.account-login-site {
   margin: 0.75rem 0 0;
   font-size: 0.72rem;
 }

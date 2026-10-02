@@ -124,16 +124,18 @@ Browser
 
 Restricted mode does not add sudo, root, Docker socket, product secrets, or deployment credentials. Host-admin
 mode deliberately runs only the Codex app-server runner as root; the API remains non-root. The installed update
-broker is not part of a Codex permission preset: it is a separate root-owned, socket-activated boundary
-that accepts only `status` and `apply` for one fixed, operator-staged release. Neither the browser nor the API
-can supply a URL, filesystem path, package name, version, systemd unit or shell command.
+broker is not part of a Codex permission preset: it is a separate root-owned, socket-activated boundary that
+accepts only `status` and `apply` for one fixed operator-staged release or one repository-reviewed runtime
+target. Neither the browser nor the API can supply a URL, filesystem path, package name, version, systemd unit
+or shell command.
 
 Version discovery is deliberately outside that privileged broker. The non-root API reads only the fixed HTTPS
 `@openai/codex/latest` metadata endpoint with redirects disabled, a five-second timeout, a 32 KiB response cap
 and bounded semantic-version validation. Successful results are cached for fifteen minutes, failures for one
 minute, and a background check runs at startup and every six hours. The authenticated browser may force the
 same fixed check with an empty request but cannot supply a URL, version or package. Discovery never changes the
-prepared candidate and never makes an npm-only CLI eligible for activation.
+prepared candidate or reviewed runtime target and never makes an arbitrary npm-only CLI eligible for
+activation.
 
 Because the non-root API cannot traverse every valid host-admin project (notably `0700` paths below `/root`),
 host-admin installs also use a separate read-only project-path broker. Its private socket accepts only an exact
@@ -279,19 +281,22 @@ fixed registry source when Status opens, supports an explicit “check now” ac
 without hiding the existing prepared-release state. After a completed activation, capabilities and the model
 catalog are both refreshed; a still-supported selected model is preserved.
 
-An operator first places a complete reviewed application package in the immutable release store and stages its
-release identifier through the root-only host helper. The authenticated Status drawer can then request only
-activation of that fixed candidate. The API keeps an admission interlock while the request is uncertain or the
+An operator may place a complete reviewed application package in the immutable release store and stage its
+release identifier through the root-only host helper. When no full package is staged, the installed release may
+instead expose one reviewed runtime-only target whose version, architecture archives and protocol hashes are
+fixed in root-owned package files. The authenticated Status drawer can request only activation of whichever
+fixed candidate the broker reports. The API keeps an admission interlock while the request is uncertain or the
 worker is applying, and rejects activation unless root turns, pending starts, subagents, account login, resource
 changes and voice transcription are idle.
 
 The root broker authenticates the API peer from the Unix socket, validates root ownership and containment,
-checks the installed package inventory, architecture and `apiCompatibility`, and starts one fixed systemd
-oneshot. Before drain or activation, the installer runs the candidate Codex binary as the non-root runner to
-generate its app-server schemas and byte-compares their SHA-256 values with the reviewed protocol snapshot in
-that same package. The worker performs the normal full-release activation, health check and transactional
-rollback; therefore a Codex CLI change may also switch the compatible backend and UI rather than replacing the
-CLI in isolation. The browser polls the broker result across the API restart.
+checks package/runtime target metadata and starts one fixed systemd oneshot. Full packages retain the existing
+inventory, architecture and `apiCompatibility` checks. A runtime-only target is downloaded from fixed npm URLs
+with no redirects, bounded before extraction, and accepted only when both published and repository-committed
+SHA-512 digests match. The candidate Codex binary runs unprivileged to generate schemas and must byte-match the
+reviewed protocol snapshot before drain. The worker switches immutable runtime/version-pin state, health-checks
+the API/app-server and transactionally restores the previous configuration on failure. A protocol-changing CLI
+still requires a compatible full release. The browser polls the broker result across the API restart.
 
 ## Independent Web UI releases
 

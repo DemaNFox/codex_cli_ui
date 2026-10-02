@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -33,12 +34,21 @@ CANDIDATE_LINK = OPT_ROOT / "codex-update-candidate"
 RELEASES_ROOT = OPT_ROOT / "releases"
 CURRENT_LINK = OPT_ROOT / "current"
 RESULT_PATH = Path("/var/lib/codex-web-ui/codex-update-result.json")
+RUNNER_CONFIG = Path("/etc/codex-web-ui/codex-runner.env")
+API_CONFIG = Path("/etc/codex-web-ui/codex-web-ui.env")
 SYSTEMCTL = "/usr/bin/systemctl"
 UPDATE_SERVICE = "codex-web-ui-codex-update.service"
 CANDIDATE_LOCK_PATH = Path("/run/codex-web-ui/codex-update-candidate.lock")
 SAFE_RELEASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 
 CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
+
+
+def _version_tuple(value: str) -> tuple[int, int, int]:
+    match = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)", value)
+    if match is None:
+        raise BrokerError("INSTALLATION_INVALID", "installed Codex version is invalid")
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
 
 
 class BrokerError(RuntimeError):
@@ -61,6 +71,13 @@ def run_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
 @dataclass(frozen=True)
 class Candidate:
     path: Path
+    release_id: str
+    version: str
+
+
+@dataclass(frozen=True)
+class RuntimeCandidate:
+    package_root: Path
     release_id: str
     version: str
 
@@ -104,6 +121,8 @@ class CodexUpdateBroker:
         result_path: Path = RESULT_PATH,
         command_runner: CommandRunner = run_command,
         machine: str | None = None,
+        runner_config: Path = RUNNER_CONFIG,
+        api_config: Path = API_CONFIG,
     ) -> None:
         self.opt_root = opt_root
         self.releases_root = opt_root / "releases"
@@ -112,6 +131,8 @@ class CodexUpdateBroker:
         self.result_path = result_path
         self.command_runner = command_runner
         self.machine = machine or platform.machine()
+        self.runner_config = runner_config
+        self.api_config = api_config
 
     @property
     def expected_arch(self) -> str:
@@ -189,10 +210,75 @@ class CodexUpdateBroker:
 
     def _current_version(self) -> str:
         _path, _release_id, manifest = self.current()
-        value = manifest.get("runtime", {}).get("codex", {}).get("versionPin")
+        configured: list[str] = []
+        for path in (self.runner_config, self.api_config):
+            if not path.exists():
+                continue
+            _trusted_regular_file(path, "INSTALLATION_INVALID", "installed configuration is unsafe")
+            values = [
+                match.group(1)
+                for line in path.read_text(encoding="utf-8").splitlines()
+                if (match := re.fullmatch(r'CODEX_WEB_CODEX_VERSION_PIN="(codex-cli \d+\.\d+\.\d+)"', line))
+            ]
+            if len(values) != 1:
+                raise BrokerError("INSTALLATION_INVALID", "installed Codex version is invalid")
+            configured.append(values[0])
+        if configured and len(set(configured)) != 1:
+            raise BrokerError("INSTALLATION_INVALID", "installed Codex version pins disagree")
+        value = configured[0] if configured else manifest.get("runtime", {}).get("codex", {}).get("versionPin")
         if not isinstance(value, str):
             raise BrokerError("INSTALLATION_INVALID", "installed Codex version is invalid")
         return value
+
+    def runtime_candidate(self) -> RuntimeCandidate:
+        package_root, _release_id, _manifest = self.current()
+        target_path = package_root / "infra/codex-update-target.json"
+        try:
+            _trusted_regular_file(
+                target_path,
+                "UPDATE_UNAVAILABLE",
+                "reviewed runtime update pins are unavailable",
+            )
+            try:
+                target = json.loads(target_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise BrokerError("RUNTIME_UPDATE_INVALID", "reviewed runtime update target is invalid") from error
+            if not isinstance(target, dict):
+                raise BrokerError("RUNTIME_UPDATE_INVALID", "reviewed runtime update target is invalid")
+            if set(target) != {"schemaVersion", "package", "version", "tarballs", "protocolFiles"}:
+                raise BrokerError("RUNTIME_UPDATE_INVALID", "reviewed runtime update target fields are invalid")
+            version = target.get("version")
+            tarballs = target.get("tarballs")
+            checksums = tuple(
+                value.get("sha512") if isinstance(value, dict) and set(value) == {"sha512"} else None
+                for value in tarballs.values()
+            ) if isinstance(tarballs, dict) and set(tarballs) == {"main", "linux-x64", "linux-arm64"} else (None,)
+            if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+                raise BrokerError("RUNTIME_UPDATE_INVALID", "reviewed runtime version is invalid")
+            if target.get("schemaVersion") != 1 or target.get("package") != "@openai/codex" or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{128}", value) for value in checksums):
+                raise BrokerError("RUNTIME_UPDATE_INVALID", "reviewed runtime integrity pins are invalid")
+            files = target.get("protocolFiles")
+            if not isinstance(files, dict) or set(files) != {
+                "codex_app_server_protocol.schemas.json",
+                "codex_app_server_protocol.v2.schemas.json",
+            } or any(not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value) for value in files.values()):
+                raise BrokerError("RUNTIME_UPDATE_INVALID", "reviewed protocol snapshot is invalid")
+            for name, expected in files.items():
+                snapshot = package_root / "protocol" / version / name
+                _trusted_regular_file(snapshot, "RUNTIME_UPDATE_INVALID", "reviewed protocol snapshot is unavailable")
+                if hashlib.sha256(snapshot.read_bytes()).hexdigest() != expected:
+                    raise BrokerError("RUNTIME_UPDATE_INVALID", "reviewed protocol snapshot checksum mismatch")
+        except OSError as error:
+            raise BrokerError("UPDATE_UNAVAILABLE", "reviewed runtime update is unavailable") from error
+        return RuntimeCandidate(package_root, f"runtime-{version}", f"codex-cli {version}")
+
+    def available_candidate(self) -> Candidate | RuntimeCandidate:
+        try:
+            return self.validate_candidate()
+        except BrokerError as error:
+            if error.code != "UPDATE_UNAVAILABLE":
+                raise
+        return self.runtime_candidate()
 
     def _worker_active(self) -> bool:
         result = self.command_runner(
@@ -247,14 +333,14 @@ class CodexUpdateBroker:
         last_result, result_release_id = self._last_result()
         if self._worker_active():
             try:
-                candidate = self.validate_candidate()
+                candidate = self.available_candidate()
                 available_version, candidate_id = candidate.version, candidate.release_id
             except BrokerError:
                 available_version, candidate_id = None, None
             state = "applying"
         else:
             try:
-                candidate = self.validate_candidate()
+                candidate = self.available_candidate()
             except BrokerError as error:
                 if error.code == "UPDATE_UNAVAILABLE":
                     candidate = None
@@ -266,7 +352,7 @@ class CodexUpdateBroker:
                 available_version, candidate_id = candidate.version, candidate.release_id
                 if result_release_id == candidate.release_id and last_result is not None and last_result["status"] != "succeeded":
                     state = "rollback_failed" if last_result["status"] == "rollback_failed" else "failed"
-                elif candidate.version == current_version:
+                elif _version_tuple(candidate.version) <= _version_tuple(current_version):
                     state = "current"
                 else:
                     state = "ready"
@@ -372,6 +458,8 @@ def main() -> int:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--serve-fd", type=int)
     group.add_argument("--validate-candidate-path", action="store_true")
+    group.add_argument("--runtime-candidate-json", action="store_true")
+    group.add_argument("--resolve-update-json", action="store_true")
     arguments = parser.parse_args()
     try:
         if not hasattr(os, "geteuid") or os.geteuid() != 0:
@@ -379,6 +467,30 @@ def main() -> int:
         broker = CodexUpdateBroker()
         if arguments.validate_candidate_path:
             print(broker.validate_candidate().path)
+            return 0
+        if arguments.runtime_candidate_json:
+            candidate = broker.runtime_candidate()
+            print(
+                json.dumps(
+                    {
+                        "candidateReleaseId": candidate.release_id,
+                        "packageRoot": str(candidate.package_root),
+                        "version": candidate.version.removeprefix("codex-cli "),
+                    },
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+            )
+            return 0
+        if arguments.resolve_update_json:
+            candidate = broker.available_candidate()
+            if _version_tuple(candidate.version) <= _version_tuple(broker._current_version()):
+                raise BrokerError("UPDATE_NOT_READY", "reviewed update is not newer than installed Codex")
+            if isinstance(candidate, Candidate):
+                value = {"candidateReleaseId": candidate.release_id, "kind": "full-package", "path": str(candidate.path), "version": candidate.version.removeprefix("codex-cli ")}
+            else:
+                value = {"candidateReleaseId": candidate.release_id, "kind": "runtime", "packageRoot": str(candidate.package_root), "version": candidate.version.removeprefix("codex-cli ")}
+            print(json.dumps(value, separators=(",", ":"), sort_keys=True))
             return 0
         assert arguments.serve_fd is not None
         return _serve(arguments.serve_fd, broker, arguments.api_user)

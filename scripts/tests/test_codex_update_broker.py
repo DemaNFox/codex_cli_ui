@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 import os
 import subprocess
@@ -86,6 +87,32 @@ class CodexUpdateBrokerTest(unittest.TestCase):
 
     def request(self, action: str) -> dict[str, object]:
         return {"version": 1, "requestId": str(uuid.uuid4()), "action": action}
+
+    def add_runtime_target(self, version: str = "0.160.0") -> None:
+        protocol = {
+            "codex_app_server_protocol.schemas.json": b'{"v":1}\n',
+            "codex_app_server_protocol.v2.schemas.json": b'{"v":2}\n',
+        }
+        for name, content in protocol.items():
+            path = self.current / "protocol" / version / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        target = {
+            "schemaVersion": 1,
+            "package": "@openai/codex",
+            "version": version,
+            "tarballs": {
+                "main": {"sha512": "1" * 128},
+                "linux-x64": {"sha512": "2" * 128},
+                "linux-arm64": {"sha512": "3" * 128},
+            },
+            "protocolFiles": {
+                name: hashlib.sha256(content).hexdigest() for name, content in protocol.items()
+            },
+        }
+        path = self.current / "infra/codex-update-target.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(target), encoding="utf-8")
 
     def test_status_reports_only_verified_fixed_candidate(self) -> None:
         result = self.broker.handle(self.request("status"))
@@ -207,6 +234,50 @@ class CodexUpdateBrokerTest(unittest.TestCase):
         result = self.broker.handle(self.request("status"))
         self.assertEqual(result["snapshot"]["state"], "unavailable")
         self.assertIsNone(result["snapshot"]["availableVersion"])
+
+    def test_reviewed_runtime_target_is_ready_without_full_package(self) -> None:
+        (self.root / "codex-update-candidate").unlink()
+        self.add_runtime_target()
+        result = self.broker.handle(self.request("status"))
+        self.assertEqual(result["snapshot"]["state"], "ready")
+        self.assertEqual(result["snapshot"]["availableVersion"], "codex-cli 0.160.0")
+        self.assertEqual(result["snapshot"]["candidateReleaseId"], "runtime-0.160.0")
+
+    def test_runtime_target_equal_or_older_than_installed_is_current(self) -> None:
+        (self.root / "codex-update-candidate").unlink()
+        for version in ("0.153.4", "0.152.9"):
+            with self.subTest(version=version):
+                self.add_runtime_target(version)
+                result = self.broker.handle(self.request("status"))
+                self.assertEqual(result["snapshot"]["state"], "current")
+
+    def test_installed_config_pin_makes_successful_runtime_target_current(self) -> None:
+        (self.root / "codex-update-candidate").unlink()
+        self.add_runtime_target()
+        runner = Path(self.temp.name) / "codex-runner.env"
+        api = Path(self.temp.name) / "codex-web-ui.env"
+        for path in (runner, api):
+            path.write_text('CODEX_WEB_CODEX_VERSION_PIN="codex-cli 0.160.0"\n', encoding="utf-8")
+            os.chmod(path, 0o600)
+        self.broker.runner_config = runner
+        self.broker.api_config = api
+        result = self.broker.handle(self.request("status"))
+        self.assertEqual(result["snapshot"]["state"], "current")
+
+    def test_runtime_target_protocol_snapshot_must_match_reviewed_hash(self) -> None:
+        (self.root / "codex-update-candidate").unlink()
+        self.add_runtime_target()
+        (self.current / "protocol/0.160.0/codex_app_server_protocol.schemas.json").write_text(
+            "changed", encoding="utf-8"
+        )
+        with self.assertRaises(MODULE.BrokerError) as caught:
+            self.broker.handle(self.request("status"))
+        self.assertEqual(caught.exception.code, "RUNTIME_UPDATE_INVALID")
+
+    def test_full_package_candidate_remains_preferred_over_runtime_target(self) -> None:
+        self.add_runtime_target("0.999.0")
+        result = self.broker.handle(self.request("status"))
+        self.assertEqual(result["snapshot"]["candidateReleaseId"], "candidate-1")
 
     def test_apply_rejects_candidate_already_at_current_version(self) -> None:
         manifest_path = self.candidate / "release.json"

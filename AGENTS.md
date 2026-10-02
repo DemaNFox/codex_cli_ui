@@ -11,8 +11,10 @@ This repository is a standalone, portable Codex server package. Its supported Ub
   mode and runs Codex as root without the runner filesystem/capability sandbox, so authenticated Codex turns may
   administer the whole machine. The browser-facing API always remains the separate non-root
   `codex-web-ui-api` identity and never receives sudo, the Docker socket or a general root helper. The installed
-  update control may call only the fixed root broker for an operator-staged, verified compatible release; it
-  must never accept a browser-supplied package, path, URL, version, command or unit.
+  update control may call only the fixed root broker for either an operator-staged compatible full release or
+  the single repository-reviewed Codex runtime target; it must never accept a browser-supplied package, path,
+  URL, version, command or unit. Runtime-only activation must match committed archive digests and the reviewed
+  app-server protocol byte-for-byte before any installed configuration changes.
 - Projects are existing directories beneath configured real-path allowlisted roots. Reject traversal, symlink escape, and unregistered working directories.
 - OpenAI credentials remain in the server-side `CODEX_HOME`; never return, log, persist, or accept them through the browser API.
 - Bootstrap Codex authentication only as the selected runner identity through its direct terminal. Root device
