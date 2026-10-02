@@ -448,7 +448,10 @@ def main() -> int:
                                     "Промежуточный отчёт, который должен скрыться после завершения."
                                     if index == 1
                                     else
-                                    "| Контур | Состояние |\n| --- | --- |\n| Web | Готово |"
+                                    "| Контур | Получено | Подтверждено | Причина остатка |\n"
+                                    "| --- | ---: | ---: | --- |\n"
+                                    "| Вчера | 196 | 114 | Подтверждение ещё не получено |\n"
+                                    "| Сегодня | 150 | 82 | Проверка и повторная отправка |"
                                     "\n\n[Скачать отчёт](reports/audit.md)"
                                     if index == 2
                                     else f"Историческое сообщение {index}: длинный чат остаётся прокручиваемым."
@@ -968,7 +971,7 @@ def main() -> int:
             raise AssertionError("active-turn attachment queue was not cleared after accepted steer")
         page.get_by_role("button", name="Открыть чат проекта Переносимый чат").click()
         page.get_by_role("heading", name="Переносимый чат").wait_for()
-        page.get_by_role("table").get_by_role("cell", name="Готово").wait_for()
+        page.get_by_role("table").get_by_role("cell", name="Вчера").wait_for()
         if page.get_by_role("button", name="Голосовой ввод").count() != 1:
             raise AssertionError("voice input control is not available in the composer")
         agent_toggle = page.get_by_label("Агенты задачи: активных 1, всего 1")
@@ -1032,6 +1035,54 @@ def main() -> int:
                 f"shell={transcript_shell_box}, transcript={transcript_box}, final={final_answer_box}"
             )
         page.set_viewport_size({"width": 1440, "height": 900})
+        transcript_box = page.locator(".transcript").bounding_box()
+        final_answer_box = final_answer.bounding_box()
+        table_scroll = final_answer.locator(".markdown-table-scroll")
+        table_metrics = table_scroll.evaluate(
+            "element => ({scrollWidth: element.scrollWidth, clientWidth: element.clientWidth})"
+        )
+        if (
+            not transcript_box
+            or not final_answer_box
+            or final_answer_box["width"] < transcript_box["width"] * 0.95
+        ):
+            raise AssertionError(
+                "wide desktop final answer does not use the available transcript width: "
+                f"transcript={transcript_box}, final={final_answer_box}"
+            )
+        if table_metrics["scrollWidth"] > table_metrics["clientWidth"] + 1:
+            raise AssertionError(
+                f"wide desktop result table still has horizontal overflow: {table_metrics}"
+            )
+        if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1":
+            page.set_viewport_size({"width": 390, "height": 780})
+            mobile_layout = page.evaluate(
+                """
+                () => ({
+                  viewportWidth: document.documentElement.clientWidth,
+                  pageWidth: document.documentElement.scrollWidth,
+                  transcriptWidth: document.querySelector('.transcript')?.scrollWidth ?? 0,
+                  transcriptClientWidth: document.querySelector('.transcript')?.clientWidth ?? 0,
+                  tableViewportWidth: document.querySelector('.markdown-table-scroll')?.clientWidth ?? 0,
+                  tableWidth: document.querySelector('.markdown-table-scroll')?.scrollWidth ?? 0,
+                })
+                """
+            )
+            if mobile_layout["pageWidth"] > mobile_layout["viewportWidth"] + 1:
+                raise AssertionError(
+                    f"mobile page overflows horizontally: {mobile_layout}"
+                )
+            if mobile_layout["transcriptWidth"] > mobile_layout["transcriptClientWidth"] + 1:
+                raise AssertionError(
+                    f"mobile transcript overflows horizontally: {mobile_layout}"
+                )
+            if mobile_layout["tableWidth"] <= mobile_layout["tableViewportWidth"]:
+                raise AssertionError(
+                    f"mobile result table lost its contained horizontal scroll: {mobile_layout}"
+                )
+            browser.close()
+            print("browser-smoke: wide and mobile transcript layout passed")
+            return 0
         generated_file = final_answer.get_by_role("link", name="Скачать отчёт")
         if generated_file.get_attribute("download") != "audit.md":
             raise AssertionError("generated project file is not marked as a download")

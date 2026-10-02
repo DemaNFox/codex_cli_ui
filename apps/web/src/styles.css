@@ -956,6 +956,31 @@ button:disabled {
 .markdown-content th {
   background: #20252a;
 }
+
+@media (min-width: 821px) {
+  .conversation-scroll {
+    padding-inline: 1.25rem;
+  }
+  .composer-wrap {
+    padding-inline: 1.25rem;
+  }
+  .slash-palette {
+    right: 1.25rem;
+    left: 1.25rem;
+  }
+  .message.agent {
+    width: 100%;
+    max-width: none;
+  }
+  .markdown-table-scroll {
+    overflow-x: visible;
+  }
+  .markdown-content table {
+    width: 100%;
+    min-width: 0;
+    table-layout: fixed;
+  }
+}
 .markdown-image-alt {
   overflow-wrap: anywhere;
 }
