@@ -109,7 +109,8 @@ rollback_runtime() {
 }
 
 apply_runtime() {
-  local arch pnpm bin stage_error
+  local arch pnpm bin stage_error units_output unit _rest
+  local -a units=()
   case "$(uname -m)" in x86_64) arch=x64 ;; aarch64) arch=arm64 ;; *) return 1 ;; esac
   pnpm=$(sed -n 's/^PNPM_VERSION=//p' "$package_root/infra/toolchain.env")
   [[ $pnpm =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
@@ -142,12 +143,18 @@ PY
   runtime_created=true
   mv -- "$runtime_stage" "$runtime_dir"; runtime_stage=; bin="$runtime_dir/lib/node_modules/@openai/codex/bin/codex.js"
   install -m 0600 -o root -g root "$runner_config" "$runtime_backups/runner"; install -m 0600 -o root -g root "$config" "$runtime_backups/api"
-  bash "$previous/scripts/graceful-drain.sh" --begin --config "$config" --service-user api --timeout 1800; runtime_drain=true
+  runtime_drain=true
+  bash "$previous/scripts/graceful-drain.sh" --begin --config "$config" --service-user api --timeout 1800
   # From this point rollback must restore/restart even if a signal arrives
   # before the protected configuration is replaced.
   runtime_switched=true
   systemctl stop codex-web-ui-app-server.socket
-  mapfile -t units < <(systemctl list-units --state=active --plain --no-legend 'codex-web-ui-app-server@*.service' | awk '{print $1}')
+  units_output=$(systemctl list-units --state=active --plain --no-legend 'codex-web-ui-app-server@*.service')
+  while read -r unit _rest; do
+    [[ -z $unit ]] && continue
+    [[ $unit =~ ^codex-web-ui-app-server@[^[:space:]]+\.service$ ]] || return 1
+    units+=("$unit")
+  done <<<"$units_output"
   if ((${#units[@]})); then systemctl stop "${units[@]}"; fi
   # From this point every error restores both protected files from the root-only backup,
   # including a failure between their two atomic replacements.

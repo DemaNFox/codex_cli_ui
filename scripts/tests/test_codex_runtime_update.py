@@ -77,6 +77,12 @@ class CodexRuntimeUpdateTest(unittest.TestCase):
             worker.index("runtime_switched=true"),
             worker.index("systemctl stop codex-web-ui-app-server.socket"),
         )
+        self.assertLess(
+            worker.index("runtime_drain=true"),
+            worker.index('graceful-drain.sh" --begin'),
+        )
+        self.assertIn("units_output=$(systemctl list-units", worker)
+        self.assertNotIn("mapfile -t units < <(systemctl list-units", worker)
         committed_finish = worker.index("if $update_committed; then")
         self.assertGreater(
             worker.index("write_result succeeded", committed_finish), committed_finish
