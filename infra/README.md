@@ -119,7 +119,7 @@ activation.
   `python3`, `xz-utils` and (for the bundled edge) Nginx through APT. It installs
   exact toolchain versions from `infra/toolchain.env`; startup fails unless
   `codex --version` exactly matches `CODEX_WEB_CODEX_VERSION_PIN` (initially
-  `codex-cli 0.160.0`). `binutils` remains an additional prerequisite only for
+  `codex-cli 0.159.3`). `binutils` remains an additional prerequisite only for
   the optional scoped AppArmor profile.
 - Restricted mode requires an existing non-root service user. The current server may use `ai-chat-agent` with
   `CODEX_HOME=/opt/ai-chat-agents/home/.codex`. Host-admin requires the root runner and defaults to root's

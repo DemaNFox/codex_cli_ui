@@ -104,7 +104,7 @@ if [[ ! -e $config ]]; then
     printf 'CODEX_WEB_PROJECT_ROOTS=%s\n' "$roots_csv"
     printf 'CODEX_BIN=%s\n' "$codex_bin"
     printf 'CODEX_HOME=%s\n' "$codex_home"
-    printf 'CODEX_WEB_CODEX_VERSION_PIN="codex-cli 0.160.0"\n'
+    printf 'CODEX_WEB_CODEX_VERSION_PIN="codex-cli 0.159.3"\n'
     printf 'CODEX_WEB_ADMIN_USERNAME=\n'
     printf 'CODEX_WEB_ADMIN_PASSWORD_HASH=\n'
     printf 'CODEX_WEB_SESSION_SECRET=\n'
