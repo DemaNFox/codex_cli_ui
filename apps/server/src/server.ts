@@ -346,6 +346,7 @@ export interface ServerDependencies {
   readonly pushSender?: PushSender;
   readonly upgradeDrainPath?: string;
   readonly accountLoginTimeoutMs?: number;
+  readonly codexUpdateStartupRetryMs?: number;
 }
 
 function publicAttachment(record: AttachmentRecord): Attachment {
@@ -808,10 +809,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   let codexUpdateInterlocked = dependencies.codexUpdateBroker !== undefined;
   let codexUpdateApplyPending = false;
   let codexUpdateGeneration = 0;
+  let codexUpdateStartupReconciled = dependencies.codexUpdateBroker === undefined;
   let resourceStartupRetry: NodeJS.Timeout | null = null;
+  let codexUpdateStartupRetry: NodeJS.Timeout | null = null;
   let serverClosing = false;
   const upgradeDrainPath = dependencies.upgradeDrainPath ?? '/run/codex-web-ui/upgrade-drain';
   const accountLoginTimeoutMs = dependencies.accountLoginTimeoutMs ?? CODEX_ACCOUNT_LOGIN_TTL_MS;
+  const codexUpdateStartupRetryMs = dependencies.codexUpdateStartupRetryMs ?? 1_000;
   const upgradeDrainRequested = (): boolean => {
     try {
       return lstatSync(upgradeDrainPath).isFile();
@@ -888,11 +892,31 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       } else if (snapshot.state === 'applying' || snapshot.state === 'rollback_failed') {
         codexUpdateInterlocked = true;
       }
+      codexUpdateStartupReconciled = true;
+      if (codexUpdateStartupRetry !== null) {
+        clearTimeout(codexUpdateStartupRetry);
+        codexUpdateStartupRetry = null;
+      }
       return snapshot;
     } catch (error) {
       if (error instanceof CodexUpdateBrokerError)
         throw new HttpError(503, error.code, error.message);
       throw error;
+    }
+  };
+
+  const reconcileStartupCodexUpdate = async (): Promise<void> => {
+    try {
+      await codexUpdateStatus();
+    } catch {
+      if (serverClosing || codexUpdateStartupReconciled) return;
+      codexUpdateInterlocked = true;
+      if (codexUpdateStartupRetry !== null) return;
+      codexUpdateStartupRetry = setTimeout(() => {
+        codexUpdateStartupRetry = null;
+        if (!serverClosing) void reconcileStartupCodexUpdate();
+      }, codexUpdateStartupRetryMs);
+      codexUpdateStartupRetry.unref();
     }
   };
 
@@ -1744,6 +1768,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   app.addHook('onClose', async () => {
     serverClosing = true;
     if (resourceStartupRetry) clearTimeout(resourceStartupRetry);
+    if (codexUpdateStartupRetry) clearTimeout(codexUpdateStartupRetry);
     clearAccountLoginTimer();
     unsubscribe();
     await pushDispatcher?.close();
@@ -3228,13 +3253,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   });
 
   if (dependencies.codexUpdateBroker) {
-    try {
-      await codexUpdateStatus();
-    } catch {
-      // Keep admission closed. A later authenticated status request may
-      // reconcile a healthy, non-applying broker snapshot.
-      codexUpdateInterlocked = true;
-    }
+    // Keep admission closed after an unavailable/ambiguous broker read, but
+    // reconcile automatically once the socket-activated broker is ready.
+    await reconcileStartupCodexUpdate();
   }
 
   return app;

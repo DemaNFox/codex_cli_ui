@@ -509,6 +509,7 @@ async function fixture(
   accountLoginTimeoutMs?: number,
   codexUpdateBroker?: CodexUpdateBroker,
   codexVersionChecker?: CodexVersionChecker,
+  codexUpdateStartupRetryMs?: number,
 ) {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-server-'));
   const root = path.join(temp, 'projects');
@@ -566,6 +567,7 @@ async function fixture(
     ...(transcriptionClient ? { transcriptionClient } : {}),
     ...(pushSender ? { pushSender } : {}),
     ...(accountLoginTimeoutMs === undefined ? {} : { accountLoginTimeoutMs }),
+    ...(codexUpdateStartupRetryMs === undefined ? {} : { codexUpdateStartupRetryMs }),
   });
   openApps.push(app);
   await app.ready();
@@ -2046,6 +2048,86 @@ describe('Codex routes', () => {
     });
     expect(blockedLogin.statusCode).toBe(409);
     expect(blockedLogin.json()).toMatchObject({ error: { code: 'CODEX_UPDATE_PENDING' } });
+  });
+
+  it('retries startup update-broker reconciliation before reopening task admission', async () => {
+    const updateBroker = new FakeCodexUpdateBroker();
+    updateBroker.failStatus = true;
+    const { app, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      updateBroker,
+      undefined,
+      10,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+
+    const blocked = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(blocked.statusCode).toBe(503);
+    expect(blocked.json()).toMatchObject({ error: { code: 'SERVICE_DRAINING' } });
+
+    const readsBeforeRecovery = updateBroker.statusReads;
+    updateBroker.failStatus = false;
+    await vi.waitFor(() => expect(updateBroker.statusReads).toBeGreaterThan(readsBeforeRecovery));
+
+    const accepted = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(accepted.statusCode).toBe(201);
+  });
+
+  it('retires startup reconciliation after an authenticated status request succeeds', async () => {
+    const updateBroker = new FakeCodexUpdateBroker();
+    updateBroker.failStatus = true;
+    const { app, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      updateBroker,
+      undefined,
+      50,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+
+    updateBroker.failStatus = false;
+    const reconciled = await app.inject({
+      method: 'GET',
+      url: '/api/system/codex-update',
+      headers: session.headers,
+    });
+    expect(reconciled.statusCode).toBe(200);
+
+    const readsAfterRecovery = updateBroker.statusReads;
+    updateBroker.failStatus = true;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+    expect(updateBroker.statusReads).toBe(readsAfterRecovery);
+
+    const accepted = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(accepted.statusCode).toBe(201);
   });
 
   it('lets the root broker download an available Codex update without accepting a target', async () => {
