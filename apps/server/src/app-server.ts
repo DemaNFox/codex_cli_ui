@@ -5,7 +5,7 @@ import type { Readable } from 'node:stream';
 import { promisify } from 'node:util';
 
 const execFileAsync = promisify(execFile);
-const MAX_RPC_LINE_BYTES = 1_048_576;
+const DEFAULT_MAX_RPC_LINE_BYTES = 32 * 1_024 * 1_024;
 
 const CODEX_ENV_ALLOWLIST = new Set([
   'PATH',
@@ -60,6 +60,22 @@ export interface AppServerClient {
   respond(id: RpcId, result: unknown): void;
   respondError(id: RpcId, code: number, message: string): void;
   subscribe(listener: (message: AppServerInbound) => void): () => void;
+  subscribeLifecycle(listener: (event: AppServerLifecycleEvent) => void): () => void;
+}
+
+export interface AppServerLifecycleEvent {
+  readonly type: 'disconnected';
+  readonly generation: number;
+}
+
+function emitLifecycle(emitter: EventEmitter, event: AppServerLifecycleEvent): void {
+  for (const listener of emitter.listeners('event')) {
+    try {
+      (listener as (value: AppServerLifecycleEvent) => void)(event);
+    } catch {
+      // A consumer cannot prevent transport recovery after an unexpected disconnect.
+    }
+  }
 }
 
 const ALLOWED_REQUESTS = new Set([
@@ -118,6 +134,7 @@ function attachBoundedLineReader(
   stream: Readable,
   consume: (line: string) => void,
   reject: () => void,
+  maxLineBytes: number,
 ): () => void {
   let buffered: Buffer<ArrayBufferLike> = Buffer.alloc(0);
   let rejected = false;
@@ -134,7 +151,7 @@ function attachBoundedLineReader(
       const newline = buffered.indexOf(0x0a);
       if (newline === -1) break;
       const hasCarriageReturn = newline > 0 && buffered[newline - 1] === 0x0d;
-      if (newline - (hasCarriageReturn ? 1 : 0) > MAX_RPC_LINE_BYTES) {
+      if (newline - (hasCarriageReturn ? 1 : 0) > maxLineBytes) {
         rejectOnce();
         return;
       }
@@ -144,7 +161,7 @@ function attachBoundedLineReader(
       consume(line.toString('utf8'));
       if (rejected) return;
     }
-    if (buffered.length > MAX_RPC_LINE_BYTES) rejectOnce();
+    if (buffered.length > maxLineBytes) rejectOnce();
   };
   stream.on('data', onData);
   return () => stream.off('data', onData);
@@ -155,6 +172,7 @@ export interface SupervisorOptions {
   readonly codexHome?: string;
   readonly expectedVersion: string;
   readonly requestTimeoutMs?: number;
+  readonly maxLineBytes?: number;
 }
 
 export class CodexAppServerSupervisor implements AppServerClient {
@@ -162,6 +180,7 @@ export class CodexAppServerSupervisor implements AppServerClient {
   private nextId = 1;
   private readonly pending = new Map<RpcId, PendingRequest>();
   private readonly events = new EventEmitter();
+  private readonly lifecycleEvents = new EventEmitter();
   private stopping = false;
   private restartAttempt = 0;
   private restartTimer: NodeJS.Timeout | null = null;
@@ -218,6 +237,11 @@ export class CodexAppServerSupervisor implements AppServerClient {
     return () => this.events.off('message', listener);
   }
 
+  subscribeLifecycle(listener: (event: AppServerLifecycleEvent) => void): () => void {
+    this.lifecycleEvents.on('event', listener);
+    return () => this.lifecycleEvents.off('event', listener);
+  }
+
   async request(method: string, params: unknown): Promise<unknown> {
     if (!ALLOWED_REQUESTS.has(method)) throw new Error('APP_SERVER_METHOD_NOT_ALLOWED');
     if (!this.ready) throw new Error('APP_SERVER_UNAVAILABLE');
@@ -249,20 +273,31 @@ export class CodexAppServerSupervisor implements AppServerClient {
       child.stdout,
       (line) => this.consumeLine(line),
       () => child.kill('SIGKILL'),
+      this.options.maxLineBytes ?? DEFAULT_MAX_RPC_LINE_BYTES,
     );
     // Drain stderr without persisting it: app-server diagnostics may contain private paths.
     child.stderr.on('data', () => undefined);
-    child.once('exit', () => {
+    let finalized = false;
+    const finalizeUnexpectedDisconnect = () => {
+      if (finalized) return;
+      finalized = true;
+      const wasInitialized = this.initialized;
       this.detachLineReader?.();
       this.detachLineReader = null;
       if (this.child === child) this.child = null;
       this.initialized = false;
       this.rejectAll(new Error('APP_SERVER_EXITED'));
-      if (!this.stopping) this.scheduleRestart();
-    });
-    child.once('error', () => {
-      if (this.child === child) this.child = null;
-    });
+      if (!this.stopping) {
+        this.scheduleRestart();
+        if (wasInitialized)
+          emitLifecycle(this.lifecycleEvents, {
+            type: 'disconnected',
+            generation: this.currentGeneration,
+          } satisfies AppServerLifecycleEvent);
+      }
+    };
+    child.once('exit', finalizeUnexpectedDisconnect);
+    child.once('error', finalizeUnexpectedDisconnect);
 
     await this.sendRequest('initialize', INITIALIZE_PARAMS);
     this.write(INITIALIZED_NOTIFICATION);
@@ -305,7 +340,7 @@ export class CodexAppServerSupervisor implements AppServerClient {
   }
 
   private consumeLine(line: string): void {
-    if (Buffer.byteLength(line) > MAX_RPC_LINE_BYTES) {
+    if (Buffer.byteLength(line) > (this.options.maxLineBytes ?? DEFAULT_MAX_RPC_LINE_BYTES)) {
       this.child?.kill('SIGKILL');
       return;
     }
@@ -345,6 +380,7 @@ export class CodexAppServerSupervisor implements AppServerClient {
 export interface SocketClientOptions {
   readonly socketPath: string;
   readonly requestTimeoutMs?: number;
+  readonly maxLineBytes?: number;
 }
 
 export class CodexAppServerSocketClient implements AppServerClient {
@@ -352,6 +388,7 @@ export class CodexAppServerSocketClient implements AppServerClient {
   private nextId = 1;
   private readonly pending = new Map<RpcId, PendingRequest>();
   private readonly events = new EventEmitter();
+  private readonly lifecycleEvents = new EventEmitter();
   private stopping = false;
   private restartAttempt = 0;
   private restartTimer: NodeJS.Timeout | null = null;
@@ -405,6 +442,11 @@ export class CodexAppServerSocketClient implements AppServerClient {
     return () => this.events.off('message', listener);
   }
 
+  subscribeLifecycle(listener: (event: AppServerLifecycleEvent) => void): () => void {
+    this.lifecycleEvents.on('event', listener);
+    return () => this.lifecycleEvents.off('event', listener);
+  }
+
   async request(method: string, params: unknown): Promise<unknown> {
     if (!ALLOWED_REQUESTS.has(method)) throw new Error('APP_SERVER_METHOD_NOT_ALLOWED');
     if (!this.ready) throw new Error('APP_SERVER_UNAVAILABLE');
@@ -441,15 +483,24 @@ export class CodexAppServerSocketClient implements AppServerClient {
       socket,
       (line) => this.consumeLine(line),
       () => socket.destroy(),
+      this.options.maxLineBytes ?? DEFAULT_MAX_RPC_LINE_BYTES,
     );
     socket.once('close', () => {
       if (this.socket !== socket) return;
+      const wasInitialized = this.initialized;
       this.detachLineReader?.();
       this.detachLineReader = null;
       this.socket = null;
       this.initialized = false;
       this.rejectAll(new Error('APP_SERVER_EXITED'));
-      this.scheduleRestart();
+      if (!this.stopping) {
+        this.scheduleRestart();
+        if (wasInitialized)
+          emitLifecycle(this.lifecycleEvents, {
+            type: 'disconnected',
+            generation: this.currentGeneration,
+          } satisfies AppServerLifecycleEvent);
+      }
     });
 
     try {
@@ -503,7 +554,7 @@ export class CodexAppServerSocketClient implements AppServerClient {
   }
 
   private consumeLine(line: string): void {
-    if (Buffer.byteLength(line) > MAX_RPC_LINE_BYTES) {
+    if (Buffer.byteLength(line) > (this.options.maxLineBytes ?? DEFAULT_MAX_RPC_LINE_BYTES)) {
       this.socket?.destroy();
       return;
     }

@@ -2561,7 +2561,7 @@ describe('App', () => {
     expect(screen.queryByText('Frontend task')).toBeNull();
   });
 
-  it('hydrates an imported thread and deduplicates its replayed SSE event', async () => {
+  it('hydrates an imported thread before streaming only newer events', async () => {
     const importedThread = {
       ...thread,
       id: 'thread-imported',
@@ -2577,10 +2577,20 @@ describe('App', () => {
       payload: { text: 'История с сервера' },
       createdAt: '2026-09-27T09:01:00.000Z',
     };
+    const liveEvent = {
+      ...historyEvent,
+      id: 85,
+      payload: { text: 'Новый ответ из потока' },
+      createdAt: '2026-09-27T09:02:00.000Z',
+    };
+    let resolveImportedHistory!: (response: Response) => void;
+    const importedHistory = new Promise<Response>((resolve) => {
+      resolveImportedHistory = resolve;
+    });
     installAuthenticatedApi((url) => {
       if (url.includes('/api/threads?')) return jsonResponse([thread, importedThread]);
       if (url === '/api/threads/thread-imported') {
-        return jsonResponse({ data: importedThread, events: [historyEvent] });
+        return importedHistory;
       }
       return undefined;
     });
@@ -2590,14 +2600,26 @@ describe('App', () => {
     await user.click(
       await screen.findByRole('button', { name: 'Открыть чат проекта Импортированный чат' }),
     );
+    expect(FakeEventSource.instances.some((source) => source.url.includes('thread-imported'))).toBe(
+      false,
+    );
+
+    resolveImportedHistory(
+      jsonResponse({ data: importedThread, events: [historyEvent], eventCursor: 84 }),
+    );
     expect(await screen.findByText('История с сервера')).not.toBeNull();
-    await waitFor(() => expect(FakeEventSource.instances.at(-1)?.url).toContain('thread-imported'));
+    await waitFor(() =>
+      expect(FakeEventSource.instances.at(-1)?.url).toBe(
+        '/api/threads/thread-imported/events?after=84',
+      ),
+    );
 
     act(() => {
-      FakeEventSource.instances.at(-1)?.emit(historyEvent);
+      FakeEventSource.instances.at(-1)?.emit(liveEvent);
     });
 
     expect(screen.getAllByText('История с сервера')).toHaveLength(1);
+    expect(await screen.findByText('Новый ответ из потока')).not.toBeNull();
   });
 
   it('renames a chat and keeps the server result in navigation and the heading', async () => {

@@ -39,7 +39,10 @@ function isSafeEvent(value: unknown): value is SafeEvent {
   );
 }
 
-export function useThreadEvents(threadId: string | null): {
+export function useThreadEvents(
+  threadId: string | null,
+  afterCursor: number | null,
+): {
   events: SafeEvent[];
   streamState: StreamState;
   mergeEvents: (incoming: SafeEvent[], expectedThreadId?: string) => void;
@@ -71,9 +74,17 @@ export function useThreadEvents(threadId: string | null): {
     }
 
     setStreamState('connecting');
-    const source = new EventSource(`/api/threads/${encodeURIComponent(threadId)}/events?after=0`, {
-      withCredentials: true,
-    });
+  }, [threadId]);
+
+  useEffect(() => {
+    if (!threadId || afterCursor === null) return;
+    setStreamState('connecting');
+    const source = new EventSource(
+      `/api/threads/${encodeURIComponent(threadId)}/events?after=${afterCursor}`,
+      {
+        withCredentials: true,
+      },
+    );
 
     const handleOpen = () => setStreamState('open');
     const handleTransportError = (event: Event) => {
@@ -107,7 +118,7 @@ export function useThreadEvents(threadId: string | null): {
       for (const kind of safeEventKinds) source.removeEventListener(kind, handleMessage);
       source.close();
     };
-  }, [mergeEvents, threadId]);
+  }, [afterCursor, mergeEvents, threadId]);
 
   return { events, streamState, mergeEvents };
 }

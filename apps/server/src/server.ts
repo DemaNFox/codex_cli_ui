@@ -47,7 +47,7 @@ import { realpath, stat } from 'node:fs/promises';
 import path from 'node:path';
 import { z } from 'zod';
 
-import type { AppServerClient, AppServerInbound } from './app-server.js';
+import type { AppServerClient, AppServerInbound, AppServerLifecycleEvent } from './app-server.js';
 import { CodexUpdateBrokerError, type CodexUpdateBroker } from './codex-update-broker.js';
 import type { CodexVersionChecker } from './codex-version-checker.js';
 import {
@@ -813,6 +813,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   let resourceStartupRetry: NodeJS.Timeout | null = null;
   let codexUpdateStartupRetry: NodeJS.Timeout | null = null;
   let serverClosing = false;
+  let lastHandledDisconnectGeneration = 0;
+  let appServerDisconnectEpoch = 0;
   const upgradeDrainPath = dependencies.upgradeDrainPath ?? '/run/codex-web-ui/upgrade-drain';
   const accountLoginTimeoutMs = dependencies.accountLoginTimeoutMs ?? CODEX_ACCOUNT_LOGIN_TTL_MS;
   const codexUpdateStartupRetryMs = dependencies.codexUpdateStartupRetryMs ?? 1_000;
@@ -1420,6 +1422,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const handlePermissionRequest = async (message: AppServerInbound): Promise<void> => {
     if (message.id === undefined) return;
     const requestGeneration = appServer.generation;
+    const requestDisconnectEpoch = appServerDisconnectEpoch;
     const request = normalizePermissionRequest(message.params);
     if (!request) {
       appServer.respondError(message.id, -32602, 'Invalid permission request');
@@ -1435,7 +1438,12 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       const cwd = await canonicalProjectPath(pathPolicy, project);
       if (request.cwd !== cwd) throw new Error('PERMISSION_CWD_MISMATCH');
       const permissions = await validatePermissionProfile(request.permissions, cwd, pathPolicy);
-      if (appServer.generation !== requestGeneration) return;
+      if (
+        !appServer.ready ||
+        appServer.generation !== requestGeneration ||
+        appServerDisconnectEpoch !== requestDisconnectEpoch
+      )
+        return;
       if (
         !persistInteractionRequest(
           {
@@ -1463,7 +1471,11 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       )
         throw new Error('PERMISSION_REQUEST_TOO_LARGE');
     } catch {
-      if (appServer.generation === requestGeneration)
+      if (
+        appServer.ready &&
+        appServer.generation === requestGeneration &&
+        appServerDisconnectEpoch === requestDisconnectEpoch
+      )
         appServer.respondError(message.id, -32602, 'Unsafe permission request');
     }
   };
@@ -1716,7 +1728,70 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         : normalized;
     publish(repository.appendEvent(persistedNotification));
   };
+  const onAppServerLifecycle = (event: AppServerLifecycleEvent): void => {
+    if (
+      serverClosing ||
+      event.type !== 'disconnected' ||
+      event.generation !== appServer.generation ||
+      event.generation <= lastHandledDisconnectGeneration
+    )
+      return;
+    lastHandledDisconnectGeneration = event.generation;
+    appServerDisconnectEpoch += 1;
+    const activeSubagents = repository.listActiveSubagents();
+    const affectedRoots = new Set(activeTurnEntries().map((entry) => entry.threadId));
+    for (const threadId of nativeActiveThreads) affectedRoots.add(threadId);
+    for (const threadId of treeBusyThreads) affectedRoots.add(threadId);
+    for (const subagent of activeSubagents) affectedRoots.add(subagent.rootThreadId);
+
+    activeTurns.clear();
+    nativeActiveThreads.clear();
+    treeBusyThreads.clear();
+    for (const threadId of repository.resetActiveThreadRuntime()) affectedRoots.add(threadId);
+    repository.resetActiveSubagentRuntime();
+    for (const approval of repository.listUnfinishedApprovals()) {
+      if (repository.cancelUnfinishedApproval(approval.id))
+        appendInteractionTerminal(approval, 'cancelled');
+    }
+    approvalGenerations.clear();
+    if (accountLoginInterlocked) setTerminalAccountLogin('failed', 'Connection to Codex was lost.');
+
+    for (const rootThreadId of affectedRoots) {
+      const threadRuntime = threadRuntimePayload(rootThreadId);
+      if (!threadRuntime) continue;
+      publish(
+        repository.appendEvent({
+          threadId: rootThreadId,
+          turnId: null,
+          kind: 'thread',
+          phase: 'state',
+          payload: { threadRuntime, appServerDisconnected: true },
+        }),
+      );
+    }
+    for (const snapshot of activeSubagents) {
+      const subagent = repository.getSubagent(snapshot.id);
+      if (!subagent) continue;
+      const threadRuntime = threadRuntimePayload(subagent.rootThreadId);
+      publish(
+        repository.appendEvent({
+          threadId: subagent.rootThreadId,
+          turnId: null,
+          kind: 'subagent',
+          phase: 'state',
+          payload: { subagent, ...(threadRuntime ? { threadRuntime } : {}) },
+        }),
+      );
+    }
+    repository.audit('app_server.disconnected', 'succeeded', {
+      generation: event.generation,
+      affectedRootCount: affectedRoots.size,
+      interruptedSubagentCount: activeSubagents.length,
+    });
+    void applyPendingResourcesWhenIdle();
+  };
   const unsubscribe = appServer.subscribe(onAppServerMessage);
+  const unsubscribeLifecycle = appServer.subscribeLifecycle(onAppServerLifecycle);
 
   app.addHook('onRequest', async (_request, reply) => {
     reply.header('X-Content-Type-Options', 'nosniff');
@@ -1771,6 +1846,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (codexUpdateStartupRetry) clearTimeout(codexUpdateStartupRetry);
     clearAccountLoginTimer();
     unsubscribe();
+    unsubscribeLifecycle();
     await pushDispatcher?.close();
     await appServer.stop();
     repository.close();

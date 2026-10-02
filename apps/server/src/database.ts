@@ -1340,12 +1340,18 @@ export class SqliteRepository {
     return this.getThread(id);
   }
 
-  resetActiveThreadRuntime(): void {
+  resetActiveThreadRuntime(): string[] {
+    const threadIds = (
+      this.database
+        .prepare("SELECT id FROM threads WHERE active_turn_id IS NOT NULL OR status='active'")
+        .all() as unknown as Array<{ id: string }>
+    ).map((row) => row.id);
     this.database
       .prepare(
         "UPDATE threads SET status=CASE WHEN status='active' THEN 'notLoaded' ELSE status END,active_turn_id=NULL WHERE active_turn_id IS NOT NULL OR status='active'",
       )
       .run();
+    return threadIds;
   }
 
   createAttachment(input: Omit<AttachmentRecord, 'turnId' | 'createdAt'>): AttachmentRecord {

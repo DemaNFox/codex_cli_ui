@@ -15,6 +15,7 @@ import {
   buildCodexEnvironment,
   type AppServerClient,
   type AppServerInbound,
+  type AppServerLifecycleEvent,
   type RpcId,
 } from './app-server.js';
 import { AttachmentStore } from './attachment-store.js';
@@ -41,6 +42,7 @@ class FakeAppServer implements AppServerClient {
   readonly responses: { id: RpcId; result: unknown }[] = [];
   readonly responseErrors: { id: RpcId; code: number; message: string }[] = [];
   private readonly listeners = new Set<(message: AppServerInbound) => void>();
+  private readonly lifecycleListeners = new Set<(event: AppServerLifecycleEvent) => void>();
   private threadCounter = 0;
   private turnCounter = 0;
   private readonly threads = new Map<string, Record<string, unknown>>();
@@ -149,6 +151,15 @@ class FakeAppServer implements AppServerClient {
     this.generation += 1;
   }
 
+  disconnect(): void {
+    this.ready = false;
+    const event: AppServerLifecycleEvent = {
+      type: 'disconnected',
+      generation: this.generation,
+    };
+    for (const listener of this.lifecycleListeners) listener(event);
+  }
+
   addExternalThread(cwd: string): string {
     const id = `external-${++this.threadCounter}`;
     const now = Math.floor(Date.now() / 1_000);
@@ -195,6 +206,11 @@ class FakeAppServer implements AppServerClient {
   subscribe(listener: (message: AppServerInbound) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  subscribeLifecycle(listener: (event: AppServerLifecycleEvent) => void): () => void {
+    this.lifecycleListeners.add(listener);
+    return () => this.lifecycleListeners.delete(listener);
   }
   emit(message: AppServerInbound): void {
     for (const listener of this.listeners) listener(message);
@@ -554,10 +570,11 @@ async function fixture(
   const appServer = new FakeAppServer();
   const attachmentStore = attachmentStoreFactory(config.attachmentStoragePath);
   const upgradeDrainPath = path.join(temp, 'upgrade-drain');
+  const pathPolicy = await ProjectPathPolicy.create([root]);
   const app = await buildServer({
     config,
     repository,
-    pathPolicy: await ProjectPathPolicy.create([root]),
+    pathPolicy,
     appServer,
     attachmentStore,
     upgradeDrainPath,
@@ -578,6 +595,7 @@ async function fixture(
     attachmentStore,
     projectPath,
     root,
+    pathPolicy,
     upgradeDrainPath,
   };
 }
@@ -726,7 +744,16 @@ describe('security and repository boundary', () => {
       listener.once('error', reject);
       listener.listen(socketPath, resolve);
     });
-    const client = new CodexAppServerSocketClient({ socketPath, requestTimeoutMs: 2_000 });
+    const client = new CodexAppServerSocketClient({
+      socketPath,
+      requestTimeoutMs: 2_000,
+      maxLineBytes: 1_024,
+    });
+    const disconnected = vi.fn();
+    client.subscribeLifecycle(() => {
+      throw new Error('listener failure');
+    });
+    client.subscribeLifecycle(disconnected);
     try {
       await client.start();
       await expect.poll(() => client.generation, { timeout: 3_000 }).toBe(2);
@@ -736,6 +763,57 @@ describe('security and repository boundary', () => {
       );
       expect(connections).toBe(2);
       expect(receivedMethods.filter((method) => method === 'initialize')).toHaveLength(2);
+      expect(disconnected).toHaveBeenCalledExactlyOnceWith({
+        type: 'disconnected',
+        generation: 1,
+      });
+    } finally {
+      await client.stop();
+      await new Promise<void>((resolve, reject) =>
+        listener.close((error) => (error ? reject(error) : resolve())),
+      );
+    }
+    expect(disconnected).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts a bounded multi-megabyte thread response without reconnecting', async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), 'codex-web-large-rpc-'));
+    const socketPath =
+      process.platform === 'win32'
+        ? `\\\\.\\pipe\\codex-web-large-${process.pid}-${Date.now()}`
+        : path.join(root, 'app-server.sock');
+    const largeText = 'x'.repeat(3_200_000);
+    let connections = 0;
+    const listener = createNetServer((socket) => {
+      connections += 1;
+      socket.on('error', () => undefined);
+      let buffered = '';
+      socket.on('data', (chunk: Buffer) => {
+        buffered += chunk.toString('utf8');
+        while (true) {
+          const newline = buffered.indexOf('\n');
+          if (newline === -1) break;
+          const line = buffered.slice(0, newline);
+          buffered = buffered.slice(newline + 1);
+          const message = JSON.parse(line) as { id?: RpcId; method?: string };
+          if (message.method === 'initialize' && message.id !== undefined) {
+            socket.write(`${JSON.stringify({ id: message.id, result: { serverInfo: {} } })}\n`);
+          } else if (message.method === 'thread/read' && message.id !== undefined) {
+            socket.write(`${JSON.stringify({ id: message.id, result: { text: largeText } })}\n`);
+          }
+        }
+      });
+    });
+    await new Promise<void>((resolve, reject) => {
+      listener.once('error', reject);
+      listener.listen(socketPath, resolve);
+    });
+    const client = new CodexAppServerSocketClient({ socketPath, requestTimeoutMs: 5_000 });
+    try {
+      await client.start();
+      await expect(client.request('thread/read', {})).resolves.toEqual({ text: largeText });
+      expect(client.generation).toBe(1);
+      expect(connections).toBe(1);
     } finally {
       await client.stop();
       await new Promise<void>((resolve, reject) =>
@@ -3659,6 +3737,82 @@ describe('Codex routes', () => {
     });
   });
 
+  it('clears stale turn and subagent activity when the app-server disconnects', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const persistedOnlyThreadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-disconnected', status: 'inProgress', items: [] } },
+    });
+    repository.upsertSubagent({
+      id: 'child-disconnected',
+      rootThreadId: threadId,
+      parentThreadId: threadId,
+      agentPath: '/root/child-disconnected',
+      nickname: 'Disconnected child',
+      role: null,
+      model: 'gpt-test',
+      reasoningEffort: 'medium',
+      status: 'running',
+      message: 'working',
+      startedAt: '2026-10-02T10:00:00.000Z',
+      lastActivityAt: '2026-10-02T10:00:01.000Z',
+      completedAt: null,
+    });
+    repository.updateThreadRuntime(persistedOnlyThreadId, {
+      status: 'active',
+      activeTurnId: null,
+    });
+
+    appServer.disconnect();
+
+    expect(repository.getThread(threadId)).toMatchObject({
+      status: 'notLoaded',
+      activeTurnId: null,
+    });
+    expect(repository.getSubagent('child-disconnected')).toMatchObject({ status: 'interrupted' });
+    expect(repository.getThread(persistedOnlyThreadId)).toMatchObject({
+      status: 'notLoaded',
+      activeTurnId: null,
+    });
+    const health = await app.inject({ method: 'GET', url: '/api/health' });
+    expect(health.statusCode).toBe(503);
+    expect(health.json()).toMatchObject({
+      upgradeDrain: { activeTurns: 0, activeSubagents: 0, activeExecutionUnits: 0 },
+    });
+    const disconnectEvents = repository.listEvents(threadId, 0);
+    expect(disconnectEvents).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'thread',
+          phase: 'state',
+          payload: {
+            threadRuntime: { status: 'notLoaded', activeTurnId: null },
+            appServerDisconnected: true,
+          },
+        }),
+      ]),
+    );
+    expect(disconnectEvents.find((event) => event.kind === 'subagent')?.payload.subagent).toEqual(
+      expect.objectContaining({ id: 'child-disconnected', status: 'interrupted' }),
+    );
+    expect(repository.listEvents(persistedOnlyThreadId, 0)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          kind: 'thread',
+          phase: 'state',
+          payload: {
+            threadRuntime: { status: 'notLoaded', activeTurnId: null },
+            appServerDisconnected: true,
+          },
+        }),
+      ]),
+    );
+  });
+
   it('recovers an active turn id from authoritative history after reconnect', async () => {
     const { app, appServer, repository, projectPath } = await fixture();
     const session = await login(app);
@@ -5340,7 +5494,7 @@ describe('Codex routes', () => {
   });
 
   it('validates one-turn permissions, rejects unsafe paths, and fails stale requests closed', async () => {
-    const { app, appServer, repository, projectPath, root } = await fixture();
+    const { app, appServer, repository, projectPath, root, pathPolicy } = await fixture();
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const thread = (
@@ -5475,6 +5629,29 @@ describe('Codex routes', () => {
     });
     expect(stale.statusCode).toBe(409);
     expect(appServer.responses.some((response) => response.id === 85)).toBe(false);
+
+    appServer.restart();
+    let releaseValidation!: () => void;
+    let signalValidation!: () => void;
+    const validationEntered = new Promise<void>((resolve) => {
+      signalValidation = resolve;
+    });
+    const validationGate = new Promise<void>((resolve) => {
+      releaseValidation = resolve;
+    });
+    const canonicalizeExisting = pathPolicy.canonicalizeExisting.bind(pathPolicy);
+    vi.spyOn(pathPolicy, 'canonicalizeExisting').mockImplementation(async (candidate) => {
+      signalValidation();
+      await validationGate;
+      return canonicalizeExisting(candidate);
+    });
+    emitPermission(87, { fileSystem: { write: [newLeaf] } });
+    await validationEntered;
+    appServer.disconnect();
+    releaseValidation();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(permissionCount()).toBe(3);
+    expect(appServer.responseErrors.some((response) => response.id === 87)).toBe(false);
   });
   it('reconciles the stored default resource policy when the server starts idle', async () => {
     const broker = new FakeResourceBroker();

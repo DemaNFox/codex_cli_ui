@@ -2491,7 +2491,13 @@ function Workspace({
   const [locallyResolvedRequests, setLocallyResolvedRequests] = useState<Set<string>>(
     () => new Set(),
   );
-  const { events, streamState, mergeEvents } = useThreadEvents(threadId);
+  const [eventStreamStart, setEventStreamStart] = useState<{
+    threadId: string;
+    cursor: number;
+  } | null>(null);
+  const eventStreamCursor =
+    eventStreamStart?.threadId === threadId ? eventStreamStart.cursor : null;
+  const { events, streamState, mergeEvents } = useThreadEvents(threadId, eventStreamCursor);
   const latestEvent = events.at(-1) ?? null;
   const latestEventId = latestEvent?.id ?? null;
   const runtimeSnapshotCursorRef = useRef(0);
@@ -3244,13 +3250,15 @@ function Workspace({
     setSubagents([]);
     setServerTurnNavigation(null);
     runtimeSnapshotCursorRef.current = 0;
+    setEventStreamStart(null);
     if (!threadId) return;
     const requestedThreadId = threadId;
     let cancelled = false;
     void Promise.all([api.thread(requestedThreadId), api.attachments(requestedThreadId)])
       .then(([history, attachments]) => {
         if (cancelled) return;
-        runtimeSnapshotCursorRef.current = history.eventCursor ?? history.events.at(-1)?.id ?? 0;
+        const historyCursor = history.eventCursor ?? history.events.at(-1)?.id ?? 0;
+        runtimeSnapshotCursorRef.current = historyCursor;
         setThreads((current) =>
           current.map((item) => (item.id === requestedThreadId ? history.data : item)),
         );
@@ -3258,6 +3266,7 @@ function Workspace({
           current.map((item) => (item.id === requestedThreadId ? history.data : item)),
         );
         mergeEvents(history.events, requestedThreadId);
+        setEventStreamStart({ threadId: requestedThreadId, cursor: historyCursor });
         setServerTurnNavigation(history.turnNavigation ?? null);
         const historySubagents = history.subagents;
         if (historySubagents) setSubagents((current) => mergeSubagents(current, historySubagents));
@@ -3266,7 +3275,10 @@ function Workspace({
         );
       })
       .catch((cause: unknown) => {
-        if (!cancelled) setError(errorMessage(cause));
+        if (!cancelled) {
+          setError(errorMessage(cause));
+          setEventStreamStart({ threadId: requestedThreadId, cursor: 0 });
+        }
       });
     void api
       .subagents(requestedThreadId)
