@@ -546,7 +546,7 @@ class InfraStaticTest(unittest.TestCase):
             "CODEX_WEB_VAPID_SUBJECT",
         ):
             self.assertIn(f"{name}=\n", environment)
-        self.assertIn('CODEX_WEB_CODEX_VERSION_PIN="codex-cli 0.159.3"', environment)
+        self.assertIn('CODEX_WEB_CODEX_VERSION_PIN="codex-cli 0.160.0"', environment)
         self.assertIn("CODEX_WEB_MIN_FREE_BYTES=5368709120", environment)
         self.assertIn("CODEX_WEB_MAX_DATABASE_BYTES=2147483648", environment)
         self.assertIn("CODEX_WEB_MAX_RELEASES=5", environment)
