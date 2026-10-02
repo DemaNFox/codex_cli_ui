@@ -35,7 +35,6 @@ RELEASES_ROOT = OPT_ROOT / "releases"
 CURRENT_LINK = OPT_ROOT / "current"
 RESULT_PATH = Path("/var/lib/codex-web-ui/codex-update-result.json")
 RUNNER_CONFIG = Path("/etc/codex-web-ui/codex-runner.env")
-API_CONFIG = Path("/etc/codex-web-ui/codex-web-ui.env")
 SYSTEMCTL = "/usr/bin/systemctl"
 UPDATE_SERVICE = "codex-web-ui-codex-update.service"
 CANDIDATE_LOCK_PATH = Path("/run/codex-web-ui/codex-update-candidate.lock")
@@ -122,7 +121,6 @@ class CodexUpdateBroker:
         command_runner: CommandRunner = run_command,
         machine: str | None = None,
         runner_config: Path = RUNNER_CONFIG,
-        api_config: Path = API_CONFIG,
     ) -> None:
         self.opt_root = opt_root
         self.releases_root = opt_root / "releases"
@@ -132,7 +130,6 @@ class CodexUpdateBroker:
         self.command_runner = command_runner
         self.machine = machine or platform.machine()
         self.runner_config = runner_config
-        self.api_config = api_config
 
     @property
     def expected_arch(self) -> str:
@@ -210,22 +207,22 @@ class CodexUpdateBroker:
 
     def _current_version(self) -> str:
         _path, _release_id, manifest = self.current()
-        configured: list[str] = []
-        for path in (self.runner_config, self.api_config):
-            if not path.exists():
-                continue
-            _trusted_regular_file(path, "INSTALLATION_INVALID", "installed configuration is unsafe")
+        configured: str | None = None
+        if self.runner_config.exists():
+            _trusted_regular_file(
+                self.runner_config,
+                "INSTALLATION_INVALID",
+                "installed runner configuration is unsafe",
+            )
             values = [
                 match.group(1)
-                for line in path.read_text(encoding="utf-8").splitlines()
+                for line in self.runner_config.read_text(encoding="utf-8").splitlines()
                 if (match := re.fullmatch(r'CODEX_WEB_CODEX_VERSION_PIN="(codex-cli \d+\.\d+\.\d+)"', line))
             ]
             if len(values) != 1:
                 raise BrokerError("INSTALLATION_INVALID", "installed Codex version is invalid")
-            configured.append(values[0])
-        if configured and len(set(configured)) != 1:
-            raise BrokerError("INSTALLATION_INVALID", "installed Codex version pins disagree")
-        value = configured[0] if configured else manifest.get("runtime", {}).get("codex", {}).get("versionPin")
+            configured = values[0]
+        value = configured or manifest.get("runtime", {}).get("codex", {}).get("versionPin")
         if not isinstance(value, str):
             raise BrokerError("INSTALLATION_INVALID", "installed Codex version is invalid")
         return value

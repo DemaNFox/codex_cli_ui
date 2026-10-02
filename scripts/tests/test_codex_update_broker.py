@@ -255,12 +255,11 @@ class CodexUpdateBrokerTest(unittest.TestCase):
         (self.root / "codex-update-candidate").unlink()
         self.add_runtime_target()
         runner = Path(self.temp.name) / "codex-runner.env"
-        api = Path(self.temp.name) / "codex-web-ui.env"
-        for path in (runner, api):
-            path.write_text('CODEX_WEB_CODEX_VERSION_PIN="codex-cli 0.160.0"\n', encoding="utf-8")
-            os.chmod(path, 0o600)
+        runner.write_text(
+            'CODEX_WEB_CODEX_VERSION_PIN="codex-cli 0.160.0"\n', encoding="utf-8"
+        )
+        os.chmod(runner, 0o600)
         self.broker.runner_config = runner
-        self.broker.api_config = api
         result = self.broker.handle(self.request("status"))
         self.assertEqual(result["snapshot"]["state"], "current")
 

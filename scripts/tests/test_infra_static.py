@@ -168,6 +168,19 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("User=root", update_broker_service)
         self.assertIn("CapabilityBoundingSet=", update_broker_service)
         self.assertIn("ProtectSystem=strict", update_broker_service)
+        self.assertIn(
+            "ReadOnlyPaths=/opt/codex-web-ui -/var/lib/codex-web-ui/codex-update-result.json /etc/codex-web-ui/codex-runner.env",
+            update_broker_service,
+        )
+        self.assertIn(
+            "InaccessiblePaths=-/etc/codex-web-ui/codex-web-ui.env", update_broker_service
+        )
+        inaccessible_paths = " ".join(
+            line.removeprefix("InaccessiblePaths=")
+            for line in update_broker_service.splitlines()
+            if line.startswith("InaccessiblePaths=")
+        )
+        self.assertNotIn("/etc/codex-web-ui/codex-runner.env", inaccessible_paths)
         self.assertIn("ReadWritePaths=/run/codex-web-ui", update_broker_service)
         self.assertIn("RestrictAddressFamilies=AF_UNIX", update_broker_service)
         self.assertIn("ExecStart=/usr/local/libexec/codex-web-ui-codex-update-worker", update_worker)
