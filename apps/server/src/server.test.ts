@@ -526,6 +526,7 @@ async function fixture(
   codexUpdateBroker?: CodexUpdateBroker,
   codexVersionChecker?: CodexVersionChecker,
   codexUpdateStartupRetryMs?: number,
+  configOverrides: Partial<Pick<ServerConfig, 'eventRetentionPerThread'>> = {},
 ) {
   const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-server-'));
   const root = path.join(temp, 'projects');
@@ -564,6 +565,7 @@ async function fixture(
           },
         }
       : {}),
+    ...configOverrides,
   };
   const repository = new SqliteRepository(':memory:', config.eventRetentionPerThread);
   seed?.({ repository, projectPath });
@@ -3344,6 +3346,231 @@ describe('Codex routes', () => {
     expect(repository.isThreadHistoryHydrated(thread.id)).toBe(true);
   });
 
+  it('recovers missed completed answers from native history after restart without duplicating them', async () => {
+    const { app, appServer, repository, attachmentStore, projectPath } = await fixture(
+      2,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { eventRetentionPerThread: 3 },
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const redactedAnswer = `finished from ${attachmentStore.root}/private-result.txt`;
+    repository.appendEvent({
+      threadId,
+      turnId: 'identical-turn',
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'make the result' },
+    });
+    repository.appendEvent({
+      threadId,
+      turnId: 'missed-turn',
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: {
+        text: 'finished from [attachment-storage]/private-result.txt',
+        messagePhase: 'final_answer',
+      },
+    });
+    appServer.setThreadTurns(threadId, [
+      {
+        id: 'missed-turn',
+        status: 'completed',
+        items: [
+          {
+            id: 'missed-user',
+            type: 'userMessage',
+            content: [{ type: 'text', text: 'make the result' }],
+          },
+          {
+            id: 'phase-less-answer',
+            type: 'agentMessage',
+            text: 'phase-less final answer',
+          },
+          {
+            id: 'missed-files',
+            type: 'fileChange',
+            status: 'completed',
+            changes: [{ path: 'result/report.md', kind: { type: 'add' } }],
+          },
+        ],
+      },
+      {
+        id: 'identical-turn',
+        status: 'completed',
+        items: [
+          {
+            id: 'first-identical-answer',
+            type: 'agentMessage',
+            phase: 'final_answer',
+            text: redactedAnswer,
+          },
+          {
+            id: 'second-identical-answer',
+            type: 'agentMessage',
+            phase: 'final_answer',
+            text: redactedAnswer,
+          },
+        ],
+      },
+      {
+        id: 'failed-turn',
+        status: 'failed',
+        items: [{ id: 'failed-answer', type: 'agentMessage', text: 'failed draft' }],
+      },
+      {
+        id: 'interrupted-turn',
+        status: 'interrupted',
+        items: [{ id: 'interrupted-answer', type: 'agentMessage', text: 'interrupted draft' }],
+      },
+    ]);
+    appServer.restart();
+
+    const recovered = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(recovered.statusCode).toBe(200);
+    const recoveredEvents = recovered.json<{ events: SafeEvent[] }>().events;
+    const answers = recoveredEvents.filter((event) => event.kind === 'agent-message');
+    expect(answers).toHaveLength(3);
+    expect(answers.every((event) => event.payload.messagePhase === 'final_answer')).toBe(true);
+    expect(answers.map((event) => event.payload.text)).toContain('phase-less final answer');
+    expect(answers.map((event) => event.payload.text)).not.toContain('failed draft');
+    expect(answers.map((event) => event.payload.text)).not.toContain('interrupted draft');
+    expect(JSON.stringify(answers)).not.toContain(attachmentStore.root);
+    expect(JSON.stringify(answers)).toContain('[attachment-storage]/private-result.txt');
+    expect(
+      recoveredEvents.find(
+        (event) => event.kind === 'file-change' && event.turnId === 'missed-turn',
+      ),
+    ).toMatchObject({
+      phase: 'completed',
+      payload: { changes: [{ path: 'result/report.md', kind: 'add' }] },
+    });
+    expect(recoveredEvents.filter((event) => event.kind === 'turn')).toHaveLength(4);
+
+    for (let index = 0; index < 5; index += 1) {
+      repository.appendEvent({
+        threadId,
+        turnId: null,
+        kind: 'warning',
+        phase: 'state',
+        payload: { index },
+      });
+    }
+
+    appServer.restart();
+    const repeated = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(repeated.statusCode).toBe(200);
+    const repeatedEvents = repeated.json<{ events: SafeEvent[] }>().events;
+    expect(repeatedEvents.filter((event) => event.kind === 'agent-message')).toHaveLength(3);
+    expect(repeatedEvents.filter((event) => event.kind === 'file-change')).toHaveLength(1);
+    expect(
+      repeatedEvents.find((event) => event.kind === 'turn' && event.turnId === 'missed-turn'),
+    ).toMatchObject({ phase: 'completed', payload: { status: 'completed' } });
+    expect(
+      repeatedEvents.find((event) => event.kind === 'turn' && event.turnId === 'failed-turn'),
+    ).toBeUndefined();
+    expect(
+      repeatedEvents.find((event) => event.kind === 'turn' && event.turnId === 'interrupted-turn'),
+    ).toBeUndefined();
+
+    appServer.emit({
+      method: 'item/completed',
+      params: {
+        threadId,
+        turnId: 'live-production-turn',
+        item: {
+          id: 'live-production-files',
+          type: 'fileChange',
+          status: 'completed',
+          changes: [{ path: 'result/live.html', kind: { type: 'add' } }],
+        },
+      },
+    });
+    appServer.emit({
+      method: 'turn/completed',
+      params: {
+        threadId,
+        turn: { id: 'live-production-turn', status: 'completed', items: [] },
+      },
+    });
+    for (let index = 0; index < 5; index += 1) {
+      repository.appendEvent({
+        threadId,
+        turnId: null,
+        kind: 'warning',
+        phase: 'state',
+        payload: { liveNoise: index },
+      });
+    }
+    const retainedLiveEvents = repository.listEvents(threadId, 0);
+    expect(
+      retainedLiveEvents.find(
+        (event) => event.kind === 'tool' && event.turnId === 'live-production-turn',
+      ),
+    ).toMatchObject({
+      phase: 'completed',
+      payload: {
+        item: {
+          id: 'live-production-files',
+          type: 'fileChange',
+          status: 'completed',
+          changes: [{ path: 'result/live.html', kind: { type: 'add' } }],
+        },
+      },
+    });
+    expect(
+      retainedLiveEvents.find(
+        (event) => event.kind === 'turn' && event.turnId === 'live-production-turn',
+      ),
+    ).toMatchObject({
+      phase: 'completed',
+      payload: { turn: { id: 'live-production-turn', status: 'completed', items: [] } },
+    });
+
+    appServer.setThreadTurns(threadId, [
+      {
+        id: 'replacement-turn',
+        status: 'completed',
+        items: [{ id: 'replacement-answer', type: 'agentMessage', text: 'replacement' }],
+      },
+    ]);
+    appServer.restart();
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: `/api/threads/${threadId}`,
+          headers: { cookie: session.cookie },
+        })
+      ).statusCode,
+    ).toBe(200);
+    expect(
+      (
+        repository.database
+          .prepare('SELECT COUNT(*) AS count FROM thread_history_event_state WHERE thread_id=?')
+          .get(threadId) as { count: number }
+      ).count,
+    ).toBe(2);
+  });
+
   it('does not let a stale initial hydration erase navigation appended while its read is pending', async () => {
     const { app, appServer, repository, projectPath } = await fixture();
     const session = await login(app);
@@ -3580,6 +3807,23 @@ describe('Codex routes', () => {
         phase: 'completed',
         payload: { text: 'retained task' },
       });
+      const finalAnswerAnchor = boundedRepository.appendEvent({
+        threadId: 'bounded-thread',
+        turnId: 'retained-anchor',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'retained answer', messagePhase: 'final_answer' },
+      });
+      const fileChangeAnchor = boundedRepository.appendEvent({
+        threadId: 'bounded-thread',
+        turnId: 'retained-anchor',
+        kind: 'file-change',
+        phase: 'completed',
+        payload: {
+          status: 'completed',
+          changes: [{ path: 'result/report.md', kind: 'add' }],
+        },
+      });
       for (let index = 0; index < 4; index += 1) {
         boundedRepository.appendEvent({
           threadId: 'bounded-thread',
@@ -3595,8 +3839,10 @@ describe('Codex routes', () => {
         });
       }
       const retainedEvents = boundedRepository.listEvents('bounded-thread', 0);
-      expect(retainedEvents).toHaveLength(4);
+      expect(retainedEvents).toHaveLength(6);
       expect(retainedEvents).toContainEqual(anchor);
+      expect(retainedEvents).toContainEqual(finalAnswerAnchor);
+      expect(retainedEvents).toContainEqual(fileChangeAnchor);
       const retainedNavigation = boundedRepository.listTurnNavigation('bounded-thread');
       expect(retainedNavigation).toHaveLength(3);
       expect(retainedNavigation[0]).toMatchObject({
@@ -3891,10 +4137,15 @@ describe('Codex routes', () => {
       events: Array<{ id: number; payload: Record<string, unknown> }>;
     }>();
     expect(reconciledHistory.eventCursor).toBe(reconciledHistory.events.at(-1)?.id);
-    expect(reconciledHistory.events.at(-1)?.payload).toEqual({
-      threadRuntime: { status: 'idle', activeTurnId: null },
-      appServerReconciled: true,
-    });
+    expect(reconciledHistory.events).toContainEqual(
+      expect.objectContaining({
+        kind: 'thread',
+        payload: {
+          threadRuntime: { status: 'idle', activeTurnId: null },
+          appServerReconciled: true,
+        },
+      }),
+    );
     expect(repository.getThread(threadId)).toMatchObject({ status: 'idle', activeTurnId: null });
   });
 

@@ -516,6 +516,279 @@ function fileChangePreview(item: Record<string, unknown>): string | null {
   return paths.length > 2 ? `${visible} и ещё ${paths.length - 2}` : visible;
 }
 
+const FILE_CHANGE_REMOVAL_KINDS = new Set(['delete', 'deleted', 'remove', 'removed']);
+const FILE_PATH_SCHEME = /^[a-z][a-z\d+.-]*:/i;
+const EXTERNAL_FILE_LINK = /^(?:https?:)?\/\//i;
+const INLINE_MARKDOWN_LINK = /(!?)\[[^\]\r\n]*\]\(\s*(?:<([^>\r\n]+)>|([^\s)]+))/gu;
+const MARKDOWN_REFERENCE_DEFINITION =
+  /^[ \t]{0,3}\[([^\]\r\n]+)\]:[ \t]*(?:<([^>\r\n]+)>|([^\s]+))/gmu;
+const MARKDOWN_REFERENCE_LINK = /(!?)\[([^\]\r\n]+)\](?:\[([^\]\r\n]*)\])?/gu;
+const MAX_MARKDOWN_LINKS = 500;
+const MAX_MARKDOWN_REFERENCE_DEFINITIONS = 200;
+
+function generatedFilePath(value: unknown): string | null {
+  if (typeof value !== 'string' || !value || value !== value.trim()) return null;
+  if (
+    value.startsWith('/') ||
+    value.startsWith('\\') ||
+    FILE_PATH_SCHEME.test(value) ||
+    [...value].some((character) => {
+      const code = character.charCodeAt(0);
+      return code <= 31 || code === 127;
+    })
+  )
+    return null;
+  const segments = value.replaceAll('\\', '/').split('/');
+  if (segments.some((segment) => segment === '..')) return null;
+  const normalized = segments.filter((segment) => segment && segment !== '.').join('/');
+  return normalized || null;
+}
+
+function explicitGeneratedFilePath(href: string): string | null {
+  if (
+    href.startsWith('/') ||
+    href.startsWith('#') ||
+    EXTERNAL_FILE_LINK.test(href) ||
+    FILE_PATH_SCHEME.test(href)
+  )
+    return null;
+  try {
+    return generatedFilePath(decodeURIComponent(href));
+  } catch {
+    return null;
+  }
+}
+
+function markdownReferenceLabel(value: string): string {
+  return value.trim().replace(/\s+/gu, ' ').toLowerCase();
+}
+
+function markdownIndentWidth(line: string): number {
+  let width = 0;
+  for (const character of line) {
+    if (character === ' ') width += 1;
+    else if (character === '\t') width += 4 - (width % 4);
+    else break;
+  }
+  return width;
+}
+
+function markdownColumnWidth(value: string): number {
+  let width = 0;
+  for (const character of value) {
+    if (character === '\t') width += 4 - (width % 4);
+    else width += 1;
+  }
+  return width;
+}
+
+function startsMarkdownBlock(line: string): boolean {
+  const candidate = line.replace(/^ {0,3}/u, '');
+  return (
+    /^(?:#{1,6}(?:[ \t]|$)|>|(?:[-*_][ \t]*){3,}$)/u.test(candidate) ||
+    /^<[A-Za-z!/]/u.test(candidate)
+  );
+}
+
+function markdownOutsideCode(markdown: string): string {
+  const masked = markdown.split('');
+  const mask = (start: number, end: number) => {
+    for (let index = start; index < end; index += 1) {
+      if (masked[index] !== '\r' && masked[index] !== '\n') masked[index] = ' ';
+    }
+  };
+
+  let offset = 0;
+  let fence: { character: '`' | '~'; length: number } | null = null;
+  let listContentIndent: number | null = null;
+  let indentedCodeOpen = false;
+  let paragraphOpen = false;
+  let previousBlank = true;
+  const lineParts = markdown.split(/(\r\n|\r|\n)/u);
+  for (let index = 0; index < lineParts.length; index += 2) {
+    const line = lineParts[index] ?? '';
+    const newline = lineParts[index + 1] ?? '';
+    const candidate = line.replace(/^ {0,3}/u, '');
+    const fenceRun = candidate.match(/^(`+|~+)/u)?.[0];
+    const listMarker = line.match(/^( {0,3})(?:[-+*]|\d{1,9}[.)])([ \t]+)/u)?.[0];
+    const indent = markdownIndentWidth(line);
+    const blank = line.trim() === '';
+    if (fence) {
+      mask(offset, offset + line.length);
+      paragraphOpen = false;
+      if (
+        fenceRun?.[0] === fence.character &&
+        fenceRun.length >= fence.length &&
+        candidate.slice(fenceRun.length).trim() === ''
+      ) {
+        fence = null;
+      }
+    } else if (fenceRun && fenceRun.length >= 3) {
+      fence = { character: fenceRun[0] as '`' | '~', length: fenceRun.length };
+      mask(offset, offset + line.length);
+      paragraphOpen = false;
+      indentedCodeOpen = false;
+    } else if (!blank && listMarker) {
+      listContentIndent = markdownColumnWidth(listMarker);
+      paragraphOpen = false;
+      indentedCodeOpen = false;
+    } else if (!blank && listContentIndent !== null && indent >= listContentIndent) {
+      if (indent >= listContentIndent + 4) mask(offset, offset + line.length);
+      paragraphOpen = false;
+      indentedCodeOpen = false;
+    } else if (!blank) {
+      listContentIndent = null;
+      if (indent >= 4 && (indentedCodeOpen || previousBlank || !paragraphOpen)) {
+        mask(offset, offset + line.length);
+        indentedCodeOpen = true;
+        paragraphOpen = false;
+      } else {
+        indentedCodeOpen = false;
+        paragraphOpen = !startsMarkdownBlock(line);
+      }
+    } else {
+      paragraphOpen = false;
+    }
+    previousBlank = blank;
+    offset += line.length + newline.length;
+  }
+
+  const outsideFences = masked.join('');
+  for (let index = 0; index < outsideFences.length;) {
+    if (outsideFences[index] !== '`') {
+      index += 1;
+      continue;
+    }
+    let runEnd = index;
+    while (outsideFences[runEnd] === '`') runEnd += 1;
+    const runLength = runEnd - index;
+    let closing = -1;
+    for (let candidate = runEnd; candidate < outsideFences.length; candidate += 1) {
+      if (outsideFences[candidate] !== '`') continue;
+      let candidateEnd = candidate;
+      while (outsideFences[candidateEnd] === '`') candidateEnd += 1;
+      if (candidateEnd - candidate === runLength) {
+        closing = candidateEnd;
+        break;
+      }
+      candidate = candidateEnd - 1;
+    }
+    if (closing < 0) {
+      index = runEnd;
+      continue;
+    }
+    mask(index, closing);
+    index = closing;
+  }
+
+  for (let index = 0; index < markdown.length; index += 1) {
+    if (markdown[index] !== '[' || masked[index] === ' ') continue;
+    let backslashes = 0;
+    for (let cursor = index - 1; cursor >= 0 && markdown[cursor] === '\\'; cursor -= 1) {
+      backslashes += 1;
+    }
+    if (backslashes % 2 === 1) masked[index] = ' ';
+  }
+  return masked.join('');
+}
+
+function explicitGeneratedFilePaths(markdown: string): Set<string> {
+  const linkSource = markdownOutsideCode(markdown);
+  const paths = new Set<string>();
+  let scannedLinks = 0;
+  for (const match of linkSource.matchAll(INLINE_MARKDOWN_LINK)) {
+    if (scannedLinks >= MAX_MARKDOWN_LINKS) break;
+    scannedLinks += 1;
+    if (match[1] === '!') continue;
+    const href = match[2] ?? match[3];
+    const path = href ? explicitGeneratedFilePath(href) : null;
+    if (path) paths.add(path);
+  }
+
+  const definitions = new Map<string, string>();
+  let scannedDefinitions = 0;
+  for (const match of linkSource.matchAll(MARKDOWN_REFERENCE_DEFINITION)) {
+    if (scannedDefinitions >= MAX_MARKDOWN_REFERENCE_DEFINITIONS) break;
+    scannedDefinitions += 1;
+    const label = match[1];
+    const href = match[2] ?? match[3];
+    if (!label || !href) continue;
+    const path = explicitGeneratedFilePath(href);
+    const normalizedLabel = markdownReferenceLabel(label);
+    if (path && !definitions.has(normalizedLabel)) definitions.set(normalizedLabel, path);
+  }
+  if (!definitions.size) return paths;
+
+  scannedLinks = 0;
+  for (const match of linkSource.matchAll(MARKDOWN_REFERENCE_LINK)) {
+    if (scannedLinks >= MAX_MARKDOWN_LINKS) break;
+    scannedLinks += 1;
+    if (match[1] === '!') continue;
+    const afterMatch = linkSource[match.index + match[0].length];
+    if (afterMatch === '(' || afterMatch === ':') continue;
+    const visibleLabel = match[2];
+    if (!visibleLabel) continue;
+    const referenceLabel = match[3] || visibleLabel;
+    const path = definitions.get(markdownReferenceLabel(referenceLabel));
+    if (path) paths.add(path);
+  }
+  return paths;
+}
+
+function fileChangeKind(change: Record<string, unknown>): string | null {
+  if (typeof change.kind === 'string') return change.kind;
+  if (change.kind && typeof change.kind === 'object') {
+    const type = (change.kind as Record<string, unknown>).type;
+    if (typeof type === 'string') return type;
+  }
+  return typeof change.type === 'string' ? change.type : null;
+}
+
+function generatedFileChanges(event: SafeEvent): Array<{ path: string; removed: boolean }> {
+  if (event.phase === 'failed') return [];
+  const item = eventItem(event);
+  const changes: unknown[] = [];
+  if (event.kind === 'file-change' && Array.isArray(event.payload.changes)) {
+    changes.push(...(event.payload.changes as unknown[]));
+  }
+  if (item?.type === 'fileChange' && Array.isArray(item.changes)) {
+    changes.push(...(item.changes as unknown[]));
+  }
+  return changes.flatMap((value) => {
+    if (!value || typeof value !== 'object') return [];
+    const change = value as Record<string, unknown>;
+    const kind = fileChangeKind(change)?.toLowerCase();
+    const path = generatedFilePath(change.path);
+    return path ? [{ path, removed: kind ? FILE_CHANGE_REMOVAL_KINDS.has(kind) : false }] : [];
+  });
+}
+
+function GeneratedFileLinks({ threadId, paths }: { threadId: string; paths: readonly string[] }) {
+  if (!paths.length) return null;
+  return (
+    <section className="generated-files" aria-label="Созданные и изменённые файлы">
+      <span className="generated-files-label">Файлы</span>
+      <ul>
+        {paths.map((path) => {
+          const name = path.split('/').at(-1) ?? path;
+          return (
+            <li key={path}>
+              <a
+                href={`/api/threads/${encodeURIComponent(threadId)}/project-files/download?path=${encodeURIComponent(path)}`}
+                download={name}
+                title="Скачать файл из проекта"
+              >
+                <span aria-hidden="true">↓</span>
+                <span>{path}</span>
+              </a>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
 function eventPreview(event: SafeEvent): string | null {
   const source = event.payload;
   const item = eventItem(event);
@@ -1525,6 +1798,25 @@ function Transcript({
     return output;
   }, [events]);
   const completedTurnIds = useMemo(() => successfullyCompletedTurnIds(events), [events]);
+  const generatedFilesByTurnId = useMemo(() => {
+    const filesByTurn = new Map<string, Map<string, true>>();
+    for (const event of events) {
+      if (!event.turnId) continue;
+      const changes = generatedFileChanges(event);
+      if (!changes.length) continue;
+      const turnFiles = filesByTurn.get(event.turnId) ?? new Map<string, true>();
+      for (const change of changes) {
+        if (change.removed) turnFiles.delete(change.path);
+        else turnFiles.set(change.path, true);
+      }
+      filesByTurn.set(event.turnId, turnFiles);
+    }
+    const result = new Map<string, string[]>();
+    for (const [turnId, paths] of filesByTurn) {
+      result.set(turnId, [...paths.keys()]);
+    }
+    return result;
+  }, [events]);
   const finalAgentMessageIds = useMemo(() => {
     const result = new Set<number>();
     const legacyCandidates = new Map<string, number>();
@@ -1669,6 +1961,17 @@ function Transcript({
             const attachments = attachmentsFrom(block.event);
             const text = eventText(block.event);
             const finalAnswer = finalAgentMessageIds.has(block.event.id);
+            const generatedFiles =
+              finalAnswer && block.event.turnId && completedTurnIds.has(block.event.turnId)
+                ? (generatedFilesByTurnId.get(block.event.turnId) ?? [])
+                : [];
+            const explicitGeneratedFiles =
+              finalAnswer && block.event.kind === 'agent-message'
+                ? explicitGeneratedFilePaths(text)
+                : new Set<string>();
+            const fallbackGeneratedFiles = generatedFiles.filter(
+              (path) => !explicitGeneratedFiles.has(path),
+            );
             const turnAnchorId =
               block.event.kind === 'user-message' && block.event.turnId
                 ? `turn-message-${block.event.id}`
@@ -1702,6 +2005,12 @@ function Transcript({
                   ) : (
                     <div className="message-text">{text}</div>
                   ))}
+                {finalAnswer && (
+                  <GeneratedFileLinks
+                    threadId={block.event.threadId}
+                    paths={fallbackGeneratedFiles}
+                  />
+                )}
                 <AttachmentList attachments={attachments} />
               </article>
             );

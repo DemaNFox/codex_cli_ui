@@ -39,6 +39,14 @@ class ManagedBlockTest(unittest.TestCase):
         self.assertTrue(updated.endswith("\n\nafter\n"))
         self.assertNotIn("old managed wording", updated)
 
+    def test_requires_project_relative_links_for_created_deliverables(self) -> None:
+        updated = MODULE.update_managed_block("# Personal\n\nKeep me.\n")
+
+        self.assertIn("project-relative Markdown links", updated)
+        self.assertIn("If you create a\nrequested archive, link the archive too", updated)
+        self.assertIn("Do not link arbitrary host files", updated)
+        self.assertTrue(updated.startswith("# Personal\n\nKeep me.\n"))
+
     def test_rejects_malformed_or_duplicate_markers(self) -> None:
         for value in (
             MODULE.BEGIN_MARKER,

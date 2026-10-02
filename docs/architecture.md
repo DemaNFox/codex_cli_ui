@@ -64,16 +64,23 @@ Browser
   messages. The transcript gives `final_answer` a labelled visual boundary while commentary remains visually
   neutral. For journal entries created before this phase was persisted, the last phase-less agent message of
   a successfully completed turn is treated as the compatibility final; explicit commentary is never promoted.
-- Once a successfully completed turn has a final answer, its transcript projection keeps the operator prompt
-  and final answer but hides commentary and execution activity. Active, failed, interrupted or final-less
-  turns retain their progress and diagnostic events. A compact server-persisted prompt rail navigates between
+- Once a successfully completed turn has a final answer, its transcript projection keeps that turn's operator
+  prompt and final answer; every other completed turn keeps its own pair too. Only commentary and execution
+  activity are hidden. Active, failed, interrupted or final-less turns retain their progress and diagnostic
+  events. After an app-server generation change, the server count-reconciles missed terminal answers, terminal
+  turn state and file changes from the redacted native history into the durable journal without duplicating
+  events already observed. Final answers, successful terminal turn markers and completed file changes each
+  have their own bounded retention allowance, so a retained answer can still be summarized and expose its
+  generated-file fallback. A compact server-persisted prompt rail navigates between
   calls without changing server state. When an older prompt predates the retained activity window, its rail
   entry targets the first retained event from that turn, or the transcript start if the entire turn has aged
   out. On narrow screens the same rail becomes horizontally scrollable.
-- Relative Markdown links emitted by Codex are presented as generated project-file downloads. The authenticated
-  download route resolves the requested file against the thread's registered canonical project directory,
-  rejects absolute paths, traversal, symlink escape, directories and files above 100 MiB, and always serves an
-  attachment with `nosniff`. External, root-relative and fragment links retain their normal link behavior.
+- Relative Markdown links emitted by Codex are presented as generated project-file downloads. If a completed
+  final answer omits a link, the transcript also presents completed file-change paths as authenticated project
+  downloads. Both paths use the same backend route, whose canonical project checks remain authoritative: it
+  resolves the requested file against the thread's registered canonical project directory, rejects absolute
+  paths, traversal, symlink escape, directories and files above 100 MiB, and always serves an attachment with
+  `nosniff`. External, root-relative and fragment links retain their normal link behavior.
 
 ## Voice transcription
 
@@ -157,7 +164,9 @@ checked-in compatible protocol snapshot.
 
 The installer writes a bounded managed block into the runner's global `CODEX_HOME/AGENTS.md`, preserving other
 content. It tells Codex that the Web UI runner is already executing on the physical target host and must use
-local commands instead of SSHing to a loopback, current-hostname or same-host address. An explicit migration to
+local commands instead of SSHing to a loopback, current-hostname or same-host address. It also instructs Codex
+to include project-relative Markdown links for user-requested deliverables created in the current project and
+to link a requested archive when one is created, without exposing arbitrary host files. An explicit migration to
 host-admin drains work, preserves SQLite, copies the complete Codex home without merging profiles, keeps a
 root-only rollback source until health succeeds and then changes only the app-server runner identity/unit.
 Because Codex persists absolute rollout paths in `state_5.sqlite`, migration and subsequent package activation

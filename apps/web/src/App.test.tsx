@@ -823,6 +823,554 @@ describe('App', () => {
     expect(document.activeElement).toBe(document.getElementById('turn-message-1'));
   });
 
+  it('keeps the prompt and final answer for every completed turn', async () => {
+    const events = [
+      ...['one', 'two'].flatMap((suffix, index) => [
+        {
+          id: index * 5 + 1,
+          threadId: 'thread-1',
+          turnId: `turn-${suffix}`,
+          kind: 'user-message',
+          phase: 'completed',
+          payload: { text: `Запрос ${index + 1}` },
+          createdAt: `2026-09-27T12:0${index}:00.000Z`,
+        },
+        {
+          id: index * 5 + 2,
+          threadId: 'thread-1',
+          turnId: `turn-${suffix}`,
+          kind: 'agent-message',
+          phase: 'completed',
+          payload: { text: `Промежуточный ответ ${index + 1}`, messagePhase: 'commentary' },
+          createdAt: `2026-09-27T12:0${index}:01.000Z`,
+        },
+        {
+          id: index * 5 + 3,
+          threadId: 'thread-1',
+          turnId: `turn-${suffix}`,
+          kind: 'command',
+          phase: 'completed',
+          payload: { command: `step-${index + 1}` },
+          createdAt: `2026-09-27T12:0${index}:02.000Z`,
+        },
+        {
+          id: index * 5 + 4,
+          threadId: 'thread-1',
+          turnId: `turn-${suffix}`,
+          kind: 'agent-message',
+          phase: 'completed',
+          payload: { text: `Итог ${index + 1}`, messagePhase: 'final_answer' },
+          createdAt: `2026-09-27T12:0${index}:03.000Z`,
+        },
+        {
+          id: index * 5 + 5,
+          threadId: 'thread-1',
+          turnId: `turn-${suffix}`,
+          kind: 'turn',
+          phase: 'completed',
+          payload: { status: 'completed' },
+          createdAt: `2026-09-27T12:0${index}:04.000Z`,
+        },
+      ]),
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText('Запрос 1')).not.toBeNull();
+    expect(screen.getByText('Запрос 2')).not.toBeNull();
+    expect(screen.getByText('Итог 1')).not.toBeNull();
+    expect(screen.getByText('Итог 2')).not.toBeNull();
+    expect(screen.getAllByRole('article', { name: 'Итоговый ответ Codex' })).toHaveLength(2);
+    expect(screen.queryByText('Промежуточный ответ 1')).toBeNull();
+    expect(screen.queryByText('Промежуточный ответ 2')).toBeNull();
+    expect(screen.queryByText('step-1')).toBeNull();
+    expect(screen.queryByText('step-2')).toBeNull();
+  });
+
+  it('adds generated-file downloads to a completed turn with a plain-text final answer', async () => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-files',
+        kind: 'file-change',
+        phase: 'completed',
+        payload: { changes: [{ path: 'reports/final report.pdf', kind: 'add' }] },
+        createdAt: '2026-09-27T13:00:00.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-files',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Готово.', messagePhase: 'final_answer' },
+        createdAt: '2026-09-27T13:00:01.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-files',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T13:00:02.000Z',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const final = await screen.findByRole('article', { name: 'Итоговый ответ Codex' });
+    expect(within(final).getByText('Готово.')).not.toBeNull();
+    const link = within(final).getByRole('link', { name: /reports\/final report\.pdf/ });
+    expect(link.getAttribute('href')).toBe(
+      '/api/threads/thread-1/project-files/download?path=reports%2Ffinal%20report.pdf',
+    );
+    expect(link.getAttribute('download')).toBe('final report.pdf');
+  });
+
+  it('shows fallback downloads only for files missing from the final-answer Markdown', async () => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-linked-files',
+        kind: 'file-change',
+        phase: 'completed',
+        payload: {
+          changes: [
+            { path: 'reports/final.pdf', kind: 'add' },
+            { path: 'reports/extra.csv', kind: 'add' },
+          ],
+        },
+        createdAt: '2026-09-27T13:05:00.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-linked-files',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: {
+          text: 'Готово: [report](reports/final.pdf)',
+          messagePhase: 'final_answer',
+        },
+        createdAt: '2026-09-27T13:05:01.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-linked-files',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T13:05:02.000Z',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const final = await screen.findByRole('article', { name: 'Итоговый ответ Codex' });
+    const explicitLink = within(final).getByRole('link', { name: 'report' });
+    expect(explicitLink.getAttribute('href')).toBe(
+      '/api/threads/thread-1/project-files/download?path=reports%2Ffinal.pdf',
+    );
+    const fallback = within(final).getByRole('region', {
+      name: 'Созданные и изменённые файлы',
+    });
+    expect(within(fallback).getAllByRole('link')).toHaveLength(1);
+    expect(within(fallback).getByRole('link', { name: /reports\/extra\.csv/ })).not.toBeNull();
+    expect(within(fallback).queryByText('reports/final.pdf')).toBeNull();
+    expect(within(final).getAllByRole('link')).toHaveLength(2);
+  });
+
+  it('does not repeat files linked through full, collapsed, or shortcut references', async () => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-reference-files',
+        kind: 'file-change',
+        phase: 'completed',
+        payload: {
+          changes: [
+            { path: 'reports/final.pdf', kind: 'add' },
+            { path: 'reports/summary.csv', kind: 'add' },
+            { path: 'reports/notes.txt', kind: 'add' },
+            { path: 'reports/extra.csv', kind: 'add' },
+          ],
+        },
+        createdAt: '2026-09-27T13:07:00.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-reference-files',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: {
+          text: [
+            'Готово: [report][artifact], [summary][] и [notes].',
+            '',
+            '[artifact]: reports/final.pdf',
+            '[summary]: reports/summary.csv',
+            '[notes]: reports/notes.txt',
+          ].join('\n'),
+          messagePhase: 'final_answer',
+        },
+        createdAt: '2026-09-27T13:07:01.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-reference-files',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T13:07:02.000Z',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const final = await screen.findByRole('article', { name: 'Итоговый ответ Codex' });
+    expect(within(final).getByRole('link', { name: 'report' })).not.toBeNull();
+    expect(within(final).getByRole('link', { name: 'summary' })).not.toBeNull();
+    expect(within(final).getByRole('link', { name: 'notes' })).not.toBeNull();
+    const fallback = within(final).getByRole('region', {
+      name: 'Созданные и изменённые файлы',
+    });
+    expect(within(fallback).getAllByRole('link')).toHaveLength(1);
+    expect(within(fallback).getByRole('link', { name: /reports\/extra\.csv/ })).not.toBeNull();
+    expect(fallback.textContent).not.toContain('reports/final.pdf');
+    expect(fallback.textContent).not.toContain('reports/summary.csv');
+    expect(fallback.textContent).not.toContain('reports/notes.txt');
+  });
+
+  it.each([
+    ['escaped link syntax', String.raw`Не ссылка: \[report](reports/final.pdf)`],
+    ['inline code', 'Пример: `[report](reports/final.pdf)`'],
+    ['fenced code', ['```md', '[report](reports/final.pdf)', '```'].join('\n')],
+  ])('keeps the fallback download for %s', async (_case, finalText) => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-code-example',
+        kind: 'file-change',
+        phase: 'completed',
+        payload: { changes: [{ path: 'reports/final.pdf', kind: 'add' }] },
+        createdAt: '2026-09-27T13:08:00.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-code-example',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: finalText, messagePhase: 'final_answer' },
+        createdAt: '2026-09-27T13:08:01.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-code-example',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T13:08:02.000Z',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const final = await screen.findByRole('article', { name: 'Итоговый ответ Codex' });
+    const fallback = within(final).getByRole('region', {
+      name: 'Созданные и изменённые файлы',
+    });
+    expect(within(fallback).getAllByRole('link')).toHaveLength(1);
+    expect(within(fallback).getByRole('link', { name: /reports\/final\.pdf/ })).not.toBeNull();
+  });
+
+  it.each([
+    ['at document start', '    [report](reports/final.pdf)'],
+    ['after a blank line', 'Вводный текст\n\n    [report](reports/final.pdf)'],
+  ])('keeps the fallback download for indented code %s', async (_case, finalText) => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-indented-code',
+        kind: 'file-change',
+        phase: 'completed',
+        payload: { changes: [{ path: 'reports/final.pdf', kind: 'add' }] },
+        createdAt: '2026-09-27T13:09:00.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-indented-code',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: {
+          text: finalText,
+          messagePhase: 'final_answer',
+        },
+        createdAt: '2026-09-27T13:09:01.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-indented-code',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T13:09:02.000Z',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const final = await screen.findByRole('article', { name: 'Итоговый ответ Codex' });
+    const fallback = within(final).getByRole('region', {
+      name: 'Созданные и изменённые файлы',
+    });
+    expect(within(fallback).getByRole('link', { name: /reports\/final\.pdf/ })).not.toBeNull();
+    expect(within(final).queryByRole('link', { name: 'report' })).toBeNull();
+  });
+
+  it('deduplicates an indented link that continues an open paragraph', async () => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-paragraph-link',
+        kind: 'file-change',
+        phase: 'completed',
+        payload: { changes: [{ path: 'reports/final.pdf', kind: 'add' }] },
+        createdAt: '2026-09-27T13:09:05.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-paragraph-link',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: {
+          text: 'Готово:\n    [report](reports/final.pdf)',
+          messagePhase: 'final_answer',
+        },
+        createdAt: '2026-09-27T13:09:06.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-paragraph-link',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T13:09:07.000Z',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const final = await screen.findByRole('article', { name: 'Итоговый ответ Codex' });
+    expect(within(final).getByRole('link', { name: 'report' })).not.toBeNull();
+    expect(
+      within(final).queryByRole('region', { name: 'Созданные и изменённые файлы' }),
+    ).toBeNull();
+  });
+
+  it('still deduplicates a valid link nested in list content', async () => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-list-link',
+        kind: 'file-change',
+        phase: 'completed',
+        payload: { changes: [{ path: 'reports/final.pdf', kind: 'add' }] },
+        createdAt: '2026-09-27T13:09:10.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-list-link',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: {
+          text: ['- Файл:', '    [report](reports/final.pdf)'].join('\n'),
+          messagePhase: 'final_answer',
+        },
+        createdAt: '2026-09-27T13:09:11.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-list-link',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T13:09:12.000Z',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const final = await screen.findByRole('article', { name: 'Итоговый ответ Codex' });
+    expect(within(final).getByRole('link', { name: 'report' })).not.toBeNull();
+    expect(
+      within(final).queryByRole('region', { name: 'Созданные и изменённые файлы' }),
+    ).toBeNull();
+  });
+
+  it('excludes deleted and unsafe file changes from generated downloads', async () => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-safe-files',
+        kind: 'tool',
+        phase: 'completed',
+        payload: {
+          item: {
+            type: 'fileChange',
+            changes: [
+              { path: 'output/kept.txt', kind: { type: 'update' } },
+              { path: 'output/deleted.txt', kind: { type: 'update' } },
+              { path: 'output/deleted.txt', kind: { type: 'delete' } },
+              { path: '../secret.txt', kind: { type: 'add' } },
+              { path: '/etc/passwd', kind: { type: 'update' } },
+              { path: 'C:\\secret.txt', kind: { type: 'update' } },
+              { path: 'https://example.test/file.txt', kind: { type: 'add' } },
+            ],
+          },
+        },
+        createdAt: '2026-09-27T13:10:00.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-safe-files',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Файлы обработаны.', messagePhase: 'final_answer' },
+        createdAt: '2026-09-27T13:10:01.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-safe-files',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T13:10:02.000Z',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const files = await screen.findByRole('region', { name: 'Созданные и изменённые файлы' });
+    expect(within(files).getAllByRole('link')).toHaveLength(1);
+    expect(within(files).getByRole('link', { name: /output\/kept\.txt/ })).not.toBeNull();
+    expect(files.textContent).not.toContain('deleted.txt');
+    expect(files.textContent).not.toContain('secret.txt');
+    expect(files.textContent).not.toContain('example.test');
+  });
+
+  it('deduplicates generated file paths across direct and item file-change events', async () => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-deduplicated-files',
+        kind: 'file-change',
+        phase: 'completed',
+        payload: { changes: [{ path: './dist/result.csv', kind: 'add' }] },
+        createdAt: '2026-09-27T13:20:00.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-deduplicated-files',
+        kind: 'tool',
+        phase: 'completed',
+        payload: {
+          item: {
+            type: 'fileChange',
+            changes: [{ path: 'dist\\result.csv', kind: { type: 'update' } }],
+          },
+        },
+        createdAt: '2026-09-27T13:20:01.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-deduplicated-files',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Результат готов.', messagePhase: 'final_answer' },
+        createdAt: '2026-09-27T13:20:02.000Z',
+      },
+      {
+        id: 4,
+        threadId: 'thread-1',
+        turnId: 'turn-deduplicated-files',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T13:20:03.000Z',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const files = await screen.findByRole('region', { name: 'Созданные и изменённые файлы' });
+    expect(within(files).getAllByRole('link')).toHaveLength(1);
+    expect(within(files).getByRole('link', { name: /dist\/result\.csv/ })).not.toBeNull();
+  });
+
   it('restores server-owned turn navigation after reload when old user messages were pruned', async () => {
     const retainedEvents = [
       {

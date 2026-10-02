@@ -33,6 +33,11 @@ Use the local filesystem and the local service manager for work on this machine.
 Never use SSH to localhost, a loopback address, the current hostname, or any local
 address to manage this same machine. Use SSH only when the user explicitly identifies
 a different remote host.
+
+When you create files in the current project as user-requested deliverables, include
+project-relative Markdown links to those files in your final answer. If you create a
+requested archive, link the archive too. Do not link arbitrary host files or files
+outside the current project.
 {END_MARKER}"""
 
 

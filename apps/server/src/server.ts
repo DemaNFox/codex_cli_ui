@@ -440,6 +440,38 @@ function completedAgentMessage(
   };
 }
 
+function recoverableCompletedHistory(
+  events: readonly Omit<SafeEvent, 'id' | 'createdAt'>[],
+): Omit<SafeEvent, 'id' | 'createdAt'>[] {
+  const successfullyCompletedTurns = new Set(
+    events
+      .filter(
+        (event) =>
+          event.kind === 'turn' && event.turnId !== null && event.payload.status === 'completed',
+      )
+      .map((event) => event.turnId as string),
+  );
+  const lastAgentMessageByTurn = new Map<string, Omit<SafeEvent, 'id' | 'createdAt'>>();
+  for (const event of events) {
+    if (event.kind === 'agent-message' && event.turnId !== null)
+      lastAgentMessageByTurn.set(event.turnId, event);
+  }
+  return events.flatMap((event) => {
+    if (event.kind === 'turn')
+      return event.phase === 'completed' || event.phase === 'failed' ? [event] : [];
+    if (event.kind === 'file-change') return event.phase !== 'delta' ? [event] : [];
+    if (event.kind !== 'agent-message' || event.turnId === null) return [];
+    if (event.payload.messagePhase === 'final_answer') return [event];
+    if (
+      event.payload.messagePhase === undefined &&
+      successfullyCompletedTurns.has(event.turnId) &&
+      lastAgentMessageByTurn.get(event.turnId) === event
+    )
+      return [{ ...event, payload: { ...event.payload, messagePhase: 'final_answer' } }];
+    return [];
+  });
+}
+
 function terminalPushStatus(message: AppServerInbound): PushNotificationPayload['status'] {
   const params = inputRecord('params' in message ? message.params : null);
   const turn = inputRecord(params?.turn);
@@ -1304,9 +1336,11 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       const navigationMutationVersion = turnNavigationMutationVersions.get(existing.id) ?? 0;
       const result = await readThreadFromAppServer(existing, true);
       const safeTurns = redactAttachmentStorage(result.turns, attachmentStore.root);
-      for (const event of normalizeThreadHistory(existing.id, safeTurns, config.maxEventBytes)) {
-        publish(repository.appendEvent(event));
-      }
+      for (const event of repository.reconcileThreadHistoryEvents(
+        existing.id,
+        normalizeThreadHistory(existing.id, safeTurns, config.maxEventBytes),
+      ))
+        publish(event);
       if ((turnNavigationMutationVersions.get(existing.id) ?? 0) === navigationMutationVersion) {
         repository.replaceTurnNavigation(
           existing.id,
@@ -1335,6 +1369,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       const mutationVersion = turnNavigationMutationVersions.get(existing.id) ?? 0;
       const read = await readThreadFromAppServer(existing, true);
       const safeTurns = redactAttachmentStorage(read.turns, attachmentStore.root);
+      for (const event of repository.reconcileThreadHistoryEvents(
+        existing.id,
+        recoverableCompletedHistory(
+          normalizeThreadHistory(existing.id, safeTurns, config.maxEventBytes),
+        ),
+      ))
+        publish(event);
       if ((turnNavigationMutationVersions.get(existing.id) ?? 0) !== mutationVersion)
         return read.thread;
       repository.replaceTurnNavigation(

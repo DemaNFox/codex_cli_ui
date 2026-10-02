@@ -59,6 +59,11 @@ interface EventRow {
   created_at: string;
 }
 
+interface ThreadHistoryEventStateRow {
+  fingerprint: string;
+  observed_count: number;
+}
+
 interface TurnNavigationRow {
   id: number;
   thread_id: string;
@@ -357,6 +362,14 @@ export class SqliteRepository {
       CREATE TABLE IF NOT EXISTS thread_history_state (
         thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
         hydrated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS thread_history_event_state (
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        fingerprint TEXT NOT NULL,
+        observed_count INTEGER NOT NULL CHECK(observed_count >= 0),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY(thread_id, fingerprint)
       );
 
       CREATE TABLE IF NOT EXISTS events (
@@ -1472,6 +1485,166 @@ export class SqliteRepository {
       .run(threadId, new Date().toISOString());
   }
 
+  reconcileThreadHistoryEvents(
+    threadId: string,
+    events: readonly Omit<SafeEvent, 'id' | 'createdAt'>[],
+  ): SafeEvent[] {
+    const fingerprint = (event: Omit<SafeEvent, 'id' | 'createdAt'>): string => {
+      const canonicalJson = (value: unknown): string => {
+        if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+        if (value !== null && typeof value === 'object') {
+          const source = value as Record<string, unknown>;
+          return `{${Object.keys(source)
+            .sort()
+            .map((key) => `${JSON.stringify(key)}:${canonicalJson(source[key])}`)
+            .join(',')}}`;
+        }
+        return JSON.stringify(value) ?? 'null';
+      };
+      const identity =
+        event.kind === 'turn'
+          ? [event.turnId, event.kind, event.phase]
+          : [event.turnId, event.kind, event.phase, event.payload];
+      return createHash('sha256').update(canonicalJson(identity)).digest('hex');
+    };
+
+    const authoritativeCounts = new Map<string, number>();
+    const fingerprints = events.map((event) => {
+      const value = fingerprint(event);
+      authoritativeCounts.set(value, (authoritativeCounts.get(value) ?? 0) + 1);
+      return value;
+    });
+    const observedCounts = new Map(
+      (
+        this.database
+          .prepare(
+            'SELECT fingerprint,observed_count FROM thread_history_event_state WHERE thread_id=?',
+          )
+          .all(threadId) as unknown as ThreadHistoryEventStateRow[]
+      ).map((row) => [row.fingerprint, row.observed_count] as const),
+    );
+    const retainedCounts = new Map<string, number>();
+    for (const event of this.listEvents(threadId, 0)) {
+      const value = fingerprint(event);
+      retainedCounts.set(value, (retainedCounts.get(value) ?? 0) + 1);
+    }
+    const baselineCounts = new Map<string, number>();
+    for (const value of authoritativeCounts.keys()) {
+      baselineCounts.set(
+        value,
+        Math.max(observedCounts.get(value) ?? 0, retainedCounts.get(value) ?? 0),
+      );
+    }
+
+    const occurrenceCounts = new Map<string, number>();
+    const appended: SafeEvent[] = [];
+    const createdAt = new Date().toISOString();
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const insertEvent = this.database.prepare(
+        'INSERT INTO events(thread_id,turn_id,kind,phase,payload_json,created_at) VALUES(?,?,?,?,?,?)',
+      );
+      for (let index = 0; index < events.length; index += 1) {
+        const event = events[index]!;
+        const value = fingerprints[index]!;
+        const occurrence = (occurrenceCounts.get(value) ?? 0) + 1;
+        occurrenceCounts.set(value, occurrence);
+        if (occurrence <= (baselineCounts.get(value) ?? 0)) continue;
+        const result = insertEvent.run(
+          event.threadId,
+          event.turnId,
+          event.kind,
+          event.phase,
+          JSON.stringify(event.payload),
+          createdAt,
+        );
+        appended.push({ ...event, id: Number(result.lastInsertRowid), createdAt });
+      }
+      const upsertState = this.database.prepare(
+        `INSERT INTO thread_history_event_state(thread_id,fingerprint,observed_count,updated_at)
+         VALUES(?,?,?,?)
+         ON CONFLICT(thread_id,fingerprint) DO UPDATE SET
+           observed_count=MAX(thread_history_event_state.observed_count,excluded.observed_count),
+           updated_at=excluded.updated_at`,
+      );
+      for (const [value, count] of authoritativeCounts)
+        upsertState.run(threadId, value, count, createdAt);
+      const deleteState = this.database.prepare(
+        'DELETE FROM thread_history_event_state WHERE thread_id=? AND fingerprint=?',
+      );
+      for (const value of observedCounts.keys()) {
+        if (!authoritativeCounts.has(value)) deleteState.run(threadId, value);
+      }
+      this.database
+        .prepare(
+          `DELETE FROM events
+           WHERE thread_id=?
+             AND id NOT IN (
+               SELECT id FROM events WHERE thread_id=? ORDER BY id DESC LIMIT ?
+             )
+             AND id NOT IN (
+               SELECT id FROM events
+               WHERE thread_id=? AND kind='user-message'
+               ORDER BY id DESC LIMIT ?
+             )
+             AND id NOT IN (
+               SELECT id FROM events
+               WHERE thread_id=? AND kind='agent-message'
+                 AND json_extract(payload_json,'$.messagePhase')='final_answer'
+               ORDER BY id DESC LIMIT ?
+             )
+             AND id NOT IN (
+               SELECT id FROM events
+               WHERE thread_id=? AND phase='completed'
+                 AND (
+                   kind='file-change'
+                   OR (
+                     kind='tool'
+                     AND json_extract(payload_json,'$.item.type')='fileChange'
+                     AND COALESCE(json_extract(payload_json,'$.item.status'),'completed')='completed'
+                   )
+                 )
+               ORDER BY id DESC LIMIT ?
+             )
+             AND id NOT IN (
+               SELECT id FROM events
+               WHERE thread_id=? AND kind='turn' AND phase='completed'
+                 AND (
+                   json_extract(payload_json,'$.status')='completed'
+                   OR json_extract(payload_json,'$.turn.status')='completed'
+                 )
+               ORDER BY id DESC LIMIT ?
+             )`,
+        )
+        .run(
+          threadId,
+          threadId,
+          this.eventRetentionPerThread,
+          threadId,
+          this.eventRetentionPerThread,
+          threadId,
+          this.eventRetentionPerThread,
+          threadId,
+          this.eventRetentionPerThread,
+          threadId,
+          this.eventRetentionPerThread,
+        );
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+    if (appended.length === 0) return appended;
+    const retainedIds = new Set(
+      (
+        this.database
+          .prepare('SELECT id FROM events WHERE thread_id=? AND id>=? ORDER BY id')
+          .all(threadId, appended[0]!.id) as unknown as Array<{ id: number }>
+      ).map((row) => row.id),
+    );
+    return appended.filter((event) => retainedIds.has(event.id));
+  }
+
   appendEvent(event: Omit<SafeEvent, 'id' | 'createdAt'>): SafeEvent {
     const createdAt = new Date().toISOString();
     const result = this.database
@@ -1498,10 +1671,44 @@ export class SqliteRepository {
              SELECT id FROM events
              WHERE thread_id=? AND kind='user-message'
              ORDER BY id DESC LIMIT ?
+           )
+           AND id NOT IN (
+             SELECT id FROM events
+             WHERE thread_id=? AND kind='agent-message'
+               AND json_extract(payload_json,'$.messagePhase')='final_answer'
+             ORDER BY id DESC LIMIT ?
+           )
+           AND id NOT IN (
+             SELECT id FROM events
+             WHERE thread_id=? AND phase='completed'
+               AND (
+                 kind='file-change'
+                 OR (
+                   kind='tool'
+                   AND json_extract(payload_json,'$.item.type')='fileChange'
+                   AND COALESCE(json_extract(payload_json,'$.item.status'),'completed')='completed'
+                 )
+               )
+             ORDER BY id DESC LIMIT ?
+           )
+           AND id NOT IN (
+             SELECT id FROM events
+             WHERE thread_id=? AND kind='turn' AND phase='completed'
+               AND (
+                 json_extract(payload_json,'$.status')='completed'
+                 OR json_extract(payload_json,'$.turn.status')='completed'
+               )
+             ORDER BY id DESC LIMIT ?
            )`,
       )
       .run(
         event.threadId,
+        event.threadId,
+        this.eventRetentionPerThread,
+        event.threadId,
+        this.eventRetentionPerThread,
+        event.threadId,
+        this.eventRetentionPerThread,
         event.threadId,
         this.eventRetentionPerThread,
         event.threadId,
