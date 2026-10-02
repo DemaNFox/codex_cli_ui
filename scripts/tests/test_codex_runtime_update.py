@@ -62,7 +62,7 @@ class CodexRuntimeUpdateTest(unittest.TestCase):
         self.assertIn("rm -rf --one-file-system -- \"$runtime_dir\"", worker)
         self.assertIn("if $runtime_created && $can_remove", worker)
         self.assertIn("if $restore_ok; then can_remove=true; else failed=true; fi", worker)
-        commit_point = worker.index("runtime_committed=true")
+        commit_point = worker.index("update_committed=true", worker.index("apply_runtime()"))
         backup_removal = worker.index(
             'rm -rf --one-file-system -- "$runtime_schemas" "$runtime_backups"'
         )
@@ -70,9 +70,16 @@ class CodexRuntimeUpdateTest(unittest.TestCase):
         self.assertLess(commit_point, backup_removal)
         self.assertLess(backup_removal, success_result)
         self.assertIn('if ! rm -rf --one-file-system -- "$runtime_schemas" "$runtime_backups"', worker)
-        self.assertIn("$runtime_committed && return 0", worker)
-        self.assertIn(
-            "if [[ ${update_kind:-} == runtime ]] && $runtime_committed; then", worker
+        self.assertIn("$update_committed && return 0", worker)
+        self.assertIn("if $update_committed; then", worker)
+        self.assertLess(worker.index("runtime_created=true"), worker.index('mv -- "$runtime_stage"'))
+        self.assertLess(
+            worker.index("runtime_switched=true"),
+            worker.index("systemctl stop codex-web-ui-app-server.socket"),
+        )
+        committed_finish = worker.index("if $update_committed; then")
+        self.assertGreater(
+            worker.index("write_result succeeded", committed_finish), committed_finish
         )
         self.assertIn("or set(t) !=", worker)
         self.assertNotIn("trap rollback RETURN", worker)

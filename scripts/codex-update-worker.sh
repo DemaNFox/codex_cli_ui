@@ -59,6 +59,7 @@ apply_full_package() {
   bash "$candidate/scripts/install-package.sh" --package "$candidate" --upgrade --public-origin "$origin" --external-proxy
   active=$(readlink -f -- "$current_link"); [[ $active != "$previous" ]] || return 1
   "$active/scripts/health-check.sh" --service-user api --timeout 45
+  update_committed=true
 }
 
 runtime_stage=
@@ -68,11 +69,11 @@ runtime_dir=
 runtime_drain=false
 runtime_switched=false
 runtime_created=false
-runtime_committed=false
+update_committed=false
 
 rollback_runtime() {
   local failed=false can_remove=true restore_ok=true
-  $runtime_committed && return 0
+  $update_committed && return 0
   if $runtime_switched; then
     can_remove=false
     [[ -f $runtime_backups/runner && -f $runtime_backups/api ]] || restore_ok=false
@@ -138,15 +139,18 @@ if any(not p.is_file() or p.is_symlink() for p in outputs) or set(t) != {p.name 
 if any(hashlib.sha256((g/n).read_bytes()).hexdigest()!=d for n,d in t.items()): raise SystemExit(1)
 PY
   then message='Latest Codex requires a full app package because its protocol differs from the supported snapshot.'; printf '%s\n' "$message" >&2; return 1; fi
-  mv -- "$runtime_stage" "$runtime_dir"; runtime_created=true; runtime_stage=; bin="$runtime_dir/lib/node_modules/@openai/codex/bin/codex.js"
+  runtime_created=true
+  mv -- "$runtime_stage" "$runtime_dir"; runtime_stage=; bin="$runtime_dir/lib/node_modules/@openai/codex/bin/codex.js"
   install -m 0600 -o root -g root "$runner_config" "$runtime_backups/runner"; install -m 0600 -o root -g root "$config" "$runtime_backups/api"
   bash "$previous/scripts/graceful-drain.sh" --begin --config "$config" --service-user api --timeout 1800; runtime_drain=true
+  # From this point rollback must restore/restart even if a signal arrives
+  # before the protected configuration is replaced.
+  runtime_switched=true
   systemctl stop codex-web-ui-app-server.socket
   mapfile -t units < <(systemctl list-units --state=active --plain --no-legend 'codex-web-ui-app-server@*.service' | awk '{print $1}')
   if ((${#units[@]})); then systemctl stop "${units[@]}"; fi
   # From this point every error restores both protected files from the root-only backup,
   # including a failure between their two atomic replacements.
-  runtime_switched=true
   CONFIG=$config RUNNER=$runner_config BIN=$bin VERSION="codex-cli $target_version" python3 - <<'PY'
 import os,re,tempfile
 from pathlib import Path
@@ -170,7 +174,7 @@ PY
   # The healthy runtime and both protected configs are now committed. Later
   # result/cleanup failures must not delete the active executable or require a
   # backup that is about to be removed.
-  runtime_committed=true
+  update_committed=true
   if ! rm -rf --one-file-system -- "$runtime_schemas" "$runtime_backups"; then
     printf 'Codex update succeeded, but temporary verification data could not be removed.\n' >&2
   fi
@@ -182,7 +186,8 @@ finish() {
   local code=$?
   trap - EXIT INT TERM
   if ((code != 0)); then
-    if [[ ${update_kind:-} == runtime ]] && $runtime_committed; then
+    if $update_committed; then
+      write_result succeeded 'Codex update completed successfully.' || true
       cleanup_self
       exit "$code"
     elif [[ ${update_kind:-} == runtime ]]; then
