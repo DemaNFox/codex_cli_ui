@@ -62,7 +62,7 @@ class CodexRuntimeUpdateTest(unittest.TestCase):
         self.assertIn("rm -rf --one-file-system -- \"$runtime_dir\"", worker)
         self.assertIn("if $runtime_created && $can_remove", worker)
         self.assertIn("if $restore_ok; then can_remove=true; else failed=true; fi", worker)
-        commit_point = worker.index("runtime_switched=false; runtime_created=false")
+        commit_point = worker.index("runtime_committed=true")
         backup_removal = worker.index(
             'rm -rf --one-file-system -- "$runtime_schemas" "$runtime_backups"'
         )
@@ -70,6 +70,10 @@ class CodexRuntimeUpdateTest(unittest.TestCase):
         self.assertLess(commit_point, backup_removal)
         self.assertLess(backup_removal, success_result)
         self.assertIn('if ! rm -rf --one-file-system -- "$runtime_schemas" "$runtime_backups"', worker)
+        self.assertIn("$runtime_committed && return 0", worker)
+        self.assertIn(
+            "if [[ ${update_kind:-} == runtime ]] && $runtime_committed; then", worker
+        )
         self.assertIn("or set(t) !=", worker)
         self.assertNotIn("trap rollback RETURN", worker)
         for forbidden in ("$URL", "$COMMAND", "browser_version", "request_path"):

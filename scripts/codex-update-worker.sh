@@ -68,9 +68,11 @@ runtime_dir=
 runtime_drain=false
 runtime_switched=false
 runtime_created=false
+runtime_committed=false
 
 rollback_runtime() {
   local failed=false can_remove=true restore_ok=true
+  $runtime_committed && return 0
   if $runtime_switched; then
     can_remove=false
     [[ -f $runtime_backups/runner && -f $runtime_backups/api ]] || restore_ok=false
@@ -168,7 +170,7 @@ PY
   # The healthy runtime and both protected configs are now committed. Later
   # result/cleanup failures must not delete the active executable or require a
   # backup that is about to be removed.
-  runtime_switched=false; runtime_created=false
+  runtime_committed=true
   if ! rm -rf --one-file-system -- "$runtime_schemas" "$runtime_backups"; then
     printf 'Codex update succeeded, but temporary verification data could not be removed.\n' >&2
   fi
@@ -180,7 +182,10 @@ finish() {
   local code=$?
   trap - EXIT INT TERM
   if ((code != 0)); then
-    if [[ ${update_kind:-} == runtime ]]; then
+    if [[ ${update_kind:-} == runtime ]] && $runtime_committed; then
+      cleanup_self
+      exit "$code"
+    elif [[ ${update_kind:-} == runtime ]]; then
       if ! rollback_runtime; then status=rollback_failed; message='Codex update failed and automatic rollback could not be verified.'; fi
     else
       active=$(readlink -f -- "$current_link" 2>/dev/null || true)
