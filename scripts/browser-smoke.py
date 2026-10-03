@@ -473,6 +473,7 @@ def main() -> int:
                                     "| Вчера | 196 | 114 | Подтверждение ещё не получено |\n"
                                     "| Сегодня | 150 | 82 | Проверка и повторная отправка |"
                                     "\n\n[Скачать отчёт](reports/audit.md)"
+                                    "\n\n```text\nvery-long-code-value-without-breaks-0123456789-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ\n```"
                                     if index == 2
                                     else f"Историческое сообщение {index}: длинный чат остаётся прокручиваемым."
                                 ),
@@ -1057,22 +1058,54 @@ def main() -> int:
         page.set_viewport_size({"width": 1440, "height": 900})
         transcript_box = page.locator(".transcript").bounding_box()
         final_answer_box = final_answer.bounding_box()
+        composer_box = page.locator(".composer").bounding_box()
         table_scroll = final_answer.locator(".markdown-table-scroll")
         table_metrics = table_scroll.evaluate(
             "element => ({scrollWidth: element.scrollWidth, clientWidth: element.clientWidth})"
         )
+        code_metrics = final_answer.locator("pre").evaluate(
+            "element => ({scrollWidth: element.scrollWidth, clientWidth: element.clientWidth})"
+        )
+        page_metrics = page.evaluate(
+            "() => ({clientWidth: document.documentElement.clientWidth, scrollWidth: document.documentElement.scrollWidth})"
+        )
         if (
             not transcript_box
             or not final_answer_box
-            or final_answer_box["width"] < transcript_box["width"] * 0.95
+            or not composer_box
+            or final_answer_box["width"] < min(720, transcript_box["width"] * 0.75)
+            or final_answer_box["width"] > 865
         ):
             raise AssertionError(
-                "wide desktop final answer does not use the available transcript width: "
-                f"transcript={transcript_box}, final={final_answer_box}"
+                "wide desktop reading column is not bounded but usable: "
+                f"transcript={transcript_box}, final={final_answer_box}, composer={composer_box}"
             )
+        left_gutter = final_answer_box["x"] - transcript_box["x"]
+        right_gutter = (
+            transcript_box["x"]
+            + transcript_box["width"]
+            - final_answer_box["x"]
+            - final_answer_box["width"]
+        )
+        if left_gutter < 24 or abs(left_gutter - right_gutter) > 2:
+            raise AssertionError(
+                "wide desktop reading column does not have balanced adaptive gutters: "
+                f"left={left_gutter}, right={right_gutter}"
+            )
+        if abs(composer_box["width"] - final_answer_box["width"]) > 2:
+            raise AssertionError(
+                "composer is not aligned with the reading column: "
+                f"final={final_answer_box}, composer={composer_box}"
+            )
+        if page_metrics["scrollWidth"] > page_metrics["clientWidth"] + 1:
+            raise AssertionError(f"wide desktop page overflows horizontally: {page_metrics}")
         if table_metrics["scrollWidth"] > table_metrics["clientWidth"] + 1:
             raise AssertionError(
                 f"wide desktop result table still has horizontal overflow: {table_metrics}"
+            )
+        if code_metrics["scrollWidth"] > code_metrics["clientWidth"] + 1:
+            raise AssertionError(
+                f"wide desktop code block still has horizontal overflow: {code_metrics}"
             )
         if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1":
             page.set_viewport_size({"width": 390, "height": 780})
