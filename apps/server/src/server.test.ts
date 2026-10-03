@@ -1,4 +1,10 @@
-import type { Attachment, CodexUpdateSnapshot, SafeEvent, Thread } from '@codex-web/contracts';
+import {
+  capabilitySchema,
+  type Attachment,
+  type CodexUpdateSnapshot,
+  type SafeEvent,
+  type Thread,
+} from '@codex-web/contracts';
 import { hash } from 'argon2';
 import { EventEmitter } from 'node:events';
 import { mkdtemp, mkdir, rename, symlink, unlink, writeFile } from 'node:fs/promises';
@@ -59,6 +65,7 @@ class FakeAppServer implements AppServerClient {
   failTurnStartWith: Error | null = null;
   failNextResponseWith: Error | null = null;
   failAccountStatusReads = false;
+  failThreadUsageReads = false;
   failAccountLoginCancels = false;
   accountLoginCancelStatus: 'canceled' | 'notFound' = 'canceled';
   beforeThreadReadReturn: (() => Promise<void>) | null = null;
@@ -74,6 +81,7 @@ class FakeAppServer implements AppServerClient {
     userCode: 'ABCD-EFGH',
     verificationUrl: 'https://auth.openai.com/codex/device',
   };
+  threadUsageResponse: unknown = null;
 
   blockTurnStarts(): { entered: Promise<void>; release: () => void } {
     let releaseGate!: () => void;
@@ -365,6 +373,43 @@ class FakeAppServer implements AppServerClient {
       };
     }
     if (method === 'account/usage/read') {
+      const requestedThreadId =
+        params !== null && typeof params === 'object'
+          ? (params as Record<string, unknown>).threadId
+          : undefined;
+      if (typeof requestedThreadId === 'string') {
+        if (this.failThreadUsageReads) throw new Error('thread usage unavailable');
+        return (
+          this.threadUsageResponse ?? {
+            summary: {},
+            threadUsage: {
+              threadId: requestedThreadId,
+              groups: [
+                {
+                  inputTokens: 1_000,
+                  cachedInputTokens: 400,
+                  netNewInputTokens: 600,
+                  outputTokens: 200,
+                  totalTokens: 1_200,
+                  estimatedUsageCreditsMicros: 123_000,
+                  model: 'must-not-leak',
+                },
+                {
+                  inputTokens: 500,
+                  cachedInputTokens: null,
+                  netNewInputTokens: 500,
+                  outputTokens: 100,
+                  totalTokens: 600,
+                  estimatedUsageCreditsMicros: 61_000,
+                },
+              ],
+              estimatedUsageCreditsMicros: 184_000,
+              estimatedUsageUsdMicros: 20_000,
+              billingRoute: 'must-not-leak',
+            },
+          }
+        );
+      }
       if (this.failAccountStatusReads) throw new Error('unsupported status method');
       return {
         summary: {
@@ -2060,6 +2105,100 @@ describe('Codex routes', () => {
       sourceKinds: ['cli', 'vscode', 'appServer', 'exec'],
     });
     expect(appServer.requests.filter((item) => item.method === 'thread/list')).toHaveLength(2);
+  });
+
+  it('reports only safe aggregated usage for a selected repository thread', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/system/capabilities?threadId=${encodeURIComponent(threadId)}`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      usage: {
+        summary: { lifetimeTokens: 10_000 },
+      },
+      threadUsage: {
+        threadId,
+        estimated: true,
+        inputTokens: 1_500,
+        cachedInputTokens: null,
+        netNewInputTokens: 1_100,
+        outputTokens: 300,
+        totalTokens: 1_800,
+      },
+    });
+    expect(response.body).not.toContain('estimatedUsageCreditsMicros');
+    expect(response.body).not.toContain('estimatedUsageUsdMicros');
+    expect(response.body).not.toContain('billingRoute');
+    expect(response.body).not.toContain('must-not-leak');
+    expect(
+      appServer.requests
+        .filter((item) => item.method === 'account/usage/read')
+        .map((item) => item.params),
+    ).toEqual([null, { threadId }]);
+  });
+
+  it('degrades malformed or failed thread usage independently from account usage', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.threadUsageResponse = {
+      summary: { lifetimeTokens: 999_999 },
+      threadUsage: {
+        threadId: 'wrong-thread',
+        groups: [{ inputTokens: 9_999 }],
+        estimatedUsageCreditsMicros: 123_000,
+      },
+    };
+
+    const malformed = await app.inject({
+      method: 'GET',
+      url: `/api/system/capabilities?threadId=${encodeURIComponent(threadId)}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(malformed.statusCode).toBe(200);
+    const malformedBody = capabilitySchema.parse(malformed.json());
+    expect(malformedBody.usage?.summary.lifetimeTokens).toBe(10_000);
+    expect(malformedBody.threadUsage).toBeNull();
+    expect(malformedBody.warnings).toContain('Codex thread usage is unavailable.');
+
+    appServer.failThreadUsageReads = true;
+    const failed = await app.inject({
+      method: 'GET',
+      url: `/api/system/capabilities?threadId=${encodeURIComponent(threadId)}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(failed.statusCode).toBe(200);
+    const failedBody = capabilitySchema.parse(failed.json());
+    expect(failedBody.usage?.summary.lifetimeTokens).toBe(10_000);
+    expect(failedBody.threadUsage).toBeNull();
+    expect(failedBody.warnings).toContain('Codex thread usage is unavailable.');
+  });
+
+  it('rejects an unknown capability thread before making upstream requests', async () => {
+    const { app, appServer } = await fixture();
+    const session = await login(app);
+    const requestCount = appServer.requests.length;
+
+    const response = await app.inject({
+      method: 'GET',
+      url: '/api/system/capabilities?threadId=unknown-thread',
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(404);
+    expect(response.json()).toEqual({
+      error: { code: 'THREAD_NOT_FOUND', message: 'THREAD_NOT_FOUND' },
+    });
+    expect(appServer.requests).toHaveLength(requestCount);
   });
 
   it('applies a Codex update while all execution work is idle', async () => {

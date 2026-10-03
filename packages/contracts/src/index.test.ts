@@ -282,6 +282,17 @@ describe('contracts', () => {
         },
         dailyUsageBuckets: [{ startDate: '2026-09-27', tokens: 500 }],
       },
+      threadUsage: {
+        threadId: 'thread-1',
+        estimated: true,
+        inputTokens: 1_000,
+        cachedInputTokens: 400,
+        netNewInputTokens: 600,
+        outputTokens: 200,
+        totalTokens: 1_200,
+        estimatedUsageCreditsMicros: 123_000,
+        model: 'must-not-survive',
+      },
       transcription: {
         available: true,
         model: 'onnx-community/whisper-base',
@@ -301,6 +312,17 @@ describe('contracts', () => {
       planType: 'plus',
     });
     expect(parsed.usage?.summary).not.toHaveProperty('email');
+    expect(parsed.threadUsage).toEqual({
+      threadId: 'thread-1',
+      estimated: true,
+      inputTokens: 1_000,
+      cachedInputTokens: 400,
+      netNewInputTokens: 600,
+      outputTokens: 200,
+      totalTokens: 1_200,
+    });
+    expect(parsed.threadUsage).not.toHaveProperty('estimatedUsageCreditsMicros');
+    expect(parsed.threadUsage).not.toHaveProperty('model');
     expect(parsed.transcription).toEqual({
       available: true,
       model: 'onnx-community/whisper-base',
@@ -312,6 +334,13 @@ describe('contracts', () => {
       vapidPublicKey: 'A'.repeat(87),
     });
     expect(capabilitySchema.safeParse({ ...parsed, transcription: undefined }).success).toBe(true);
+    expect(capabilitySchema.safeParse({ ...parsed, threadUsage: null }).success).toBe(true);
+    expect(
+      capabilitySchema.safeParse({
+        ...parsed,
+        threadUsage: { ...parsed.threadUsage, inputTokens: -1 },
+      }).success,
+    ).toBe(false);
     expect(
       capabilitySchema.safeParse({
         ...parsed,

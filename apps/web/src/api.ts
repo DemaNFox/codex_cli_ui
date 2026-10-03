@@ -436,7 +436,12 @@ export const api = {
       csrfToken,
       body: { decision, scope: 'turn' },
     }),
-  capabilities: () => request<Capability>('/api/system/capabilities'),
+  capabilities: (threadId?: string | null) =>
+    request<Capability>(
+      threadId
+        ? `/api/system/capabilities?${new URLSearchParams({ threadId }).toString()}`
+        : '/api/system/capabilities',
+    ),
   codexUpdate: async () =>
     unwrapData(
       await request<CodexUpdateSnapshot | { data: CodexUpdateSnapshot }>(

@@ -20,6 +20,7 @@ import {
   startThreadRequestSchema,
   startTurnRequestSchema,
   steerTurnRequestSchema,
+  threadUsageSchema,
   threadListQuerySchema,
   updateRuntimePreferencesRequestSchema,
   updateResourceLimitsRequestSchema,
@@ -319,6 +320,24 @@ const usageResponseSchema = z.object({
     .optional(),
 });
 
+const upstreamThreadUsageGroupSchema = z.object({
+  inputTokens: nullableUsageIntegerSchema.optional(),
+  cachedInputTokens: nullableUsageIntegerSchema.optional(),
+  netNewInputTokens: nullableUsageIntegerSchema.optional(),
+  outputTokens: nullableUsageIntegerSchema.optional(),
+  totalTokens: nullableUsageIntegerSchema.optional(),
+});
+
+const threadUsageResponseSchema = z.object({
+  threadUsage: z
+    .object({
+      threadId: z.string().min(1).max(200),
+      groups: z.array(upstreamThreadUsageGroupSchema.passthrough()).max(1_000),
+    })
+    .passthrough()
+    .nullable(),
+});
+
 const storedUserInputDetailsSchema = z.object({
   itemId: z.string(),
   isBlocking: z.boolean(),
@@ -593,6 +612,35 @@ function publicUsage(input: z.infer<typeof usageResponseSchema>) {
       longestRunningTurnSec: input.summary.longestRunningTurnSec ?? null,
     },
     dailyUsageBuckets: input.dailyUsageBuckets ?? null,
+  });
+}
+
+function publicThreadUsage(
+  requestedThreadId: string,
+  input: Exclude<z.infer<typeof threadUsageResponseSchema>['threadUsage'], null>,
+) {
+  if (input.threadId !== requestedThreadId) throw new Error('THREAD_USAGE_ID_MISMATCH');
+  const aggregate = (
+    metric: keyof z.infer<typeof upstreamThreadUsageGroupSchema>,
+  ): number | null => {
+    if (input.groups.length === 0) return null;
+    let total = 0;
+    for (const group of input.groups) {
+      const value = group[metric];
+      if (typeof value !== 'number') return null;
+      total += value;
+      if (!Number.isSafeInteger(total)) return null;
+    }
+    return total;
+  };
+  return threadUsageSchema.parse({
+    threadId: requestedThreadId,
+    estimated: true,
+    inputTokens: aggregate('inputTokens'),
+    cachedInputTokens: aggregate('cachedInputTokens'),
+    netNewInputTokens: aggregate('netNewInputTokens'),
+    outputTokens: aggregate('outputTokens'),
+    totalTokens: aggregate('totalTokens'),
   });
 }
 
@@ -3285,6 +3333,11 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
 
   app.get('/api/system/capabilities', async (request) => {
     auth.authenticate(request);
+    const query = z
+      .object({ threadId: z.string().min(1).max(200).optional() })
+      .parse(request.query);
+    if (query.threadId !== undefined && !repository.getThread(query.threadId))
+      throw new HttpError(404, 'THREAD_NOT_FOUND');
     const projectPaths = await Promise.all(
       repository.listProjects().map(async (project) => canonicalProjectPath(pathPolicy, project)),
     );
@@ -3299,9 +3352,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const warnings: string[] = [];
     let rateLimits: z.infer<typeof accountRateLimitSchema>[] | null = null;
     let usage: z.infer<typeof accountUsageSchema> | null = null;
-    const [rateLimitsResult, usageResult] = await Promise.allSettled([
+    let threadUsage: z.infer<typeof threadUsageSchema> | null = null;
+    const [rateLimitsResult, usageResult, threadUsageResult] = await Promise.allSettled([
       appServer.request('account/rateLimits/read', null),
       appServer.request('account/usage/read', null),
+      query.threadId === undefined
+        ? Promise.resolve(null)
+        : appServer.request('account/usage/read', { threadId: query.threadId }),
     ]);
     if (rateLimitsResult.status === 'fulfilled') {
       try {
@@ -3330,6 +3387,19 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     } else {
       warnings.push('Codex account usage is unavailable.');
     }
+    if (query.threadId !== undefined && threadUsageResult.status === 'fulfilled') {
+      try {
+        const parsed = threadUsageResponseSchema.parse(threadUsageResult.value);
+        threadUsage =
+          parsed.threadUsage === null
+            ? null
+            : publicThreadUsage(query.threadId, parsed.threadUsage);
+      } catch {
+        warnings.push('Codex thread usage is unavailable.');
+      }
+    } else if (query.threadId !== undefined) {
+      warnings.push('Codex thread usage is unavailable.');
+    }
     if (skills.data.some((entry) => entry.errors.length > 0))
       warnings.push('One or more project skill scans reported errors.');
     const names = new Set(skills.data.flatMap((entry) => entry.skills.map((skill) => skill.name)));
@@ -3355,6 +3425,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       ),
       rateLimits,
       usage,
+      threadUsage,
       transcription: {
         available: dependencies.transcriptionClient !== undefined,
         model: config.transcriptionModel,

@@ -1994,6 +1994,36 @@ button:disabled {
   text-align: right;
   overflow-wrap: anywhere;
 }
+.usage-scope {
+  margin-top: 1.2rem;
+}
+.diagnostics .usage-scope h3 {
+  margin-top: 0;
+}
+.usage-scope-name {
+  margin: 0 0 0.2rem;
+  color: var(--text);
+  font-size: 0.8rem;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.usage-scope-note,
+.usage-estimate {
+  margin: 0 0 0.55rem;
+  color: var(--muted);
+  font-size: 0.68rem;
+  line-height: 1.45;
+}
+.usage-estimate {
+  color: #d8e7a5;
+  font-weight: 600;
+}
+.usage-grid dt {
+  min-width: 0;
+}
+.usage-grid {
+  grid-template-columns: minmax(0, 1fr) auto;
+}
 .rate-limit-list {
   display: grid;
   gap: 0.55rem;

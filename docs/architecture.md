@@ -46,8 +46,13 @@ Browser
 - `instructionSources` from thread start/resume and `skills/list` are visible in the status drawer so the operator can verify that `AGENTS.md` and required skills loaded.
 - The backend reads account identity, rate limits and aggregate usage through bounded app-server methods. The
   public projection exposes only the authenticated account type, email and plan label; it omits account IDs,
-  credits, authentication material and unknown upstream fields. An unsupported optional usage method degrades
-  to `null` plus a static warning.
+  credits, authentication material and unknown upstream fields. Account usage preserves the bounded daily
+  buckets needed to label today and trailing 7/30-day totals separately from the upstream lifetime summary.
+  When Status names a registered selected thread, the backend performs a second `account/usage/read` with that
+  exact `threadId` and exposes only an explicitly estimated aggregate of input, cached input, net-new input,
+  output and total tokens. It does not expose billing-route groups or invent a historical reasoning-token split
+  that the thread estimate does not provide. Account-wide and selected-thread failures degrade independently to
+  `null` plus a static warning.
 - The authenticated owner can replace the runner's Codex account through the official app-server device-code
   flow. The API exposes the short-lived verification URL and one-time code only in process memory, never reads
   `CODEX_HOME`, and never receives an access or refresh token. Starting the flow atomically closes task
@@ -215,7 +220,8 @@ that derived ceiling is rejected.
 - `GET /api/threads/:id/events` using SSE and `Last-Event-ID`
 - `GET /api/threads/:id/subagents` for the durable root-chat subagent projection
 - `POST/GET /api/threads/:id/attachments`, `GET/DELETE /api/threads/:id/attachments/:attachmentId`; uploads use multipart field `file`
-- `GET /api/system/capabilities` for safe version/auth/instruction/skill, rate-limit and aggregate-usage status
+- `GET /api/system/capabilities`, with an optional registered `threadId`, for safe
+  version/auth/instruction/skill, rate-limit, account-usage and selected-thread usage status
 - `POST /api/audio/transcriptions` for bounded ephemeral speech-to-text; uploads use multipart field `file`
 - `POST /api/threads/:id/push-subscriptions/status`, plus `PUT` and `DELETE` on
   `/api/threads/:id/push-subscriptions`, for a CSRF-protected per-device chat subscription

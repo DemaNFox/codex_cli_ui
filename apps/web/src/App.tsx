@@ -187,6 +187,57 @@ function formatMetric(value: number | null): string {
   return value === null ? 'нет данных' : value.toLocaleString('ru');
 }
 
+function localCalendarKey(date: Date): string {
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function parseLocalCalendarDate(value: string): Date | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+  if (!match) return null;
+  const date = new Date(Number(match[1]), Number(match[2]) - 1, Number(match[3]), 12);
+  return localCalendarKey(date) === value ? date : null;
+}
+
+function formatLocalCalendarDate(value: string): string | null {
+  const date = parseLocalCalendarDate(value);
+  return date
+    ? new Intl.DateTimeFormat('ru-RU', {
+        day: 'numeric',
+        month: 'short',
+        year: 'numeric',
+      }).format(date)
+    : null;
+}
+
+function calendarUsageTotal(
+  buckets: NonNullable<NonNullable<Capability['usage']>['dailyUsageBuckets']>,
+  days: number,
+  now = new Date(),
+): number | null {
+  const byDate = new Map(buckets.map((bucket) => [bucket.startDate, bucket.tokens]));
+  let total = 0;
+  for (let offset = 0; offset < days; offset += 1) {
+    const date = new Date(now.getFullYear(), now.getMonth(), now.getDate() - offset, 12);
+    const tokens = byDate.get(localCalendarKey(date));
+    if (tokens === undefined) return null;
+    total += tokens;
+  }
+  return total;
+}
+
+function peakUsageLabel(usage: NonNullable<Capability['usage']>): string {
+  const peakTokens = usage.summary.peakDailyTokens;
+  if (peakTokens === null) return 'нет данных';
+  const matchingBucket = usage.dailyUsageBuckets
+    ?.filter((bucket) => bucket.tokens === peakTokens)
+    .sort((left, right) => right.startDate.localeCompare(left.startDate))[0];
+  const dateLabel = matchingBucket ? formatLocalCalendarDate(matchingBucket.startDate) : null;
+  return dateLabel ? `${formatMetric(peakTokens)} · ${dateLabel}` : formatMetric(peakTokens);
+}
+
 function formatEventDateTime(value: string): string {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? value : EVENT_TIME_FORMATTER.format(date);
@@ -2540,23 +2591,83 @@ function Diagnostics({
           ) : (
             <p className="empty-hint compact">Данные о лимитах недоступны.</p>
           )}
-          {capability.usage && (
-            <>
-              <h3>Использование</h3>
-              <dl className="status-grid">
-                <dt>Всего токенов</dt>
-                <dd>{formatMetric(capability.usage.summary.lifetimeTokens)}</dd>
-                <dt>Пиковый день</dt>
-                <dd>{formatMetric(capability.usage.summary.peakDailyTokens)}</dd>
-                <dt>Текущая серия</dt>
-                <dd>
-                  {capability.usage.summary.currentStreakDays === null
-                    ? 'нет данных'
-                    : `${capability.usage.summary.currentStreakDays} дн.`}
-                </dd>
-              </dl>
-            </>
-          )}
+          <section className="usage-scope" aria-labelledby="thread-usage-title">
+            <h3 id="thread-usage-title">Текущий чат</h3>
+            {thread ? (
+              <>
+                <p className="usage-scope-name">{thread.name}</p>
+                <p className="usage-scope-note">
+                  Период: {formatEventDateTime(thread.createdAt)} — сейчас
+                </p>
+              </>
+            ) : (
+              <p className="usage-scope-note">Чат не выбран.</p>
+            )}
+            {thread && capability.threadUsage?.threadId === thread.id ? (
+              <>
+                <p className="usage-estimate">Оценка Codex по этому чату</p>
+                <dl className="status-grid usage-grid">
+                  <dt>Входные</dt>
+                  <dd>{formatMetric(capability.threadUsage.inputTokens)}</dd>
+                  <dt>Кешированные входные</dt>
+                  <dd>{formatMetric(capability.threadUsage.cachedInputTokens)}</dd>
+                  <dt>Новые входные</dt>
+                  <dd>{formatMetric(capability.threadUsage.netNewInputTokens)}</dd>
+                  <dt>Выходные</dt>
+                  <dd>{formatMetric(capability.threadUsage.outputTokens)}</dd>
+                  <dt>Всего</dt>
+                  <dd>{formatMetric(capability.threadUsage.totalTokens)}</dd>
+                </dl>
+              </>
+            ) : (
+              <p className="empty-hint compact">Статистика этого чата пока недоступна.</p>
+            )}
+            <p className="usage-scope-note">
+              Reasoning-токены в исторической оценке чата Codex отдельно не возвращает.
+            </p>
+          </section>
+          <section className="usage-scope" aria-labelledby="account-usage-title">
+            <h3 id="account-usage-title">Весь аккаунт Codex</h3>
+            <p className="usage-scope-note">
+              Вся токен-активность аккаунта Codex · календарные даты браузера
+            </p>
+            <dl className="status-grid usage-grid">
+              <dt>Сегодня</dt>
+              <dd>
+                {formatMetric(
+                  capability.usage?.dailyUsageBuckets
+                    ? calendarUsageTotal(capability.usage.dailyUsageBuckets, 1)
+                    : null,
+                )}
+              </dd>
+              <dt>Последние 7 дней</dt>
+              <dd>
+                {formatMetric(
+                  capability.usage?.dailyUsageBuckets
+                    ? calendarUsageTotal(capability.usage.dailyUsageBuckets, 7)
+                    : null,
+                )}
+              </dd>
+              <dt>Последние 30 дней</dt>
+              <dd>
+                {formatMetric(
+                  capability.usage?.dailyUsageBuckets
+                    ? calendarUsageTotal(capability.usage.dailyUsageBuckets, 30)
+                    : null,
+                )}
+              </dd>
+              <dt>За всё доступное время</dt>
+              <dd>{formatMetric(capability.usage?.summary.lifetimeTokens ?? null)}</dd>
+              <dt>Пиковый день</dt>
+              <dd>{capability.usage ? peakUsageLabel(capability.usage) : 'нет данных'}</dd>
+              <dt>Текущая серия</dt>
+              <dd>
+                {capability.usage?.summary.currentStreakDays === null || !capability.usage
+                  ? 'нет данных'
+                  : `${capability.usage.summary.currentStreakDays} дн.`}
+              </dd>
+            </dl>
+          </section>
           <h3>Instruction sources</h3>
           <ul className="path-list">
             {thread?.instructionSources.map((path) => (
@@ -2801,6 +2912,7 @@ function Workspace({
   const statusToggleRef = useRef<HTMLButtonElement>(null);
   const accountSwitchButtonRef = useRef<HTMLButtonElement>(null);
   const refreshedCodexUpdateRef = useRef<string | null>(null);
+  const capabilityRequestRef = useRef(0);
   const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
   const attachmentThreadRef = useRef<string | null>(null);
   const csrfTokenRef = useRef(session.csrfToken);
@@ -3149,6 +3261,35 @@ function Workspace({
     window.setTimeout(() => statusToggleRef.current?.focus());
   }
 
+  async function refreshCapabilityForThread(requestedThreadId: string | null): Promise<void> {
+    const requestId = ++capabilityRequestRef.current;
+    const next = await api.capabilities(requestedThreadId);
+    if (
+      requestId === capabilityRequestRef.current &&
+      (selectedThreadRef.current?.id ?? null) === requestedThreadId
+    ) {
+      setCapability(next);
+    }
+  }
+
+  useEffect(() => {
+    if (!showDiagnostics) return;
+    let disposed = false;
+    setStatusRefreshing(true);
+    void refreshCapabilityForThread(threadId)
+      .catch((cause: unknown) => {
+        if (!disposed) setError(errorMessage(cause));
+      })
+      .finally(() => {
+        if (!disposed) setStatusRefreshing(false);
+      });
+    return () => {
+      disposed = true;
+      capabilityRequestRef.current += 1;
+      setStatusRefreshing(false);
+    };
+  }, [showDiagnostics, threadId]);
+
   function closeAccountLoginDialog() {
     setAccountLoginOpen(false);
     setAccountLogin(null);
@@ -3159,7 +3300,7 @@ function Workspace({
 
   async function refreshCapabilitiesAfterLogin() {
     try {
-      setCapability(await api.capabilities());
+      await refreshCapabilityForThread(selectedThreadRef.current?.id ?? null);
     } catch (cause) {
       setAccountLoginError(
         `Вход завершён, но статус аккаунта не обновился: ${errorMessage(cause)}`,
@@ -3271,7 +3412,7 @@ function Workspace({
           window.clearInterval(timer);
           setAccountLoginError(null);
           try {
-            setCapability(await api.capabilities());
+            await refreshCapabilityForThread(selectedThreadRef.current?.id ?? null);
           } catch (cause) {
             if (!disposed)
               setAccountLoginError(
@@ -3334,9 +3475,11 @@ function Workspace({
     )
       return;
     refreshedCodexUpdateRef.current = codexUpdate.lastResult.completedAt;
-    void Promise.all([api.capabilities(), api.models()])
-      .then(([nextCapability, nextModels]) => {
-        setCapability(nextCapability);
+    void Promise.all([
+      refreshCapabilityForThread(selectedThreadRef.current?.id ?? null),
+      api.models(),
+    ])
+      .then(([, nextModels]) => {
         setModels(nextModels);
         setModel((currentModel) => {
           const selectedModel = nextModels.find((item) => item.id === currentModel);
@@ -4008,19 +4151,14 @@ function Workspace({
 
   async function openStatus() {
     setShowDiagnostics(true);
-    setStatusRefreshing(true);
     setCodexUpdateDiscoveryBusy(true);
     setError(null);
     try {
-      const [capabilityResult, resourceResult, codexUpdateResult, discoveryResult] =
-        await Promise.allSettled([
-          api.capabilities(),
-          api.resourceLimits(),
-          api.codexUpdate(),
-          api.codexUpdateDiscovery(),
-        ]);
-      if (capabilityResult.status === 'rejected') throw capabilityResult.reason;
-      setCapability(capabilityResult.value);
+      const [resourceResult, codexUpdateResult, discoveryResult] = await Promise.allSettled([
+        api.resourceLimits(),
+        api.codexUpdate(),
+        api.codexUpdateDiscovery(),
+      ]);
       if (resourceResult.status === 'fulfilled') {
         setResourceLimits(resourceResult.value);
         setResourceError(null);
@@ -4042,7 +4180,6 @@ function Workspace({
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
-      setStatusRefreshing(false);
       setCodexUpdateDiscoveryBusy(false);
     }
   }

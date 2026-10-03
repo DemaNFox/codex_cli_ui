@@ -279,7 +279,8 @@ function installAuthenticatedApi(
         }),
       );
     if (url === '/api/models') return Promise.resolve(jsonResponse(models));
-    if (url === '/api/system/capabilities') return Promise.resolve(jsonResponse(capabilities));
+    if (url.startsWith('/api/system/capabilities'))
+      return Promise.resolve(jsonResponse(capabilities));
     if (url === '/api/system/codex-update')
       return Promise.resolve(jsonResponse({ data: unavailableCodexUpdate }));
     if (url === '/api/system/codex-update/discovery')
@@ -455,7 +456,7 @@ describe('App', () => {
 
   it('shows a clear unavailable state when server push is not configured', async () => {
     installAuthenticatedApi((url) => {
-      if (url !== '/api/system/capabilities') return undefined;
+      if (!url.startsWith('/api/system/capabilities')) return undefined;
       return jsonResponse({ ...capabilities, notifications: undefined });
     });
 
@@ -554,7 +555,7 @@ describe('App', () => {
 
   it('remains compatible with a backend that predates transcription capabilities', async () => {
     installAuthenticatedApi((url) => {
-      if (url !== '/api/system/capabilities') return undefined;
+      if (!url.startsWith('/api/system/capabilities')) return undefined;
       const legacyCapabilities = { ...capabilities, transcription: undefined };
       return jsonResponse(legacyCapabilities);
     });
@@ -3518,6 +3519,223 @@ describe('App', () => {
     expect(screen.queryByRole('button', { name: 'Обновить Codex' })).toBeNull();
   });
 
+  it('separates current-chat estimates from account usage across local calendar periods', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(2026, 9, 3, 12, 0, 0));
+    try {
+      const dailyUsageBuckets = Array.from({ length: 30 }, (_, index) => {
+        const date = new Date(2026, 9, 3 - index, 12, 0, 0);
+        const year = date.getFullYear();
+        const month = String(date.getMonth() + 1).padStart(2, '0');
+        const day = String(date.getDate()).padStart(2, '0');
+        return { startDate: `${year}-${month}-${day}`, tokens: index + 1 };
+      });
+      const scopedCapabilities = {
+        ...capabilities,
+        usage: {
+          summary: {
+            ...capabilities.usage.summary,
+            peakDailyTokens: 30,
+          },
+          dailyUsageBuckets,
+        },
+        threadUsage: {
+          threadId: thread.id,
+          estimated: true as const,
+          inputTokens: 1000,
+          cachedInputTokens: 400,
+          netNewInputTokens: 600,
+          outputTokens: 250,
+          totalTokens: 1250,
+        },
+      };
+      const fetchMock = installAuthenticatedApi((url) => {
+        if (url === '/api/system/capabilities?threadId=thread-1') {
+          return jsonResponse(scopedCapabilities);
+        }
+        return undefined;
+      });
+      const user = userEvent.setup();
+      render(<App />);
+
+      await screen.findByRole('button', { name: 'Открыть недавний чат Frontend task' });
+      await user.click(await screen.findByRole('button', { name: 'Статус' }));
+
+      const threadSection = screen.getByRole('heading', { name: 'Текущий чат' }).closest('section');
+      if (!threadSection) throw new Error('Current chat usage section not found');
+      const threadUsage = within(threadSection);
+      expect(threadUsage.getByText('Frontend task')).not.toBeNull();
+      expect(threadUsage.getByText('Входные')).not.toBeNull();
+      expect(threadUsage.getByText('Кешированные входные')).not.toBeNull();
+      expect(threadUsage.getByText('Новые входные')).not.toBeNull();
+      expect(threadUsage.getByText('Выходные')).not.toBeNull();
+      expect(threadUsage.getByText('Всего')).not.toBeNull();
+      expect(threadSection.textContent?.replace(/\s/g, '')).toContain('1000');
+      expect(threadSection.textContent?.replace(/\s/g, '')).toContain('1250');
+      expect(threadSection.textContent).toContain('Оценка Codex');
+      expect(threadSection.textContent).toContain('Reasoning-токены');
+
+      const accountSection = screen
+        .getByRole('heading', { name: 'Весь аккаунт Codex' })
+        .closest('section');
+      if (!accountSection) throw new Error('Account usage section not found');
+      const accountUsage = within(accountSection);
+      expect(accountUsage.getByText('Сегодня')).not.toBeNull();
+      expect(accountUsage.getByText('Последние 7 дней')).not.toBeNull();
+      expect(accountUsage.getByText('Последние 30 дней')).not.toBeNull();
+      expect(accountUsage.getByText('За всё доступное время')).not.toBeNull();
+      const normalizedAccountText = accountSection.textContent?.replace(/\s/g, '');
+      expect(normalizedAccountText).toContain('Сегодня1');
+      expect(normalizedAccountText).toContain('Последние7дней28');
+      expect(normalizedAccountText).toContain('Последние30дней465');
+      expect(normalizedAccountText).toContain('Завсёдоступноевремя123456');
+      expect(accountSection.textContent).toMatch(/Пиковый день[\s\S]*30[\s\S]*2026/);
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/system/capabilities?threadId=thread-1',
+        expect.objectContaining({ credentials: 'same-origin' }),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('shows unavailable usage explicitly instead of inventing zero values', async () => {
+    installAuthenticatedApi((url) => {
+      if (url !== '/api/system/capabilities?threadId=thread-1') return undefined;
+      return jsonResponse({
+        ...capabilities,
+        threadUsage: null,
+        usage: {
+          summary: {
+            lifetimeTokens: null,
+            currentStreakDays: null,
+            longestStreakDays: null,
+            peakDailyTokens: null,
+            longestRunningTurnSec: null,
+          },
+          dailyUsageBuckets: null,
+        },
+      });
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByRole('button', { name: 'Открыть недавний чат Frontend task' });
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+
+    const threadSection = screen.getByRole('heading', { name: 'Текущий чат' }).closest('section');
+    const accountSection = screen
+      .getByRole('heading', { name: 'Весь аккаунт Codex' })
+      .closest('section');
+    expect(threadSection?.textContent).toContain('Статистика этого чата пока недоступна.');
+    expect(accountSection?.querySelectorAll('dd')).toHaveLength(6);
+    for (const value of accountSection?.querySelectorAll('dd') ?? []) {
+      expect(value.textContent).toBe('нет данных');
+    }
+  });
+
+  it('does not treat missing calendar days as zero usage', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(2026, 9, 3, 12, 0, 0));
+    try {
+      const partialBuckets = Array.from({ length: 29 }, (_, index) => {
+        const offset = index === 0 ? 0 : index + 1;
+        const bucketDate = new Date(2026, 9, 3 - offset, 12, 0, 0);
+        return {
+          startDate: `${bucketDate.getFullYear()}-${String(bucketDate.getMonth() + 1).padStart(2, '0')}-${String(bucketDate.getDate()).padStart(2, '0')}`,
+          tokens: offset + 1,
+        };
+      });
+      installAuthenticatedApi((url) => {
+        if (url !== '/api/system/capabilities?threadId=thread-1') return undefined;
+        return jsonResponse({
+          ...capabilities,
+          usage: { ...capabilities.usage, dailyUsageBuckets: partialBuckets },
+          threadUsage: null,
+        });
+      });
+      const user = userEvent.setup();
+      render(<App />);
+
+      await screen.findByRole('button', { name: 'Открыть недавний чат Frontend task' });
+      await user.click(await screen.findByRole('button', { name: 'Статус' }));
+
+      const accountSection = screen
+        .getByRole('heading', { name: 'Весь аккаунт Codex' })
+        .closest('section');
+      if (!accountSection) throw new Error('Account usage section not found');
+      const values = Array.from(
+        accountSection.querySelectorAll('dd'),
+        (value) => value.textContent,
+      );
+      expect(values[0]).toBe('1');
+      expect(values[1]).toBe('нет данных');
+      expect(values[2]).toBe('нет данных');
+      expect(values[3]?.replace(/\s/g, '')).toBe('123456');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('refreshes an open Status for the selected chat and ignores the stale prior response', async () => {
+    const secondThread = { ...thread, id: 'thread-2', name: 'Second task' };
+    let resolveFirstUsage!: (response: Response) => void;
+    const firstUsage = new Promise<Response>((resolve) => {
+      resolveFirstUsage = resolve;
+    });
+    installAuthenticatedApi((url) => {
+      if (url.includes('/api/threads?')) return jsonResponse([thread, secondThread]);
+      if (url === '/api/threads/thread-2') return jsonResponse({ data: secondThread, events: [] });
+      if (url === '/api/threads/thread-2/subagents') return jsonResponse({ data: [] });
+      if (url === '/api/system/capabilities?threadId=thread-1') return firstUsage;
+      if (url === '/api/system/capabilities?threadId=thread-2') {
+        return jsonResponse({
+          ...capabilities,
+          threadUsage: {
+            threadId: 'thread-2',
+            estimated: true,
+            inputTokens: 2_000,
+            cachedInputTokens: 1_000,
+            netNewInputTokens: 1_000,
+            outputTokens: 222,
+            totalTokens: 2_222,
+          },
+        });
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByRole('button', { name: 'Открыть чат проекта Second task' });
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await user.click(screen.getByRole('button', { name: 'Открыть чат проекта Second task' }));
+
+    const status = await screen.findByRole('complementary', { name: 'Статус Codex' });
+    await within(status).findByText('2 222', { exact: true });
+    expect(within(status).getByText('Second task', { exact: true })).not.toBeNull();
+
+    await act(async () => {
+      resolveFirstUsage(
+        jsonResponse({
+          ...capabilities,
+          threadUsage: {
+            threadId: 'thread-1',
+            estimated: true,
+            inputTokens: 1_000,
+            cachedInputTokens: 500,
+            netNewInputTokens: 500,
+            outputTokens: 111,
+            totalTokens: 1_111,
+          },
+        }),
+      );
+      await Promise.resolve();
+    });
+    expect(within(status).queryByText('1 111', { exact: true })).toBeNull();
+    expect(within(status).getByText('2 222', { exact: true })).not.toBeNull();
+  });
+
   it('starts a prepared Codex update and refreshes its version after completion', async () => {
     let updateReads = 0;
     let capabilityReads = 0;
@@ -3560,7 +3778,7 @@ describe('App', () => {
             : models,
         );
       }
-      if (url === '/api/system/capabilities') {
+      if (url.startsWith('/api/system/capabilities')) {
         capabilityReads += 1;
         return jsonResponse({
           ...capabilities,
@@ -3589,6 +3807,9 @@ describe('App', () => {
 
     await user.click(await screen.findByRole('button', { name: 'Статус' }));
     expect((await screen.findAllByText('1.2.4')).length).toBeGreaterThan(0);
+    const scopedCapabilityReadsBeforeApply = fetchMock.mock.calls.filter(
+      ([input]) => requestUrl(input) === '/api/system/capabilities?threadId=thread-1',
+    ).length;
     await user.click(screen.getByRole('button', { name: 'Скачать и установить' }));
 
     expect(await screen.findByText('Обновляем Codex…')).not.toBeNull();
@@ -3610,6 +3831,13 @@ describe('App', () => {
         requestUrl(input) === '/api/system/codex-update/apply' && init?.method === 'POST',
     );
     expect(new Headers(applyCall?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf-token');
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(
+          ([input]) => requestUrl(input) === '/api/system/capabilities?threadId=thread-1',
+        ).length,
+      ).toBeGreaterThan(scopedCapabilityReadsBeforeApply),
+    );
   });
 
   it('offers to download and install a discovered update without a staged candidate', async () => {
@@ -3762,8 +3990,8 @@ describe('App', () => {
   it('refreshes capabilities and reports completion after account login succeeds', async () => {
     let statusReads = 0;
     let capabilityReads = 0;
-    installAuthenticatedApi((url, init) => {
-      if (url === '/api/system/capabilities') {
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url.startsWith('/api/system/capabilities')) {
         capabilityReads += 1;
         return jsonResponse(
           capabilityReads > 1
@@ -3802,11 +4030,19 @@ describe('App', () => {
     render(<App />);
 
     await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    const scopedCapabilityReadsBeforeLogin = fetchMock.mock.calls.filter(
+      ([input]) => requestUrl(input) === '/api/system/capabilities?threadId=thread-1',
+    ).length;
     await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
 
     expect(await screen.findByText(/Аккаунт Codex успешно сменён/)).not.toBeNull();
     expect(statusReads).toBeGreaterThan(0);
     expect(await screen.findByText('new@example.com')).not.toBeNull();
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input]) => requestUrl(input) === '/api/system/capabilities?threadId=thread-1',
+      ).length,
+    ).toBeGreaterThan(scopedCapabilityReadsBeforeLogin);
   });
 
   it('cancels a pending Codex account login and keeps the current account', async () => {
@@ -3857,7 +4093,7 @@ describe('App', () => {
   it('treats a successful login returned by cancel as completion instead of cancellation', async () => {
     let capabilityReads = 0;
     installAuthenticatedApi((url, init) => {
-      if (url === '/api/system/capabilities') {
+      if (url.startsWith('/api/system/capabilities')) {
         capabilityReads += 1;
         return jsonResponse(
           capabilityReads > 1

@@ -405,6 +405,16 @@ export const accountUsageSchema = z.object({
     .nullable(),
 });
 
+export const threadUsageSchema = z.object({
+  threadId: z.string().min(1).max(200),
+  estimated: z.literal(true),
+  inputTokens: z.number().int().nonnegative().nullable(),
+  cachedInputTokens: z.number().int().nonnegative().nullable(),
+  netNewInputTokens: z.number().int().nonnegative().nullable(),
+  outputTokens: z.number().int().nonnegative().nullable(),
+  totalTokens: z.number().int().nonnegative().nullable(),
+});
+
 export const codexAccountSchema = z.object({
   type: z.enum(['chatgpt', 'apiKey', 'amazonBedrock', 'unknown']),
   email: z.string().email().max(320).nullable(),
@@ -431,6 +441,7 @@ export const capabilitySchema = z.object({
   skills: z.array(z.object({ name: z.string(), path: z.string(), enabled: z.boolean() })),
   rateLimits: z.array(accountRateLimitSchema).nullable(),
   usage: accountUsageSchema.nullable(),
+  threadUsage: threadUsageSchema.nullable().optional(),
   transcription: z
     .object({
       available: z.boolean(),

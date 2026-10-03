@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import date, timedelta
 from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import Route, sync_playwright
@@ -174,8 +175,27 @@ def main() -> int:
                             "peakDailyTokens": 23456,
                             "longestRunningTurnSec": 321,
                         },
-                        "dailyUsageBuckets": None,
+                        "dailyUsageBuckets": [
+                            {
+                                "startDate": (
+                                    date.today() - timedelta(days=index)
+                                ).isoformat(),
+                                "tokens": 23456 if index == 6 else index + 1,
+                            }
+                            for index in range(30)
+                        ],
                     },
+                    "threadUsage": {
+                        "threadId": "t1",
+                        "estimated": True,
+                        "inputTokens": 120000,
+                        "cachedInputTokens": 90000,
+                        "netNewInputTokens": 30000,
+                        "outputTokens": 12000,
+                        "totalTokens": 132000,
+                    }
+                    if query.get("threadId") == ["t1"]
+                    else None,
                     "transcription": {
                         "available": True,
                         "model": "onnx-community/whisper-base",
@@ -1186,6 +1206,40 @@ def main() -> int:
         page.get_by_text("31% использовано · 300 мин.").wait_for()
         page.get_by_text("multi-agent-orchestrator", exact=True).wait_for()
         diagnostics = page.get_by_label("Статус Codex")
+        current_chat_usage = diagnostics.get_by_role("heading", name="Текущий чат").locator("..")
+        current_chat_usage.get_by_text("Переносимый чат", exact=True).wait_for()
+        current_chat_usage.get_by_text("Оценка Codex по этому чату", exact=True).wait_for()
+        current_chat_usage.get_by_text("132 000", exact=True).wait_for()
+        account_usage = diagnostics.get_by_role("heading", name="Весь аккаунт Codex").locator("..")
+        account_usage.get_by_text("Сегодня", exact=True).wait_for()
+        account_usage.get_by_text("Последние 7 дней", exact=True).wait_for()
+        account_usage.get_by_text("Последние 30 дней", exact=True).wait_for()
+        account_usage.get_by_text("За всё доступное время", exact=True).wait_for()
+        account_usage.get_by_text("23 477", exact=True).wait_for()
+        account_usage.get_by_text("23 914", exact=True).wait_for()
+        if os.environ.get("CODEX_WEB_USAGE_ONLY") == "1":
+            page.set_viewport_size({"width": 390, "height": 780})
+            mobile_usage = diagnostics.evaluate(
+                """
+                element => ({
+                  viewportWidth: document.documentElement.clientWidth,
+                  pageWidth: document.documentElement.scrollWidth,
+                  drawerWidth: element.scrollWidth,
+                  drawerClientWidth: element.clientWidth,
+                })
+                """
+            )
+            if mobile_usage["pageWidth"] > mobile_usage["viewportWidth"] + 1:
+                raise AssertionError(
+                    f"mobile usage page overflows horizontally: {mobile_usage}"
+                )
+            if mobile_usage["drawerWidth"] > mobile_usage["drawerClientWidth"] + 1:
+                raise AssertionError(
+                    f"mobile usage drawer overflows horizontally: {mobile_usage}"
+                )
+            browser.close()
+            print("browser-smoke: chat and account usage scopes passed")
+            return 0
         diagnostics.get_by_text("owner@example.test", exact=True).wait_for()
         diagnostics.get_by_text("Доступна новая версия Codex.", exact=False).wait_for()
         diagnostics.get_by_role("button", name="Проверить обновления").click()

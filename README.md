@@ -18,8 +18,11 @@ is never exposed publicly.
 
 The workspace uses one navigation sidebar: projects expand to their chats, each project has its own new-chat
 action and archived chats remain recoverable from the project menu. The composer stays pinned while a long
-transcript scrolls independently. `/status` opens safe Codex account limits and aggregate usage; `/skills`
-opens the same status surface at the loaded skills and instruction-source inventory.
+transcript scrolls independently. `/status` opens safe Codex account limits plus two explicitly labelled usage
+scopes: an estimate for the selected chat and dated totals for all token activity on the signed-in account.
+Account totals distinguish today, the trailing 7 and 30 days and all available time; unavailable per-chat
+breakdowns stay visibly unavailable instead of being inferred. `/skills` opens the same status surface at the
+loaded skills and instruction-source inventory.
 The same Status drawer can replace the runner's Codex account through the official device-code flow when no
 task or subagent is running. The short-lived code is shown only to the authenticated owner; access and refresh
 tokens never pass through the Web application.
