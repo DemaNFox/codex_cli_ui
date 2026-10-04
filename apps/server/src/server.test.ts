@@ -65,6 +65,7 @@ class FakeAppServer implements AppServerClient {
   private signalThreadList: (() => void) | null = null;
   private failArchiveAfterMutation = false;
   private readonly archivedThreadIds = new Set<string>();
+  private readonly unloadedThreadIds = new Set<string>();
   failNextRequestWith: Error | null = null;
   failTurnStartWith: Error | null = null;
   failNextResponseWith: Error | null = null;
@@ -324,6 +325,7 @@ class FakeAppServer implements AppServerClient {
     }
     if (method === 'thread/resume') {
       const thread = this.threads.get(String(values.threadId));
+      this.unloadedThreadIds.delete(String(values.threadId));
       return { thread, model: thread?.model ?? 'gpt-test', instructionSources: [] };
     }
     if (method === 'thread/name/set') {
@@ -333,8 +335,10 @@ class FakeAppServer implements AppServerClient {
     }
     if (method === 'thread/archive' || method === 'thread/unarchive') {
       const threadId = String(values.threadId);
-      if (method === 'thread/archive') this.archivedThreadIds.add(threadId);
-      else this.archivedThreadIds.delete(threadId);
+      if (method === 'thread/archive') {
+        this.archivedThreadIds.add(threadId);
+        this.unloadedThreadIds.add(threadId);
+      } else this.archivedThreadIds.delete(threadId);
       if (this.failArchiveAfterMutation) {
         this.failArchiveAfterMutation = false;
         throw new Error('APP_SERVER_REQUEST_FAILED');
@@ -343,6 +347,8 @@ class FakeAppServer implements AppServerClient {
     }
     if (method === 'turn/interrupt') return {};
     if (method === 'turn/start') {
+      if (this.unloadedThreadIds.has(String(values.threadId)))
+        throw new Error('APP_SERVER_REQUEST_FAILED');
       this.signalTurnStart?.();
       this.signalTurnStart = null;
       if (this.turnStartGate) await this.turnStartGate;
@@ -2076,6 +2082,46 @@ describe('Codex routes', () => {
     expect(archiveRequest?.method).toBe('thread/archive');
     expect(reconciliationRequest?.method).toBe('thread/list');
     expect(reconciliationRequest?.params).toMatchObject({ archived: true });
+  });
+
+  it('resumes a restored thread before starting its next turn', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+
+    const archived = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/archive`,
+      headers: session.headers,
+    });
+    expect(archived.statusCode).toBe(200);
+    const restored = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/unarchive`,
+      headers: session.headers,
+    });
+    expect(restored.statusCode).toBe(200);
+
+    const sent = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Continue after restore',
+        idempotencyKey: '00000000-0000-4000-8000-000000000063',
+      },
+    });
+
+    expect(sent.statusCode).toBe(202);
+    const resumeIndex = appServer.requests.findIndex(
+      (request) => request.method === 'thread/resume',
+    );
+    const turnStartIndex = appServer.requests.findIndex(
+      (request) => request.method === 'turn/start',
+    );
+    expect(resumeIndex).toBeGreaterThan(-1);
+    expect(turnStartIndex).toBeGreaterThan(resumeIndex);
   });
 
   it('archives an empty local chat when Codex has not persisted its thread yet', async () => {

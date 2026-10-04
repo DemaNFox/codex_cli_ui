@@ -2627,6 +2627,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       }
     }
     const updated = repository.setThreadArchived(id, archived)!;
+    loadedThreadGenerations.delete(id);
     repository.audit(archived ? 'thread.archive' : 'thread.unarchive', 'succeeded', {
       threadId: id,
     });
