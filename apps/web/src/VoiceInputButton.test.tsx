@@ -91,6 +91,43 @@ describe('VoiceInputButton', () => {
     expect(stopTrack).toHaveBeenCalledOnce();
   });
 
+  it('shows and announces progress while transcribing', async () => {
+    const user = userEvent.setup();
+    const stream = {
+      getTracks: () => [{ stop: vi.fn() }],
+    } as unknown as MediaStream;
+    Object.defineProperty(navigator, 'mediaDevices', {
+      configurable: true,
+      value: { getUserMedia: vi.fn().mockResolvedValue(stream) },
+    });
+    vi.stubGlobal('MediaRecorder', FakeMediaRecorder);
+    vi.stubGlobal('AudioContext', FakeAudioContext);
+    vi.spyOn(api, 'transcribeAudio').mockImplementation(() => new Promise(() => undefined));
+
+    const { container } = render(
+      <VoiceInputButton
+        available
+        csrfToken="csrf-token"
+        disabled={false}
+        maxBytes={1024}
+        maxDurationSeconds={60}
+        onError={vi.fn()}
+        onTranscript={vi.fn()}
+      />,
+    );
+
+    await user.click(screen.getByRole('button', { name: /Голосовой ввод/ }));
+    await user.click(screen.getByRole('button', { name: /Остановить запись/ }));
+
+    const transcribingButton = await screen.findByRole('button', { name: 'Распознаётся…' });
+    expect((transcribingButton as HTMLButtonElement).disabled).toBe(true);
+    expect(transcribingButton.getAttribute('aria-busy')).toBe('true');
+    expect(screen.getByRole('status').textContent).toBe('Распознаём голосовое сообщение…');
+    expect(
+      container.querySelector('.voice-transcribing-spinner')?.getAttribute('aria-hidden'),
+    ).toBe('true');
+  });
+
   it('explains when the server has no local transcription model', async () => {
     const user = userEvent.setup();
     const onError = vi.fn();

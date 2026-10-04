@@ -244,11 +244,14 @@ export function VoiceInputButton({
         : 'Голосовой ввод';
 
   return (
-    <div className={`voice-input ${recording ? 'recording' : ''}`}>
+    <div
+      className={`voice-input ${recording ? 'recording' : ''} ${state === 'transcribing' ? 'transcribing' : ''}`}
+    >
       <button
         type="button"
         className="voice-button"
         aria-label={label}
+        aria-busy={state === 'transcribing'}
         title={available ? label : 'Локальная модель голоса не установлена на сервере'}
         aria-pressed={recording}
         disabled={blocked}
@@ -257,13 +260,18 @@ export function VoiceInputButton({
         {recording ? (
           <span>{formatRecordingTime(elapsedSeconds)}</span>
         ) : state === 'transcribing' ? (
-          '…'
+          <span className="voice-transcribing-spinner" aria-hidden="true" />
         ) : (
           <svg viewBox="0 0 24 24" aria-hidden="true">
             <path d="M12 15.25a3.75 3.75 0 0 0 3.75-3.75v-5a3.75 3.75 0 1 0-7.5 0v5A3.75 3.75 0 0 0 12 15.25Zm-6-4a6 6 0 0 0 12 0M12 17.25V21M9.5 21h5" />
           </svg>
         )}
       </button>
+      {state === 'transcribing' && (
+        <span className="visually-hidden" role="status" aria-live="polite">
+          Распознаём голосовое сообщение…
+        </span>
+      )}
       {recording && (
         <button
           type="button"
