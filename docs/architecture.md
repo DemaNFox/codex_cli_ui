@@ -192,7 +192,8 @@ snapshot/apply protocol from the API service identity and can change only that s
 policy never allocates more than the parent cgroup/host permits and reserves at least one CPU plus 15% of RAM
 (at least 1 GiB) for Ubuntu. Custom ceilings are validated against live capacity, staged while any root task or
 subagent is active and applied only after the workload becomes idle. New work fails closed while a policy is
-pending/degraded and when live memory or the effective execution-unit ceiling is exhausted. Disk admission and a periodic guard stop work on low space
+pending/degraded or live memory is unsafe. Exhaustion of an otherwise healthy execution-unit ceiling is handled
+by the durable root-turn queue described below. Disk admission and a periodic guard stop work on low space
 or database overflow, while an administrator-enforced filesystem quota or
 dedicated bounded volume remains mandatory for a hard disk limit.
 In host-admin mode these cgroup settings remain the normal operating defaults, but they are not a security
@@ -206,6 +207,25 @@ machine-level enforcement boundary. Automatic concurrency allows at most eight t
 one CPU core and 2 GiB of the selected workload memory per concurrent root/subagent slot; a custom value above
 that derived ceiling is rejected.
 
+Ordinary saturation of the effective root-turn ceiling is a scheduling state, not an admission error. The API
+persists the complete root-turn request in SQLite, including its idempotency key, runtime settings and attachment
+references, and returns a queued projection to the client. The selected chat displays pending requests and their
+current positions after reload. A single dispatcher starts the oldest eligible request when the target thread is
+idle and capacity is available; completion events and process startup both trigger reconciliation. Claiming and
+state transition are transactional so a retry, refresh or concurrent dispatcher cannot start the same request
+twice. Account switching, service draining, resource-policy changes and degraded-capacity conditions remain
+separate fail-closed states. Guidance sent to an already running turn continues to use the explicit steer path;
+the durable queue is only for new root turns.
+
+If the API process loses the result of `turn/start`, the row is retained as visible `needsReview` work and is
+never started again automatically. Recovery reads the authoritative Codex thread and matches the persisted
+client message id: an existing native turn completes the queue record and attachment binding without another
+side effect. Absence from a read is not proof that an earlier request cannot still be applied, so the ambiguous
+outcome remains visible and fail closed; it cannot be retried, cancelled or archived through the normal UI
+until Codex supplies positive evidence that resolves it. New root turns and queued followers for that same
+thread are also held back so a late native turn cannot overtake a newer request; unrelated threads continue to
+use the available execution slots.
+
 ## Initial API
 
 - `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/session`
@@ -213,7 +233,8 @@ that derived ceiling is rejected.
 - `GET /api/models`
 - `GET/POST /api/threads`, `GET/PATCH /api/threads/:id`
 - `POST /api/threads/:id/archive`, `POST /api/threads/:id/unarchive`; listing accepts a project-scoped `archived` filter
-- `POST /api/threads/:id/turns`, `POST /api/threads/:id/steer`, `POST /api/threads/:id/interrupt`
+- `POST /api/threads/:id/turns`, `GET /api/threads/:id/queued-turns`,
+  `POST /api/threads/:id/steer`, `POST /api/threads/:id/interrupt`
 - `POST /api/approvals/:id/resolve`
 - `POST /api/user-input-requests/:id/resolve` for typed `request_user_input` answers; secret answers are never persisted or echoed
 - `POST /api/permission-requests/:id/resolve` for an explicit deny or one-turn grant derived from the validated request

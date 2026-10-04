@@ -117,7 +117,7 @@ describe('api response envelopes', () => {
         if (url === '/api/threads/thread-1/subagents')
           return Promise.resolve(response({ data: [{ id: 'agent-1' }] }));
         if (url.endsWith('/turns'))
-          return Promise.resolve(response({ data: { turnId: 'turn-1' } }));
+          return Promise.resolve(response({ data: { status: 'started', turnId: 'turn-1' } }));
         if (url.endsWith('/archive')) {
           return Promise.resolve(response({ data: { ...thread, archived: true } }));
         }
@@ -146,7 +146,7 @@ describe('api response envelopes', () => {
         approvalPolicy: 'on-request',
         idempotencyKey: '22222222-2222-4222-8222-222222222222',
       }),
-    ).resolves.toEqual({ turnId: 'turn-1' });
+    ).resolves.toEqual({ status: 'started', turnId: 'turn-1' });
     await expect(api.archiveThread('csrf', thread.id)).resolves.toEqual({
       ...thread,
       archived: true,

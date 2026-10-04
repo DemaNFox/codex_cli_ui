@@ -9,6 +9,7 @@ import type {
   PendingApproval,
   PermissionPreset,
   Project,
+  QueuedTurn,
   ResolveUserInputRequest,
   ResourceLimitPolicy,
   ResourceLimitSnapshot,
@@ -16,6 +17,7 @@ import type {
   SafeEvent,
   Session,
   Subagent,
+  StartTurnResult,
   Thread,
   TurnNavigationEntry,
 } from '@codex-web/contracts';
@@ -101,6 +103,7 @@ export interface ThreadHistory {
   data: Thread;
   events: SafeEvent[];
   eventCursor?: number;
+  queuedTurns?: QueuedTurn[];
   subagents?: Subagent[];
   turnNavigation?: TurnNavigationEntry[];
 }
@@ -322,7 +325,7 @@ export const api = {
       attachmentIds?: string[];
     },
   ) =>
-    request<{ turnId: string } | { data: { turnId: string } }>(
+    request<StartTurnResult | { data: StartTurnResult }>(
       `/api/threads/${encodeURIComponent(threadId)}/turns`,
       {
         method: 'POST',
@@ -330,6 +333,12 @@ export const api = {
         body: input,
       },
     ).then(unwrapData),
+  queuedTurns: async (threadId: string) =>
+    asList(
+      await request<QueuedTurn[] | { data: QueuedTurn[] }>(
+        `/api/threads/${encodeURIComponent(threadId)}/queued-turns`,
+      ),
+    ),
   uploadAttachment,
   transcribeAudio,
   steer: async (
@@ -499,12 +508,14 @@ export type {
   ModelOption,
   PendingApproval,
   Project,
+  QueuedTurn,
   ResourceLimitPolicy,
   ResourceLimitSnapshot,
   RuntimePreferences,
   SafeEvent,
   Session,
   Subagent,
+  StartTurnResult,
   Thread,
   TurnNavigationEntry,
 };

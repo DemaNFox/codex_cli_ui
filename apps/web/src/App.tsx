@@ -30,6 +30,7 @@ import type {
   ModelOption,
   PendingApproval,
   Project,
+  QueuedTurn,
   ResourceLimitPolicy,
   ResourceLimitSnapshot,
   RuntimePreferences,
@@ -59,6 +60,7 @@ const MAX_THREAD_ATTACHMENT_BYTES = 50 * 1024 * 1024;
 const ACCOUNT_LOGIN_POLL_INTERVAL_MS = 500;
 const ACCOUNT_LOGIN_MAX_POLLS = 1_800;
 const CODEX_UPDATE_POLL_INTERVAL_MS = 1_000;
+const QUEUED_TURN_POLL_INTERVAL_MS = 2_000;
 const EVENT_TIME_FORMATTER = new Intl.DateTimeFormat('ru-RU', {
   dateStyle: 'short',
   timeStyle: 'medium',
@@ -2891,6 +2893,7 @@ function Workspace({
   const [permission, setPermission] = useState<PermissionPreset>('workspace-write');
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>('on-request');
   const [composer, setComposer] = useState('');
+  const [queuedTurns, setQueuedTurns] = useState<QueuedTurn[]>([]);
   const [queuedAttachments, setQueuedAttachments] = useState<QueuedAttachment[]>([]);
   const [threadAttachmentBytes, setThreadAttachmentBytes] = useState(0);
   const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
@@ -2934,6 +2937,9 @@ function Workspace({
   const { events, streamState, mergeEvents } = useThreadEvents(threadId, eventStreamCursor);
   const latestEvent = events.at(-1) ?? null;
   const latestEventId = latestEvent?.id ?? null;
+  const queueChangeEventId = [...events]
+    .reverse()
+    .find((event) => event.payload.queueChanged === true)?.id;
   const runtimeSnapshotCursorRef = useRef(0);
 
   const selectedThread = threads.find((item) => item.id === threadId) ?? null;
@@ -3090,7 +3096,7 @@ function Workspace({
     )
       return;
     positionAtLatestImmediately(scroll);
-  }, [approvals, events, permissionRequests, subagents, threadId, userInputRequests]);
+  }, [approvals, events, permissionRequests, queuedTurns, subagents, threadId, userInputRequests]);
 
   useEffect(() => {
     const scroll = conversationScrollRef.current;
@@ -3203,6 +3209,31 @@ function Workspace({
   useEffect(() => {
     queuedAttachmentsRef.current = queuedAttachments;
   }, [queuedAttachments]);
+
+  useEffect(() => {
+    if (!threadId || (queuedTurns.length === 0 && queueChangeEventId === undefined)) return;
+    let disposed = false;
+    let refreshing = false;
+    const refreshQueuedTurns = async () => {
+      if (disposed || refreshing) return;
+      refreshing = true;
+      try {
+        const next = await api.queuedTurns(threadId);
+        if (!disposed && attachmentThreadRef.current === threadId) setQueuedTurns(next);
+      } catch {
+        // The retained queue projection is still visible while a refresh is temporarily unavailable.
+      } finally {
+        refreshing = false;
+      }
+    };
+    void refreshQueuedTurns();
+    if (queuedTurns.length === 0) return () => void (disposed = true);
+    const timer = window.setInterval(() => void refreshQueuedTurns(), QUEUED_TURN_POLL_INTERVAL_MS);
+    return () => {
+      disposed = true;
+      window.clearInterval(timer);
+    };
+  }, [queueChangeEventId, queuedTurns.length, threadId]);
 
   useEffect(() => {
     if (!mobileNavigationOpen) return;
@@ -3712,6 +3743,7 @@ function Workspace({
     });
     setAttachmentNotice(null);
     setThreadAttachmentBytes(0);
+    setQueuedTurns([]);
     setSubagents([]);
     setServerTurnNavigation(null);
     runtimeSnapshotCursorRef.current = 0;
@@ -3733,6 +3765,7 @@ function Workspace({
         mergeEvents(history.events, requestedThreadId);
         setEventStreamStart({ threadId: requestedThreadId, cursor: historyCursor });
         setServerTurnNavigation(history.turnNavigation ?? null);
+        setQueuedTurns(history.queuedTurns ?? []);
         const historySubagents = history.subagents;
         if (historySubagents) setSubagents((current) => mergeSubagents(current, historySubagents));
         setThreadAttachmentBytes(
@@ -4074,7 +4107,7 @@ function Workspace({
         });
         setActionNotice('Уточнение принято активной задачей.');
       } else {
-        await api.startTurn(session.csrfToken, threadId, {
+        const result = await api.startTurn(session.csrfToken, threadId, {
           text,
           ...(model ? { model } : {}),
           ...(effort ? { reasoningEffort: effort } : {}),
@@ -4083,7 +4116,15 @@ function Workspace({
           idempotencyKey: crypto.randomUUID(),
           attachmentIds: attachments.map((attachment) => attachment.id),
         });
-        setActionNotice('Задача принята Codex.');
+        if (result.status === 'queued') {
+          setQueuedTurns((current) => [
+            ...current.filter((item) => item.id !== result.queuedTurn.id),
+            result.queuedTurn,
+          ]);
+          setActionNotice(`Задача принята в очередь · позиция ${result.queuedTurn.position}.`);
+        } else {
+          setActionNotice('Задача принята Codex.');
+        }
       }
       finishQueuedAttachments(threadId, attachments);
       setComposer('');
@@ -4451,6 +4492,42 @@ function Workspace({
               serverTurnNavigation={serverTurnNavigation}
               onNavigateTurn={navigateToTurn}
             />
+            {queuedTurns.length > 0 && (
+              <section className="queued-turns" aria-label="Задачи в очереди" aria-live="polite">
+                {queuedTurns.map((queuedTurn) => (
+                  <article
+                    className={`queued-turn-card ${queuedTurn.status === 'needsReview' ? 'needs-review' : ''}`}
+                    key={queuedTurn.id}
+                  >
+                    <header>
+                      <strong>
+                        {queuedTurn.status === 'queued'
+                          ? `В очереди · позиция ${queuedTurn.position}`
+                          : 'Требует проверки'}
+                      </strong>
+                      <time dateTime={queuedTurn.createdAt}>
+                        {EVENT_TIME_FORMATTER.format(new Date(queuedTurn.createdAt))}
+                      </time>
+                    </header>
+                    {queuedTurn.textPreview && <p>{queuedTurn.textPreview}</p>}
+                    {queuedTurn.attachmentCount > 0 && (
+                      <small>
+                        {queuedTurn.attachmentCount.toLocaleString('ru')}{' '}
+                        {queuedTurn.attachmentCount === 1 ? 'вложение' : 'вложений'}
+                      </small>
+                    )}
+                    {queuedTurn.status === 'needsReview' && (
+                      <div className="queued-turn-review">
+                        <small>
+                          Сервер потерял подтверждение запуска, продолжает сверку с Codex и не будет
+                          повторять задачу вслепую.
+                        </small>
+                      </div>
+                    )}
+                  </article>
+                ))}
+              </section>
+            )}
             {approvals.map((approval) => (
               <ApprovalCard
                 key={approval.id}

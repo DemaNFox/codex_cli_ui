@@ -296,6 +296,9 @@ function installAuthenticatedApi(
     if (url === '/api/threads/thread-1') {
       return Promise.resolve(jsonResponse({ data: thread, events: [] }));
     }
+    if (url === '/api/threads/thread-1/turns' && init?.method === 'POST') {
+      return Promise.resolve(jsonResponse({ data: { status: 'started', turnId: 'turn-started' } }));
+    }
     return Promise.resolve(new Response(null, { status: 204 }));
   });
   vi.stubGlobal('fetch', fetchMock);
@@ -453,6 +456,95 @@ describe('App', () => {
       expect(document.querySelectorAll('.thread-running-dot')).toHaveLength(2);
     },
   );
+
+  it('accepts a saturated task into the visible durable queue and clears the draft', async () => {
+    const queuedTurn = {
+      id: 7,
+      threadId: thread.id,
+      status: 'queued' as const,
+      position: 2,
+      errorCode: null,
+      textPreview: 'Запусти после освобождения слота',
+      attachmentCount: 0,
+      createdAt: '2026-10-04T10:00:00.000Z',
+    };
+    installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1/turns' && init?.method === 'POST')
+        return jsonResponse({ data: { status: 'queued', queuedTurn } }, 202);
+      if (url === '/api/threads/thread-1/queued-turns') return jsonResponse({ data: [queuedTurn] });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(
+      await screen.findByRole('button', { name: 'Открыть недавний чат Frontend task' }),
+    );
+    const input = await screen.findByLabelText('Сообщение Codex');
+    await user.type(input, queuedTurn.textPreview);
+    await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
+
+    expect(await screen.findByText('Задача принята в очередь · позиция 2.')).not.toBeNull();
+    const queue = screen.getByRole('region', { name: 'Задачи в очереди' });
+    expect(within(queue).getByText('В очереди · позиция 2')).not.toBeNull();
+    expect(within(queue).getByText(queuedTurn.textPreview)).not.toBeNull();
+    expect((input as HTMLTextAreaElement).value).toBe('');
+  });
+
+  it('restores queued tasks from thread detail after a page load', async () => {
+    const queuedTurn = {
+      id: 8,
+      threadId: thread.id,
+      status: 'queued' as const,
+      position: 1,
+      errorCode: null,
+      textPreview: 'Проверь очередь после обновления',
+      attachmentCount: 2,
+      createdAt: '2026-10-04T10:05:00.000Z',
+    };
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [], queuedTurns: [queuedTurn] });
+      if (url === '/api/threads/thread-1/queued-turns') return jsonResponse({ data: [queuedTurn] });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const queue = await screen.findByRole('region', { name: 'Задачи в очереди' });
+    expect(within(queue).getByText(queuedTurn.textPreview)).not.toBeNull();
+    expect(within(queue).getByText('2 вложений')).not.toBeNull();
+  });
+
+  it('keeps an ambiguous start visible without offering an unsafe retry', async () => {
+    const queuedTurn = {
+      id: 9,
+      threadId: thread.id,
+      status: 'needsReview' as const,
+      position: null,
+      errorCode: 'IDEMPOTENCY_OUTCOME_UNKNOWN',
+      textPreview: 'Не повторять без сверки',
+      attachmentCount: 1,
+      createdAt: '2026-10-04T10:06:00.000Z',
+    };
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [], queuedTurns: [queuedTurn] });
+      if (url === '/api/threads/thread-1/queued-turns') return jsonResponse({ data: [queuedTurn] });
+      return undefined;
+    });
+    render(<App />);
+
+    const queue = await screen.findByRole('region', { name: 'Задачи в очереди' });
+    expect(within(queue).getByText('Требует проверки')).not.toBeNull();
+    expect(within(queue).getByText(queuedTurn.textPreview)).not.toBeNull();
+    expect(
+      within(queue).getByText(
+        'Сервер потерял подтверждение запуска, продолжает сверку с Codex и не будет повторять задачу вслепую.',
+      ),
+    ).not.toBeNull();
+    expect(within(queue).queryByRole('button', { name: /повтор|отмен/i })).toBeNull();
+  });
 
   it('shows a clear unavailable state when server push is not configured', async () => {
     installAuthenticatedApi((url) => {

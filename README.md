@@ -109,6 +109,11 @@ The installed service starts in automatic resource mode. It uses the live host/a
 keeps one CPU core and at least 15% RAM (minimum 1 GiB) outside the Codex workload, and derives a safe
 concurrency ceiling. The administrator can inspect or lower CPU, RAM, task and agent limits in the Status
 drawer. Changes wait for all root turns and subagents to finish; they never terminate active work.
+Temporary saturation is not shown as a rejected task. A new root task is stored in the local durable queue
+with its runtime settings and attachments, shown in the chat with its position, and started automatically when
+that chat is idle and a safe slot becomes available. Resource reconfiguration, draining and degraded-capacity
+states still fail closed instead of silently adding work. A rare interrupted start is shown as requiring review;
+it is reconciled against Codex and is never retried blindly.
 
 A new host needs only:
 

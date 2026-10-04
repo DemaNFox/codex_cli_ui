@@ -509,6 +509,45 @@ def main() -> int:
                             "createdAt": "2026-09-27T11:59:02.000Z",
                         }
                     ],
+                    "queuedTurns": (
+                        [
+                            {
+                                "id": 17,
+                                "threadId": "t1",
+                                "status": "queued",
+                                "position": 1,
+                                "errorCode": None,
+                                "textPreview": "Запустить после освобождения безопасного слота",
+                                "attachmentCount": 1,
+                                "createdAt": "2026-09-27T12:00:03.000Z",
+                            }
+                        ]
+                        if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1"
+                        else []
+                    ),
+                },
+            )
+        elif path == "/api/threads/t1/queued-turns" and request.method == "GET":
+            payload(
+                route,
+                200,
+                {
+                    "data": (
+                        [
+                            {
+                                "id": 17,
+                                "threadId": "t1",
+                                "status": "queued",
+                                "position": 1,
+                                "errorCode": None,
+                                "textPreview": "Запустить после освобождения безопасного слота",
+                                "attachmentCount": 1,
+                                "createdAt": "2026-09-27T12:00:03.000Z",
+                            }
+                        ]
+                        if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1"
+                        else []
+                    )
                 },
             )
         elif path == "/api/threads/t2" and request.method == "GET":
@@ -899,6 +938,13 @@ def main() -> int:
         page.get_by_label("Пароль").fill("correct-horse-battery-staple")
         page.get_by_role("button", name="Войти").click()
         page.get_by_role("heading", name="Переносимый чат").wait_for()
+        if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1":
+            queued_region = page.get_by_role("region", name="Задачи в очереди")
+            queued_region.get_by_text("В очереди · позиция 1", exact=True).wait_for()
+            queued_region.get_by_text(
+                "Запустить после освобождения безопасного слота", exact=True
+            ).wait_for()
+            queued_region.get_by_text("1 вложение", exact=True).wait_for()
 
         if page.evaluate("window.innerWidth") != 390:
             raise AssertionError("long chat was not opened with the mobile viewport")
