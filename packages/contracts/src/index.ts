@@ -253,16 +253,32 @@ export const startTurnRequestSchema = z
   });
 export type StartTurnRequest = z.infer<typeof startTurnRequestSchema>;
 
-export const queuedTurnSchema = z.object({
+const queuedTurnBaseSchema = z.object({
   id: z.number().int().positive(),
   threadId: z.string().min(1).max(200),
-  status: z.literal('queued'),
-  position: z.number().int().positive(),
   textPreview: z.string().max(240),
   attachmentCount: z.number().int().min(0).max(8),
   createdAt: z.string().datetime(),
 });
+export const queuedTurnSchema = z.discriminatedUnion('status', [
+  queuedTurnBaseSchema.extend({
+    status: z.literal('queued'),
+    position: z.number().int().positive(),
+    errorCode: z.null(),
+  }),
+  queuedTurnBaseSchema.extend({
+    status: z.literal('needsReview'),
+    position: z.null(),
+    errorCode: z.string().min(1).max(120),
+  }),
+]);
 export type QueuedTurn = z.infer<typeof queuedTurnSchema>;
+
+export const cancelQueuedTurnResultSchema = z.object({
+  cancelled: z.literal(true),
+  queuedTurnId: z.number().int().positive(),
+});
+export type CancelQueuedTurnResult = z.infer<typeof cancelQueuedTurnResultSchema>;
 
 export const startTurnResultSchema = z.discriminatedUnion('status', [
   z.object({ status: z.literal('started'), turnId: z.string().min(1) }),

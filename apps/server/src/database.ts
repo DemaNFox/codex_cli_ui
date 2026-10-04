@@ -1668,6 +1668,24 @@ export class SqliteRepository {
     return rows.map(queuedTurnFromRow);
   }
 
+  listVisibleQueuedTurns(threadId: string): QueuedTurnRecord[] {
+    return (
+      this.database
+        .prepare(
+          "SELECT * FROM queued_turns WHERE thread_id=? AND status IN ('queued','unknown') ORDER BY id",
+        )
+        .all(threadId) as unknown as QueuedTurnRow[]
+    ).map(queuedTurnFromRow);
+  }
+
+  listUnknownQueuedTurns(): QueuedTurnRecord[] {
+    return (
+      this.database
+        .prepare("SELECT * FROM queued_turns WHERE status='unknown' ORDER BY id")
+        .all() as unknown as QueuedTurnRow[]
+    ).map(queuedTurnFromRow);
+  }
+
   hasOutstandingQueuedTurns(threadId: string): boolean {
     return (
       this.database
@@ -1733,7 +1751,7 @@ export class SqliteRepository {
 
   completeQueuedTurn(id: number, turnId: string): boolean {
     const record = this.getQueuedTurn(id);
-    if (!record || record.status !== 'dispatching') return false;
+    if (!record || (record.status !== 'dispatching' && record.status !== 'unknown')) return false;
     const now = new Date().toISOString();
     const response = { data: { status: 'started', turnId } };
     this.database.exec('BEGIN IMMEDIATE');
@@ -1745,7 +1763,7 @@ export class SqliteRepository {
       const idempotency = this.database
         .prepare(
           `UPDATE idempotency SET state='completed',response_json=?,updated_at=?
-           WHERE operation=? AND key=? AND request_hash=? AND state='completed'`,
+           WHERE operation=? AND key=? AND request_hash=? AND state IN ('completed','unknown')`,
         )
         .run(
           JSON.stringify(response),
@@ -1755,11 +1773,30 @@ export class SqliteRepository {
           record.requestHash,
         ).changes;
       const removed = this.database
-        .prepare("DELETE FROM queued_turns WHERE id=? AND status='dispatching'")
+        .prepare("DELETE FROM queued_turns WHERE id=? AND status IN ('dispatching','unknown')")
         .run(id).changes;
       if (idempotency !== 1 || removed !== 1) throw new Error('QUEUED_TURN_COMPLETION_FAILED');
       this.database.exec('COMMIT');
       return true;
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  cancelUnknownQueuedTurn(id: number): boolean {
+    const record = this.getQueuedTurn(id);
+    if (!record || record.status !== 'unknown') return false;
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      this.database
+        .prepare('UPDATE attachments SET turn_id=NULL WHERE thread_id=? AND turn_id=?')
+        .run(record.threadId, record.claimToken);
+      const removed = this.database
+        .prepare("DELETE FROM queued_turns WHERE id=? AND status='unknown'")
+        .run(id).changes;
+      this.database.exec('COMMIT');
+      return removed === 1;
     } catch (error) {
       this.database.exec('ROLLBACK');
       throw error;

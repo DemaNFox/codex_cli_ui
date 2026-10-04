@@ -111,6 +111,10 @@ const attachmentParamsSchema = z.object({
   id: z.string().min(1).max(200),
   attachmentId: z.string().uuid(),
 });
+const queuedTurnParamsSchema = z.object({
+  id: z.string().min(1).max(200),
+  queueId: z.coerce.number().int().positive(),
+});
 const projectFileQuerySchema = z.object({ path: z.string().min(1).max(4_096) });
 const MAX_PROJECT_FILE_DOWNLOAD_BYTES = 100 * 1_024 * 1_024;
 const projectPatchSchema = z
@@ -583,6 +587,30 @@ function activeTurnIdFromHistory(turns: unknown): string | null {
       return turn.id;
   }
   return null;
+}
+
+function queuedClientMessageEvidence(
+  turns: unknown,
+  clientUserMessageId: string,
+): { turnId: string | null; hasInProgressTurn: boolean } {
+  if (!Array.isArray(turns)) return { turnId: null, hasInProgressTurn: true };
+  let hasInProgressTurn = false;
+  for (const turnValue of turns) {
+    const turn = inputRecord(turnValue);
+    if (!turn) continue;
+    if (turn.status === 'inProgress') hasInProgressTurn = true;
+    if (!Array.isArray(turn.items)) continue;
+    for (const itemValue of turn.items) {
+      const item = inputRecord(itemValue);
+      if (
+        item?.type === 'userMessage' &&
+        item.clientId === clientUserMessageId &&
+        typeof turn.id === 'string'
+      )
+        return { turnId: turn.id, hasInProgressTurn };
+    }
+  }
+  return { turnId: null, hasInProgressTurn };
 }
 
 function dateFromSeconds(value: number): string {
@@ -2493,7 +2521,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       eventCursor: events.at(-1)?.id ?? 0,
       turnNavigation: repository.listTurnNavigation(id),
       subagents: repository.listSubagents(id),
-      queuedTurns: repository.listQueuedTurns(id).map(publicQueuedTurn),
+      queuedTurns: repository.listVisibleQueuedTurns(id).map(publicQueuedTurn),
     };
   });
 
@@ -2722,15 +2750,28 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return reply.code(204).send();
   });
 
-  const publicQueuedTurn = (record: QueuedTurnRecord): QueuedTurn => ({
-    id: record.id,
-    threadId: record.threadId,
-    status: 'queued',
-    position: repository.queuedTurnPosition(record.id) ?? 1,
-    textPreview: record.request.text.slice(0, 240),
-    attachmentCount: record.request.attachmentIds.length,
-    createdAt: record.createdAt,
-  });
+  const publicQueuedTurn = (record: QueuedTurnRecord): QueuedTurn => {
+    const base = {
+      id: record.id,
+      threadId: record.threadId,
+      textPreview: record.request.text.slice(0, 240),
+      attachmentCount: record.request.attachmentIds.length,
+      createdAt: record.createdAt,
+    };
+    return record.status === 'unknown'
+      ? {
+          ...base,
+          status: 'needsReview',
+          position: null,
+          errorCode: record.errorCode ?? 'IDEMPOTENCY_OUTCOME_UNKNOWN',
+        }
+      : {
+          ...base,
+          status: 'queued',
+          position: repository.queuedTurnPosition(record.id) ?? 1,
+          errorCode: null,
+        };
+  };
 
   const publishQueueChanged = (threadId: string): void => {
     publish(
@@ -2922,6 +2963,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       if (turnStartIssued) {
         repository.markQueuedTurnUnknown(claimed.id, 'IDEMPOTENCY_OUTCOME_UNKNOWN');
         publishQueueChanged(claimed.threadId);
+        requestQueuedTurnDispatch();
       } else repository.requeueTurn(claimed.id);
       repository.audit('turn.queue.dispatch', turnStartIssued ? 'unknown' : 'deferred', {
         threadId: claimed.threadId,
@@ -2933,7 +2975,60 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
   };
 
+  const reconcileUnknownQueuedTurns = async (): Promise<void> => {
+    for (const record of repository.listUnknownQueuedTurns()) {
+      if (serverClosing || !appServer.ready) return;
+      const thread = repository.getThread(record.threadId);
+      if (!thread) continue;
+      try {
+        const read = threadResponseSchema.parse(
+          await appServer.request('thread/read', {
+            threadId: record.threadId,
+            includeTurns: true,
+          }),
+        );
+        const evidence = queuedClientMessageEvidence(
+          inputRecord(read.thread)?.turns,
+          record.idempotencyKey,
+        );
+        if (evidence.turnId === null) continue;
+        const attachments = record.request.attachmentIds
+          .map((attachmentId) => repository.getAttachment(attachmentId))
+          .filter((attachment): attachment is AttachmentRecord => attachment !== undefined);
+        if (!repository.completeQueuedTurn(record.id, evidence.turnId)) continue;
+        publishQueueChanged(record.threadId);
+        const userEvent = repository.appendEvent({
+          threadId: record.threadId,
+          turnId: evidence.turnId,
+          kind: 'user-message',
+          phase: 'completed',
+          payload: sanitizeEventPayload(
+            { text: record.request.text, attachments: attachments.map(publicAttachment) },
+            config.maxEventBytes,
+          ),
+        });
+        appendTurnNavigation({
+          threadId: record.threadId,
+          turnId: evidence.turnId,
+          label: normalizeTurnNavigationLabel(record.request.text, config.maxEventBytes),
+        });
+        publish(userEvent);
+        repository.audit('turn.queue.reconcile', 'succeeded', {
+          threadId: record.threadId,
+          queuedTurnId: record.id,
+          turnId: evidence.turnId,
+        });
+      } catch {
+        repository.audit('turn.queue.reconcile', 'deferred', {
+          threadId: record.threadId,
+          queuedTurnId: record.id,
+        });
+      }
+    }
+  };
+
   const runQueuedTurnDispatch = async (): Promise<void> => {
+    await reconcileUnknownQueuedTurns();
     while (!serverClosing) {
       const candidates = repository.listQueuedTurns();
       if (candidates.length === 0) return;
@@ -2956,12 +3051,18 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         queueMicrotask(requestQueuedTurnDispatch);
         return;
       }
-      if (serverClosing || repository.listQueuedTurns().length === 0) return;
+      if (
+        serverClosing ||
+        (repository.listQueuedTurns().length === 0 &&
+          repository.listUnknownQueuedTurns().length === 0)
+      )
+        return;
       if (queuedTurnRetry) clearTimeout(queuedTurnRetry);
+      const retryDelayMs = repository.listQueuedTurns().length > 0 ? 1_000 : 5_000;
       queuedTurnRetry = setTimeout(() => {
         queuedTurnRetry = null;
         requestQueuedTurnDispatch();
-      }, 1_000);
+      }, retryDelayMs);
       queuedTurnRetry.unref();
     });
   };
@@ -2970,7 +3071,65 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     auth.authenticate(request);
     const id = parseId(request);
     if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
-    return { data: repository.listQueuedTurns(id).map(publicQueuedTurn) };
+    return { data: repository.listVisibleQueuedTurns(id).map(publicQueuedTurn) };
+  });
+
+  app.post('/api/threads/:id/queued-turns/:queueId/cancel', async (request) => {
+    csrfGuard(auth, request);
+    const params = queuedTurnParamsSchema.parse(request.params);
+    let record = repository.getQueuedTurn(params.queueId);
+    if (!record || record.threadId !== params.id) throw new HttpError(404, 'QUEUED_TURN_NOT_FOUND');
+    if (record.status !== 'unknown') throw new HttpError(409, 'QUEUED_TURN_NOT_REVIEWABLE');
+
+    await reconcileUnknownQueuedTurns();
+    record = repository.getQueuedTurn(params.queueId);
+    if (!record) throw new HttpError(409, 'QUEUED_TURN_ALREADY_STARTED');
+    const readEvidence = async (): Promise<{
+      updatedAt: number;
+      status: string;
+      turnId: string | null;
+      hasInProgressTurn: boolean;
+    }> => {
+      const read = threadResponseSchema.parse(
+        await appServer.request('thread/read', { threadId: params.id, includeTurns: true }),
+      );
+      const evidence = queuedClientMessageEvidence(
+        inputRecord(read.thread)?.turns,
+        record.idempotencyKey,
+      );
+      const rawStatus = inputRecord(read.thread.status)?.type ?? read.thread.status;
+      return {
+        updatedAt: read.thread.updatedAt,
+        status: typeof rawStatus === 'string' ? rawStatus : 'unknown',
+        turnId: evidence.turnId,
+        hasInProgressTurn: evidence.hasInProgressTurn,
+      };
+    };
+    let first: Awaited<ReturnType<typeof readEvidence>>;
+    let second: Awaited<ReturnType<typeof readEvidence>>;
+    try {
+      first = await readEvidence();
+      second = await readEvidence();
+    } catch {
+      throw new HttpError(409, 'QUEUED_TURN_OUTCOME_UNKNOWN');
+    }
+    const stableTerminalAbsence =
+      first.turnId === null &&
+      second.turnId === null &&
+      !first.hasInProgressTurn &&
+      !second.hasInProgressTurn &&
+      first.updatedAt === second.updatedAt &&
+      first.status !== 'active' &&
+      second.status !== 'active';
+    if (!stableTerminalAbsence) throw new HttpError(409, 'QUEUED_TURN_OUTCOME_UNKNOWN');
+    if (!repository.cancelUnknownQueuedTurn(record.id))
+      throw new HttpError(409, 'QUEUED_TURN_OUTCOME_UNKNOWN');
+    publishQueueChanged(record.threadId);
+    repository.audit('turn.queue.cancel', 'succeeded', {
+      threadId: record.threadId,
+      queuedTurnId: record.id,
+    });
+    return { data: { cancelled: true as const, queuedTurnId: record.id } };
   });
 
   app.post('/api/threads/:id/turns', async (request, reply) => {

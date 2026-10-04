@@ -5194,6 +5194,132 @@ describe('Codex routes', () => {
     expect(replay.json()).toMatchObject({ data: { status: 'started' } });
   });
 
+  it('reconciles a crash-window dispatch from native client message evidence without retrying', async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-queue-ambiguous-'));
+    const appServer = new FakeAppServer();
+    const first = await fixture(
+      1,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      { temp, appServer },
+    );
+    const session = await login(first.app);
+    const project = await createProject(first.app, first.projectPath, session.headers);
+    const threadId = await createThread(first.app, project.id, session.headers);
+    const key = '41000000-0000-4000-8000-000000000001';
+    const requestHashValue = 'crash-window-hash';
+    first.repository.reserveIdempotent(`turn:${threadId}`, key, requestHashValue);
+    const queued = first.repository.enqueueTurn({
+      threadId,
+      idempotencyKey: key,
+      requestHash: requestHashValue,
+      request: { text: 'possibly delivered', attachmentIds: [], idempotencyKey: key },
+      claimToken: `queued:${threadId}:${key}`,
+    }).record;
+    expect(first.repository.claimQueuedTurn(queued.id)).toBeDefined();
+    appServer.setThreadTurns(threadId, [
+      {
+        id: 'native-turn-after-crash',
+        status: 'completed',
+        items: [{ type: 'userMessage', clientId: key, content: [] }],
+      },
+    ]);
+    await first.app.close();
+    openApps.splice(openApps.indexOf(first.app), 1);
+
+    const second = await fixture(
+      1,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      { temp, appServer },
+    );
+    await vi.waitFor(() => {
+      expect(second.repository.getQueuedTurn(queued.id)).toBeUndefined();
+      expect(second.repository.getIdempotent(`turn:${threadId}`, key)).toMatchObject({
+        state: 'completed',
+        response: { data: { status: 'started', turnId: 'native-turn-after-crash' } },
+      });
+    });
+    expect(
+      appServer.requests.filter(
+        (request) =>
+          request.method === 'turn/start' &&
+          (request.params as { clientUserMessageId?: string }).clientUserMessageId === key,
+      ),
+    ).toHaveLength(0);
+  });
+
+  it('exposes unresolved crash outcomes and cancels only after two stable terminal reads', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const key = '42000000-0000-4000-8000-000000000001';
+    const requestHashValue = 'unknown-hash';
+    repository.reserveIdempotent(`turn:${threadId}`, key, requestHashValue);
+    const queued = repository.enqueueTurn({
+      threadId,
+      idempotencyKey: key,
+      requestHash: requestHashValue,
+      request: { text: 'review me', attachmentIds: [], idempotencyKey: key },
+      claimToken: `queued:${threadId}:${key}`,
+    }).record;
+    repository.claimQueuedTurn(queued.id);
+    repository.markQueuedTurnUnknown(queued.id, 'IDEMPOTENCY_OUTCOME_UNKNOWN');
+    const visible = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/queued-turns`,
+      headers: { cookie: session.cookie },
+    });
+    expect(visible.json()).toMatchObject({
+      data: [
+        {
+          id: queued.id,
+          status: 'needsReview',
+          position: null,
+          errorCode: 'IDEMPOTENCY_OUTCOME_UNKNOWN',
+        },
+      ],
+    });
+
+    appServer.setThreadTurns(threadId, [{ id: 'still-running', status: 'inProgress', items: [] }]);
+    const unsafe = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/queued-turns/${queued.id}/cancel`,
+      headers: session.headers,
+    });
+    expect(unsafe.statusCode).toBe(409);
+    expect(unsafe.json()).toMatchObject({ error: { code: 'QUEUED_TURN_OUTCOME_UNKNOWN' } });
+    expect(repository.getQueuedTurn(queued.id)?.status).toBe('unknown');
+
+    appServer.setThreadTurns(threadId, []);
+    appServer.setThreadStatus(threadId, 'idle');
+    const cancelled = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/queued-turns/${queued.id}/cancel`,
+      headers: session.headers,
+    });
+    expect(cancelled.statusCode).toBe(200);
+    expect(cancelled.json()).toEqual({ data: { cancelled: true, queuedTurnId: queued.id } });
+    expect(repository.getQueuedTurn(queued.id)).toBeUndefined();
+  });
+
   it('rejects queue overflow without consuming the idempotency key', async () => {
     const { app, repository, projectPath } = await fixture(1);
     const session = await login(app);

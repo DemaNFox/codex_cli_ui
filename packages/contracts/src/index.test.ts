@@ -35,6 +35,7 @@ describe('contracts', () => {
           threadId: 'thread-1',
           status: 'queued',
           position: 2,
+          errorCode: null,
           textPreview: 'wait',
           attachmentCount: 1,
           createdAt: '2026-10-04T00:00:00.000Z',
@@ -47,11 +48,24 @@ describe('contracts', () => {
         threadId: 'thread-1',
         status: 'queued',
         position: 2,
+        errorCode: null,
         textPreview: 'wait',
         attachmentCount: 1,
         createdAt: '2026-10-04T00:00:00.000Z',
       }),
     });
+    expect(
+      queuedTurnSchema.parse({
+        id: 2,
+        threadId: 'thread-1',
+        status: 'needsReview',
+        position: null,
+        errorCode: 'IDEMPOTENCY_OUTCOME_UNKNOWN',
+        textPreview: 'possibly delivered',
+        attachmentCount: 0,
+        createdAt: '2026-10-04T00:00:00.000Z',
+      }),
+    ).toMatchObject({ status: 'needsReview', position: null });
   });
   it('rejects traversal-like empty project values before filesystem policy', () => {
     expect(createProjectRequestSchema.safeParse({ name: '', path: '' }).success).toBe(false);
