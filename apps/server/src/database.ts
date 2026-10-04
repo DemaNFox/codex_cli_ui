@@ -1784,25 +1784,6 @@ export class SqliteRepository {
     }
   }
 
-  cancelUnknownQueuedTurn(id: number): boolean {
-    const record = this.getQueuedTurn(id);
-    if (!record || record.status !== 'unknown') return false;
-    this.database.exec('BEGIN IMMEDIATE');
-    try {
-      this.database
-        .prepare('UPDATE attachments SET turn_id=NULL WHERE thread_id=? AND turn_id=?')
-        .run(record.threadId, record.claimToken);
-      const removed = this.database
-        .prepare("DELETE FROM queued_turns WHERE id=? AND status='unknown'")
-        .run(id).changes;
-      this.database.exec('COMMIT');
-      return removed === 1;
-    } catch (error) {
-      this.database.exec('ROLLBACK');
-      throw error;
-    }
-  }
-
   isThreadHistoryHydrated(threadId: string): boolean {
     return (
       this.database

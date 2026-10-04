@@ -274,12 +274,6 @@ export const queuedTurnSchema = z.discriminatedUnion('status', [
 ]);
 export type QueuedTurn = z.infer<typeof queuedTurnSchema>;
 
-export const cancelQueuedTurnResultSchema = z.object({
-  cancelled: z.literal(true),
-  queuedTurnId: z.number().int().positive(),
-});
-export type CancelQueuedTurnResult = z.infer<typeof cancelQueuedTurnResultSchema>;
-
 export const startTurnResultSchema = z.discriminatedUnion('status', [
   z.object({ status: z.literal('started'), turnId: z.string().min(1) }),
   z.object({ status: z.literal('queued'), queuedTurn: queuedTurnSchema }),

@@ -111,10 +111,6 @@ const attachmentParamsSchema = z.object({
   id: z.string().min(1).max(200),
   attachmentId: z.string().uuid(),
 });
-const queuedTurnParamsSchema = z.object({
-  id: z.string().min(1).max(200),
-  queueId: z.coerce.number().int().positive(),
-});
 const projectFileQuerySchema = z.object({ path: z.string().min(1).max(4_096) });
 const MAX_PROJECT_FILE_DOWNLOAD_BYTES = 100 * 1_024 * 1_024;
 const projectPatchSchema = z
@@ -3072,64 +3068,6 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const id = parseId(request);
     if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
     return { data: repository.listVisibleQueuedTurns(id).map(publicQueuedTurn) };
-  });
-
-  app.post('/api/threads/:id/queued-turns/:queueId/cancel', async (request) => {
-    csrfGuard(auth, request);
-    const params = queuedTurnParamsSchema.parse(request.params);
-    let record = repository.getQueuedTurn(params.queueId);
-    if (!record || record.threadId !== params.id) throw new HttpError(404, 'QUEUED_TURN_NOT_FOUND');
-    if (record.status !== 'unknown') throw new HttpError(409, 'QUEUED_TURN_NOT_REVIEWABLE');
-
-    await reconcileUnknownQueuedTurns();
-    record = repository.getQueuedTurn(params.queueId);
-    if (!record) throw new HttpError(409, 'QUEUED_TURN_ALREADY_STARTED');
-    const readEvidence = async (): Promise<{
-      updatedAt: number;
-      status: string;
-      turnId: string | null;
-      hasInProgressTurn: boolean;
-    }> => {
-      const read = threadResponseSchema.parse(
-        await appServer.request('thread/read', { threadId: params.id, includeTurns: true }),
-      );
-      const evidence = queuedClientMessageEvidence(
-        inputRecord(read.thread)?.turns,
-        record.idempotencyKey,
-      );
-      const rawStatus = inputRecord(read.thread.status)?.type ?? read.thread.status;
-      return {
-        updatedAt: read.thread.updatedAt,
-        status: typeof rawStatus === 'string' ? rawStatus : 'unknown',
-        turnId: evidence.turnId,
-        hasInProgressTurn: evidence.hasInProgressTurn,
-      };
-    };
-    let first: Awaited<ReturnType<typeof readEvidence>>;
-    let second: Awaited<ReturnType<typeof readEvidence>>;
-    try {
-      first = await readEvidence();
-      second = await readEvidence();
-    } catch {
-      throw new HttpError(409, 'QUEUED_TURN_OUTCOME_UNKNOWN');
-    }
-    const stableTerminalAbsence =
-      first.turnId === null &&
-      second.turnId === null &&
-      !first.hasInProgressTurn &&
-      !second.hasInProgressTurn &&
-      first.updatedAt === second.updatedAt &&
-      first.status !== 'active' &&
-      second.status !== 'active';
-    if (!stableTerminalAbsence) throw new HttpError(409, 'QUEUED_TURN_OUTCOME_UNKNOWN');
-    if (!repository.cancelUnknownQueuedTurn(record.id))
-      throw new HttpError(409, 'QUEUED_TURN_OUTCOME_UNKNOWN');
-    publishQueueChanged(record.threadId);
-    repository.audit('turn.queue.cancel', 'succeeded', {
-      threadId: record.threadId,
-      queuedTurnId: record.id,
-    });
-    return { data: { cancelled: true as const, queuedTurnId: record.id } };
   });
 
   app.post('/api/threads/:id/turns', async (request, reply) => {

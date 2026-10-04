@@ -5265,8 +5265,8 @@ describe('Codex routes', () => {
     ).toHaveLength(0);
   });
 
-  it('exposes unresolved crash outcomes and cancels only after two stable terminal reads', async () => {
-    const { app, appServer, repository, projectPath } = await fixture();
+  it('exposes unresolved crash outcomes without an unsafe destructive resolution path', async () => {
+    const { app, repository, projectPath } = await fixture();
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const threadId = await createThread(app, project.id, session.headers);
@@ -5298,26 +5298,22 @@ describe('Codex routes', () => {
       ],
     });
 
-    appServer.setThreadTurns(threadId, [{ id: 'still-running', status: 'inProgress', items: [] }]);
-    const unsafe = await app.inject({
+    const unavailableCancel = await app.inject({
       method: 'POST',
       url: `/api/threads/${threadId}/queued-turns/${queued.id}/cancel`,
       headers: session.headers,
     });
-    expect(unsafe.statusCode).toBe(409);
-    expect(unsafe.json()).toMatchObject({ error: { code: 'QUEUED_TURN_OUTCOME_UNKNOWN' } });
+    expect(unavailableCancel.statusCode).toBe(404);
     expect(repository.getQueuedTurn(queued.id)?.status).toBe('unknown');
 
-    appServer.setThreadTurns(threadId, []);
-    appServer.setThreadStatus(threadId, 'idle');
-    const cancelled = await app.inject({
+    const archive = await app.inject({
       method: 'POST',
-      url: `/api/threads/${threadId}/queued-turns/${queued.id}/cancel`,
+      url: `/api/threads/${threadId}/archive`,
       headers: session.headers,
     });
-    expect(cancelled.statusCode).toBe(200);
-    expect(cancelled.json()).toEqual({ data: { cancelled: true, queuedTurnId: queued.id } });
-    expect(repository.getQueuedTurn(queued.id)).toBeUndefined();
+    expect(archive.statusCode).toBe(409);
+    expect(archive.json()).toMatchObject({ error: { code: 'QUEUED_TURNS_PENDING' } });
+    expect(repository.getQueuedTurn(queued.id)?.status).toBe('unknown');
   });
 
   it('rejects queue overflow without consuming the idempotency key', async () => {
