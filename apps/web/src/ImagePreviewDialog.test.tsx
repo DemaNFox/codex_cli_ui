@@ -13,6 +13,7 @@ describe('ImagePreviewDialog', () => {
 
     expect(screen.getByRole('dialog', { name: 'макет.png' })).not.toBeNull();
     expect(screen.getByRole('img', { name: 'макет.png' }).getAttribute('src')).toBe('blob:preview');
+    expect(screen.queryByRole('link', { name: 'Скачать оригинал' })).toBeNull();
     const close = screen.getByRole('button', { name: 'Закрыть предпросмотр' });
     expect(document.activeElement).toBe(close);
     await user.click(close);
@@ -34,17 +35,30 @@ describe('ImagePreviewDialog', () => {
     expect(onClose).toHaveBeenCalledTimes(2);
   });
 
-  it('keeps keyboard focus inside and restores the opener on unmount', () => {
+  it('offers the persisted original, traps focus across controls, and restores the opener', async () => {
+    const user = userEvent.setup();
     const opener = document.createElement('button');
     document.body.append(opener);
     opener.focus();
     const { unmount } = render(
-      <ImagePreviewDialog name="photo.jpg" src="/safe/photo.jpg" onClose={() => undefined} />,
+      <ImagePreviewDialog
+        name="photo.jpg"
+        src="/safe/photo.jpg"
+        originalUrl="/api/threads/thread-1/attachments/photo/content"
+        onClose={() => undefined}
+      />,
     );
     const close = screen.getByRole('button', { name: 'Закрыть предпросмотр' });
+    const original = screen.getByRole('link', { name: 'Скачать оригинал' });
+    expect(original.getAttribute('href')).toBe('/api/threads/thread-1/attachments/photo/content');
+    expect(original.getAttribute('download')).toBe('photo.jpg');
 
-    fireEvent.keyDown(document, { key: 'Tab' });
+    await user.tab();
+    expect(document.activeElement).toBe(original);
+    await user.tab();
     expect(document.activeElement).toBe(close);
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(original);
     expect(document.body.style.overflow).toBe('hidden');
 
     unmount();

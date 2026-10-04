@@ -3005,6 +3005,7 @@ describe('App', () => {
     expect(within(preview).getByRole('img', { name: 'paste.png' }).getAttribute('src')).toBe(
       'blob:preview',
     );
+    expect(within(preview).queryByRole('link', { name: 'Скачать оригинал' })).toBeNull();
     fireEvent.keyDown(document, { key: 'Escape' });
     expect(screen.queryByRole('dialog', { name: 'paste.png' })).toBeNull();
 
@@ -3154,6 +3155,9 @@ describe('App', () => {
     expect(within(preview).getByRole('img', { name: 'макет.png' }).getAttribute('src')).toBe(
       '/api/threads/thread-1/attachments/image-1/content',
     );
+    const original = within(preview).getByRole('link', { name: 'Скачать оригинал' });
+    expect(original.getAttribute('href')).toBe('/api/threads/thread-1/attachments/image-1/content');
+    expect(original.getAttribute('download')).toBe('макет.png');
     await userEvent
       .setup()
       .click(within(preview).getByRole('button', { name: 'Закрыть предпросмотр' }));

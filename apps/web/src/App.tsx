@@ -127,6 +127,7 @@ interface QueuedAttachment {
 interface PreviewImage {
   name: string;
   src: string;
+  originalUrl?: string;
 }
 
 function formatBytes(bytes: number): string {
@@ -400,7 +401,7 @@ function AttachmentList({
                 type="button"
                 className="attachment-image-button"
                 aria-label={`Предпросмотреть ${attachment.name}`}
-                onClick={() => onPreview({ name: attachment.name, src: url })}
+                onClick={() => onPreview({ name: attachment.name, src: url, originalUrl: url })}
               >
                 <img src={url} alt={attachment.name} loading="lazy" />
                 <span>{attachment.name}</span>
@@ -4933,6 +4934,7 @@ function Workspace({
         <ImagePreviewDialog
           name={previewImage.name}
           src={previewImage.src}
+          {...(previewImage.originalUrl ? { originalUrl: previewImage.originalUrl } : {})}
           onClose={closeImagePreview}
         />
       )}
