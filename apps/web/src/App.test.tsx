@@ -3244,6 +3244,91 @@ describe('App', () => {
     expect(screen.queryByText('Frontend task')).toBeNull();
   });
 
+  it('explains that a chat with queued tasks cannot be archived and preserves its draft', async () => {
+    installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1/archive' && init?.method === 'POST') {
+        return jsonResponse(
+          {
+            error: {
+              code: 'QUEUED_TURNS_PENDING',
+              message: 'Request failed',
+            },
+          },
+          409,
+        );
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findAllByText('Frontend task');
+    const composer = screen.getByLabelText<HTMLTextAreaElement>('Сообщение Codex');
+    await user.type(composer, 'Важный черновик');
+
+    await user.click(screen.getByRole('button', { name: 'Меню недавнего чата Frontend task' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Архивировать чат' }));
+
+    expect(
+      await screen.findByText(
+        'В этом чате есть задачи в очереди. Дождитесь их запуска или завершения, затем архивируйте чат.',
+      ),
+    ).not.toBeNull();
+    expect(composer.value).toBe('Важный черновик');
+    expect(composer.disabled).toBe(false);
+    expect((await screen.findAllByText('Frontend task')).length).toBeGreaterThan(0);
+  });
+
+  it('shows an actionable fallback instead of a raw archive request failure', async () => {
+    installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1/archive' && init?.method === 'POST') {
+        return jsonResponse({ error: { code: 'INTERNAL_ERROR', message: 'Request failed' } }, 500);
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findAllByText('Frontend task');
+
+    await user.click(screen.getByRole('button', { name: 'Меню недавнего чата Frontend task' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Архивировать чат' }));
+
+    expect(
+      await screen.findByText('Не удалось архивировать чат. Он остался на месте; повторите позже.'),
+    ).not.toBeNull();
+    expect(screen.queryByText('Request failed')).toBeNull();
+  });
+
+  it('keeps an archived chat in place when Codex is unavailable during restore', async () => {
+    const archivedThread = { ...thread, id: 'thread-old', name: 'Старый чат', archived: true };
+    installAuthenticatedApi((url, init) => {
+      if (url.includes('archived=true')) return jsonResponse([archivedThread]);
+      if (url === '/api/threads/thread-old') {
+        return jsonResponse({ data: archivedThread, events: [] });
+      }
+      if (url === '/api/threads/thread-old/unarchive' && init?.method === 'POST') {
+        return jsonResponse(
+          { error: { code: 'APP_SERVER_UNAVAILABLE', message: 'Request failed' } },
+          503,
+        );
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByLabelText('Меню проекта AI Chat Bot'));
+    await user.click(screen.getByRole('menuitem', { name: 'Архивированные чаты' }));
+    await screen.findAllByText('Старый чат');
+    await user.click(screen.getByRole('button', { name: 'Меню чата проекта Старый чат' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Восстановить чат' }));
+
+    expect(
+      await screen.findByText('Codex временно недоступен. Чат не восстановлен — повторите позже.'),
+    ).not.toBeNull();
+    expect((await screen.findAllByText('Старый чат')).length).toBeGreaterThan(0);
+    expect(screen.getByLabelText<HTMLTextAreaElement>('Сообщение Codex').disabled).toBe(true);
+  });
+
   it('hydrates an imported thread before streaming only newer events', async () => {
     const importedThread = {
       ...thread,

@@ -424,6 +424,26 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Неизвестная ошибка';
 }
 
+function archiveErrorMessage(error: unknown, action: 'archive' | 'restore'): string {
+  if (error instanceof ApiError) {
+    if (error.code === 'QUEUED_TURNS_PENDING') {
+      return 'В этом чате есть задачи в очереди. Дождитесь их запуска или завершения, затем архивируйте чат.';
+    }
+    if (
+      error.code === 'APP_SERVER_UNAVAILABLE' ||
+      error.code === 'APP_SERVER_REQUEST_FAILED' ||
+      error.code === 'REQUEST_FAILED'
+    ) {
+      return action === 'archive'
+        ? 'Codex временно недоступен. Чат не архивирован — повторите позже.'
+        : 'Codex временно недоступен. Чат не восстановлен — повторите позже.';
+    }
+  }
+  return action === 'archive'
+    ? 'Не удалось архивировать чат. Он остался на месте; повторите позже.'
+    : 'Не удалось восстановить чат. Он остался в архиве; повторите позже.';
+}
+
 function valueText(value: unknown): string | null {
   if (typeof value === 'string') return value;
   if (Array.isArray(value)) {
@@ -3853,7 +3873,7 @@ function Workspace({
     try {
       await api.archiveThread(session.csrfToken, id);
     } catch (cause) {
-      setError(errorMessage(cause));
+      setError(archiveErrorMessage(cause, 'archive'));
       return;
     }
     setThreads((current) => current.filter((item) => item.id !== id));
@@ -3874,7 +3894,7 @@ function Workspace({
     try {
       await api.unarchiveThread(session.csrfToken, id);
     } catch (cause) {
-      setError(errorMessage(cause));
+      setError(archiveErrorMessage(cause, 'restore'));
       return;
     }
     setThreads((current) => current.filter((item) => item.id !== id));
