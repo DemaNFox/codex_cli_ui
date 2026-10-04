@@ -114,7 +114,7 @@ Browser
 
 - The browser uploads each attachment before starting or steering a turn and receives only an opaque attachment ID plus safe display metadata. Uploads are scoped to their thread and stored beneath the bounded application-state directory; the original client path is never trusted.
 - A start or active-turn steer may claim at most eight already uploaded attachments. Each attachment is limited to 20 MiB and the durable total is limited to 50 MiB per thread. Deleting or archiving a chat does not escape the thread boundary.
-- PNG, JPEG and WebP images are signature-checked and passed to app-server as native `localImage` inputs. The UI renders them through an authenticated, thread-scoped content route.
+- PNG, JPEG and WebP images are signature-checked and passed to app-server as native `localImage` inputs. The UI renders them through an authenticated, thread-scoped content route. Clicking either a staged image thumbnail or a persisted message image opens the same in-app preview; the preview has an explicit close control and also closes on backdrop click or `Escape` without changing attachment state.
 - Common text, source, PDF and office documents remain inert files in the Web API. Codex receives a backend-generated instruction containing only a server-verified internal path; the API does not parse, execute, unzip or embed their content.
 - App-server `userMessage` notifications are not copied into the public event journal. The backend writes one canonical user event containing only text and safe attachment metadata, preventing duplicated messages and internal-path disclosure during streaming or history hydration.
 - Fragmented agent-message deltas are not exposed because an internal path could span fragments and bypass per-event redaction. The UI receives the complete redacted agent message; other safe progress and state events continue to stream.
@@ -252,9 +252,16 @@ use the available execution slots.
 All state-changing routes require an authenticated session, exact Origin and a session-bound CSRF token.
 
 An empty chat can exist locally before Codex has written a rollout for it. Archive and restore first use the
-upstream Codex operation; if Codex specifically rejects that request and the local chat has no persisted events,
-the Web UI records the state locally and audits the degraded path. Timeouts, unavailable Codex and failures for
-chats with history remain errors rather than being silently accepted.
+upstream Codex operation. If Codex specifically rejects that request and the local chat has no persisted events,
+the Web UI records the state locally and audits the degraded path only after an exhaustive requested-state
+`thread/list` read proves the thread is absent. A list error, cursor loop, page-limit exhaustion or matching ID
+under another canonical project path is inconclusive and fails closed. Timeouts, unavailable Codex and failures
+for chats with history remain errors rather than being silently accepted. If the mutation reached Codex but its
+response was lost, the API accepts success only after the bounded read positively finds the exact thread,
+canonical project path and requested archive state. An older list request cannot overwrite an archive/unarchive
+mutation that completed while that list was in flight. Every successful, reconciled or ambiguous archive-state
+transition invalidates the server's loaded-thread marker, because Codex unloads archived native threads; the
+next turn after restore must resume the exact thread before it starts.
 
 The single navigation sidebar expands each project into its chat list, offers global and per-project new-chat
 actions and keeps a cross-project recent list. The project context menu exposes an archived-chat view scoped
