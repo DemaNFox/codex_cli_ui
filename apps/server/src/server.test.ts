@@ -178,6 +178,11 @@ class FakeAppServer implements AppServerClient {
     if (thread) thread.updatedAt = updatedAt;
   }
 
+  setThreadCwd(threadId: string, cwd: string): void {
+    const thread = this.threads.get(threadId);
+    if (thread) thread.cwd = cwd;
+  }
+
   setThreadListPageSize(size: number): void {
     this.listPageSize = size;
   }
@@ -2094,18 +2099,11 @@ describe('Codex routes', () => {
     expect(reconciliationRequest?.params).toMatchObject({ archived: true });
   });
 
-  it('invalidates loaded state when an archive outcome and reconciliation are both ambiguous', async () => {
-    const { app, appServer, projectPath, repository } = await fixture();
+  it('fails closed and invalidates loaded state when archive reconciliation is incomplete', async () => {
+    const { app, appServer, projectPath } = await fixture();
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const threadId = await createThread(app, project.id, session.headers);
-    repository.appendEvent({
-      threadId,
-      turnId: 'turn-existing',
-      kind: 'user-message',
-      phase: 'completed',
-      payload: { text: 'Existing persisted history' },
-    });
     appServer.failNextArchiveResponseAndReconciliation();
 
     const archive = await app.inject({
@@ -2134,6 +2132,26 @@ describe('Codex routes', () => {
     );
     expect(resumeIndex).toBeGreaterThan(-1);
     expect(turnStartIndex).toBeGreaterThan(resumeIndex);
+  });
+
+  it('fails closed when archive reconciliation finds the thread under another cwd', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.setThreadCwd(threadId, `${projectPath}-other`);
+    appServer.failNextArchiveResponseAfterMutation();
+
+    const archive = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/archive`,
+      headers: session.headers,
+    });
+
+    expect(archive.statusCode).toBe(500);
+    expect(archive.json()).toEqual({
+      error: { code: 'INTERNAL_ERROR', message: 'Request failed' },
+    });
   });
 
   it('resumes a restored thread before starting its next turn', async () => {

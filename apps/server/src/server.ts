@@ -2571,7 +2571,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         // The native mutation may have succeeded even when its response was lost. Treat the
         // loaded-state cache as invalid immediately so a later turn cannot skip thread/resume.
         loadedThreadGenerations.delete(id);
-        let upstreamStateConfirmed = false;
+        let upstreamArchiveEvidence:
+          'confirmed' | 'exhaustive_absent' | 'inconclusive' | 'cwd_mismatch' = 'inconclusive';
         if (error instanceof Error && error.message === 'APP_SERVER_REQUEST_FAILED') {
           try {
             const project = repository.getProject(thread.projectId);
@@ -2595,20 +2596,25 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
                       sourceKinds: ['cli', 'vscode', 'appServer', 'exec'],
                     }),
                   );
-                upstreamStateConfirmed = remote.data.some(
-                  (candidate) => candidate.id === id && candidate.cwd === cwd,
-                );
-                if (upstreamStateConfirmed || remote.nextCursor == null) break;
+                const candidate = remote.data.find((item) => item.id === id);
+                if (candidate) {
+                  upstreamArchiveEvidence = candidate.cwd === cwd ? 'confirmed' : 'cwd_mismatch';
+                  break;
+                }
+                if (remote.nextCursor == null) {
+                  upstreamArchiveEvidence = 'exhaustive_absent';
+                  break;
+                }
                 if (seenCursors.has(remote.nextCursor)) break;
                 seenCursors.add(remote.nextCursor);
                 cursor = remote.nextCursor;
               }
             }
           } catch {
-            upstreamStateConfirmed = false;
+            upstreamArchiveEvidence = 'inconclusive';
           }
         }
-        if (upstreamStateConfirmed) {
+        if (upstreamArchiveEvidence === 'confirmed') {
           repository.audit(archived ? 'thread.archive' : 'thread.unarchive', 'degraded', {
             threadId: id,
             reason: 'upstream_state_already_applied',
@@ -2620,6 +2626,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           const isUnpersistedEmptyThread =
             error instanceof Error &&
             error.message === 'APP_SERVER_REQUEST_FAILED' &&
+            upstreamArchiveEvidence === 'exhaustive_absent' &&
             !hasUserContent;
           if (!isUnpersistedEmptyThread) throw error;
           repository.audit(archived ? 'thread.archive' : 'thread.unarchive', 'degraded', {
