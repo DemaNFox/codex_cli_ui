@@ -19,6 +19,7 @@ import {
   pushSubscriptionStatusRequestSchema,
   startThreadRequestSchema,
   startTurnRequestSchema,
+  startTurnResultSchema,
   steerTurnRequestSchema,
   threadUsageSchema,
   threadListQuerySchema,
@@ -38,6 +39,7 @@ import {
   type Subagent,
   type Thread,
   type TurnNavigationEntry,
+  type QueuedTurn,
   type PushSubscriptionInput,
 } from '@codex-web/contracts';
 import cookie from '@fastify/cookie';
@@ -65,7 +67,13 @@ import {
 } from './attachment-store.js';
 import { AuthService, HttpError, type AuthContext } from './auth.js';
 import type { ServerConfig } from './config.js';
-import { PushStorageLimitError, type AttachmentRecord, type SqliteRepository } from './database.js';
+import {
+  PushStorageLimitError,
+  TurnQueueStorageLimitError,
+  type AttachmentRecord,
+  type QueuedTurnRecord,
+  type SqliteRepository,
+} from './database.js';
 import {
   normalizeApproval,
   normalizeNotification,
@@ -811,6 +819,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   repository.resetActiveSubagentRuntime();
   let pendingTurnStarts = 0;
   let pendingThreadStarts = 0;
+  let queuedTurnRetry: NodeJS.Timeout | null = null;
+  let queuedTurnDispatch: Promise<void> | null = null;
+  let queuedTurnDispatchRequested = false;
+  let requestQueuedTurnDispatch: () => void = () => {};
   let accountLogin: CodexAccountLogin = codexAccountLoginSchema.parse({
     state: 'idle',
     loginId: null,
@@ -1722,6 +1734,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         }),
       );
       void applyPendingResourcesWhenIdle();
+      requestQueuedTurnDispatch();
     }
     const normalized =
       completedAgentMessage(redactedMessage, config.maxEventBytes) ??
@@ -1760,6 +1773,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         if (runtimeTurnEvent)
           pushDispatcher?.enqueue(thread.id, normalized.turnId, terminalPushStatus(message));
       void applyPendingResourcesWhenIdle();
+      requestQueuedTurnDispatch();
     }
     if (message.method === 'thread/status/changed') {
       const status = threadStatusChangedSchema.safeParse(message.params);
@@ -1790,6 +1804,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         if (nextStatus !== 'active' && !preserveActive) {
           clearActiveTurns(normalized.threadId);
           void applyPendingResourcesWhenIdle();
+          requestQueuedTurnDispatch();
         }
       }
     }
@@ -1878,6 +1893,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       interruptedSubagentCount: activeSubagents.length,
     });
     void applyPendingResourcesWhenIdle();
+    requestQueuedTurnDispatch();
   };
   const unsubscribe = appServer.subscribe(onAppServerMessage);
   const unsubscribeLifecycle = appServer.subscribeLifecycle(onAppServerLifecycle);
@@ -1928,14 +1944,17 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     await appServer.start();
     pushDispatcher?.start();
     if (dependencies.resourceBroker) void reconcileStartupResources();
+    requestQueuedTurnDispatch();
   });
   app.addHook('onClose', async () => {
     serverClosing = true;
     if (resourceStartupRetry) clearTimeout(resourceStartupRetry);
     if (codexUpdateStartupRetry) clearTimeout(codexUpdateStartupRetry);
+    if (queuedTurnRetry) clearTimeout(queuedTurnRetry);
     clearAccountLoginTimer();
     unsubscribe();
     unsubscribeLifecycle();
+    await queuedTurnDispatch?.catch(() => undefined);
     await pushDispatcher?.close();
     await appServer.stop();
     repository.close();
@@ -2474,6 +2493,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       eventCursor: events.at(-1)?.id ?? 0,
       turnNavigation: repository.listTurnNavigation(id),
       subagents: repository.listSubagents(id),
+      queuedTurns: repository.listQueuedTurns(id).map(publicQueuedTurn),
     };
   });
 
@@ -2507,6 +2527,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const id = parseId(request);
     const thread = repository.getThread(id);
     if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    if (archived && repository.hasOutstandingQueuedTurns(id))
+      throw new HttpError(409, 'QUEUED_TURNS_PENDING');
     if (thread.archived !== archived) {
       try {
         await appServer.request(archived ? 'thread/archive' : 'thread/unarchive', { threadId: id });
@@ -2700,6 +2722,257 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return reply.code(204).send();
   });
 
+  const publicQueuedTurn = (record: QueuedTurnRecord): QueuedTurn => ({
+    id: record.id,
+    threadId: record.threadId,
+    status: 'queued',
+    position: repository.queuedTurnPosition(record.id) ?? 1,
+    textPreview: record.request.text.slice(0, 240),
+    attachmentCount: record.request.attachmentIds.length,
+    createdAt: record.createdAt,
+  });
+
+  const publishQueueChanged = (threadId: string): void => {
+    publish(
+      repository.appendEvent({
+        threadId,
+        turnId: null,
+        kind: 'turn',
+        phase: 'state',
+        payload: { queueChanged: true },
+      }),
+    );
+  };
+
+  const enqueueReservedTurn = (
+    threadId: string,
+    input: z.infer<typeof startTurnRequestSchema>,
+    requestHashValue: string,
+  ): { data: z.infer<typeof startTurnResultSchema> } => {
+    const claimToken = `queued:${threadId}:${input.idempotencyKey}`;
+    try {
+      const queued = repository.enqueueTurn({
+        threadId,
+        idempotencyKey: input.idempotencyKey,
+        requestHash: requestHashValue,
+        request: input,
+        claimToken,
+      }).record;
+      repository.audit('turn.queue', 'succeeded', { threadId, queuedTurnId: queued.id });
+      publishQueueChanged(threadId);
+      return { data: { status: 'queued', queuedTurn: publicQueuedTurn(queued) } };
+    } catch (error) {
+      repository.releasePendingIdempotent(
+        `turn:${threadId}`,
+        input.idempotencyKey,
+        requestHashValue,
+      );
+      if (error instanceof TurnQueueStorageLimitError)
+        throw new HttpError(429, 'TURN_QUEUE_CAPACITY_EXHAUSTED', 'The safe task queue is full');
+      if (error instanceof Error && error.message === 'ATTACHMENT_CLAIM_FAILED')
+        throw new HttpError(409, 'ATTACHMENT_NOT_AVAILABLE');
+      throw error;
+    }
+  };
+
+  const queuedThreadIsEligible = (record: QueuedTurnRecord): boolean => {
+    const thread = repository.getThread(record.threadId);
+    if (!thread || thread.archived) return false;
+    return (
+      activeTurnIdForThread(record.threadId) === null &&
+      !nativeActiveThreads.has(record.threadId) &&
+      repository.countActiveSubagentsForRoot(record.threadId) === 0 &&
+      thread.status !== 'active'
+    );
+  };
+
+  const dispatchQueuedTurn = async (record: QueuedTurnRecord): Promise<'started' | 'wait'> => {
+    if (
+      serverClosing ||
+      codexUpdateInterlocked ||
+      upgradeDrainRequested() ||
+      accountLoginInterlocked ||
+      (dependencies.resourceBroker !== undefined &&
+        repository.getResourceLimits().state !== 'applied')
+    )
+      return 'wait';
+    if (!queuedThreadIsEligible(record)) return 'wait';
+
+    let executionAgentLimit: number | undefined;
+    if (!dependencies.resourceBroker) {
+      if (activeRootCount() + pendingTurnStarts >= config.maxConcurrentTurns)
+        await reconcileStaleExecutionCapacity();
+      if (activeRootCount() + pendingTurnStarts >= config.maxConcurrentTurns) return 'wait';
+      pendingTurnStarts += 1;
+    } else {
+      pendingTurnStarts += 1;
+      try {
+        const capacity = await brokerSnapshot();
+        const maximumExecutionUnits =
+          repository.getResourceLimits().desired.maxParallelAgents ?? autoParallelAgents(capacity);
+        executionAgentLimit = maximumExecutionUnits;
+        let activeExecutionUnits =
+          activeRootCount() + pendingTurnStarts + repository.countActiveSubagents();
+        if (activeExecutionUnits > maximumExecutionUnits) {
+          await reconcileStaleExecutionCapacity();
+          activeExecutionUnits =
+            activeRootCount() + pendingTurnStarts + repository.countActiveSubagents();
+        }
+        if (
+          activeExecutionUnits > maximumExecutionUnits ||
+          capacity.capacity.memoryAvailableBytes < 512 * 1_024 * 1_024
+        ) {
+          pendingTurnStarts -= 1;
+          return 'wait';
+        }
+      } catch {
+        pendingTurnStarts -= 1;
+        return 'wait';
+      }
+    }
+
+    const claimed = repository.claimQueuedTurn(record.id);
+    if (!claimed) {
+      pendingTurnStarts -= 1;
+      return 'wait';
+    }
+    const thread = repository.getThread(claimed.threadId);
+    const project = thread && repository.getProject(thread.projectId);
+    let turnStartIssued = false;
+    try {
+      if (!thread || thread.archived || !project) {
+        repository.requeueTurn(claimed.id);
+        return 'wait';
+      }
+      const resumeCwd = await canonicalProjectPath(pathPolicy, project);
+      if (loadedThreadGenerations.get(thread.id) !== appServer.generation) {
+        if (!repository.isThreadHistoryHydrated(thread.id)) await hydrateThreadHistory(thread);
+        const resumed = threadResponseSchema.parse(
+          await appServer.request('thread/resume', {
+            threadId: thread.id,
+            cwd: resumeCwd,
+            excludeTurns: true,
+            ...(executionAgentLimit === undefined
+              ? {}
+              : { config: { agents: { max_threads: executionAgentLimit } } }),
+          }),
+        );
+        if (resumed.thread.cwd !== resumeCwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
+        loadedThreadGenerations.set(thread.id, appServer.generation);
+      }
+      const attachments = claimed.request.attachmentIds.map((attachmentId) => {
+        const attachment = repository.getAttachment(attachmentId);
+        if (
+          !attachment ||
+          attachment.threadId !== thread.id ||
+          attachment.turnId !== claimed.claimToken
+        )
+          throw new HttpError(409, 'ATTACHMENT_NOT_AVAILABLE');
+        return attachment;
+      });
+      const turnCwd = await canonicalProjectPath(pathPolicy, project);
+      const appInput = attachmentUserInput(claimed.request.text, attachments, (attachment) =>
+        attachmentStore.localPath(project.id, thread.id, attachment.storageName),
+      );
+      turnStartIssued = true;
+      const result = turnResponseSchema.parse(
+        await appServer.request('turn/start', {
+          threadId: thread.id,
+          clientUserMessageId: claimed.idempotencyKey,
+          input: appInput,
+          cwd: turnCwd,
+          model: claimed.request.model ?? project.defaultModel,
+          effort: claimed.request.reasoningEffort ?? project.defaultReasoningEffort,
+          approvalPolicy: claimed.request.approvalPolicy,
+          approvalsReviewer: 'user',
+          sandboxPolicy: sandboxPolicy(
+            claimed.request.permissionPreset ?? project.defaultPermissionPreset,
+            turnCwd,
+          ),
+        }),
+      );
+      if (!repository.completeQueuedTurn(claimed.id, result.turn.id))
+        throw new HttpError(409, 'IDEMPOTENCY_OUTCOME_UNKNOWN');
+      publishQueueChanged(thread.id);
+      setActiveTurn(thread.id, result.turn.id);
+      repository.updateThreadRuntime(thread.id, { status: 'active', activeTurnId: result.turn.id });
+      const userEvent = repository.appendEvent({
+        threadId: thread.id,
+        turnId: result.turn.id,
+        kind: 'user-message',
+        phase: 'completed',
+        payload: sanitizeEventPayload(
+          { text: claimed.request.text, attachments: attachments.map(publicAttachment) },
+          config.maxEventBytes,
+        ),
+      });
+      appendTurnNavigation({
+        threadId: thread.id,
+        turnId: result.turn.id,
+        label: normalizeTurnNavigationLabel(claimed.request.text, config.maxEventBytes),
+      });
+      publish(userEvent);
+      repository.audit('turn.queue.dispatch', 'succeeded', {
+        threadId: thread.id,
+        turnId: result.turn.id,
+        queuedTurnId: claimed.id,
+      });
+      return 'started';
+    } catch {
+      if (turnStartIssued) {
+        repository.markQueuedTurnUnknown(claimed.id, 'IDEMPOTENCY_OUTCOME_UNKNOWN');
+        publishQueueChanged(claimed.threadId);
+      } else repository.requeueTurn(claimed.id);
+      repository.audit('turn.queue.dispatch', turnStartIssued ? 'unknown' : 'deferred', {
+        threadId: claimed.threadId,
+        queuedTurnId: claimed.id,
+      });
+      return 'wait';
+    } finally {
+      pendingTurnStarts -= 1;
+    }
+  };
+
+  const runQueuedTurnDispatch = async (): Promise<void> => {
+    while (!serverClosing) {
+      const candidates = repository.listQueuedTurns();
+      if (candidates.length === 0) return;
+      const candidate = candidates.find(queuedThreadIsEligible);
+      if (!candidate) return;
+      if ((await dispatchQueuedTurn(candidate)) !== 'started') return;
+    }
+  };
+
+  requestQueuedTurnDispatch = () => {
+    if (serverClosing) return;
+    if (queuedTurnDispatch) {
+      queuedTurnDispatchRequested = true;
+      return;
+    }
+    queuedTurnDispatch = runQueuedTurnDispatch().finally(() => {
+      queuedTurnDispatch = null;
+      if (queuedTurnDispatchRequested) {
+        queuedTurnDispatchRequested = false;
+        queueMicrotask(requestQueuedTurnDispatch);
+        return;
+      }
+      if (serverClosing || repository.listQueuedTurns().length === 0) return;
+      if (queuedTurnRetry) clearTimeout(queuedTurnRetry);
+      queuedTurnRetry = setTimeout(() => {
+        queuedTurnRetry = null;
+        requestQueuedTurnDispatch();
+      }, 1_000);
+      queuedTurnRetry.unref();
+    });
+  };
+
+  app.get('/api/threads/:id/queued-turns', (request) => {
+    auth.authenticate(request);
+    const id = parseId(request);
+    if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    return { data: repository.listQueuedTurns(id).map(publicQueuedTurn) };
+  });
+
   app.post('/api/threads/:id/turns', async (request, reply) => {
     csrfGuard(auth, request);
     const id = parseId(request);
@@ -2725,8 +2998,14 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const reservation = repository.reserveIdempotent(operation, input.idempotencyKey, hash);
     if (!reservation.reserved) {
       if (reservation.record.requestHash !== hash) throw new HttpError(409, 'IDEMPOTENCY_CONFLICT');
-      if (reservation.record.state === 'completed')
+      if (reservation.record.state === 'completed') {
+        const queued = repository.getQueuedTurnByIdempotency(id, input.idempotencyKey);
+        if (queued?.status === 'queued')
+          return reply.code(200).send({
+            data: { status: 'queued', queuedTurn: publicQueuedTurn(queued) },
+          });
         return reply.code(200).send(reservation.record.response);
+      }
       throw new HttpError(
         409,
         reservation.record.state === 'pending'
@@ -2743,6 +3022,17 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       throw new HttpError(409, 'ATTACHMENT_ALREADY_SENT');
     }
     if (
+      repository.listQueuedTurns().length > 0 ||
+      thread.status === 'active' ||
+      activeTurnIdForThread(id) !== null ||
+      nativeActiveThreads.has(id) ||
+      repository.countActiveSubagentsForRoot(id) > 0
+    ) {
+      const response = enqueueReservedTurn(id, input, hash);
+      requestQueuedTurnDispatch();
+      return reply.code(202).send(response);
+    }
+    if (
       !dependencies.resourceBroker &&
       activeRootCount() + pendingTurnStarts >= config.maxConcurrentTurns
     ) {
@@ -2752,8 +3042,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       !dependencies.resourceBroker &&
       activeRootCount() + pendingTurnStarts >= config.maxConcurrentTurns
     ) {
-      repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
-      throw new HttpError(429, 'TURN_CAPACITY_EXHAUSTED');
+      const response = enqueueReservedTurn(id, input, hash);
+      requestQueuedTurnDispatch();
+      return reply.code(202).send(response);
     }
     if (dependencies.resourceBroker) {
       const resourceState = repository.getResourceLimits().state;
@@ -2803,6 +3094,11 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           );
       } catch (error) {
         pendingTurnStarts -= 1;
+        if (error instanceof HttpError && error.code === 'RESOURCE_CAPACITY_EXHAUSTED') {
+          const response = enqueueReservedTurn(id, input, hash);
+          requestQueuedTurnDispatch();
+          return reply.code(202).send(response);
+        }
         repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
         throw error;
       }
@@ -2879,7 +3175,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     } finally {
       pendingTurnStarts -= 1;
     }
-    const response = { data: { turnId: result.turn.id } };
+    const response = { data: { status: 'started' as const, turnId: result.turn.id } };
     if (attachments.length > 0)
       repository.finalizeAttachmentClaims(id, attachmentClaim, result.turn.id);
     if (!repository.completeIdempotent(operation, input.idempotencyKey, hash, response))

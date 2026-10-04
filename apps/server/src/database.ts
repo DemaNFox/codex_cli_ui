@@ -8,6 +8,7 @@ import type {
   Subagent,
   Thread,
   TurnNavigationEntry,
+  StartTurnRequest,
   PushSubscriptionInput,
 } from '@codex-web/contracts';
 import { DatabaseSync } from 'node:sqlite';
@@ -83,6 +84,19 @@ interface AttachmentRow {
   created_at: string;
 }
 
+interface QueuedTurnRow {
+  id: number;
+  thread_id: string;
+  idempotency_key: string;
+  request_hash: string;
+  request_json: string;
+  claim_token: string;
+  status: QueuedTurnRecord['status'];
+  error_code: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 interface SubagentRow {
   id: string;
   root_thread_id: string;
@@ -126,6 +140,12 @@ export class PushStorageLimitError extends Error {
   }
 }
 
+export class TurnQueueStorageLimitError extends Error {
+  constructor() {
+    super('Turn queue limit reached');
+  }
+}
+
 export interface ClaimedPushDelivery {
   readonly id: string;
   readonly threadId: string;
@@ -154,6 +174,36 @@ export interface AttachmentRecord {
   storageName: string;
   turnId: string | null;
   createdAt: string;
+}
+
+export interface QueuedTurnRecord {
+  id: number;
+  threadId: string;
+  idempotencyKey: string;
+  requestHash: string;
+  request: StartTurnRequest;
+  claimToken: string;
+  status: 'queued' | 'dispatching' | 'unknown' | 'failed';
+  errorCode: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const MAX_QUEUED_TURNS = 128;
+
+function queuedTurnFromRow(row: QueuedTurnRow): QueuedTurnRecord {
+  return {
+    id: row.id,
+    threadId: row.thread_id,
+    idempotencyKey: row.idempotency_key,
+    requestHash: row.request_hash,
+    request: JSON.parse(row.request_json) as StartTurnRequest,
+    claimToken: row.claim_token,
+    status: row.status,
+    errorCode: row.error_code,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
 }
 
 interface ApprovalRow {
@@ -418,6 +468,21 @@ export class SqliteRepository {
         PRIMARY KEY(operation, key)
       );
 
+      CREATE TABLE IF NOT EXISTS queued_turns (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE RESTRICT,
+        idempotency_key TEXT NOT NULL,
+        request_hash TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        claim_token TEXT NOT NULL UNIQUE,
+        status TEXT NOT NULL CHECK(status IN ('queued','dispatching','unknown','failed')),
+        error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        UNIQUE(thread_id,idempotency_key)
+      );
+      CREATE INDEX IF NOT EXISTS queued_turns_fifo_idx ON queued_turns(status,id);
+
       CREATE TABLE IF NOT EXISTS audit_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         action TEXT NOT NULL,
@@ -471,7 +536,38 @@ export class SqliteRepository {
     this.migrateApprovalResolvingState();
     this.migrateIdempotencyState();
     this.migrateThreadActiveTurn();
+    this.recoverInterruptedQueuedTurns();
     this.enforcePushStorageBounds();
+  }
+
+  private recoverInterruptedQueuedTurns(): void {
+    const now = new Date().toISOString();
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const rows = this.database
+        .prepare(
+          "SELECT thread_id,idempotency_key,request_hash FROM queued_turns WHERE status='dispatching'",
+        )
+        .all() as unknown as Array<{
+        thread_id: string;
+        idempotency_key: string;
+        request_hash: string;
+      }>;
+      const markUnknown = this.database.prepare(
+        "UPDATE idempotency SET state='unknown',updated_at=? WHERE operation=? AND key=? AND request_hash=?",
+      );
+      for (const row of rows)
+        markUnknown.run(now, `turn:${row.thread_id}`, row.idempotency_key, row.request_hash);
+      this.database
+        .prepare(
+          "UPDATE queued_turns SET status='unknown',error_code='IDEMPOTENCY_OUTCOME_UNKNOWN',updated_at=? WHERE status='dispatching'",
+        )
+        .run(now);
+      this.database.exec('COMMIT');
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   private enforcePushStorageBounds(): void {
@@ -1466,6 +1562,208 @@ export class SqliteRepository {
         .prepare('UPDATE attachments SET turn_id=NULL WHERE thread_id=? AND turn_id=?')
         .run(threadId, claimToken).changes,
     );
+  }
+
+  enqueueTurn(input: {
+    threadId: string;
+    idempotencyKey: string;
+    requestHash: string;
+    request: StartTurnRequest;
+    claimToken: string;
+  }): { record: QueuedTurnRecord; position: number } {
+    const now = new Date().toISOString();
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const count = this.database
+        .prepare(
+          "SELECT COUNT(*) AS count FROM queued_turns WHERE status IN ('queued','dispatching')",
+        )
+        .get() as { count: number };
+      if (count.count >= MAX_QUEUED_TURNS) throw new TurnQueueStorageLimitError();
+      for (const attachmentId of input.request.attachmentIds) {
+        const claimed = this.database
+          .prepare(
+            'UPDATE attachments SET turn_id=? WHERE id=? AND thread_id=? AND turn_id IS NULL',
+          )
+          .run(input.claimToken, attachmentId, input.threadId).changes;
+        if (claimed !== 1) throw new Error('ATTACHMENT_CLAIM_FAILED');
+      }
+      const inserted = this.database
+        .prepare(
+          `INSERT INTO queued_turns(thread_id,idempotency_key,request_hash,request_json,claim_token,status,error_code,created_at,updated_at)
+           VALUES(?,?,?,?,?,'queued',NULL,?,?)`,
+        )
+        .run(
+          input.threadId,
+          input.idempotencyKey,
+          input.requestHash,
+          JSON.stringify(input.request),
+          input.claimToken,
+          now,
+          now,
+        );
+      const id = Number(inserted.lastInsertRowid);
+      const position = (
+        this.database
+          .prepare("SELECT COUNT(*) AS count FROM queued_turns WHERE status='queued' AND id<=?")
+          .get(id) as { count: number }
+      ).count;
+      const response = {
+        data: {
+          status: 'queued',
+          queuedTurn: {
+            id,
+            threadId: input.threadId,
+            status: 'queued',
+            position,
+            textPreview: input.request.text.slice(0, 240),
+            attachmentCount: input.request.attachmentIds.length,
+            createdAt: now,
+          },
+        },
+      };
+      const completed = this.database
+        .prepare(
+          `UPDATE idempotency SET state='completed',response_json=?,updated_at=?
+           WHERE operation=? AND key=? AND request_hash=? AND state='pending'`,
+        )
+        .run(
+          JSON.stringify(response),
+          now,
+          `turn:${input.threadId}`,
+          input.idempotencyKey,
+          input.requestHash,
+        ).changes;
+      if (completed !== 1) throw new Error('IDEMPOTENCY_RESERVATION_LOST');
+      this.database.exec('COMMIT');
+      return { record: this.getQueuedTurn(id)!, position };
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  getQueuedTurn(id: number): QueuedTurnRecord | undefined {
+    const row = this.database.prepare('SELECT * FROM queued_turns WHERE id=?').get(id) as
+      QueuedTurnRow | undefined;
+    return row && queuedTurnFromRow(row);
+  }
+
+  getQueuedTurnByIdempotency(
+    threadId: string,
+    idempotencyKey: string,
+  ): QueuedTurnRecord | undefined {
+    const row = this.database
+      .prepare('SELECT * FROM queued_turns WHERE thread_id=? AND idempotency_key=?')
+      .get(threadId, idempotencyKey) as QueuedTurnRow | undefined;
+    return row && queuedTurnFromRow(row);
+  }
+
+  listQueuedTurns(threadId?: string): QueuedTurnRecord[] {
+    const rows = (threadId === undefined
+      ? this.database.prepare("SELECT * FROM queued_turns WHERE status='queued' ORDER BY id").all()
+      : this.database
+          .prepare("SELECT * FROM queued_turns WHERE status='queued' AND thread_id=? ORDER BY id")
+          .all(threadId)) as unknown as QueuedTurnRow[];
+    return rows.map(queuedTurnFromRow);
+  }
+
+  hasOutstandingQueuedTurns(threadId: string): boolean {
+    return (
+      this.database
+        .prepare(
+          "SELECT 1 FROM queued_turns WHERE thread_id=? AND status IN ('queued','dispatching','unknown','failed') LIMIT 1",
+        )
+        .get(threadId) !== undefined
+    );
+  }
+
+  queuedTurnPosition(id: number): number | null {
+    const current = this.getQueuedTurn(id);
+    if (!current || current.status !== 'queued') return null;
+    return (
+      this.database
+        .prepare("SELECT COUNT(*) AS count FROM queued_turns WHERE status='queued' AND id<=?")
+        .get(id) as { count: number }
+    ).count;
+  }
+
+  claimQueuedTurn(id: number): QueuedTurnRecord | undefined {
+    const result = this.database
+      .prepare(
+        "UPDATE queued_turns SET status='dispatching',updated_at=? WHERE id=? AND status='queued'",
+      )
+      .run(new Date().toISOString(), id);
+    return result.changes === 1 ? this.getQueuedTurn(id) : undefined;
+  }
+
+  requeueTurn(id: number): boolean {
+    return (
+      this.database
+        .prepare(
+          "UPDATE queued_turns SET status='queued',error_code=NULL,updated_at=? WHERE id=? AND status='dispatching'",
+        )
+        .run(new Date().toISOString(), id).changes === 1
+    );
+  }
+
+  markQueuedTurnUnknown(id: number, errorCode: string): boolean {
+    const record = this.getQueuedTurn(id);
+    if (!record || record.status !== 'dispatching') return false;
+    const now = new Date().toISOString();
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const changed = this.database
+        .prepare(
+          "UPDATE queued_turns SET status='unknown',error_code=?,updated_at=? WHERE id=? AND status='dispatching'",
+        )
+        .run(errorCode, now, id).changes;
+      this.database
+        .prepare(
+          "UPDATE idempotency SET state='unknown',updated_at=? WHERE operation=? AND key=? AND request_hash=?",
+        )
+        .run(now, `turn:${record.threadId}`, record.idempotencyKey, record.requestHash);
+      this.database.exec('COMMIT');
+      return changed === 1;
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  completeQueuedTurn(id: number, turnId: string): boolean {
+    const record = this.getQueuedTurn(id);
+    if (!record || record.status !== 'dispatching') return false;
+    const now = new Date().toISOString();
+    const response = { data: { status: 'started', turnId } };
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      if (record.request.attachmentIds.length > 0)
+        this.database
+          .prepare('UPDATE attachments SET turn_id=? WHERE thread_id=? AND turn_id=?')
+          .run(turnId, record.threadId, record.claimToken);
+      const idempotency = this.database
+        .prepare(
+          `UPDATE idempotency SET state='completed',response_json=?,updated_at=?
+           WHERE operation=? AND key=? AND request_hash=? AND state='completed'`,
+        )
+        .run(
+          JSON.stringify(response),
+          now,
+          `turn:${record.threadId}`,
+          record.idempotencyKey,
+          record.requestHash,
+        ).changes;
+      const removed = this.database
+        .prepare("DELETE FROM queued_turns WHERE id=? AND status='dispatching'")
+        .run(id).changes;
+      if (idempotency !== 1 || removed !== 1) throw new Error('QUEUED_TURN_COMPLETION_FAILED');
+      this.database.exec('COMMIT');
+      return true;
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   isThreadHistoryHydrated(threadId: string): boolean {

@@ -4,6 +4,8 @@ import {
   applyCodexUpdateRequestSchema,
   createProjectRequestSchema,
   attachmentSchema,
+  queuedTurnSchema,
+  startTurnResultSchema,
   codexAccountLoginSchema,
   codexUpdateSnapshotSchema,
   codexVersionDiscoverySchema,
@@ -20,6 +22,37 @@ import {
 } from './index.js';
 
 describe('contracts', () => {
+  it('discriminates started and queued turn admission results', () => {
+    expect(startTurnResultSchema.parse({ status: 'started', turnId: 'turn-1' })).toEqual({
+      status: 'started',
+      turnId: 'turn-1',
+    });
+    expect(
+      startTurnResultSchema.parse({
+        status: 'queued',
+        queuedTurn: {
+          id: 1,
+          threadId: 'thread-1',
+          status: 'queued',
+          position: 2,
+          textPreview: 'wait',
+          attachmentCount: 1,
+          createdAt: '2026-10-04T00:00:00.000Z',
+        },
+      }),
+    ).toEqual({
+      status: 'queued',
+      queuedTurn: queuedTurnSchema.parse({
+        id: 1,
+        threadId: 'thread-1',
+        status: 'queued',
+        position: 2,
+        textPreview: 'wait',
+        attachmentCount: 1,
+        createdAt: '2026-10-04T00:00:00.000Z',
+      }),
+    });
+  });
   it('rejects traversal-like empty project values before filesystem policy', () => {
     expect(createProjectRequestSchema.safeParse({ name: '', path: '' }).success).toBe(false);
   });

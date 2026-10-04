@@ -29,7 +29,7 @@ import type { AudioTranscriptionClient, TranscriptionUpload } from './audio-tran
 import type { CodexUpdateBroker } from './codex-update-broker.js';
 import type { CodexVersionChecker } from './codex-version-checker.js';
 import { loadConfig, type ServerConfig } from './config.js';
-import { SqliteRepository } from './database.js';
+import { MAX_QUEUED_TURNS, SqliteRepository } from './database.js';
 import { normalizeNotification, sanitizeEventPayload } from './event-normalizer.js';
 import { normalizeThreadHistory } from './history-normalizer.js';
 import { ProjectPathPolicy } from './path-policy.js';
@@ -572,8 +572,9 @@ async function fixture(
   codexVersionChecker?: CodexVersionChecker,
   codexUpdateStartupRetryMs?: number,
   configOverrides: Partial<Pick<ServerConfig, 'eventRetentionPerThread'>> = {},
+  persistent?: { temp: string; appServer: FakeAppServer },
 ) {
-  const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-server-'));
+  const temp = persistent?.temp ?? (await mkdtemp(path.join(os.tmpdir(), 'codex-web-server-')));
   const root = path.join(temp, 'projects');
   const projectPath = path.join(root, 'demo');
   await mkdir(projectPath, { recursive: true });
@@ -612,9 +613,12 @@ async function fixture(
       : {}),
     ...configOverrides,
   };
-  const repository = new SqliteRepository(':memory:', config.eventRetentionPerThread);
+  const repository = new SqliteRepository(
+    persistent ? config.databasePath : ':memory:',
+    config.eventRetentionPerThread,
+  );
   seed?.({ repository, projectPath });
-  const appServer = new FakeAppServer();
+  const appServer = persistent?.appServer ?? new FakeAppServer();
   const attachmentStore = attachmentStoreFactory(config.attachmentStoragePath);
   const upgradeDrainPath = path.join(temp, 'upgrade-drain');
   const pathPolicy = await ProjectPathPolicy.create([root]);
@@ -4925,10 +4929,26 @@ describe('Codex routes', () => {
       headers: session.headers,
       payload: { text: 'second', idempotencyKey: '22222222-2222-4222-8222-222222222222' },
     });
-    expect(saturated.statusCode).toBe(429);
+    expect(saturated.statusCode).toBe(202);
+    expect(saturated.json()).toMatchObject({
+      data: { status: 'queued', queuedTurn: { position: 1, textPreview: 'second' } },
+    });
+    const queuedReplay = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${thread.id}/turns`,
+      headers: session.headers,
+      payload: { text: 'second', idempotencyKey: '22222222-2222-4222-8222-222222222222' },
+    });
+    expect(queuedReplay.statusCode).toBe(200);
+    expect(queuedReplay.json()).toMatchObject({ data: { status: 'queued' } });
     appServer.emit({
       method: 'turn/completed',
       params: { threadId: thread.id, turn: { id: 'turn-1' } },
+    });
+    await vi.waitFor(() => {
+      expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(
+        2,
+      );
     });
     const afterCompletion = await app.inject({
       method: 'POST',
@@ -4937,6 +4957,280 @@ describe('Codex routes', () => {
       payload: { text: 'third', idempotencyKey: '33333333-3333-4333-8333-333333333333' },
     });
     expect(afterCompletion.statusCode).toBe(202);
+    expect(afterCompletion.json()).toMatchObject({
+      data: { status: 'queued', queuedTurn: { position: 1 } },
+    });
+  });
+
+  it('dispatches queued root turns FIFO and exposes the durable projection on reload', async () => {
+    const { app, appServer, projectPath } = await fixture(1);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const firstThreadId = await createThread(app, project.id, session.headers);
+    const secondThreadId = await createThread(app, project.id, session.headers);
+    const thirdThreadId = await createThread(app, project.id, session.headers);
+    const start = (threadId: string, text: string, key: string) =>
+      app.inject({
+        method: 'POST',
+        url: `/api/threads/${threadId}/turns`,
+        headers: session.headers,
+        payload: { text, idempotencyKey: key },
+      });
+    expect(
+      (await start(firstThreadId, 'active', '10000000-0000-4000-8000-000000000001')).json(),
+    ).toMatchObject({ data: { status: 'started' } });
+    expect(
+      (await start(secondThreadId, 'queued second', '10000000-0000-4000-8000-000000000002')).json(),
+    ).toMatchObject({ data: { status: 'queued', queuedTurn: { position: 1 } } });
+    expect(
+      (await start(thirdThreadId, 'queued third', '10000000-0000-4000-8000-000000000002')).json(),
+    ).toMatchObject({ data: { status: 'queued', queuedTurn: { position: 2 } } });
+
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${thirdThreadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(detail.json()).toMatchObject({
+      queuedTurns: [{ status: 'queued', position: 2, textPreview: 'queued third' }],
+    });
+
+    appServer.setThreadStatus(firstThreadId, 'idle');
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: firstThreadId, turn: { id: 'turn-1' } },
+    });
+    await vi.waitFor(
+      () => {
+        const starts = appServer.requests.filter((request) => request.method === 'turn/start');
+        expect(starts).toHaveLength(2);
+        expect(starts[1]?.params).toMatchObject({ threadId: secondThreadId });
+      },
+      { timeout: 2_000 },
+    );
+    appServer.setThreadStatus(secondThreadId, 'idle');
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: secondThreadId, turn: { id: 'turn-2' } },
+    });
+    await vi.waitFor(
+      () => {
+        const starts = appServer.requests.filter((request) => request.method === 'turn/start');
+        expect(starts).toHaveLength(3);
+        expect(starts[2]?.params).toMatchObject({ threadId: thirdThreadId });
+      },
+      { timeout: 2_000 },
+    );
+  });
+
+  it('skips a queued follow-up for a busy thread and starts the oldest eligible thread', async () => {
+    const { app, appServer, repository, projectPath } = await fixture(2);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const busyThreadId = await createThread(app, project.id, session.headers);
+    const idleThreadId = await createThread(app, project.id, session.headers);
+    const send = (threadId: string, text: string, idempotencyKey: string) =>
+      app.inject({
+        method: 'POST',
+        url: `/api/threads/${threadId}/turns`,
+        headers: session.headers,
+        payload: { text, idempotencyKey },
+      });
+    await send(busyThreadId, 'active', '20000000-0000-4000-8000-000000000001');
+    await send(busyThreadId, 'follow-up', '20000000-0000-4000-8000-000000000002');
+    await send(idleThreadId, 'eligible', '20000000-0000-4000-8000-000000000003');
+
+    await vi.waitFor(
+      () => {
+        const starts = appServer.requests.filter((request) => request.method === 'turn/start');
+        expect(starts).toHaveLength(2);
+        expect(starts[1]?.params).toMatchObject({ threadId: idleThreadId });
+      },
+      { timeout: 2_000 },
+    );
+    const busyQueue = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${busyThreadId}/queued-turns`,
+      headers: { cookie: session.cookie },
+    });
+    expect(busyQueue.json()).toMatchObject({ data: [{ textPreview: 'follow-up' }] });
+    const queuedRecord = repository.listQueuedTurns(busyThreadId)[0];
+    expect(queuedRecord).toBeDefined();
+    expect(repository.claimQueuedTurn(queuedRecord!.id)).toBeDefined();
+    const archive = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${busyThreadId}/archive`,
+      headers: session.headers,
+    });
+    expect(archive.statusCode).toBe(409);
+    expect(archive.json()).toMatchObject({ error: { code: 'QUEUED_TURNS_PENDING' } });
+    repository.requeueTurn(queuedRecord!.id);
+  });
+
+  it('keeps queued attachment ownership until automatic dispatch binds the real turn', async () => {
+    const { app, appServer, repository, projectPath } = await fixture(1);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const firstThreadId = await createThread(app, project.id, session.headers);
+    const queuedThreadId = await createThread(app, project.id, session.headers);
+    await app.inject({
+      method: 'POST',
+      url: `/api/threads/${firstThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'active',
+        idempotencyKey: '30000000-0000-4000-8000-000000000001',
+      },
+    });
+    const upload = multipartFile('queued.txt', 'text/plain', Buffer.from('queued context'));
+    const uploaded = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/attachments`,
+      headers: { ...session.headers, 'content-type': upload.contentType },
+      payload: upload.body,
+    });
+    const attachment = uploaded.json<{ data: Attachment }>().data;
+    const queued = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'use attachment',
+        attachmentIds: [attachment.id],
+        idempotencyKey: '30000000-0000-4000-8000-000000000002',
+      },
+    });
+    expect(queued.json()).toMatchObject({ data: { status: 'queued' } });
+    expect(repository.getAttachment(attachment.id)?.turnId).toBe(
+      `queued:${queuedThreadId}:30000000-0000-4000-8000-000000000002`,
+    );
+
+    appServer.setThreadStatus(firstThreadId, 'idle');
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: firstThreadId, turn: { id: 'turn-1' } },
+    });
+    await vi.waitFor(() => {
+      expect(repository.getAttachment(attachment.id)?.turnId).toBe('turn-2');
+    });
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(2);
+  });
+
+  it('recovers a persisted queued request on API startup without duplicate native starts', async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-queue-restart-'));
+    const appServer = new FakeAppServer();
+    const first = await fixture(
+      1,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      { temp, appServer },
+    );
+    const session = await login(first.app);
+    const project = await createProject(first.app, first.projectPath, session.headers);
+    const firstThreadId = await createThread(first.app, project.id, session.headers);
+    const queuedThreadId = await createThread(first.app, project.id, session.headers);
+    await first.app.inject({
+      method: 'POST',
+      url: `/api/threads/${firstThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'active before restart',
+        idempotencyKey: '40000000-0000-4000-8000-000000000001',
+      },
+    });
+    await first.app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'survive restart',
+        idempotencyKey: '40000000-0000-4000-8000-000000000002',
+      },
+    });
+    await first.app.close();
+    openApps.splice(openApps.indexOf(first.app), 1);
+
+    const second = await fixture(
+      1,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      { temp, appServer },
+    );
+    await vi.waitFor(() => {
+      const queuedStarts = appServer.requests.filter(
+        (request) =>
+          request.method === 'turn/start' &&
+          (request.params as { clientUserMessageId?: string }).clientUserMessageId ===
+            '40000000-0000-4000-8000-000000000002',
+      );
+      expect(queuedStarts).toHaveLength(1);
+    });
+    const replay = await second.app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'survive restart',
+        idempotencyKey: '40000000-0000-4000-8000-000000000002',
+      },
+    });
+    expect(replay.statusCode).toBe(200);
+    expect(replay.json()).toMatchObject({ data: { status: 'started' } });
+  });
+
+  it('rejects queue overflow without consuming the idempotency key', async () => {
+    const { app, repository, projectPath } = await fixture(1);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    for (let index = 0; index < MAX_QUEUED_TURNS; index += 1) {
+      const idempotencyKey = `50000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+      const requestHashValue = `hash-${index}`;
+      expect(
+        repository.reserveIdempotent(`turn:${threadId}`, idempotencyKey, requestHashValue),
+      ).toEqual({
+        reserved: true,
+      });
+      repository.enqueueTurn({
+        threadId,
+        idempotencyKey,
+        requestHash: requestHashValue,
+        request: {
+          text: `queued ${index}`,
+          attachmentIds: [],
+          idempotencyKey,
+        },
+        claimToken: `queued:${idempotencyKey}`,
+      });
+    }
+    const overflowKey = '50000000-0000-4000-8000-999999999999';
+    const overflow = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'overflow', idempotencyKey: overflowKey },
+    });
+    expect(overflow.statusCode).toBe(429);
+    expect(overflow.json()).toMatchObject({
+      error: { code: 'TURN_QUEUE_CAPACITY_EXHAUSTED' },
+    });
+    expect(repository.getIdempotent(`turn:${threadId}`, overflowKey)).toBeUndefined();
   });
 
   it('reconciles a missed root terminal before the no-broker capacity fallback rejects', async () => {
@@ -5043,7 +5337,7 @@ describe('Codex routes', () => {
     });
     gate.release();
 
-    expect((await attemptedStart).statusCode).toBe(429);
+    expect((await attemptedStart).statusCode).toBe(202);
     expect(repository.getThread(firstThreadId)).toMatchObject({
       status: 'active',
       activeTurnId: null,
@@ -5121,18 +5415,25 @@ describe('Codex routes', () => {
       headers: session.headers,
       payload: { text: 'wait for capacity', idempotencyKey: saturatedKey },
     });
-    expect(saturated.statusCode).toBe(429);
+    expect(saturated.statusCode).toBe(202);
     expect(saturated.json()).toMatchObject({
-      error: { code: 'RESOURCE_CAPACITY_EXHAUSTED' },
+      data: { status: 'queued', queuedTurn: { position: 1 } },
     });
     expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(6);
-    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
-      upgradeDrain: { activeTurns: 6, pendingTurnStarts: 0 },
+    await vi.waitFor(async () => {
+      expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+        upgradeDrain: { activeTurns: 6, pendingTurnStarts: 0 },
+      });
     });
 
     appServer.emit({
       method: 'turn/completed',
       params: { threadId: threadIds[0], turn: { id: 'turn-1' } },
+    });
+    await vi.waitFor(() => {
+      expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(
+        7,
+      );
     });
     const retried = await app.inject({
       method: 'POST',
@@ -5140,7 +5441,8 @@ describe('Codex routes', () => {
       headers: session.headers,
       payload: { text: 'wait for capacity', idempotencyKey: saturatedKey },
     });
-    expect(retried.statusCode).toBe(202);
+    expect(retried.statusCode).toBe(200);
+    expect(retried.json()).toMatchObject({ data: { status: 'started' } });
     expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(7);
   });
 

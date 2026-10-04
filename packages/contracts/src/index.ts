@@ -251,6 +251,24 @@ export const startTurnRequestSchema = z
   .refine((value) => value.text.length > 0 || value.attachmentIds.length > 0, {
     message: 'A turn requires text or at least one attachment',
   });
+export type StartTurnRequest = z.infer<typeof startTurnRequestSchema>;
+
+export const queuedTurnSchema = z.object({
+  id: z.number().int().positive(),
+  threadId: z.string().min(1).max(200),
+  status: z.literal('queued'),
+  position: z.number().int().positive(),
+  textPreview: z.string().max(240),
+  attachmentCount: z.number().int().min(0).max(8),
+  createdAt: z.string().datetime(),
+});
+export type QueuedTurn = z.infer<typeof queuedTurnSchema>;
+
+export const startTurnResultSchema = z.discriminatedUnion('status', [
+  z.object({ status: z.literal('started'), turnId: z.string().min(1) }),
+  z.object({ status: z.literal('queued'), queuedTurn: queuedTurnSchema }),
+]);
+export type StartTurnResult = z.infer<typeof startTurnResultSchema>;
 
 export const attachmentKindSchema = z.enum(['image', 'file']);
 export const attachmentSchema = z.object({
