@@ -5265,11 +5265,12 @@ describe('Codex routes', () => {
     ).toHaveLength(0);
   });
 
-  it('exposes unresolved crash outcomes without an unsafe destructive resolution path', async () => {
-    const { app, repository, projectPath } = await fixture();
+  it('keeps an unresolved crash outcome fail closed while other threads continue', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const threadId = await createThread(app, project.id, session.headers);
+    const otherThreadId = await createThread(app, project.id, session.headers);
     const key = '42000000-0000-4000-8000-000000000001';
     const requestHashValue = 'unknown-hash';
     repository.reserveIdempotent(`turn:${threadId}`, key, requestHashValue);
@@ -5305,6 +5306,62 @@ describe('Codex routes', () => {
     });
     expect(unavailableCancel.statusCode).toBe(404);
     expect(repository.getQueuedTurn(queued.id)?.status).toBe('unknown');
+
+    const startsBeforeBlockedPost = appServer.requests.filter(
+      (request) => request.method === 'turn/start',
+    ).length;
+    const blocked = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'must not pass an ambiguous predecessor',
+        idempotencyKey: '42000000-0000-4000-8000-000000000002',
+      },
+    });
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json()).toMatchObject({ error: { code: 'QUEUED_TURN_OUTCOME_UNKNOWN' } });
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(
+      startsBeforeBlockedPost,
+    );
+
+    const followerKey = '42000000-0000-4000-8000-000000000003';
+    expect(repository.reserveIdempotent(`turn:${threadId}`, followerKey, 'follower-hash')).toEqual({
+      reserved: true,
+    });
+    const follower = repository.enqueueTurn({
+      threadId,
+      idempotencyKey: followerKey,
+      requestHash: 'follower-hash',
+      request: { text: 'already queued follower', attachmentIds: [], idempotencyKey: followerKey },
+      claimToken: `queued:${threadId}:${followerKey}`,
+    }).record;
+
+    const otherKey = '42000000-0000-4000-8000-000000000004';
+    const other = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${otherThreadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'independent thread', idempotencyKey: otherKey },
+    });
+    expect(other.statusCode).toBe(202);
+    await vi.waitFor(() => {
+      expect(
+        appServer.requests.filter(
+          (request) =>
+            request.method === 'turn/start' &&
+            (request.params as { clientUserMessageId?: string }).clientUserMessageId === otherKey,
+        ),
+      ).toHaveLength(1);
+    });
+    expect(repository.getQueuedTurn(follower.id)?.status).toBe('queued');
+    expect(
+      appServer.requests.filter(
+        (request) =>
+          request.method === 'turn/start' &&
+          (request.params as { clientUserMessageId?: string }).clientUserMessageId === followerKey,
+      ),
+    ).toHaveLength(0);
 
     const archive = await app.inject({
       method: 'POST',

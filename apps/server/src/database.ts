@@ -1686,6 +1686,14 @@ export class SqliteRepository {
     ).map(queuedTurnFromRow);
   }
 
+  hasUnknownQueuedTurn(threadId: string): boolean {
+    return (
+      this.database
+        .prepare("SELECT 1 FROM queued_turns WHERE thread_id=? AND status='unknown' LIMIT 1")
+        .get(threadId) !== undefined
+    );
+  }
+
   hasOutstandingQueuedTurns(threadId: string): boolean {
     return (
       this.database

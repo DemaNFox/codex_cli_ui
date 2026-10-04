@@ -2816,6 +2816,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const thread = repository.getThread(record.threadId);
     if (!thread || thread.archived) return false;
     return (
+      !repository.hasUnknownQueuedTurn(record.threadId) &&
       activeTurnIdForThread(record.threadId) === null &&
       !nativeActiveThreads.has(record.threadId) &&
       repository.countActiveSubagentsForRoot(record.threadId) === 0 &&
@@ -3077,6 +3078,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const thread = repository.getThread(id);
     if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
     if (thread.archived) throw new HttpError(409, 'THREAD_ARCHIVED');
+    if (repository.hasUnknownQueuedTurn(id))
+      throw new HttpError(409, 'QUEUED_TURN_OUTCOME_UNKNOWN');
     const project = repository.getProject(thread.projectId);
     if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
     if (new Set(input.attachmentIds).size !== input.attachmentIds.length)
