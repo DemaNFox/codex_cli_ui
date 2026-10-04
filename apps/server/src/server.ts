@@ -2381,6 +2381,12 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     });
     const project = repository.getProject(query.projectId);
     if (!project) throw new HttpError(404, 'PROJECT_NOT_FOUND');
+    const archiveStateAtRequestStart = new Map(
+      [
+        ...repository.listThreads(project.id, false),
+        ...repository.listThreads(project.id, true),
+      ].map((thread) => [thread.id, thread.archived] as const),
+    );
     const pageSchema = z
       .object({ data: z.array(rpcThreadSchema), nextCursor: z.string().nullable().optional() })
       .passthrough();
@@ -2400,11 +2406,16 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       for (const rpcThread of remote.data) {
         if (rpcThread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
         const existing = repository.getThread(rpcThread.id);
+        const archiveStateWasKnown = archiveStateAtRequestStart.has(rpcThread.id);
+        const archiveStateChanged =
+          existing !== undefined &&
+          (!archiveStateWasKnown ||
+            existing.archived !== archiveStateAtRequestStart.get(rpcThread.id));
         repository.upsertThread(
           mapThread(
             rpcThread,
             project.id,
-            query.archived,
+            archiveStateChanged ? existing.archived : query.archived,
             existing?.instructionSources ?? [],
             undefined,
             existing,
@@ -2557,18 +2568,62 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       try {
         await appServer.request(archived ? 'thread/archive' : 'thread/unarchive', { threadId: id });
       } catch (error) {
-        const hasUserContent = repository
-          .listEvents(id, 0)
-          .some((event) => event.kind === 'user-message');
-        const isUnpersistedEmptyThread =
-          error instanceof Error &&
-          error.message === 'APP_SERVER_REQUEST_FAILED' &&
-          !hasUserContent;
-        if (!isUnpersistedEmptyThread) throw error;
-        repository.audit(archived ? 'thread.archive' : 'thread.unarchive', 'degraded', {
-          threadId: id,
-          reason: 'empty_thread_not_persisted_upstream',
-        });
+        let upstreamStateConfirmed = false;
+        if (error instanceof Error && error.message === 'APP_SERVER_REQUEST_FAILED') {
+          try {
+            const project = repository.getProject(thread.projectId);
+            if (project) {
+              const cwd = await canonicalProjectPath(pathPolicy, project);
+              let cursor: string | null = null;
+              const seenCursors = new Set<string>();
+              for (let page = 0; page < 100; page += 1) {
+                const remote = z
+                  .object({
+                    data: z.array(rpcThreadSchema),
+                    nextCursor: z.string().nullable().optional(),
+                  })
+                  .passthrough()
+                  .parse(
+                    await appServer.request('thread/list', {
+                      cwd,
+                      archived,
+                      cursor,
+                      limit: 100,
+                      sourceKinds: ['cli', 'vscode', 'appServer', 'exec'],
+                    }),
+                  );
+                upstreamStateConfirmed = remote.data.some(
+                  (candidate) => candidate.id === id && candidate.cwd === cwd,
+                );
+                if (upstreamStateConfirmed || remote.nextCursor == null) break;
+                if (seenCursors.has(remote.nextCursor)) break;
+                seenCursors.add(remote.nextCursor);
+                cursor = remote.nextCursor;
+              }
+            }
+          } catch {
+            upstreamStateConfirmed = false;
+          }
+        }
+        if (upstreamStateConfirmed) {
+          repository.audit(archived ? 'thread.archive' : 'thread.unarchive', 'degraded', {
+            threadId: id,
+            reason: 'upstream_state_already_applied',
+          });
+        } else {
+          const hasUserContent = repository
+            .listEvents(id, 0)
+            .some((event) => event.kind === 'user-message');
+          const isUnpersistedEmptyThread =
+            error instanceof Error &&
+            error.message === 'APP_SERVER_REQUEST_FAILED' &&
+            !hasUserContent;
+          if (!isUnpersistedEmptyThread) throw error;
+          repository.audit(archived ? 'thread.archive' : 'thread.unarchive', 'degraded', {
+            threadId: id,
+            reason: 'empty_thread_not_persisted_upstream',
+          });
+        }
       }
     }
     const updated = repository.setThreadArchived(id, archived)!;

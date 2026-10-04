@@ -61,6 +61,10 @@ class FakeAppServer implements AppServerClient {
   private signalAccountLoginStart: (() => void) | null = null;
   private threadStartGate: Promise<void> | null = null;
   private signalThreadStart: (() => void) | null = null;
+  private threadListGate: Promise<void> | null = null;
+  private signalThreadList: (() => void) | null = null;
+  private failArchiveAfterMutation = false;
+  private readonly archivedThreadIds = new Set<string>();
   failNextRequestWith: Error | null = null;
   failTurnStartWith: Error | null = null;
   failNextResponseWith: Error | null = null;
@@ -133,6 +137,23 @@ class FakeAppServer implements AppServerClient {
     });
     this.signalThreadStart = signalEntered;
     return { entered, release: releaseGate };
+  }
+
+  blockThreadLists(): { entered: Promise<void>; release: () => void } {
+    let releaseGate!: () => void;
+    let signalEntered!: () => void;
+    this.threadListGate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve;
+    });
+    this.signalThreadList = signalEntered;
+    return { entered, release: releaseGate };
+  }
+
+  failNextArchiveResponseAfterMutation(): void {
+    this.failArchiveAfterMutation = true;
   }
 
   setThreadTurns(threadId: string, turns: unknown[]): void {
@@ -270,7 +291,14 @@ class FakeAppServer implements AppServerClient {
     }
     if (method === 'thread/list') {
       const offset = values.cursor === null ? 0 : Number(values.cursor);
-      const threads = [...this.threads.values()];
+      const archived = values.archived === true;
+      const threads = [...this.threads.entries()]
+        .filter(([id]) => this.archivedThreadIds.has(id) === archived)
+        .map(([, thread]) => ({ ...thread }));
+      this.signalThreadList?.();
+      this.signalThreadList = null;
+      if (this.threadListGate) await this.threadListGate;
+      this.threadListGate = null;
       const end = Math.min(threads.length, offset + this.listPageSize);
       return {
         data: threads.slice(offset, end),
@@ -303,8 +331,17 @@ class FakeAppServer implements AppServerClient {
       if (thread) thread.name = values.name;
       return {};
     }
-    if (method === 'thread/archive' || method === 'thread/unarchive' || method === 'turn/interrupt')
+    if (method === 'thread/archive' || method === 'thread/unarchive') {
+      const threadId = String(values.threadId);
+      if (method === 'thread/archive') this.archivedThreadIds.add(threadId);
+      else this.archivedThreadIds.delete(threadId);
+      if (this.failArchiveAfterMutation) {
+        this.failArchiveAfterMutation = false;
+        throw new Error('APP_SERVER_REQUEST_FAILED');
+      }
       return {};
+    }
+    if (method === 'turn/interrupt') return {};
     if (method === 'turn/start') {
       this.signalTurnStart?.();
       this.signalTurnStart = null;
@@ -1977,6 +2014,68 @@ describe('Codex routes', () => {
     ).toBe(200);
     expect(appServer.requests.map((item) => item.method)).toContain('thread/archive');
     expect(appServer.requests.map((item) => item.method)).toContain('thread/unarchive');
+  });
+
+  it('does not let a stale active-thread list overwrite a concurrent archive', async () => {
+    const { app, appServer, projectPath, repository } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const listGate = appServer.blockThreadLists();
+
+    const staleList = app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
+    await listGate.entered;
+
+    const archived = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/archive`,
+      headers: session.headers,
+    });
+    expect(archived.statusCode).toBe(200);
+    listGate.release();
+
+    const staleResponse = await staleList;
+    expect(staleResponse.statusCode).toBe(200);
+    expect(staleResponse.json<{ data: { id: string }[] }>().data).not.toContainEqual(
+      expect.objectContaining({ id: threadId }),
+    );
+    expect(repository.getThread(threadId)?.archived).toBe(true);
+  });
+
+  it('reconciles an archive whose upstream mutation succeeded but response failed', async () => {
+    const { app, appServer, projectPath, repository } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Persisted before archive',
+        idempotencyKey: '00000000-0000-4000-8000-000000000062',
+      },
+    });
+    expect(turn.statusCode).toBe(202);
+    appServer.failNextArchiveResponseAfterMutation();
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/archive`,
+      headers: session.headers,
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json<{ data: { archived: boolean } }>().data.archived).toBe(true);
+    expect(repository.getThread(threadId)?.archived).toBe(true);
+    const [archiveRequest, reconciliationRequest] = appServer.requests.slice(-2);
+    expect(archiveRequest?.method).toBe('thread/archive');
+    expect(reconciliationRequest?.method).toBe('thread/list');
+    expect(reconciliationRequest?.params).toMatchObject({ archived: true });
   });
 
   it('archives an empty local chat when Codex has not persisted its thread yet', async () => {
