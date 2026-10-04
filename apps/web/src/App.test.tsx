@@ -3293,7 +3293,9 @@ describe('App', () => {
     await user.click(screen.getByRole('menuitem', { name: 'Архивировать чат' }));
 
     expect(
-      await screen.findByText('Не удалось архивировать чат. Он остался на месте; повторите позже.'),
+      await screen.findByText(
+        'Не удалось подтвердить, что чат архивирован. Обновите страницу и проверьте состояние чата перед повторной попыткой.',
+      ),
     ).not.toBeNull();
     expect(screen.queryByText('Request failed')).toBeNull();
   });
