@@ -5,6 +5,7 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type ReactNode,
   type RefObject,
+  useCallback,
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -21,6 +22,7 @@ import type {
 
 import { ApiError, api } from './api.js';
 import { AgentMessageContent } from './AgentMessageContent.js';
+import { ImagePreviewDialog } from './ImagePreviewDialog.js';
 import type {
   Attachment,
   Capability,
@@ -120,6 +122,11 @@ interface QueuedAttachment {
   status: 'queued' | 'uploading' | 'uploaded' | 'error';
   uploaded: Attachment | null;
   error: string | null;
+}
+
+interface PreviewImage {
+  name: string;
+  src: string;
 }
 
 function formatBytes(bytes: number): string {
@@ -374,7 +381,13 @@ function safeAttachmentUrl(value: string): string | null {
   return value.startsWith('/api/threads/') ? value : null;
 }
 
-function AttachmentList({ attachments }: { attachments: Attachment[] }) {
+function AttachmentList({
+  attachments,
+  onPreview,
+}: {
+  attachments: Attachment[];
+  onPreview: (image: PreviewImage) => void;
+}) {
   if (!attachments.length) return null;
   return (
     <ul className="message-attachments" aria-label="Вложения сообщения">
@@ -383,15 +396,15 @@ function AttachmentList({ attachments }: { attachments: Attachment[] }) {
         return (
           <li key={attachment.id}>
             {attachment.kind === 'image' && url ? (
-              <a
-                href={url}
-                target="_blank"
-                rel="noreferrer"
-                aria-label={`Открыть ${attachment.name}`}
+              <button
+                type="button"
+                className="attachment-image-button"
+                aria-label={`Предпросмотреть ${attachment.name}`}
+                onClick={() => onPreview({ name: attachment.name, src: url })}
               >
                 <img src={url} alt={attachment.name} loading="lazy" />
                 <span>{attachment.name}</span>
-              </a>
+              </button>
             ) : url ? (
               <a href={url} download={attachment.name}>
                 <span className="attachment-file-icon" aria-hidden="true">
@@ -1812,10 +1825,12 @@ function Transcript({
   events,
   serverTurnNavigation,
   onNavigateTurn,
+  onPreviewImage,
 }: {
   events: SafeEvent[];
   serverTurnNavigation: TurnNavigationEntry[] | null;
   onNavigateTurn: (anchorId: string) => void;
+  onPreviewImage: (image: PreviewImage) => void;
 }) {
   const displayEvents = useMemo(() => {
     const output: SafeEvent[] = [];
@@ -2080,7 +2095,7 @@ function Transcript({
                     paths={fallbackGeneratedFiles}
                   />
                 )}
-                <AttachmentList attachments={attachments} />
+                <AttachmentList attachments={attachments} onPreview={onPreviewImage} />
               </article>
             );
           }
@@ -2911,6 +2926,7 @@ function Workspace({
   const [composer, setComposer] = useState('');
   const [queuedTurns, setQueuedTurns] = useState<QueuedTurn[]>([]);
   const [queuedAttachments, setQueuedAttachments] = useState<QueuedAttachment[]>([]);
+  const [previewImage, setPreviewImage] = useState<PreviewImage | null>(null);
   const [threadAttachmentBytes, setThreadAttachmentBytes] = useState(0);
   const [attachmentNotice, setAttachmentNotice] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
@@ -3225,6 +3241,19 @@ function Workspace({
   useEffect(() => {
     queuedAttachmentsRef.current = queuedAttachments;
   }, [queuedAttachments]);
+
+  useEffect(
+    () => () => {
+      for (const item of queuedAttachmentsRef.current) {
+        if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+      }
+      queuedAttachmentsRef.current = [];
+    },
+    [],
+  );
+
+  const openImagePreview = useCallback((image: PreviewImage) => setPreviewImage(image), []);
+  const closeImagePreview = useCallback(() => setPreviewImage(null), []);
 
   useEffect(() => {
     if (!threadId || (queuedTurns.length === 0 && queueChangeEventId === undefined)) return;
@@ -3739,6 +3768,7 @@ function Workspace({
   useEffect(() => {
     const previousThreadId = attachmentThreadRef.current;
     attachmentThreadRef.current = threadId;
+    closeImagePreview();
     if (previousThreadId && previousThreadId !== threadId) {
       for (const upload of activeUploadsRef.current.values()) {
         if (upload.threadId === previousThreadId) upload.abort();
@@ -3805,7 +3835,7 @@ function Workspace({
     return () => {
       cancelled = true;
     };
-  }, [mergeEvents, threadId]);
+  }, [closeImagePreview, mergeEvents, threadId]);
 
   async function refreshThreads(selectId?: string | null) {
     if (!projectId) return;
@@ -3967,7 +3997,10 @@ function Workspace({
         return;
       }
     }
-    if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+    if (item.previewUrl) {
+      setPreviewImage((current) => (current?.src === item.previewUrl ? null : current));
+      URL.revokeObjectURL(item.previewUrl);
+    }
     setQueuedAttachments((current) => current.filter((candidate) => candidate.localId !== localId));
   }
 
@@ -4025,6 +4058,9 @@ function Workspace({
     setThreadAttachmentBytes(
       (current) =>
         current + attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
+    );
+    setPreviewImage((preview) =>
+      preview && queuedAttachments.some((item) => item.previewUrl === preview.src) ? null : preview,
     );
     setQueuedAttachments((current) => {
       current.forEach((item) => {
@@ -4507,6 +4543,7 @@ function Workspace({
               events={events}
               serverTurnNavigation={serverTurnNavigation}
               onNavigateTurn={navigateToTurn}
+              onPreviewImage={openImagePreview}
             />
             {queuedTurns.length > 0 && (
               <section className="queued-turns" aria-label="Задачи в очереди" aria-live="polite">
@@ -4730,7 +4767,16 @@ function Workspace({
                 {queuedAttachments.map((item) => (
                   <li className={item.status === 'error' ? 'failed' : ''} key={item.localId}>
                     {item.previewUrl ? (
-                      <img src={item.previewUrl} alt="" />
+                      <button
+                        type="button"
+                        className="queued-image-preview"
+                        aria-label={`Предпросмотреть ${item.file.name}`}
+                        onClick={() =>
+                          openImagePreview({ name: item.file.name, src: item.previewUrl! })
+                        }
+                      >
+                        <img src={item.previewUrl} alt="" />
+                      </button>
                     ) : (
                       <span className="attachment-file-icon" aria-hidden="true">
                         ＋
@@ -4881,6 +4927,13 @@ function Workspace({
           onCopy={() => void copyAccountLoginCode()}
           onCancel={() => void cancelAccountLogin()}
           onClose={closeAccountLoginDialog}
+        />
+      )}
+      {previewImage && (
+        <ImagePreviewDialog
+          name={previewImage.name}
+          src={previewImage.src}
+          onClose={closeImagePreview}
         />
       )}
     </main>

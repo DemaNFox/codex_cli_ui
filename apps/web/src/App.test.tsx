@@ -3000,6 +3000,13 @@ describe('App', () => {
       clipboardData: { files: [new File(['paste'], 'paste.png', { type: 'image/png' })] },
     });
     expect(await screen.findByText('paste.png')).not.toBeNull();
+    await user.click(screen.getByRole('button', { name: 'Предпросмотреть paste.png' }));
+    const preview = screen.getByRole('dialog', { name: 'paste.png' });
+    expect(within(preview).getByRole('img', { name: 'paste.png' }).getAttribute('src')).toBe(
+      'blob:preview',
+    );
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(screen.queryByRole('dialog', { name: 'paste.png' })).toBeNull();
 
     const composer = textarea.closest('.composer');
     expect(composer).not.toBeNull();
@@ -3013,6 +3020,10 @@ describe('App', () => {
 
     await user.click(screen.getByRole('button', { name: 'Удалить picker.txt' }));
     expect(screen.queryByText('picker.txt')).toBeNull();
+    await user.click(screen.getByRole('button', { name: 'Удалить paste.png' }));
+    expect(
+      (URL.revokeObjectURL as unknown as { mock: { calls: unknown[][] } }).mock.calls,
+    ).toContainEqual(['blob:preview']);
     expect(FakeXMLHttpRequest.instances).toHaveLength(0);
   });
 
@@ -3136,6 +3147,17 @@ describe('App', () => {
 
     const image = await screen.findByRole('img', { name: 'макет.png' });
     expect(image.getAttribute('src')).toBe('/api/threads/thread-1/attachments/image-1/content');
+    await userEvent
+      .setup()
+      .click(screen.getByRole('button', { name: 'Предпросмотреть макет.png' }));
+    const preview = screen.getByRole('dialog', { name: 'макет.png' });
+    expect(within(preview).getByRole('img', { name: 'макет.png' }).getAttribute('src')).toBe(
+      '/api/threads/thread-1/attachments/image-1/content',
+    );
+    await userEvent
+      .setup()
+      .click(within(preview).getByRole('button', { name: 'Закрыть предпросмотр' }));
+    expect(screen.queryByRole('dialog', { name: 'макет.png' })).toBeNull();
     const download = screen.getByRole('link', { name: /требования\.pdf/ });
     expect(download.getAttribute('href')).toBe('/api/threads/thread-1/attachments/file-1/content');
     expect(download.hasAttribute('download')).toBe(true);
