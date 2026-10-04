@@ -2568,6 +2568,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       try {
         await appServer.request(archived ? 'thread/archive' : 'thread/unarchive', { threadId: id });
       } catch (error) {
+        // The native mutation may have succeeded even when its response was lost. Treat the
+        // loaded-state cache as invalid immediately so a later turn cannot skip thread/resume.
+        loadedThreadGenerations.delete(id);
         let upstreamStateConfirmed = false;
         if (error instanceof Error && error.message === 'APP_SERVER_REQUEST_FAILED') {
           try {

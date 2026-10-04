@@ -64,6 +64,7 @@ class FakeAppServer implements AppServerClient {
   private threadListGate: Promise<void> | null = null;
   private signalThreadList: (() => void) | null = null;
   private failArchiveAfterMutation = false;
+  private failArchiveReconciliationList = false;
   private readonly archivedThreadIds = new Set<string>();
   private readonly unloadedThreadIds = new Set<string>();
   failNextRequestWith: Error | null = null;
@@ -155,6 +156,11 @@ class FakeAppServer implements AppServerClient {
 
   failNextArchiveResponseAfterMutation(): void {
     this.failArchiveAfterMutation = true;
+  }
+
+  failNextArchiveResponseAndReconciliation(): void {
+    this.failArchiveAfterMutation = true;
+    this.failArchiveReconciliationList = true;
   }
 
   setThreadTurns(threadId: string, turns: unknown[]): void {
@@ -291,6 +297,10 @@ class FakeAppServer implements AppServerClient {
       };
     }
     if (method === 'thread/list') {
+      if (this.failArchiveReconciliationList) {
+        this.failArchiveReconciliationList = false;
+        throw new Error('APP_SERVER_REQUEST_FAILED');
+      }
       const offset = values.cursor === null ? 0 : Number(values.cursor);
       const archived = values.archived === true;
       const threads = [...this.threads.entries()]
@@ -2082,6 +2092,48 @@ describe('Codex routes', () => {
     expect(archiveRequest?.method).toBe('thread/archive');
     expect(reconciliationRequest?.method).toBe('thread/list');
     expect(reconciliationRequest?.params).toMatchObject({ archived: true });
+  });
+
+  it('invalidates loaded state when an archive outcome and reconciliation are both ambiguous', async () => {
+    const { app, appServer, projectPath, repository } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    repository.appendEvent({
+      threadId,
+      turnId: 'turn-existing',
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'Existing persisted history' },
+    });
+    appServer.failNextArchiveResponseAndReconciliation();
+
+    const archive = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/archive`,
+      headers: session.headers,
+    });
+    expect(archive.statusCode).toBe(500);
+
+    const sent = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Continue after ambiguous archive',
+        idempotencyKey: '00000000-0000-4000-8000-000000000064',
+      },
+    });
+
+    expect(sent.statusCode).toBe(202);
+    const resumeIndex = appServer.requests.findIndex(
+      (request) => request.method === 'thread/resume',
+    );
+    const turnStartIndex = appServer.requests.findIndex(
+      (request) => request.method === 'turn/start',
+    );
+    expect(resumeIndex).toBeGreaterThan(-1);
+    expect(turnStartIndex).toBeGreaterThan(resumeIndex);
   });
 
   it('resumes a restored thread before starting its next turn', async () => {
