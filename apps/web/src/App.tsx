@@ -429,11 +429,7 @@ function archiveErrorMessage(error: unknown, action: 'archive' | 'restore'): str
     if (error.code === 'QUEUED_TURNS_PENDING') {
       return 'В этом чате есть задачи в очереди. Дождитесь их запуска или завершения, затем архивируйте чат.';
     }
-    if (
-      error.code === 'APP_SERVER_UNAVAILABLE' ||
-      error.code === 'APP_SERVER_REQUEST_FAILED' ||
-      error.code === 'REQUEST_FAILED'
-    ) {
+    if (error.code === 'APP_SERVER_UNAVAILABLE') {
       return action === 'archive'
         ? 'Codex временно недоступен. Чат не архивирован — повторите позже.'
         : 'Codex временно недоступен. Чат не восстановлен — повторите позже.';
