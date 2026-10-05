@@ -5239,7 +5239,7 @@ describe('Codex routes', () => {
   });
 
   it('cancels only the addressed queued turn, releases attachments, audits and publishes the change', async () => {
-    const { app, repository, projectPath } = await fixture(1);
+    const { app, repository, attachmentStore, projectPath } = await fixture(1);
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const activeThreadId = await createThread(app, project.id, session.headers);
@@ -5261,6 +5261,7 @@ describe('Codex routes', () => {
       payload: upload.body,
     });
     const attachment = uploaded.json<{ data: Attachment }>().data;
+    const storedAttachment = repository.getAttachment(attachment.id)!;
     const queuedResponse = await app.inject({
       method: 'POST',
       url: `/api/threads/${queuedThreadId}/turns`,
@@ -5295,7 +5296,11 @@ describe('Codex routes', () => {
     expect(cancelled.statusCode).toBe(204);
     expect(repository.getQueuedTurn(queuedTurnId)).toBeUndefined();
     expect(repository.claimQueuedTurn(queuedTurnId)).toBeUndefined();
-    expect(repository.getAttachment(attachment.id)?.turnId).toBeNull();
+    expect(repository.getAttachment(attachment.id)).toBeUndefined();
+    expect(repository.attachmentBytesForThread(queuedThreadId)).toBe(0);
+    await expect(
+      attachmentStore.read(project.id, queuedThreadId, storedAttachment.storageName),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
     expect(
       repository
         .listEvents(queuedThreadId, 0)
@@ -5307,7 +5312,11 @@ describe('Codex routes', () => {
       )
       .get() as { outcome: string; metadata_json: string };
     expect(audit.outcome).toBe('succeeded');
-    expect(JSON.parse(audit.metadata_json)).toEqual({ threadId: queuedThreadId, queuedTurnId });
+    expect(JSON.parse(audit.metadata_json)).toEqual({
+      threadId: queuedThreadId,
+      queuedTurnId,
+      attachmentCount: 1,
+    });
     const alreadyGone = await app.inject({
       method: 'DELETE',
       url: `/api/threads/${queuedThreadId}/queued-turns/${queuedTurnId}`,
@@ -5315,6 +5324,64 @@ describe('Codex routes', () => {
     });
     expect(alreadyGone.statusCode).toBe(404);
     expect(alreadyGone.json()).toMatchObject({ error: { code: 'QUEUED_TURN_NOT_FOUND' } });
+  });
+
+  it('bounds and audits queued attachment file cleanup failures after releasing database quota', async () => {
+    const { app, repository, projectPath } = await fixture(
+      1,
+      undefined,
+      (root) => new FailingRemoveAttachmentStore(root),
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const activeThreadId = await createThread(app, project.id, session.headers);
+    const queuedThreadId = await createThread(app, project.id, session.headers);
+    await app.inject({
+      method: 'POST',
+      url: `/api/threads/${activeThreadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'active', idempotencyKey: '11500000-0000-4000-8000-000000000001' },
+    });
+    const upload = multipartFile('cleanup.txt', 'text/plain', Buffer.from('cleanup context'));
+    const uploaded = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/attachments`,
+      headers: { ...session.headers, 'content-type': upload.contentType },
+      payload: upload.body,
+    });
+    const attachment = uploaded.json<{ data: Attachment }>().data;
+    const queued = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'cancel despite cleanup failure',
+        attachmentIds: [attachment.id],
+        idempotencyKey: '11500000-0000-4000-8000-000000000002',
+      },
+    });
+    const queuedTurnId = queued.json<{ data: { queuedTurn: { id: number } } }>().data.queuedTurn.id;
+
+    const cancelled = await app.inject({
+      method: 'DELETE',
+      url: `/api/threads/${queuedThreadId}/queued-turns/${queuedTurnId}`,
+      headers: session.headers,
+    });
+    expect(cancelled.statusCode).toBe(204);
+    expect(repository.getQueuedTurn(queuedTurnId)).toBeUndefined();
+    expect(repository.getAttachment(attachment.id)).toBeUndefined();
+    expect(repository.attachmentBytesForThread(queuedThreadId)).toBe(0);
+    const cleanupAudit = repository.database
+      .prepare(
+        "SELECT outcome,metadata_json FROM audit_events WHERE action='turn.queue.cancel.cleanup' ORDER BY id DESC LIMIT 1",
+      )
+      .get() as { outcome: string; metadata_json: string };
+    expect(cleanupAudit.outcome).toBe('failed');
+    expect(JSON.parse(cleanupAudit.metadata_json)).toEqual({
+      threadId: queuedThreadId,
+      queuedTurnId,
+      failedAttachmentCount: 1,
+    });
   });
 
   it('protects queued-turn cancellation and validates its numeric identifier', async () => {

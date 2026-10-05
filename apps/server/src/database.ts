@@ -1723,7 +1723,13 @@ export class SqliteRepository {
     return result.changes === 1 ? this.getQueuedTurn(id) : undefined;
   }
 
-  cancelQueuedTurn(threadId: string, id: number): 'cancelled' | 'not_found' | 'not_cancellable' {
+  cancelQueuedTurn(
+    threadId: string,
+    id: number,
+  ):
+    | { status: 'cancelled'; attachments: AttachmentRecord[] }
+    | { status: 'not_found' }
+    | { status: 'not_cancellable' } {
     this.database.exec('BEGIN IMMEDIATE');
     try {
       const row = this.database
@@ -1732,21 +1738,30 @@ export class SqliteRepository {
         { thread_id: string; status: QueuedTurnRecord['status']; claim_token: string } | undefined;
       if (!row || row.thread_id !== threadId) {
         this.database.exec('COMMIT');
-        return 'not_found';
+        return { status: 'not_found' };
       }
       if (row.status !== 'queued') {
         this.database.exec('COMMIT');
-        return 'not_cancellable';
+        return { status: 'not_cancellable' };
       }
-      this.database
-        .prepare('UPDATE attachments SET turn_id=NULL WHERE thread_id=? AND turn_id=?')
-        .run(threadId, row.claim_token);
+      const attachments = (
+        this.database
+          .prepare(
+            'SELECT * FROM attachments WHERE thread_id=? AND turn_id=? ORDER BY created_at,id',
+          )
+          .all(threadId, row.claim_token) as unknown as AttachmentRow[]
+      ).map(attachmentFromRow);
+      const removedAttachments = this.database
+        .prepare('DELETE FROM attachments WHERE thread_id=? AND turn_id=?')
+        .run(threadId, row.claim_token).changes;
+      if (removedAttachments !== attachments.length)
+        throw new Error('QUEUED_TURN_ATTACHMENT_CANCELLATION_FAILED');
       const removed = this.database
         .prepare("DELETE FROM queued_turns WHERE id=? AND thread_id=? AND status='queued'")
         .run(id, threadId).changes;
       if (removed !== 1) throw new Error('QUEUED_TURN_CANCELLATION_FAILED');
       this.database.exec('COMMIT');
-      return 'cancelled';
+      return { status: 'cancelled', attachments };
     } catch (error) {
       this.database.exec('ROLLBACK');
       throw error;

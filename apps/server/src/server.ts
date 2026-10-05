@@ -3179,16 +3179,40 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return { data: repository.listVisibleQueuedTurns(id).map(publicQueuedTurn) };
   });
 
-  app.delete('/api/threads/:id/queued-turns/:queuedTurnId', (request, reply) => {
+  app.delete('/api/threads/:id/queued-turns/:queuedTurnId', async (request, reply) => {
     csrfGuard(auth, request);
     const params = queuedTurnParamsSchema.parse(request.params);
-    if (!repository.getThread(params.id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
-    const result = repository.cancelQueuedTurn(params.id, params.queuedTurnId);
-    if (result === 'not_found') throw new HttpError(404, 'QUEUED_TURN_NOT_FOUND');
-    if (result === 'not_cancellable') throw new HttpError(409, 'QUEUED_TURN_NOT_CANCELLABLE');
+    const thread = repository.getThread(params.id);
+    if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    const project = repository.getProject(thread.projectId);
+    if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+    const cancellation = await attachmentStore.withThreadLock(params.id, async () => {
+      const result = repository.cancelQueuedTurn(params.id, params.queuedTurnId);
+      if (result.status !== 'cancelled') return { result, cleanupFailures: 0 };
+      const cleanup = await Promise.allSettled(
+        result.attachments.map((attachment) =>
+          attachmentStore.remove(project.id, params.id, attachment.storageName),
+        ),
+      );
+      return {
+        result,
+        cleanupFailures: cleanup.filter((item) => item.status === 'rejected').length,
+      };
+    });
+    const result = cancellation.result;
+    if (result.status === 'not_found') throw new HttpError(404, 'QUEUED_TURN_NOT_FOUND');
+    if (result.status === 'not_cancellable')
+      throw new HttpError(409, 'QUEUED_TURN_NOT_CANCELLABLE');
+    if (cancellation.cleanupFailures > 0)
+      repository.audit('turn.queue.cancel.cleanup', 'failed', {
+        threadId: params.id,
+        queuedTurnId: params.queuedTurnId,
+        failedAttachmentCount: cancellation.cleanupFailures,
+      });
     repository.audit('turn.queue.cancel', 'succeeded', {
       threadId: params.id,
       queuedTurnId: params.queuedTurnId,
+      attachmentCount: result.attachments.length,
     });
     publishQueueChanged(params.id);
     requestQueuedTurnDispatch();
