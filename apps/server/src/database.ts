@@ -430,9 +430,6 @@ export class SqliteRepository {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS attachment_file_deletions_order_idx
-        ON attachment_file_deletions(next_attempt_at,created_at,id);
-
       CREATE TABLE IF NOT EXISTS thread_history_state (
         thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
         hydrated_at TEXT NOT NULL
@@ -560,6 +557,7 @@ export class SqliteRepository {
     this.migrateApprovalResolvingState();
     this.migrateIdempotencyState();
     this.migrateThreadActiveTurn();
+    this.migrateAttachmentFileDeletionDueTime();
     this.recoverInterruptedQueuedTurns();
     this.enforcePushStorageBounds();
   }
@@ -657,6 +655,40 @@ export class SqliteRepository {
     }[];
     if (!columns.some((column) => column.name === 'active_turn_id'))
       this.database.exec('ALTER TABLE threads ADD COLUMN active_turn_id TEXT');
+  }
+
+  private migrateAttachmentFileDeletionDueTime(): void {
+    const columns = this.database
+      .prepare('PRAGMA table_info(attachment_file_deletions)')
+      .all() as unknown as { name: string }[];
+    const hasDueTime = columns.some((column) => column.name === 'next_attempt_at');
+    const index = this.database
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='attachment_file_deletions_order_idx'",
+      )
+      .get() as { sql: string | null } | undefined;
+    const normalizedIndex = index?.sql?.replaceAll(/\s+/gu, '').toLowerCase() ?? '';
+    if (
+      hasDueTime &&
+      normalizedIndex.includes('onattachment_file_deletions(next_attempt_at,created_at,id)')
+    )
+      return;
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      if (!hasDueTime)
+        this.database.exec(
+          'ALTER TABLE attachment_file_deletions ADD COLUMN next_attempt_at INTEGER NOT NULL DEFAULT 0',
+        );
+      this.database.exec(`
+        DROP INDEX IF EXISTS attachment_file_deletions_order_idx;
+        CREATE INDEX attachment_file_deletions_order_idx
+          ON attachment_file_deletions(next_attempt_at,created_at,id);
+        COMMIT;
+      `);
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   private migrateApprovalResolvingState(): void {

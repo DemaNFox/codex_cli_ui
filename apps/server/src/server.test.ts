@@ -11,6 +11,7 @@ import { mkdtemp, mkdir, rename, symlink, unlink, writeFile } from 'node:fs/prom
 import { createServer as createNetServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 
 import {
@@ -5251,6 +5252,60 @@ describe('Codex routes', () => {
       },
       { timeout: 2_000 },
     );
+  });
+
+  it('migrates legacy attachment cleanup tombstones to due-time scheduling without data loss', async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-cleanup-migration-'));
+    const databasePath = path.join(temp, 'legacy.sqlite3');
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      CREATE TABLE attachment_file_deletions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        storage_name TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX attachment_file_deletions_order_idx
+        ON attachment_file_deletions(created_at,id);
+      INSERT INTO attachment_file_deletions(
+        id,project_id,thread_id,storage_name,attempts,created_at,updated_at
+      ) VALUES(
+        '00000000-0000-4000-8000-000000000099','legacy-project','legacy-thread',
+        '00000000-0000-4000-8000-000000000099.txt',3,
+        '2026-10-06T00:00:00.000Z','2026-10-06T00:01:00.000Z'
+      );
+    `);
+    legacy.close();
+
+    const migrated = new SqliteRepository(databasePath, 1_000);
+    const columns = migrated.database
+      .prepare('PRAGMA table_info(attachment_file_deletions)')
+      .all() as unknown as { name: string }[];
+    expect(columns.map((column) => column.name)).toContain('next_attempt_at');
+    const index = migrated.database
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND name='attachment_file_deletions_order_idx'",
+      )
+      .get() as { sql: string };
+    expect(index.sql.replaceAll(/\s+/gu, '').toLowerCase()).toContain(
+      'onattachment_file_deletions(next_attempt_at,created_at,id)',
+    );
+    expect(migrated.listAttachmentFileDeletions()).toEqual([
+      {
+        id: '00000000-0000-4000-8000-000000000099',
+        projectId: 'legacy-project',
+        threadId: 'legacy-thread',
+        storageName: '00000000-0000-4000-8000-000000000099.txt',
+        attempts: 3,
+        nextAttemptAt: 0,
+        createdAt: '2026-10-06T00:00:00.000Z',
+        updatedAt: '2026-10-06T00:01:00.000Z',
+      },
+    ]);
+    migrated.close();
   });
 
   it('cancels only the addressed queued turn, releases attachments, audits and publishes the change', async () => {
