@@ -1004,7 +1004,21 @@ def main() -> int:
         jump_to_latest.click()
 
         if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1":
-            queued_region.get_by_role("button", name="Отменить задачу").click()
+            cancel_queued = queued_region.get_by_role("button", name="Отменить задачу")
+            cancel_box = cancel_queued.bounding_box()
+            if (
+                not cancel_box
+                or cancel_box["x"] < 0
+                or cancel_box["x"] + cancel_box["width"] > 390
+            ):
+                raise AssertionError(
+                    f"queued cancellation is outside the mobile viewport: {cancel_box}"
+                )
+            if page.evaluate(
+                "document.documentElement.scrollWidth > document.documentElement.clientWidth"
+            ):
+                raise AssertionError("queued cancellation creates mobile horizontal overflow")
+            cancel_queued.click()
             page.get_by_text("Задача отменена и удалена из очереди.", exact=True).wait_for()
             queued_region.wait_for(state="detached")
 
