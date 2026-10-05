@@ -111,7 +111,9 @@ concurrency ceiling. The administrator can inspect or lower CPU, RAM, task and a
 drawer. Changes wait for all root turns and subagents to finish; they never terminate active work.
 Temporary saturation is not shown as a rejected task. A new root task is stored in the local durable queue
 with its runtime settings and attachments, shown in the chat with its position, and started automatically when
-that chat is idle and a safe slot becomes available. Resource reconfiguration, draining and degraded-capacity
+that chat is idle and a safe slot becomes available. A task that is still waiting can be cancelled from its
+queue card; cancellation never interrupts work that has already started, and an ambiguous start that requires
+review remains non-cancellable. Resource reconfiguration, draining and degraded-capacity
 states still fail closed instead of silently adding work. A rare interrupted start is shown as requiring review;
 it is reconciled against Codex and is never retried blindly.
 

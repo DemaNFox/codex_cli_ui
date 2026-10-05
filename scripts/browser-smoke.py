@@ -36,6 +36,7 @@ def main() -> int:
     push_endpoint = "https://push.example/smoke-device"
     account_login_pending = False
     codex_update_state = "ready"
+    queued_turn_visible = True
     resource_snapshot = {
         "capacity": {
             "cpuCores": 8,
@@ -71,6 +72,7 @@ def main() -> int:
         nonlocal account_login_pending
         nonlocal codex_update_state
         nonlocal resource_snapshot
+        nonlocal queued_turn_visible
         request = route.request
         parsed = urlparse(request.url)
         path = parsed.path
@@ -522,7 +524,7 @@ def main() -> int:
                                 "createdAt": "2026-09-27T12:00:03.000Z",
                             }
                         ]
-                        if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1"
+                        if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1" and queued_turn_visible
                         else []
                     ),
                 },
@@ -545,11 +547,16 @@ def main() -> int:
                                 "createdAt": "2026-09-27T12:00:03.000Z",
                             }
                         ]
-                        if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1"
+                        if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1" and queued_turn_visible
                         else []
                     )
                 },
             )
+        elif path == "/api/threads/t1/queued-turns/17" and request.method == "DELETE":
+            if request.headers.get("x-csrf-token") != "csrf-smoke":
+                raise AssertionError("queued turn cancellation did not carry CSRF protection")
+            queued_turn_visible = False
+            route.fulfill(status=204, body="")
         elif path == "/api/threads/t2" and request.method == "GET":
             payload(
                 route,
@@ -995,6 +1002,11 @@ def main() -> int:
         )
         jump_to_latest.wait_for()
         jump_to_latest.click()
+
+        if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1":
+            queued_region.get_by_role("button", name="Отменить задачу").click()
+            page.get_by_text("Задача отменена и удалена из очереди.", exact=True).wait_for()
+            queued_region.wait_for(state="detached")
 
         page.set_viewport_size({"width": 1440, "height": 900})
         page.get_by_text("GitHub").wait_for()

@@ -222,6 +222,12 @@ switching, service draining, resource-policy changes and degraded-capacity condi
 separate fail-closed states. Guidance sent to an already running turn continues to use the explicit steer path;
 the durable queue is only for new root turns.
 
+An authenticated operator may cancel a request only while its durable row is still `queued`. The cancellation
+and release of its attachment claims are one SQLite transaction. A concurrent dispatcher claim wins over
+cancellation, so `dispatching` and `unknown` rows cannot be cancelled and active native work is never
+interrupted by this operation. Successful cancellation publishes a queue-change event so every device refreshes
+the remaining positions. Ambiguous `needsReview` work stays fail closed until authoritative reconciliation.
+
 If the API process loses the result of `turn/start`, the row is retained as visible `needsReview` work and is
 never started again automatically. Recovery reads the authoritative Codex thread and matches the persisted
 client message id: an existing native turn completes the queue record and attachment binding without another
@@ -239,6 +245,7 @@ use the available execution slots.
 - `GET/POST /api/threads`, `GET/PATCH /api/threads/:id`
 - `POST /api/threads/:id/archive`, `POST /api/threads/:id/unarchive`; listing accepts a project-scoped `archived` filter
 - `POST /api/threads/:id/turns`, `GET /api/threads/:id/queued-turns`,
+  `DELETE /api/threads/:id/queued-turns/:queuedTurnId`,
   `POST /api/threads/:id/steer`, `POST /api/threads/:id/interrupt`
 - `POST /api/approvals/:id/resolve`
 - `POST /api/user-input-requests/:id/resolve` for typed `request_user_input` answers; secret answers are never persisted or echoed
