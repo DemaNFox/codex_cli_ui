@@ -225,8 +225,9 @@ the durable queue is only for new root turns.
 An authenticated operator may cancel a request only while its durable row is still `queued`. The cancellation
 removes the row and its exclusively claimed attachment records in one SQLite transaction, immediately releasing
 the thread quota. The same transaction creates no-foreign-key file-deletion tombstones, so bounded idempotent
-cleanup under the thread attachment lock survives a crash, retries after startup and on a timer, and removes a
-tombstone only after the file is absent. A concurrent dispatcher claim wins over cancellation, so `dispatching`
+cleanup under the thread attachment lock survives a crash, retries after startup with fair exponential backoff,
+and removes a tombstone only after the file is absent. Cleanup processes at most 16 due records per pass; failed
+records yield to newer work and emit only finitely many audit milestones. A concurrent dispatcher claim wins over cancellation, so `dispatching`
 and `unknown` rows cannot be cancelled and active native work is never interrupted by this operation.
 Successful cancellation publishes a queue-change event so every device refreshes the remaining positions.
 Ambiguous `needsReview` work stays fail closed until authoritative reconciliation.
