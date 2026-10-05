@@ -847,6 +847,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   let queuedTurnDispatch: Promise<void> | null = null;
   let queuedTurnDispatchRequested = false;
   let requestQueuedTurnDispatch: () => void = () => {};
+  let lastQueuedEligibilityReconcileAt = 0;
+  const queuedEligibilityReconcileGraceMs = 1_000;
   let accountLogin: CodexAccountLogin = codexAccountLoginSchema.parse({
     state: 'idle',
     loginId: null,
@@ -2890,6 +2892,21 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     );
   };
 
+  const queuedThreadNeedsRuntimeReconciliation = (record: QueuedTurnRecord): boolean => {
+    const thread = repository.getThread(record.threadId);
+    if (!thread || thread.archived || repository.hasUnknownQueuedTurn(record.threadId))
+      return false;
+    const queuedAt = Date.parse(record.createdAt);
+    if (!Number.isFinite(queuedAt) || Date.now() - queuedAt < queuedEligibilityReconcileGraceMs)
+      return false;
+    return (
+      activeTurnIdForThread(record.threadId) !== null ||
+      nativeActiveThreads.has(record.threadId) ||
+      repository.countActiveSubagentsForRoot(record.threadId) > 0 ||
+      thread.status === 'active'
+    );
+  };
+
   const dispatchQueuedTurn = async (record: QueuedTurnRecord): Promise<'started' | 'wait'> => {
     if (
       serverClosing ||
@@ -3093,9 +3110,26 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const runQueuedTurnDispatch = async (): Promise<void> => {
     await reconcileUnknownQueuedTurns();
     while (!serverClosing) {
-      const candidates = repository.listQueuedTurns();
+      let candidates = repository.listQueuedTurns();
       if (candidates.length === 0) return;
-      const candidate = candidates.find(queuedThreadIsEligible);
+      let candidate = candidates.find(queuedThreadIsEligible);
+      if (
+        !candidate &&
+        !codexUpdateInterlocked &&
+        !upgradeDrainRequested() &&
+        !accountLoginInterlocked &&
+        appServer.ready &&
+        candidates.some(queuedThreadNeedsRuntimeReconciliation) &&
+        Date.now() - lastQueuedEligibilityReconcileAt >= 15_000
+      ) {
+        try {
+          await reconcileStaleExecutionCapacity();
+        } finally {
+          lastQueuedEligibilityReconcileAt = Date.now();
+        }
+        candidates = repository.listQueuedTurns();
+        candidate = candidates.find(queuedThreadIsEligible);
+      }
       if (!candidate) return;
       if ((await dispatchQueuedTurn(candidate)) !== 'started') return;
     }

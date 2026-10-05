@@ -5282,6 +5282,248 @@ describe('Codex routes', () => {
     repository.requeueTurn(queuedRecord!.id);
   });
 
+  it('reconciles a stale subagent before dispatching queued work for its root thread', async () => {
+    const { app, appServer, repository, projectPath } = await fixture(2);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const rootThreadId = await createThread(app, project.id, session.headers);
+    const observedAt = '2026-10-05T10:00:00.000Z';
+    appServer.addSubagentThread('stale-queued-child', projectPath, 'idle');
+    repository.upsertSubagent({
+      id: 'stale-queued-child',
+      rootThreadId,
+      parentThreadId: rootThreadId,
+      agentPath: '/root/stale-queued-child',
+      nickname: null,
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'running',
+      message: null,
+      startedAt: observedAt,
+      lastActivityAt: observedAt,
+      completedAt: null,
+    });
+
+    const queued = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${rootThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'start after stale child recovery',
+        idempotencyKey: '21000000-0000-4000-8000-000000000001',
+      },
+    });
+
+    expect(queued.statusCode).toBe(202);
+    expect(queued.json()).toMatchObject({ data: { status: 'queued' } });
+    await vi.waitFor(
+      () => {
+        expect(
+          appServer.requests.filter((request) => request.method === 'turn/start'),
+        ).toHaveLength(1);
+      },
+      { timeout: 2_000 },
+    );
+    expect(
+      appServer.requests.some(
+        (request) =>
+          request.method === 'thread/read' &&
+          (request.params as { threadId?: string }).threadId === 'stale-queued-child',
+      ),
+    ).toBe(true);
+    expect(repository.getSubagent('stale-queued-child')).toMatchObject({ status: 'interrupted' });
+    expect(repository.listQueuedTurns(rootThreadId)).toHaveLength(0);
+  });
+
+  it('keeps confirmed-live queued work blocked while another chat uses the free slot', async () => {
+    const { app, appServer, repository, projectPath } = await fixture(2);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const blockedThreadId = await createThread(app, project.id, session.headers);
+    const eligibleThreadId = await createThread(app, project.id, session.headers);
+    const observedAt = '2026-10-05T10:00:00.000Z';
+    appServer.addSubagentThread('live-queued-child', projectPath, 'active');
+    repository.upsertSubagent({
+      id: 'live-queued-child',
+      rootThreadId: blockedThreadId,
+      parentThreadId: blockedThreadId,
+      agentPath: '/root/live-queued-child',
+      nickname: null,
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'running',
+      message: null,
+      startedAt: observedAt,
+      lastActivityAt: observedAt,
+      completedAt: null,
+    });
+
+    const blocked = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${blockedThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'wait for the live child',
+        idempotencyKey: '22000000-0000-4000-8000-000000000001',
+      },
+    });
+    expect(blocked.json()).toMatchObject({ data: { status: 'queued' } });
+    await vi.waitFor(
+      () => {
+        expect(
+          appServer.requests.filter(
+            (request) =>
+              request.method === 'thread/read' &&
+              (request.params as { threadId?: string }).threadId === 'live-queued-child',
+          ),
+        ).toHaveLength(1);
+      },
+      { timeout: 2_000 },
+    );
+
+    const eligible = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${eligibleThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'use the remaining slot',
+        idempotencyKey: '22000000-0000-4000-8000-000000000002',
+      },
+    });
+    expect(eligible.json()).toMatchObject({ data: { status: 'queued' } });
+    await vi.waitFor(
+      () => {
+        const starts = appServer.requests.filter((request) => request.method === 'turn/start');
+        expect(starts).toHaveLength(1);
+        expect(starts[0]?.params).toMatchObject({ threadId: eligibleThreadId });
+      },
+      { timeout: 2_000 },
+    );
+    expect(repository.getSubagent('live-queued-child')).toMatchObject({ status: 'running' });
+    expect(repository.listQueuedTurns(blockedThreadId)).toHaveLength(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 1_100));
+    expect(
+      appServer.requests.filter(
+        (request) =>
+          request.method === 'thread/read' &&
+          (request.params as { threadId?: string }).threadId === 'live-queued-child',
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('throttles queued runtime reconciliation from the end of a slow authoritative read', async () => {
+    const { app, appServer, repository, projectPath } = await fixture(2);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const rootThreadId = await createThread(app, project.id, session.headers);
+    const observedAt = '2026-10-05T10:00:00.000Z';
+    appServer.addSubagentThread('slow-live-queued-child', projectPath, 'active');
+    repository.upsertSubagent({
+      id: 'slow-live-queued-child',
+      rootThreadId,
+      parentThreadId: rootThreadId,
+      agentPath: '/root/slow-live-queued-child',
+      nickname: null,
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'running',
+      message: null,
+      startedAt: observedAt,
+      lastActivityAt: observedAt,
+      completedAt: null,
+    });
+    const gate = appServer.blockThreadReads();
+    await app.inject({
+      method: 'POST',
+      url: `/api/threads/${rootThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'remain queued during a slow read',
+        idempotencyKey: '22500000-0000-4000-8000-000000000001',
+      },
+    });
+    await gate.entered;
+
+    const futureNow = Date.now() + 20_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(futureNow);
+    try {
+      gate.release();
+      await vi.waitFor(() => {
+        expect(
+          appServer.requests.filter(
+            (request) =>
+              request.method === 'thread/read' &&
+              (request.params as { threadId?: string }).threadId === 'slow-live-queued-child',
+          ),
+        ).toHaveLength(1);
+      });
+      await new Promise((resolve) => setTimeout(resolve, 1_100));
+      expect(
+        appServer.requests.filter(
+          (request) =>
+            request.method === 'thread/read' &&
+            (request.params as { threadId?: string }).threadId === 'slow-live-queued-child',
+        ),
+      ).toHaveLength(1);
+      expect(repository.getSubagent('slow-live-queued-child')).toMatchObject({ status: 'running' });
+      expect(repository.listQueuedTurns(rootThreadId)).toHaveLength(1);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('keeps stale-looking queued work blocked when authoritative reconciliation fails', async () => {
+    const { app, appServer, repository, projectPath } = await fixture(2);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const rootThreadId = await createThread(app, project.id, session.headers);
+    const observedAt = '2026-10-05T10:00:00.000Z';
+    appServer.addSubagentThread('unreadable-queued-child', projectPath, 'idle');
+    repository.upsertSubagent({
+      id: 'unreadable-queued-child',
+      rootThreadId,
+      parentThreadId: rootThreadId,
+      agentPath: '/root/unreadable-queued-child',
+      nickname: null,
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'running',
+      message: null,
+      startedAt: observedAt,
+      lastActivityAt: observedAt,
+      completedAt: null,
+    });
+    appServer.failNextRequestWith = new Error('thread/read unavailable');
+
+    const queued = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${rootThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'stay queued on inconclusive recovery',
+        idempotencyKey: '23000000-0000-4000-8000-000000000001',
+      },
+    });
+
+    expect(queued.json()).toMatchObject({ data: { status: 'queued' } });
+    await vi.waitFor(
+      () => {
+        expect(
+          appServer.requests.filter((request) => request.method === 'thread/read'),
+        ).toHaveLength(1);
+      },
+      { timeout: 2_000 },
+    );
+    expect(repository.getSubagent('unreadable-queued-child')).toMatchObject({ status: 'running' });
+    expect(repository.listQueuedTurns(rootThreadId)).toHaveLength(1);
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(0);
+  });
+
   it('keeps queued attachment ownership until automatic dispatch binds the real turn', async () => {
     const { app, appServer, repository, projectPath } = await fixture(1);
     const session = await login(app);

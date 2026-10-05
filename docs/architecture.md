@@ -211,9 +211,14 @@ Ordinary saturation of the effective root-turn ceiling is a scheduling state, no
 persists the complete root-turn request in SQLite, including its idempotency key, runtime settings and attachment
 references, and returns a queued projection to the client. The selected chat displays pending requests and their
 current positions after reload. A single dispatcher starts the oldest eligible request when the target thread is
-idle and capacity is available; completion events and process startup both trigger reconciliation. Claiming and
-state transition are transactional so a retry, refresh or concurrent dispatcher cannot start the same request
-twice. Account switching, service draining, resource-policy changes and degraded-capacity conditions remain
+idle and capacity is available; completion events and process startup both trigger reconciliation. If queued
+work remains without an eligible target past a short grace period because persisted root or subagent activity
+may be stale, the dispatcher performs a bounded authoritative `thread/read` reconciliation before waiting.
+Only a confirmed inactive native runtime releases the occupied projection; failed or mismatched reads stay fail
+closed. Reconciliation is throttled so a confirmed-live task does not cause one-second native polling, and an
+ineligible chat never prevents another eligible chat from using a free slot. Claiming and state transition are
+transactional so a retry, refresh or concurrent dispatcher cannot start the same request twice. Account
+switching, service draining, resource-policy changes and degraded-capacity conditions remain
 separate fail-closed states. Guidance sent to an already running turn continues to use the explicit steer path;
 the durable queue is only for new root turns.
 
