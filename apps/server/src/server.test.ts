@@ -5297,6 +5297,7 @@ describe('Codex routes', () => {
     expect(repository.getQueuedTurn(queuedTurnId)).toBeUndefined();
     expect(repository.claimQueuedTurn(queuedTurnId)).toBeUndefined();
     expect(repository.getAttachment(attachment.id)).toBeUndefined();
+    expect(repository.hasAttachmentFileDeletion(attachment.id)).toBe(false);
     expect(repository.attachmentBytesForThread(queuedThreadId)).toBe(0);
     await expect(
       attachmentStore.read(project.id, queuedThreadId, storedAttachment.storageName),
@@ -5326,31 +5327,43 @@ describe('Codex routes', () => {
     expect(alreadyGone.json()).toMatchObject({ error: { code: 'QUEUED_TURN_NOT_FOUND' } });
   });
 
-  it('bounds and audits queued attachment file cleanup failures after releasing database quota', async () => {
-    const { app, repository, projectPath } = await fixture(
+  it('persists failed queued attachment cleanup and reconciles it after restart', async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-attachment-cleanup-'));
+    const appServer = new FakeAppServer();
+    const first = await fixture(
       1,
       undefined,
       (root) => new FailingRemoveAttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      { temp, appServer },
     );
-    const session = await login(app);
-    const project = await createProject(app, projectPath, session.headers);
-    const activeThreadId = await createThread(app, project.id, session.headers);
-    const queuedThreadId = await createThread(app, project.id, session.headers);
-    await app.inject({
+    const session = await login(first.app);
+    const project = await createProject(first.app, first.projectPath, session.headers);
+    const activeThreadId = await createThread(first.app, project.id, session.headers);
+    const queuedThreadId = await createThread(first.app, project.id, session.headers);
+    await first.app.inject({
       method: 'POST',
       url: `/api/threads/${activeThreadId}/turns`,
       headers: session.headers,
       payload: { text: 'active', idempotencyKey: '11500000-0000-4000-8000-000000000001' },
     });
     const upload = multipartFile('cleanup.txt', 'text/plain', Buffer.from('cleanup context'));
-    const uploaded = await app.inject({
+    const uploaded = await first.app.inject({
       method: 'POST',
       url: `/api/threads/${queuedThreadId}/attachments`,
       headers: { ...session.headers, 'content-type': upload.contentType },
       payload: upload.body,
     });
     const attachment = uploaded.json<{ data: Attachment }>().data;
-    const queued = await app.inject({
+    const storedAttachment = first.repository.getAttachment(attachment.id)!;
+    const queued = await first.app.inject({
       method: 'POST',
       url: `/api/threads/${queuedThreadId}/turns`,
       headers: session.headers,
@@ -5362,25 +5375,170 @@ describe('Codex routes', () => {
     });
     const queuedTurnId = queued.json<{ data: { queuedTurn: { id: number } } }>().data.queuedTurn.id;
 
-    const cancelled = await app.inject({
+    const cancelled = await first.app.inject({
       method: 'DELETE',
       url: `/api/threads/${queuedThreadId}/queued-turns/${queuedTurnId}`,
       headers: session.headers,
     });
     expect(cancelled.statusCode).toBe(204);
-    expect(repository.getQueuedTurn(queuedTurnId)).toBeUndefined();
-    expect(repository.getAttachment(attachment.id)).toBeUndefined();
-    expect(repository.attachmentBytesForThread(queuedThreadId)).toBe(0);
-    const cleanupAudit = repository.database
+    expect(first.repository.getQueuedTurn(queuedTurnId)).toBeUndefined();
+    expect(first.repository.getAttachment(attachment.id)).toBeUndefined();
+    expect(first.repository.attachmentBytesForThread(queuedThreadId)).toBe(0);
+    expect(first.repository.hasAttachmentFileDeletion(attachment.id)).toBe(true);
+    expect(
+      await first.attachmentStore.read(project.id, queuedThreadId, storedAttachment.storageName),
+    ).toEqual(Buffer.from('cleanup context'));
+    const cleanupAudit = first.repository.database
       .prepare(
-        "SELECT outcome,metadata_json FROM audit_events WHERE action='turn.queue.cancel.cleanup' ORDER BY id DESC LIMIT 1",
+        "SELECT outcome,metadata_json FROM audit_events WHERE action='attachment.file.delete' ORDER BY id DESC LIMIT 1",
       )
       .get() as { outcome: string; metadata_json: string };
     expect(cleanupAudit.outcome).toBe('failed');
     expect(JSON.parse(cleanupAudit.metadata_json)).toEqual({
+      attachmentId: attachment.id,
       threadId: queuedThreadId,
-      queuedTurnId,
-      failedAttachmentCount: 1,
+      attempt: 1,
+    });
+
+    await first.app.close();
+    openApps.splice(openApps.indexOf(first.app), 1);
+    const second = await fixture(
+      1,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      { temp, appServer },
+    );
+    await vi.waitFor(() => {
+      expect(second.repository.hasAttachmentFileDeletion(attachment.id)).toBe(false);
+    });
+    await expect(
+      second.attachmentStore.read(project.id, queuedThreadId, storedAttachment.storageName),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('recovers a pre-cleanup cancellation tombstone after repository restart', async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-cleanup-crash-window-'));
+    const databasePath = path.join(temp, 'codex-web.sqlite3');
+    const repository = new SqliteRepository(databasePath, 1_000);
+    const projectPath = path.join(temp, 'projects', 'demo');
+    await mkdir(projectPath, { recursive: true });
+    const project = repository.createProject({
+      name: 'Demo',
+      path: projectPath,
+      defaultModel: null,
+      defaultReasoningEffort: null,
+      defaultPermissionPreset: 'workspace-write',
+    });
+    const threadId = 'crash-window-cleanup-thread';
+    const now = new Date().toISOString();
+    repository.upsertThread({
+      id: threadId,
+      projectId: project.id,
+      name: null,
+      preview: '',
+      model: null,
+      status: 'idle',
+      activeTurnId: null,
+      archived: false,
+      instructionSources: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+    const attachmentStore = new AttachmentStore(path.join(temp, 'attachments'));
+    const stored = await attachmentStore.write(
+      project.id,
+      threadId,
+      'crash.txt',
+      Buffer.from('survive until cleanup'),
+    );
+    repository.createAttachment({
+      id: stored.id,
+      threadId,
+      name: 'crash.txt',
+      mimeType: 'text/plain',
+      kind: 'file',
+      size: 21,
+      storageName: stored.storageName,
+    });
+    const key = '11600000-0000-4000-8000-000000000001';
+    const requestHashValue = 'crash-cleanup-hash';
+    repository.reserveIdempotent(`turn:${threadId}`, key, requestHashValue);
+    const queued = repository.enqueueTurn({
+      threadId,
+      idempotencyKey: key,
+      requestHash: requestHashValue,
+      request: { text: 'cancel before cleanup', attachmentIds: [stored.id], idempotencyKey: key },
+      claimToken: `queued:${threadId}:${key}`,
+    }).record;
+    expect(repository.cancelQueuedTurn(threadId, queued.id).status).toBe('cancelled');
+    expect(repository.hasAttachmentFileDeletion(stored.id)).toBe(true);
+    repository.close();
+
+    const appServer = new FakeAppServer();
+    const restarted = await fixture(
+      1,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      { temp, appServer },
+    );
+    await vi.waitFor(() => {
+      expect(restarted.repository.hasAttachmentFileDeletion(stored.id)).toBe(false);
+    });
+    await expect(
+      restarted.attachmentStore.read(project.id, threadId, stored.storageName),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('processes only one bounded attachment cleanup batch per reconciliation pass', async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-cleanup-batch-'));
+    const repository = new SqliteRepository(path.join(temp, 'codex-web.sqlite3'), 1_000);
+    const now = new Date().toISOString();
+    const insert = repository.database.prepare(
+      `INSERT INTO attachment_file_deletions(
+         id,project_id,thread_id,storage_name,attempts,created_at,updated_at
+       ) VALUES(?,?,?,?,0,?,?)`,
+    );
+    for (let index = 0; index < 17; index += 1) {
+      const id = `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+      insert.run(id, 'project', 'thread', `${id}.txt`, now, now);
+    }
+    repository.close();
+    const appServer = new FakeAppServer();
+    const started = await fixture(
+      1,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      { temp, appServer },
+    );
+    await vi.waitFor(() => {
+      const remaining = started.repository.database
+        .prepare('SELECT COUNT(*) AS count FROM attachment_file_deletions')
+        .get() as { count: number };
+      expect(remaining.count).toBe(1);
     });
   });
 

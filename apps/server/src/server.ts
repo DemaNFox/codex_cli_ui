@@ -938,6 +938,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   let codexUpdateStartupReconciled = dependencies.codexUpdateBroker === undefined;
   let resourceStartupRetry: NodeJS.Timeout | null = null;
   let codexUpdateStartupRetry: NodeJS.Timeout | null = null;
+  let attachmentFileDeletionRetry: NodeJS.Timeout | null = null;
+  let attachmentFileDeletionDrain: Promise<void> | null = null;
+  let attachmentFileDeletionDrainRequested = false;
   let serverClosing = false;
   let lastHandledDisconnectGeneration = 0;
   let appServerDisconnectEpoch = 0;
@@ -1149,6 +1152,54 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
 
   const publish = (event: SafeEvent): void => {
     for (const listener of sseListeners.get(event.threadId) ?? []) listener(event);
+  };
+
+  const requestAttachmentFileDeletionDrain = (): Promise<void> => {
+    if (serverClosing) return Promise.resolve();
+    if (attachmentFileDeletionRetry) {
+      clearTimeout(attachmentFileDeletionRetry);
+      attachmentFileDeletionRetry = null;
+    }
+    if (attachmentFileDeletionDrain) {
+      attachmentFileDeletionDrainRequested = true;
+      return attachmentFileDeletionDrain;
+    }
+    attachmentFileDeletionDrain = (async () => {
+      for (const deletion of repository.listAttachmentFileDeletions()) {
+        if (serverClosing) return;
+        try {
+          await attachmentStore.withThreadLock(deletion.threadId, () =>
+            attachmentStore.remove(deletion.projectId, deletion.threadId, deletion.storageName),
+          );
+          repository.completeAttachmentFileDeletion(deletion.id);
+        } catch {
+          repository.recordAttachmentFileDeletionFailure(deletion.id);
+          repository.audit('attachment.file.delete', 'failed', {
+            attachmentId: deletion.id,
+            threadId: deletion.threadId,
+            attempt: deletion.attempts + 1,
+          });
+        }
+      }
+    })()
+      .catch(() => undefined)
+      .finally(() => {
+        attachmentFileDeletionDrain = null;
+        if (serverClosing) return;
+        if (attachmentFileDeletionDrainRequested) {
+          attachmentFileDeletionDrainRequested = false;
+          queueMicrotask(() => void requestAttachmentFileDeletionDrain());
+          return;
+        }
+        if (repository.listAttachmentFileDeletions().length === 0) return;
+        attachmentFileDeletionRetry = setTimeout(() => {
+          attachmentFileDeletionRetry = null;
+          void requestAttachmentFileDeletionDrain();
+        }, 30_000);
+        attachmentFileDeletionRetry.unref();
+      })
+      .catch(() => undefined);
+    return attachmentFileDeletionDrain;
   };
 
   const appendInteractionTerminal = (
@@ -1978,16 +2029,19 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     await appServer.start();
     pushDispatcher?.start();
     if (dependencies.resourceBroker) void reconcileStartupResources();
+    void requestAttachmentFileDeletionDrain();
     requestQueuedTurnDispatch();
   });
   app.addHook('onClose', async () => {
     serverClosing = true;
     if (resourceStartupRetry) clearTimeout(resourceStartupRetry);
     if (codexUpdateStartupRetry) clearTimeout(codexUpdateStartupRetry);
+    if (attachmentFileDeletionRetry) clearTimeout(attachmentFileDeletionRetry);
     if (queuedTurnRetry) clearTimeout(queuedTurnRetry);
     clearAccountLoginTimer();
     unsubscribe();
     unsubscribeLifecycle();
+    await attachmentFileDeletionDrain?.catch(() => undefined);
     await queuedTurnDispatch?.catch(() => undefined);
     await pushDispatcher?.close();
     await appServer.stop();
@@ -3186,29 +3240,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
     const project = repository.getProject(thread.projectId);
     if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
-    const cancellation = await attachmentStore.withThreadLock(params.id, async () => {
-      const result = repository.cancelQueuedTurn(params.id, params.queuedTurnId);
-      if (result.status !== 'cancelled') return { result, cleanupFailures: 0 };
-      const cleanup = await Promise.allSettled(
-        result.attachments.map((attachment) =>
-          attachmentStore.remove(project.id, params.id, attachment.storageName),
-        ),
-      );
-      return {
-        result,
-        cleanupFailures: cleanup.filter((item) => item.status === 'rejected').length,
-      };
-    });
-    const result = cancellation.result;
+    const result = await attachmentStore.withThreadLock(params.id, () =>
+      Promise.resolve(repository.cancelQueuedTurn(params.id, params.queuedTurnId)),
+    );
     if (result.status === 'not_found') throw new HttpError(404, 'QUEUED_TURN_NOT_FOUND');
     if (result.status === 'not_cancellable')
       throw new HttpError(409, 'QUEUED_TURN_NOT_CANCELLABLE');
-    if (cancellation.cleanupFailures > 0)
-      repository.audit('turn.queue.cancel.cleanup', 'failed', {
-        threadId: params.id,
-        queuedTurnId: params.queuedTurnId,
-        failedAttachmentCount: cancellation.cleanupFailures,
-      });
+    await requestAttachmentFileDeletionDrain();
     repository.audit('turn.queue.cancel', 'succeeded', {
       threadId: params.id,
       queuedTurnId: params.queuedTurnId,

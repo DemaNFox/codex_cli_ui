@@ -176,6 +176,16 @@ export interface AttachmentRecord {
   createdAt: string;
 }
 
+export interface AttachmentFileDeletionRecord {
+  id: string;
+  projectId: string;
+  threadId: string;
+  storageName: string;
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface QueuedTurnRecord {
   id: number;
   threadId: string;
@@ -408,6 +418,18 @@ export class SqliteRepository {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS attachments_thread_idx ON attachments(thread_id, created_at, id);
+
+      CREATE TABLE IF NOT EXISTS attachment_file_deletions (
+        id TEXT PRIMARY KEY,
+        project_id TEXT NOT NULL,
+        thread_id TEXT NOT NULL,
+        storage_name TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS attachment_file_deletions_order_idx
+        ON attachment_file_deletions(created_at,id);
 
       CREATE TABLE IF NOT EXISTS thread_history_state (
         thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
@@ -1751,6 +1773,25 @@ export class SqliteRepository {
           )
           .all(threadId, row.claim_token) as unknown as AttachmentRow[]
       ).map(attachmentFromRow);
+      const project = this.database
+        .prepare('SELECT project_id FROM threads WHERE id=?')
+        .get(threadId) as { project_id: string } | undefined;
+      if (!project) throw new Error('QUEUED_TURN_PROJECT_MISSING');
+      const now = new Date().toISOString();
+      const insertDeletion = this.database.prepare(
+        `INSERT INTO attachment_file_deletions(
+           id,project_id,thread_id,storage_name,attempts,created_at,updated_at
+         ) VALUES(?,?,?,?,0,?,?)`,
+      );
+      for (const attachment of attachments)
+        insertDeletion.run(
+          attachment.id,
+          project.project_id,
+          threadId,
+          attachment.storageName,
+          now,
+          now,
+        );
       const removedAttachments = this.database
         .prepare('DELETE FROM attachments WHERE thread_id=? AND turn_id=?')
         .run(threadId, row.claim_token).changes;
@@ -1766,6 +1807,55 @@ export class SqliteRepository {
       this.database.exec('ROLLBACK');
       throw error;
     }
+  }
+
+  listAttachmentFileDeletions(): AttachmentFileDeletionRecord[] {
+    return (
+      this.database
+        .prepare(
+          `SELECT id,project_id,thread_id,storage_name,attempts,created_at,updated_at
+           FROM attachment_file_deletions ORDER BY created_at,id LIMIT 16`,
+        )
+        .all() as unknown as {
+        id: string;
+        project_id: string;
+        thread_id: string;
+        storage_name: string;
+        attempts: number;
+        created_at: string;
+        updated_at: string;
+      }[]
+    ).map((row) => ({
+      id: row.id,
+      projectId: row.project_id,
+      threadId: row.thread_id,
+      storageName: row.storage_name,
+      attempts: row.attempts,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    }));
+  }
+
+  hasAttachmentFileDeletion(id: string): boolean {
+    return (
+      this.database.prepare('SELECT 1 FROM attachment_file_deletions WHERE id=?').get(id) !==
+      undefined
+    );
+  }
+
+  completeAttachmentFileDeletion(id: string): boolean {
+    return (
+      this.database.prepare('DELETE FROM attachment_file_deletions WHERE id=?').run(id).changes ===
+      1
+    );
+  }
+
+  recordAttachmentFileDeletionFailure(id: string): boolean {
+    return (
+      this.database
+        .prepare('UPDATE attachment_file_deletions SET attempts=attempts+1,updated_at=? WHERE id=?')
+        .run(new Date().toISOString(), id).changes === 1
+    );
   }
 
   requeueTurn(id: number): boolean {
