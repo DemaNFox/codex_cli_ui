@@ -575,6 +575,72 @@ describe('App', () => {
     );
   });
 
+  it('keeps an in-flight cancellation guarded while navigating away and back', async () => {
+    const otherThread = {
+      ...thread,
+      id: 'thread-2',
+      name: 'Другой чат',
+      preview: 'Параллельная задача',
+      updatedAt: '2026-10-04T10:09:00.000Z',
+    };
+    const queuedTurn = {
+      id: 12,
+      threadId: thread.id,
+      status: 'queued' as const,
+      position: 1,
+      errorCode: null,
+      textPreview: 'Отмена продолжается при навигации',
+      attachmentCount: 0,
+      createdAt: '2026-10-04T10:09:00.000Z',
+    };
+    let finishCancellation!: (response: Response) => void;
+    const cancellationResponse = new Promise<Response>((resolve) => {
+      finishCancellation = resolve;
+    });
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url.includes('/api/threads?')) return jsonResponse([thread, otherThread]);
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [], queuedTurns: [queuedTurn] });
+      if (url === '/api/threads/thread-2')
+        return jsonResponse({ data: otherThread, events: [], queuedTurns: [] });
+      if (url === '/api/threads/thread-2/subagents') return jsonResponse({ data: [] });
+      if (url === '/api/threads/thread-1/queued-turns/12' && init?.method === 'DELETE')
+        return cancellationResponse;
+      if (url === '/api/threads/thread-1/queued-turns') return jsonResponse({ data: [queuedTurn] });
+      if (url === '/api/threads/thread-2/queued-turns') return jsonResponse({ data: [] });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const queue = await screen.findByRole('region', { name: 'Задачи в очереди' });
+    await user.click(within(queue).getByRole('button', { name: 'Отменить задачу' }));
+    expect(within(queue).getByRole('button', { name: 'Отменяем…' })).not.toBeNull();
+
+    await user.click(screen.getByRole('button', { name: 'Открыть недавний чат Другой чат' }));
+    await screen.findByRole('heading', { name: 'Другой чат' });
+    await user.click(screen.getByRole('button', { name: 'Открыть недавний чат Frontend task' }));
+
+    const restoredQueue = await screen.findByRole('region', { name: 'Задачи в очереди' });
+    const pendingButton = within(restoredQueue).getByRole('button', { name: 'Отменяем…' });
+    expect(pendingButton.hasAttribute('disabled')).toBe(true);
+    await user.click(pendingButton);
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input, init]) =>
+          requestUrl(input) === '/api/threads/thread-1/queued-turns/12' &&
+          init?.method === 'DELETE',
+      ),
+    ).toHaveLength(1);
+
+    finishCancellation(new Response(null, { status: 204 }));
+
+    expect(await screen.findByText('Задача отменена и удалена из очереди.')).not.toBeNull();
+    await waitFor(() =>
+      expect(screen.queryByRole('region', { name: 'Задачи в очереди' })).toBeNull(),
+    );
+  });
+
   it('keeps the queued card and explains a cancellation race', async () => {
     const queuedTurn = {
       id: 11,

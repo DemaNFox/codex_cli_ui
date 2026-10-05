@@ -952,6 +952,7 @@ button:disabled {
   margin-top: 0.15rem;
 }
 .queued-turn-cancel {
+  max-width: 100%;
   min-height: 2rem;
   padding: 0.35rem 0.65rem;
   border: 1px solid rgba(255, 180, 178, 0.35);
@@ -964,6 +965,12 @@ button:disabled {
 .queued-turn-cancel:hover:not(:disabled) {
   border-color: rgba(255, 180, 178, 0.62);
   background: rgba(255, 113, 111, 0.18);
+}
+@media (max-width: 640px) {
+  .queued-turn-actions,
+  .queued-turn-cancel {
+    width: 100%;
+  }
 }
 .markdown-content > :first-child {
   margin-top: 0;

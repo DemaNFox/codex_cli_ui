@@ -461,6 +461,10 @@ function queuedTurnCancelErrorMessage(error: unknown): string {
   return 'Не удалось отменить задачу. Карточка сохранена — повторите попытку или обновите чат.';
 }
 
+function queuedTurnKey(threadId: string, queuedTurnId: number): string {
+  return `${threadId}:${queuedTurnId}`;
+}
+
 function valueText(value: unknown): string | null {
   if (typeof value === 'string') return value;
   if (Array.isArray(value)) {
@@ -2933,7 +2937,7 @@ function Workspace({
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>('on-request');
   const [composer, setComposer] = useState('');
   const [queuedTurns, setQueuedTurns] = useState<QueuedTurn[]>([]);
-  const [cancellingQueuedTurnIds, setCancellingQueuedTurnIds] = useState<Set<number>>(
+  const [cancellingQueuedTurnKeys, setCancellingQueuedTurnKeys] = useState<Set<string>>(
     () => new Set(),
   );
   const [queuedAttachments, setQueuedAttachments] = useState<QueuedAttachment[]>([]);
@@ -2966,8 +2970,8 @@ function Workspace({
   const activeUploadsRef = useRef(new Map<string, { threadId: string; abort: () => void }>());
   const preferencesWriteRef = useRef<Promise<void>>(Promise.resolve());
   const sendInFlightRef = useRef(false);
-  const queuedTurnCancellationsRef = useRef(new Set<number>());
-  const cancelledQueuedTurnIdsRef = useRef(new Set<number>());
+  const queuedTurnCancellationsRef = useRef(new Set<string>());
+  const cancelledQueuedTurnKeysRef = useRef(new Set<string>());
   const subagentsRef = useRef<Subagent[]>(subagents);
   subagentsRef.current = subagents;
   const [locallyResolvedRequests, setLocallyResolvedRequests] = useState<Set<string>>(
@@ -3279,7 +3283,10 @@ function Workspace({
         const next = await api.queuedTurns(threadId);
         if (!disposed && attachmentThreadRef.current === threadId) {
           setQueuedTurns(
-            next.filter((queuedTurn) => !cancelledQueuedTurnIdsRef.current.has(queuedTurn.id)),
+            next.filter(
+              (queuedTurn) =>
+                !cancelledQueuedTurnKeysRef.current.has(queuedTurnKey(threadId, queuedTurn.id)),
+            ),
           );
         }
       } catch {
@@ -3807,9 +3814,6 @@ function Workspace({
     setAttachmentNotice(null);
     setThreadAttachmentBytes(0);
     setQueuedTurns([]);
-    setCancellingQueuedTurnIds(new Set());
-    queuedTurnCancellationsRef.current.clear();
-    cancelledQueuedTurnIdsRef.current.clear();
     setSubagents([]);
     setServerTurnNavigation(null);
     runtimeSnapshotCursorRef.current = 0;
@@ -3831,7 +3835,14 @@ function Workspace({
         mergeEvents(history.events, requestedThreadId);
         setEventStreamStart({ threadId: requestedThreadId, cursor: historyCursor });
         setServerTurnNavigation(history.turnNavigation ?? null);
-        setQueuedTurns(history.queuedTurns ?? []);
+        setQueuedTurns(
+          (history.queuedTurns ?? []).filter(
+            (queuedTurn) =>
+              !cancelledQueuedTurnKeysRef.current.has(
+                queuedTurnKey(requestedThreadId, queuedTurn.id),
+              ),
+          ),
+        );
         const historySubagents = history.subagents;
         if (historySubagents) setSubagents((current) => mergeSubagents(current, historySubagents));
         setThreadAttachmentBytes(
@@ -4263,39 +4274,41 @@ function Workspace({
   }
 
   async function cancelQueuedTurn(queuedTurn: QueuedTurn) {
+    const targetThreadId = threadId;
+    if (!targetThreadId || queuedTurn.status !== 'queued') return;
+    const cancellationKey = queuedTurnKey(targetThreadId, queuedTurn.id);
     if (
-      !threadId ||
-      queuedTurn.status !== 'queued' ||
-      queuedTurnCancellationsRef.current.has(queuedTurn.id)
+      queuedTurnCancellationsRef.current.has(cancellationKey) ||
+      cancelledQueuedTurnKeysRef.current.has(cancellationKey)
     )
       return;
-    const targetThreadId = threadId;
-    queuedTurnCancellationsRef.current.add(queuedTurn.id);
-    setCancellingQueuedTurnIds((current) => new Set(current).add(queuedTurn.id));
+    queuedTurnCancellationsRef.current.add(cancellationKey);
+    setCancellingQueuedTurnKeys((current) => new Set(current).add(cancellationKey));
     setError(null);
     setActionNotice(null);
     try {
       await api.cancelQueuedTurn(session.csrfToken, targetThreadId, queuedTurn.id);
+      cancelledQueuedTurnKeysRef.current.add(cancellationKey);
       if (attachmentThreadRef.current === targetThreadId) {
-        cancelledQueuedTurnIdsRef.current.add(queuedTurn.id);
         setQueuedTurns((current) => current.filter((item) => item.id !== queuedTurn.id));
         setError(null);
         setActionNotice('Задача отменена и удалена из очереди.');
       }
     } catch (cause) {
-      if (attachmentThreadRef.current === targetThreadId) {
+      if (
+        !cancelledQueuedTurnKeysRef.current.has(cancellationKey) &&
+        attachmentThreadRef.current === targetThreadId
+      ) {
         setActionNotice(null);
         setError(queuedTurnCancelErrorMessage(cause));
       }
     } finally {
-      queuedTurnCancellationsRef.current.delete(queuedTurn.id);
-      if (attachmentThreadRef.current === targetThreadId) {
-        setCancellingQueuedTurnIds((current) => {
-          const next = new Set(current);
-          next.delete(queuedTurn.id);
-          return next;
-        });
-      }
+      queuedTurnCancellationsRef.current.delete(cancellationKey);
+      setCancellingQueuedTurnKeys((current) => {
+        const next = new Set(current);
+        next.delete(cancellationKey);
+        return next;
+      });
     }
   }
 
@@ -4605,7 +4618,9 @@ function Workspace({
             {queuedTurns.length > 0 && (
               <section className="queued-turns" aria-label="Задачи в очереди" aria-live="polite">
                 {queuedTurns.map((queuedTurn) => {
-                  const cancelling = cancellingQueuedTurnIds.has(queuedTurn.id);
+                  const cancelling =
+                    threadId !== null &&
+                    cancellingQueuedTurnKeys.has(queuedTurnKey(threadId, queuedTurn.id));
                   return (
                     <article
                       className={`queued-turn-card ${queuedTurn.status === 'needsReview' ? 'needs-review' : ''}`}
