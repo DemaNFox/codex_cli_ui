@@ -5238,6 +5238,167 @@ describe('Codex routes', () => {
     );
   });
 
+  it('cancels only the addressed queued turn, releases attachments, audits and publishes the change', async () => {
+    const { app, repository, projectPath } = await fixture(1);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const activeThreadId = await createThread(app, project.id, session.headers);
+    const queuedThreadId = await createThread(app, project.id, session.headers);
+    await app.inject({
+      method: 'POST',
+      url: `/api/threads/${activeThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'occupy capacity',
+        idempotencyKey: '11000000-0000-4000-8000-000000000001',
+      },
+    });
+    const upload = multipartFile('cancel.txt', 'text/plain', Buffer.from('cancel context'));
+    const uploaded = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/attachments`,
+      headers: { ...session.headers, 'content-type': upload.contentType },
+      payload: upload.body,
+    });
+    const attachment = uploaded.json<{ data: Attachment }>().data;
+    const queuedResponse = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'cancel me',
+        attachmentIds: [attachment.id],
+        idempotencyKey: '11000000-0000-4000-8000-000000000002',
+      },
+    });
+    const queuedTurnId = queuedResponse.json<{ data: { queuedTurn: { id: number } } }>().data
+      .queuedTurn.id;
+    expect(repository.getAttachment(attachment.id)?.turnId).not.toBeNull();
+
+    const wrongThread = await app.inject({
+      method: 'DELETE',
+      url: `/api/threads/${activeThreadId}/queued-turns/${queuedTurnId}`,
+      headers: session.headers,
+    });
+    expect(wrongThread.statusCode).toBe(404);
+    expect(wrongThread.json()).toMatchObject({ error: { code: 'QUEUED_TURN_NOT_FOUND' } });
+    expect(repository.getQueuedTurn(queuedTurnId)).toBeDefined();
+
+    const queueEventsBefore = repository
+      .listEvents(queuedThreadId, 0)
+      .filter((event) => event.payload.queueChanged === true).length;
+    const cancelled = await app.inject({
+      method: 'DELETE',
+      url: `/api/threads/${queuedThreadId}/queued-turns/${queuedTurnId}`,
+      headers: session.headers,
+    });
+    expect(cancelled.statusCode).toBe(204);
+    expect(repository.getQueuedTurn(queuedTurnId)).toBeUndefined();
+    expect(repository.claimQueuedTurn(queuedTurnId)).toBeUndefined();
+    expect(repository.getAttachment(attachment.id)?.turnId).toBeNull();
+    expect(
+      repository
+        .listEvents(queuedThreadId, 0)
+        .filter((event) => event.payload.queueChanged === true),
+    ).toHaveLength(queueEventsBefore + 1);
+    const audit = repository.database
+      .prepare(
+        "SELECT outcome,metadata_json FROM audit_events WHERE action='turn.queue.cancel' ORDER BY id DESC LIMIT 1",
+      )
+      .get() as { outcome: string; metadata_json: string };
+    expect(audit.outcome).toBe('succeeded');
+    expect(JSON.parse(audit.metadata_json)).toEqual({ threadId: queuedThreadId, queuedTurnId });
+    const alreadyGone = await app.inject({
+      method: 'DELETE',
+      url: `/api/threads/${queuedThreadId}/queued-turns/${queuedTurnId}`,
+      headers: session.headers,
+    });
+    expect(alreadyGone.statusCode).toBe(404);
+    expect(alreadyGone.json()).toMatchObject({ error: { code: 'QUEUED_TURN_NOT_FOUND' } });
+  });
+
+  it('protects queued-turn cancellation and validates its numeric identifier', async () => {
+    const { app, repository, projectPath } = await fixture(1);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const activeThreadId = await createThread(app, project.id, session.headers);
+    const queuedThreadId = await createThread(app, project.id, session.headers);
+    await app.inject({
+      method: 'POST',
+      url: `/api/threads/${activeThreadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'active', idempotencyKey: '12000000-0000-4000-8000-000000000001' },
+    });
+    const queued = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'queued', idempotencyKey: '12000000-0000-4000-8000-000000000002' },
+    });
+    const queuedTurnId = queued.json<{ data: { queuedTurn: { id: number } } }>().data.queuedTurn.id;
+
+    expect(
+      (
+        await app.inject({
+          method: 'DELETE',
+          url: `/api/threads/${queuedThreadId}/queued-turns/${queuedTurnId}`,
+        })
+      ).statusCode,
+    ).toBe(401);
+    const missingCsrf = await app.inject({
+      method: 'DELETE',
+      url: `/api/threads/${queuedThreadId}/queued-turns/${queuedTurnId}`,
+      headers: { origin: 'https://codex.test', cookie: session.cookie },
+    });
+    expect(missingCsrf.statusCode).toBe(403);
+    expect(missingCsrf.json()).toMatchObject({ error: { code: 'CSRF_REQUIRED' } });
+    expect(
+      (
+        await app.inject({
+          method: 'DELETE',
+          url: `/api/threads/${queuedThreadId}/queued-turns/0`,
+          headers: session.headers,
+        })
+      ).statusCode,
+    ).toBe(400);
+    expect(repository.getQueuedTurn(queuedTurnId)).toBeDefined();
+  });
+
+  it('makes queued dispatch claim and cancellation mutually exclusive without interrupting native work', async () => {
+    const { app, appServer, repository, projectPath } = await fixture(1);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const activeThreadId = await createThread(app, project.id, session.headers);
+    const queuedThreadId = await createThread(app, project.id, session.headers);
+    await app.inject({
+      method: 'POST',
+      url: `/api/threads/${activeThreadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'active', idempotencyKey: '13000000-0000-4000-8000-000000000001' },
+    });
+    const queued = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'claim first', idempotencyKey: '13000000-0000-4000-8000-000000000002' },
+    });
+    const queuedTurnId = queued.json<{ data: { queuedTurn: { id: number } } }>().data.queuedTurn.id;
+    expect(repository.claimQueuedTurn(queuedTurnId)?.status).toBe('dispatching');
+    const nativeRequestsBefore = appServer.requests.length;
+
+    const cancellation = await app.inject({
+      method: 'DELETE',
+      url: `/api/threads/${queuedThreadId}/queued-turns/${queuedTurnId}`,
+      headers: session.headers,
+    });
+    expect(cancellation.statusCode).toBe(409);
+    expect(cancellation.json()).toMatchObject({
+      error: { code: 'QUEUED_TURN_NOT_CANCELLABLE' },
+    });
+    expect(repository.getQueuedTurn(queuedTurnId)?.status).toBe('dispatching');
+    expect(appServer.requests).toHaveLength(nativeRequestsBefore);
+  });
+
   it('skips a queued follow-up for a busy thread and starts the oldest eligible thread', async () => {
     const { app, appServer, repository, projectPath } = await fixture(2);
     const session = await login(app);

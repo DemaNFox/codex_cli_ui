@@ -111,6 +111,14 @@ const attachmentParamsSchema = z.object({
   id: z.string().min(1).max(200),
   attachmentId: z.string().uuid(),
 });
+const queuedTurnParamsSchema = z.object({
+  id: z.string().min(1).max(200),
+  queuedTurnId: z
+    .string()
+    .regex(/^[1-9]\d*$/)
+    .transform(Number)
+    .pipe(z.number().int().positive().max(Number.MAX_SAFE_INTEGER)),
+});
 const projectFileQuerySchema = z.object({ path: z.string().min(1).max(4_096) });
 const MAX_PROJECT_FILE_DOWNLOAD_BYTES = 100 * 1_024 * 1_024;
 const projectPatchSchema = z
@@ -3169,6 +3177,22 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const id = parseId(request);
     if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
     return { data: repository.listVisibleQueuedTurns(id).map(publicQueuedTurn) };
+  });
+
+  app.delete('/api/threads/:id/queued-turns/:queuedTurnId', (request, reply) => {
+    csrfGuard(auth, request);
+    const params = queuedTurnParamsSchema.parse(request.params);
+    if (!repository.getThread(params.id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    const result = repository.cancelQueuedTurn(params.id, params.queuedTurnId);
+    if (result === 'not_found') throw new HttpError(404, 'QUEUED_TURN_NOT_FOUND');
+    if (result === 'not_cancellable') throw new HttpError(409, 'QUEUED_TURN_NOT_CANCELLABLE');
+    repository.audit('turn.queue.cancel', 'succeeded', {
+      threadId: params.id,
+      queuedTurnId: params.queuedTurnId,
+    });
+    publishQueueChanged(params.id);
+    requestQueuedTurnDispatch();
+    return reply.code(204).send();
   });
 
   app.post('/api/threads/:id/turns', async (request, reply) => {

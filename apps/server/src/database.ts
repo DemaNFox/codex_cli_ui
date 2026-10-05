@@ -1723,6 +1723,36 @@ export class SqliteRepository {
     return result.changes === 1 ? this.getQueuedTurn(id) : undefined;
   }
 
+  cancelQueuedTurn(threadId: string, id: number): 'cancelled' | 'not_found' | 'not_cancellable' {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.database
+        .prepare('SELECT thread_id,status,claim_token FROM queued_turns WHERE id=?')
+        .get(id) as
+        { thread_id: string; status: QueuedTurnRecord['status']; claim_token: string } | undefined;
+      if (!row || row.thread_id !== threadId) {
+        this.database.exec('COMMIT');
+        return 'not_found';
+      }
+      if (row.status !== 'queued') {
+        this.database.exec('COMMIT');
+        return 'not_cancellable';
+      }
+      this.database
+        .prepare('UPDATE attachments SET turn_id=NULL WHERE thread_id=? AND turn_id=?')
+        .run(threadId, row.claim_token);
+      const removed = this.database
+        .prepare("DELETE FROM queued_turns WHERE id=? AND thread_id=? AND status='queued'")
+        .run(id, threadId).changes;
+      if (removed !== 1) throw new Error('QUEUED_TURN_CANCELLATION_FAILED');
+      this.database.exec('COMMIT');
+      return 'cancelled';
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
   requeueTurn(id: number): boolean {
     return (
       this.database
