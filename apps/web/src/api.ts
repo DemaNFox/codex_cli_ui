@@ -339,6 +339,11 @@ export const api = {
         `/api/threads/${encodeURIComponent(threadId)}/queued-turns`,
       ),
     ),
+  cancelQueuedTurn: (csrfToken: string, threadId: string, queuedTurnId: number) =>
+    request<void>(
+      `/api/threads/${encodeURIComponent(threadId)}/queued-turns/${encodeURIComponent(String(queuedTurnId))}`,
+      { method: 'DELETE', csrfToken },
+    ),
   uploadAttachment,
   transcribeAudio,
   steer: async (

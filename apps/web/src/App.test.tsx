@@ -520,6 +520,96 @@ describe('App', () => {
     expect(within(queue).getByText('2 вложений')).not.toBeNull();
   });
 
+  it('cancels a queued task once, exposes the pending state, and removes the card', async () => {
+    const queuedTurn = {
+      id: 10,
+      threadId: thread.id,
+      status: 'queued' as const,
+      position: 1,
+      errorCode: null,
+      textPreview: 'Эту задачу можно отменить',
+      attachmentCount: 0,
+      createdAt: '2026-10-04T10:07:00.000Z',
+    };
+    let finishCancellation!: (response: Response) => void;
+    const cancellationResponse = new Promise<Response>((resolve) => {
+      finishCancellation = resolve;
+    });
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [], queuedTurns: [queuedTurn] });
+      if (url === '/api/threads/thread-1/queued-turns/10' && init?.method === 'DELETE')
+        return cancellationResponse;
+      if (url === '/api/threads/thread-1/queued-turns') return jsonResponse({ data: [queuedTurn] });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const queue = await screen.findByRole('region', { name: 'Задачи в очереди' });
+    const cancelButton = within(queue).getByRole('button', { name: 'Отменить задачу' });
+    await user.click(cancelButton);
+
+    const pendingButton = within(queue).getByRole('button', { name: 'Отменяем…' });
+    expect(pendingButton.hasAttribute('disabled')).toBe(true);
+    expect(pendingButton.getAttribute('aria-busy')).toBe('true');
+    await user.click(pendingButton);
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input, init]) =>
+          requestUrl(input) === '/api/threads/thread-1/queued-turns/10' &&
+          init?.method === 'DELETE',
+      ),
+    ).toHaveLength(1);
+    const cancelCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        requestUrl(input) === '/api/threads/thread-1/queued-turns/10' && init?.method === 'DELETE',
+    );
+    expect(new Headers(cancelCall?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf-token');
+
+    finishCancellation(new Response(null, { status: 204 }));
+
+    expect(await screen.findByText('Задача отменена и удалена из очереди.')).not.toBeNull();
+    await waitFor(() =>
+      expect(screen.queryByRole('region', { name: 'Задачи в очереди' })).toBeNull(),
+    );
+  });
+
+  it('keeps the queued card and explains a cancellation race', async () => {
+    const queuedTurn = {
+      id: 11,
+      threadId: thread.id,
+      status: 'queued' as const,
+      position: 1,
+      errorCode: null,
+      textPreview: 'Задача могла уже запуститься',
+      attachmentCount: 0,
+      createdAt: '2026-10-04T10:08:00.000Z',
+    };
+    installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [], queuedTurns: [queuedTurn] });
+      if (url === '/api/threads/thread-1/queued-turns/11' && init?.method === 'DELETE')
+        return jsonResponse(
+          { error: { code: 'QUEUED_TURN_NOT_CANCELLABLE', message: 'Already started' } },
+          409,
+        );
+      if (url === '/api/threads/thread-1/queued-turns') return jsonResponse({ data: [queuedTurn] });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const queue = await screen.findByRole('region', { name: 'Задачи в очереди' });
+    await user.click(within(queue).getByRole('button', { name: 'Отменить задачу' }));
+
+    expect((await screen.findByRole('alert')).textContent).toContain(
+      'возможно, она уже запущена или исчезла из очереди',
+    );
+    expect(within(queue).getByText(queuedTurn.textPreview)).not.toBeNull();
+    expect(within(queue).getByRole('button', { name: 'Отменить задачу' })).not.toBeNull();
+  });
+
   it('keeps an ambiguous start visible without offering an unsafe retry', async () => {
     const queuedTurn = {
       id: 9,

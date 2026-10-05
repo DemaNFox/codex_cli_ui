@@ -454,6 +454,13 @@ function archiveErrorMessage(error: unknown, action: 'archive' | 'restore'): str
     : 'Не удалось подтвердить, что чат восстановлен. Обновите страницу и проверьте состояние чата перед повторной попыткой.';
 }
 
+function queuedTurnCancelErrorMessage(error: unknown): string {
+  if (error instanceof ApiError && (error.status === 404 || error.status === 409)) {
+    return 'Не удалось отменить задачу: возможно, она уже запущена или исчезла из очереди. Карточка сохранена — обновите чат, чтобы сверить состояние.';
+  }
+  return 'Не удалось отменить задачу. Карточка сохранена — повторите попытку или обновите чат.';
+}
+
 function valueText(value: unknown): string | null {
   if (typeof value === 'string') return value;
   if (Array.isArray(value)) {
@@ -2926,6 +2933,9 @@ function Workspace({
   const [approvalPolicy, setApprovalPolicy] = useState<ApprovalPolicy>('on-request');
   const [composer, setComposer] = useState('');
   const [queuedTurns, setQueuedTurns] = useState<QueuedTurn[]>([]);
+  const [cancellingQueuedTurnIds, setCancellingQueuedTurnIds] = useState<Set<number>>(
+    () => new Set(),
+  );
   const [queuedAttachments, setQueuedAttachments] = useState<QueuedAttachment[]>([]);
   const [previewImage, setPreviewImage] = useState<PreviewImage | null>(null);
   const [threadAttachmentBytes, setThreadAttachmentBytes] = useState(0);
@@ -2956,6 +2966,8 @@ function Workspace({
   const activeUploadsRef = useRef(new Map<string, { threadId: string; abort: () => void }>());
   const preferencesWriteRef = useRef<Promise<void>>(Promise.resolve());
   const sendInFlightRef = useRef(false);
+  const queuedTurnCancellationsRef = useRef(new Set<number>());
+  const cancelledQueuedTurnIdsRef = useRef(new Set<number>());
   const subagentsRef = useRef<Subagent[]>(subagents);
   subagentsRef.current = subagents;
   const [locallyResolvedRequests, setLocallyResolvedRequests] = useState<Set<string>>(
@@ -3265,7 +3277,11 @@ function Workspace({
       refreshing = true;
       try {
         const next = await api.queuedTurns(threadId);
-        if (!disposed && attachmentThreadRef.current === threadId) setQueuedTurns(next);
+        if (!disposed && attachmentThreadRef.current === threadId) {
+          setQueuedTurns(
+            next.filter((queuedTurn) => !cancelledQueuedTurnIdsRef.current.has(queuedTurn.id)),
+          );
+        }
       } catch {
         // The retained queue projection is still visible while a refresh is temporarily unavailable.
       } finally {
@@ -3791,6 +3807,9 @@ function Workspace({
     setAttachmentNotice(null);
     setThreadAttachmentBytes(0);
     setQueuedTurns([]);
+    setCancellingQueuedTurnIds(new Set());
+    queuedTurnCancellationsRef.current.clear();
+    cancelledQueuedTurnIdsRef.current.clear();
     setSubagents([]);
     setServerTurnNavigation(null);
     runtimeSnapshotCursorRef.current = 0;
@@ -4243,6 +4262,43 @@ function Workspace({
     }
   }
 
+  async function cancelQueuedTurn(queuedTurn: QueuedTurn) {
+    if (
+      !threadId ||
+      queuedTurn.status !== 'queued' ||
+      queuedTurnCancellationsRef.current.has(queuedTurn.id)
+    )
+      return;
+    const targetThreadId = threadId;
+    queuedTurnCancellationsRef.current.add(queuedTurn.id);
+    setCancellingQueuedTurnIds((current) => new Set(current).add(queuedTurn.id));
+    setError(null);
+    setActionNotice(null);
+    try {
+      await api.cancelQueuedTurn(session.csrfToken, targetThreadId, queuedTurn.id);
+      if (attachmentThreadRef.current === targetThreadId) {
+        cancelledQueuedTurnIdsRef.current.add(queuedTurn.id);
+        setQueuedTurns((current) => current.filter((item) => item.id !== queuedTurn.id));
+        setError(null);
+        setActionNotice('Задача отменена и удалена из очереди.');
+      }
+    } catch (cause) {
+      if (attachmentThreadRef.current === targetThreadId) {
+        setActionNotice(null);
+        setError(queuedTurnCancelErrorMessage(cause));
+      }
+    } finally {
+      queuedTurnCancellationsRef.current.delete(queuedTurn.id);
+      if (attachmentThreadRef.current === targetThreadId) {
+        setCancellingQueuedTurnIds((current) => {
+          const next = new Set(current);
+          next.delete(queuedTurn.id);
+          return next;
+        });
+      }
+    }
+  }
+
   async function openStatus() {
     setShowDiagnostics(true);
     setCodexUpdateDiscoveryBusy(true);
@@ -4548,38 +4604,54 @@ function Workspace({
             />
             {queuedTurns.length > 0 && (
               <section className="queued-turns" aria-label="Задачи в очереди" aria-live="polite">
-                {queuedTurns.map((queuedTurn) => (
-                  <article
-                    className={`queued-turn-card ${queuedTurn.status === 'needsReview' ? 'needs-review' : ''}`}
-                    key={queuedTurn.id}
-                  >
-                    <header>
-                      <strong>
-                        {queuedTurn.status === 'queued'
-                          ? `В очереди · позиция ${queuedTurn.position}`
-                          : 'Требует проверки'}
-                      </strong>
-                      <time dateTime={queuedTurn.createdAt}>
-                        {EVENT_TIME_FORMATTER.format(new Date(queuedTurn.createdAt))}
-                      </time>
-                    </header>
-                    {queuedTurn.textPreview && <p>{queuedTurn.textPreview}</p>}
-                    {queuedTurn.attachmentCount > 0 && (
-                      <small>
-                        {queuedTurn.attachmentCount.toLocaleString('ru')}{' '}
-                        {queuedTurn.attachmentCount === 1 ? 'вложение' : 'вложений'}
-                      </small>
-                    )}
-                    {queuedTurn.status === 'needsReview' && (
-                      <div className="queued-turn-review">
+                {queuedTurns.map((queuedTurn) => {
+                  const cancelling = cancellingQueuedTurnIds.has(queuedTurn.id);
+                  return (
+                    <article
+                      className={`queued-turn-card ${queuedTurn.status === 'needsReview' ? 'needs-review' : ''}`}
+                      key={queuedTurn.id}
+                    >
+                      <header>
+                        <strong>
+                          {queuedTurn.status === 'queued'
+                            ? `В очереди · позиция ${queuedTurn.position}`
+                            : 'Требует проверки'}
+                        </strong>
+                        <time dateTime={queuedTurn.createdAt}>
+                          {EVENT_TIME_FORMATTER.format(new Date(queuedTurn.createdAt))}
+                        </time>
+                      </header>
+                      {queuedTurn.textPreview && <p>{queuedTurn.textPreview}</p>}
+                      {queuedTurn.attachmentCount > 0 && (
                         <small>
-                          Сервер потерял подтверждение запуска, продолжает сверку с Codex и не будет
-                          повторять задачу вслепую.
+                          {queuedTurn.attachmentCount.toLocaleString('ru')}{' '}
+                          {queuedTurn.attachmentCount === 1 ? 'вложение' : 'вложений'}
                         </small>
-                      </div>
-                    )}
-                  </article>
-                ))}
+                      )}
+                      {queuedTurn.status === 'needsReview' && (
+                        <div className="queued-turn-review">
+                          <small>
+                            Сервер потерял подтверждение запуска, продолжает сверку с Codex и не
+                            будет повторять задачу вслепую.
+                          </small>
+                        </div>
+                      )}
+                      {queuedTurn.status === 'queued' && (
+                        <div className="queued-turn-actions">
+                          <button
+                            type="button"
+                            className="queued-turn-cancel"
+                            disabled={cancelling}
+                            aria-busy={cancelling}
+                            onClick={() => void cancelQueuedTurn(queuedTurn)}
+                          >
+                            {cancelling ? 'Отменяем…' : 'Отменить задачу'}
+                          </button>
+                        </div>
+                      )}
+                    </article>
+                  );
+                })}
               </section>
             )}
             {approvals.map((approval) => (
