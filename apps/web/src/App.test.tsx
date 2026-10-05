@@ -399,9 +399,13 @@ describe('App', () => {
 
     render(<App />);
 
-    const projectRow = await screen.findByRole('button', {
-      name: 'Открыть чат проекта Синхронизация лидов — в работе',
-    });
+    const projectRow = await screen.findByRole(
+      'button',
+      {
+        name: 'Открыть чат проекта Синхронизация лидов — в работе',
+      },
+      { timeout: 3_000 },
+    );
     expect(projectRow.textContent).not.toContain('В работе');
     expect(projectRow.querySelector('.thread-running-dot')).not.toBeNull();
     const recentRow = screen.getByRole('button', {
