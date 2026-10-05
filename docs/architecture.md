@@ -224,11 +224,12 @@ the durable queue is only for new root turns.
 
 An authenticated operator may cancel a request only while its durable row is still `queued`. The cancellation
 removes the row and its exclusively claimed attachment records in one SQLite transaction, immediately releasing
-the thread quota; bounded physical-file cleanup then runs under the thread attachment lock and records any
-failure for storage maintenance. A concurrent dispatcher claim wins over cancellation, so `dispatching` and
-`unknown` rows cannot be cancelled and active native work is never interrupted by this operation. Successful
-cancellation publishes a queue-change event so every device refreshes the remaining positions. Ambiguous
-`needsReview` work stays fail closed until authoritative reconciliation.
+the thread quota. The same transaction creates no-foreign-key file-deletion tombstones, so bounded idempotent
+cleanup under the thread attachment lock survives a crash, retries after startup and on a timer, and removes a
+tombstone only after the file is absent. A concurrent dispatcher claim wins over cancellation, so `dispatching`
+and `unknown` rows cannot be cancelled and active native work is never interrupted by this operation.
+Successful cancellation publishes a queue-change event so every device refreshes the remaining positions.
+Ambiguous `needsReview` work stays fail closed until authoritative reconciliation.
 
 If the API process loses the result of `turn/start`, the row is retained as visible `needsReview` work and is
 never started again automatically. Recovery reads the authoritative Codex thread and matches the persisted
