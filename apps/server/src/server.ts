@@ -1173,12 +1173,16 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           );
           repository.completeAttachmentFileDeletion(deletion.id);
         } catch {
-          repository.recordAttachmentFileDeletionFailure(deletion.id);
-          repository.audit('attachment.file.delete', 'failed', {
-            attachmentId: deletion.id,
-            threadId: deletion.threadId,
-            attempt: deletion.attempts + 1,
-          });
+          const failure = repository.recordAttachmentFileDeletionFailure(
+            deletion.id,
+            deletion.attempts,
+          );
+          if (failure && [1, 2, 4, 8, 16].includes(failure.attempt))
+            repository.audit('attachment.file.delete', 'failed', {
+              attachmentId: deletion.id,
+              threadId: deletion.threadId,
+              attempt: failure.attempt,
+            });
         }
       }
     })()
@@ -1191,11 +1195,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           queueMicrotask(() => void requestAttachmentFileDeletionDrain());
           return;
         }
-        if (repository.listAttachmentFileDeletions().length === 0) return;
+        const nextAttemptAt = repository.earliestAttachmentFileDeletionAttempt();
+        if (nextAttemptAt === null) return;
+        const retryDelayMs = Math.max(0, Math.min(3_600_000, nextAttemptAt - Date.now()));
         attachmentFileDeletionRetry = setTimeout(() => {
           attachmentFileDeletionRetry = null;
           void requestAttachmentFileDeletionDrain();
-        }, 30_000);
+        }, retryDelayMs);
         attachmentFileDeletionRetry.unref();
       })
       .catch(() => undefined);

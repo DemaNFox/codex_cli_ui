@@ -585,6 +585,21 @@ class FailingRemoveAttachmentStore extends AttachmentStore {
   }
 }
 
+class SelectiveFailRemoveAttachmentStore extends AttachmentStore {
+  constructor(
+    root: string,
+    private readonly failingStorageNames: ReadonlySet<string>,
+  ) {
+    super(root);
+  }
+
+  override async remove(projectId: string, threadId: string, storageName: string): Promise<void> {
+    if (this.failingStorageNames.has(storageName))
+      throw new Error('simulated persistent attachment remove failure');
+    await super.remove(projectId, threadId, storageName);
+  }
+}
+
 class FakeAudioTranscriptionClient implements AudioTranscriptionClient {
   readonly uploads: TranscriptionUpload[] = [];
 
@@ -5399,6 +5414,9 @@ describe('Codex routes', () => {
       threadId: queuedThreadId,
       attempt: 1,
     });
+    first.repository.database
+      .prepare('UPDATE attachment_file_deletions SET next_attempt_at=? WHERE id=?')
+      .run(Date.now() - 1, attachment.id);
 
     await first.app.close();
     openApps.splice(openApps.indexOf(first.app), 1);
@@ -5505,25 +5523,30 @@ describe('Codex routes', () => {
     ).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('processes only one bounded attachment cleanup batch per reconciliation pass', async () => {
+  it('backs off persistent cleanup failures so a newer healthy tombstone is not starved', async () => {
     const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-cleanup-batch-'));
     const repository = new SqliteRepository(path.join(temp, 'codex-web.sqlite3'), 1_000);
     const now = new Date().toISOString();
+    const dueAt = Date.now() - 1;
+    const failingStorageNames = new Set<string>();
     const insert = repository.database.prepare(
       `INSERT INTO attachment_file_deletions(
-         id,project_id,thread_id,storage_name,attempts,created_at,updated_at
-       ) VALUES(?,?,?,?,0,?,?)`,
+         id,project_id,thread_id,storage_name,attempts,next_attempt_at,created_at,updated_at
+       ) VALUES(?,?,?,?,?,?,?,?)`,
     );
     for (let index = 0; index < 17; index += 1) {
       const id = `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
-      insert.run(id, 'project', 'thread', `${id}.txt`, now, now);
+      const storageName = `${id}.txt`;
+      if (index < 16) failingStorageNames.add(storageName);
+      insert.run(id, 'project', 'thread', storageName, index === 15 ? 16 : 0, dueAt, now, now);
     }
     repository.close();
     const appServer = new FakeAppServer();
+    const healthyId = '00000000-0000-4000-8000-000000000016';
     const started = await fixture(
       1,
       undefined,
-      (root) => new AttachmentStore(root),
+      (root) => new SelectiveFailRemoveAttachmentStore(root, failingStorageNames),
       undefined,
       undefined,
       undefined,
@@ -5535,11 +5558,31 @@ describe('Codex routes', () => {
       { temp, appServer },
     );
     await vi.waitFor(() => {
+      expect(started.repository.hasAttachmentFileDeletion(healthyId)).toBe(false);
       const remaining = started.repository.database
         .prepare('SELECT COUNT(*) AS count FROM attachment_file_deletions')
         .get() as { count: number };
-      expect(remaining.count).toBe(1);
+      expect(remaining.count).toBe(16);
     });
+    const firstFailure = started.repository.database
+      .prepare(
+        "SELECT attempts,next_attempt_at FROM attachment_file_deletions WHERE id='00000000-0000-4000-8000-000000000000'",
+      )
+      .get() as { attempts: number; next_attempt_at: number };
+    expect(firstFailure.attempts).toBe(1);
+    expect(firstFailure.next_attempt_at).toBeGreaterThan(dueAt + 30_000);
+    const cappedFailure = started.repository.database
+      .prepare(
+        "SELECT attempts,next_attempt_at FROM attachment_file_deletions WHERE id='00000000-0000-4000-8000-000000000015'",
+      )
+      .get() as { attempts: number; next_attempt_at: number };
+    expect(cappedFailure.attempts).toBe(17);
+    expect(cappedFailure.next_attempt_at).toBeGreaterThan(Date.now() + 3_500_000);
+    expect(cappedFailure.next_attempt_at).toBeLessThanOrEqual(Date.now() + 3_600_000);
+    const audited = started.repository.database
+      .prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action='attachment.file.delete'")
+      .get() as { count: number };
+    expect(audited.count).toBe(15);
   });
 
   it('protects queued-turn cancellation and validates its numeric identifier', async () => {

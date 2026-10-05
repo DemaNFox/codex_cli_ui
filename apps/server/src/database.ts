@@ -182,6 +182,7 @@ export interface AttachmentFileDeletionRecord {
   threadId: string;
   storageName: string;
   attempts: number;
+  nextAttemptAt: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -425,11 +426,12 @@ export class SqliteRepository {
         thread_id TEXT NOT NULL,
         storage_name TEXT NOT NULL,
         attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+        next_attempt_at INTEGER NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS attachment_file_deletions_order_idx
-        ON attachment_file_deletions(created_at,id);
+        ON attachment_file_deletions(next_attempt_at,created_at,id);
 
       CREATE TABLE IF NOT EXISTS thread_history_state (
         thread_id TEXT PRIMARY KEY REFERENCES threads(id) ON DELETE CASCADE,
@@ -1780,8 +1782,8 @@ export class SqliteRepository {
       const now = new Date().toISOString();
       const insertDeletion = this.database.prepare(
         `INSERT INTO attachment_file_deletions(
-           id,project_id,thread_id,storage_name,attempts,created_at,updated_at
-         ) VALUES(?,?,?,?,0,?,?)`,
+           id,project_id,thread_id,storage_name,attempts,next_attempt_at,created_at,updated_at
+         ) VALUES(?,?,?,?,0,?,?,?)`,
       );
       for (const attachment of attachments)
         insertDeletion.run(
@@ -1789,6 +1791,7 @@ export class SqliteRepository {
           project.project_id,
           threadId,
           attachment.storageName,
+          Date.now(),
           now,
           now,
         );
@@ -1810,18 +1813,21 @@ export class SqliteRepository {
   }
 
   listAttachmentFileDeletions(): AttachmentFileDeletionRecord[] {
+    const now = Date.now();
     return (
       this.database
         .prepare(
-          `SELECT id,project_id,thread_id,storage_name,attempts,created_at,updated_at
-           FROM attachment_file_deletions ORDER BY created_at,id LIMIT 16`,
+          `SELECT id,project_id,thread_id,storage_name,attempts,next_attempt_at,created_at,updated_at
+           FROM attachment_file_deletions WHERE next_attempt_at<=?
+           ORDER BY next_attempt_at,created_at,id LIMIT 16`,
         )
-        .all() as unknown as {
+        .all(now) as unknown as {
         id: string;
         project_id: string;
         thread_id: string;
         storage_name: string;
         attempts: number;
+        next_attempt_at: number;
         created_at: string;
         updated_at: string;
       }[]
@@ -1831,6 +1837,7 @@ export class SqliteRepository {
       threadId: row.thread_id,
       storageName: row.storage_name,
       attempts: row.attempts,
+      nextAttemptAt: row.next_attempt_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     }));
@@ -1850,12 +1857,27 @@ export class SqliteRepository {
     );
   }
 
-  recordAttachmentFileDeletionFailure(id: string): boolean {
-    return (
-      this.database
-        .prepare('UPDATE attachment_file_deletions SET attempts=attempts+1,updated_at=? WHERE id=?')
-        .run(new Date().toISOString(), id).changes === 1
-    );
+  earliestAttachmentFileDeletionAttempt(): number | null {
+    const row = this.database
+      .prepare('SELECT MIN(next_attempt_at) AS next_attempt_at FROM attachment_file_deletions')
+      .get() as { next_attempt_at: number | null };
+    return row.next_attempt_at;
+  }
+
+  recordAttachmentFileDeletionFailure(
+    id: string,
+    expectedAttempts: number,
+  ): { attempt: number; nextAttemptAt: number } | undefined {
+    const attempt = expectedAttempts + 1;
+    const delayMs = Math.min(3_600_000, 30_000 * 2 ** Math.min(expectedAttempts, 7));
+    const nextAttemptAt = Date.now() + delayMs;
+    const changed = this.database
+      .prepare(
+        `UPDATE attachment_file_deletions
+         SET attempts=?,next_attempt_at=?,updated_at=? WHERE id=? AND attempts=?`,
+      )
+      .run(attempt, nextAttemptAt, new Date().toISOString(), id, expectedAttempts).changes;
+    return changed === 1 ? { attempt, nextAttemptAt } : undefined;
   }
 
   requeueTurn(id: number): boolean {
