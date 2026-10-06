@@ -4204,7 +4204,7 @@ function Workspace({
             ...current.filter((item) => item.id !== result.queuedTurn.id),
             result.queuedTurn,
           ]);
-          setActionNotice(`Задача принята в очередь · позиция ${result.queuedTurn.position}.`);
+          setActionNotice('Задача принята и ожидает запуска.');
         } else {
           setActionNotice('Задача принята Codex.');
         }
@@ -4629,7 +4629,9 @@ function Workspace({
                       <header>
                         <strong>
                           {queuedTurn.status === 'queued'
-                            ? `В очереди · позиция ${queuedTurn.position}`
+                            ? queuedTurns.length === 1
+                              ? 'Ожидает завершения текущей работы'
+                              : `В очереди · позиция ${queuedTurn.position}`
                             : 'Требует проверки'}
                         </strong>
                         <time dateTime={queuedTurn.createdAt}>

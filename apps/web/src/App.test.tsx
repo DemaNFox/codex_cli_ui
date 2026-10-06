@@ -488,9 +488,9 @@ describe('App', () => {
     await user.type(input, queuedTurn.textPreview);
     await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
 
-    expect(await screen.findByText('Задача принята в очередь · позиция 2.')).not.toBeNull();
+    expect(await screen.findByText('Задача принята и ожидает запуска.')).not.toBeNull();
     const queue = screen.getByRole('region', { name: 'Задачи в очереди' });
-    expect(within(queue).getByText('В очереди · позиция 2')).not.toBeNull();
+    expect(within(queue).getByText('Ожидает завершения текущей работы')).not.toBeNull();
     expect(within(queue).getByText(queuedTurn.textPreview)).not.toBeNull();
     expect((input as HTMLTextAreaElement).value).toBe('');
   });
@@ -516,8 +516,34 @@ describe('App', () => {
     render(<App />);
 
     const queue = await screen.findByRole('region', { name: 'Задачи в очереди' });
+    expect(within(queue).getByText('Ожидает завершения текущей работы')).not.toBeNull();
     expect(within(queue).getByText(queuedTurn.textPreview)).not.toBeNull();
     expect(within(queue).getByText('2 вложений')).not.toBeNull();
+  });
+
+  it('shows queue positions only when several tasks are waiting', async () => {
+    const queuedTurns = [1, 2].map((position) => ({
+      id: 20 + position,
+      threadId: thread.id,
+      status: 'queued' as const,
+      position,
+      errorCode: null,
+      textPreview: `Ожидающая задача ${position}`,
+      attachmentCount: 0,
+      createdAt: `2026-10-04T10:0${position}:00.000Z`,
+    }));
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [], queuedTurns });
+      if (url === '/api/threads/thread-1/queued-turns') return jsonResponse({ data: queuedTurns });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const queue = await screen.findByRole('region', { name: 'Задачи в очереди' });
+    expect(within(queue).getByText('В очереди · позиция 1')).not.toBeNull();
+    expect(within(queue).getByText('В очереди · позиция 2')).not.toBeNull();
   });
 
   it('cancels a queued task once, exposes the pending state, and removes the card', async () => {
