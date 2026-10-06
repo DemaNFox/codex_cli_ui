@@ -1013,13 +1013,42 @@ def main() -> int:
         if not active_file_picker.is_enabled():
             raise AssertionError("file picker is disabled while the root turn is active")
         active_file_picker.set_input_files(
-            {
-                "name": "active-turn-note.txt",
-                "mimeType": "text/plain",
-                "buffer": b"active turn attachment\n",
-            }
+            [
+                {
+                    "name": name,
+                    "mimeType": "text/plain",
+                    "buffer": f"{name}\n".encode(),
+                }
+                for name in [
+                    "active-turn-note.txt",
+                    "conversation-context-one.txt",
+                    "conversation-context-two.txt",
+                    "conversation-context-three.txt",
+                ]
+            ]
         )
         page.get_by_text("active-turn-note.txt", exact=True).wait_for()
+        attachment_queue = page.get_by_label("Вложения к отправке")
+        attachment_metrics = attachment_queue.evaluate(
+            "element => ({scrollWidth: element.scrollWidth, clientWidth: element.clientWidth})"
+        )
+        if attachment_metrics["scrollWidth"] > attachment_metrics["clientWidth"] + 1:
+            raise AssertionError(
+                f"composer attachments require horizontal scrolling: {attachment_metrics}"
+            )
+        attachment_page_metrics = page.evaluate(
+            "() => ({scrollWidth: document.documentElement.scrollWidth, clientWidth: document.documentElement.clientWidth})"
+        )
+        if attachment_page_metrics["scrollWidth"] > attachment_page_metrics["clientWidth"] + 1:
+            raise AssertionError(
+                f"composer attachments widen the page: {attachment_page_metrics}"
+            )
+        for name in [
+            "conversation-context-one.txt",
+            "conversation-context-two.txt",
+            "conversation-context-three.txt",
+        ]:
+            page.get_by_role("button", name=f"Удалить {name}").click()
         active_composer = page.get_by_label("Уточнение для активной задачи")
         active_composer.fill("Учти приложенный файл")
         page.get_by_role("button", name="Направить задачу").click()

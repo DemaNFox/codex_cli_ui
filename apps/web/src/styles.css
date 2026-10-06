@@ -1599,13 +1599,18 @@ button:disabled {
   border: 0 !important;
 }
 .attachment-queue {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(15rem, 100%), 1fr));
   gap: 0.45rem;
+  min-width: 0;
+  max-width: 100%;
+  max-height: min(14rem, 32dvh);
   padding: 0.65rem 0.65rem 0;
-  overflow-x: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 }
 .attachment-queue li {
-  flex: 0 0 min(15rem, 78vw);
   display: flex;
   align-items: center;
   gap: 0.5rem;
