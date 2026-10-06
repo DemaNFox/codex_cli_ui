@@ -597,6 +597,18 @@ def main() -> int:
                             "payload": {"status": "inProgress"},
                             "createdAt": "2026-09-27T12:01:01.000Z",
                         },
+                        {
+                            "id": 3,
+                            "threadId": "t2",
+                            "turnId": "turn-background",
+                            "kind": "agent-message",
+                            "phase": "completed",
+                            "payload": {
+                                "text": "Ответ уже получен, но фоновая проверка продолжается.",
+                                "messagePhase": "final_answer",
+                            },
+                            "createdAt": "2026-09-27T12:01:01.500Z",
+                        },
                     ],
                 },
             )
@@ -633,7 +645,7 @@ def main() -> int:
             payload(route, 202, {"data": {"turnId": "turn-background"}})
         elif path == "/api/threads/t2/events":
             event = {
-                "id": 3,
+                "id": 4,
                 "threadId": "t2",
                 "turnId": "turn-background",
                 "kind": "thread",
@@ -1037,6 +1049,12 @@ def main() -> int:
             "button", name="Открыть чат проекта Фоновая задача — в работе"
         ).click()
         page.get_by_role("heading", name="Фоновая задача").wait_for()
+        active_answer = page.get_by_role(
+            "article", name="Ответ получен · работа продолжается Codex"
+        )
+        active_answer.wait_for()
+        if page.get_by_role("article", name="Итоговый ответ Codex").count():
+            raise AssertionError("active final_answer was promoted before turn completion")
         active_file_picker = page.get_by_label("Выбрать вложения")
         if not active_file_picker.is_enabled():
             raise AssertionError("file picker is disabled while the root turn is active")

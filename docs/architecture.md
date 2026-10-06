@@ -66,9 +66,12 @@ Browser
   receive safe navigation attributes and wide tables scroll inside their own mobile-safe container; model
   output is never executed as JavaScript.
 - The public event projection preserves only the bounded `commentary`/`final_answer` phase of completed agent
-  messages. The transcript gives `final_answer` a labelled visual boundary while commentary remains visually
-  neutral. For journal entries created before this phase was persisted, the last phase-less agent message of
-  a successfully completed turn is treated as the compatibility final; explicit commentary is never promoted.
+  messages. An explicit `final_answer` is shown immediately, but it is labelled as an answer received while
+  work continues until the same turn has a successful terminal event. Only then does the transcript promote it
+  to the labelled final-answer boundary and collapse that turn's progress. Failed and interrupted turns keep
+  distinct terminal labels and are never presented as successfully completed. For journal entries created
+  before this phase was persisted, the last phase-less agent message of a successfully completed turn is
+  treated as the compatibility final; explicit commentary is never promoted.
 - Once a successfully completed turn has a final answer, its transcript projection keeps that turn's operator
   prompt and final answer; every other completed turn keeps its own pair too. Only commentary and execution
   activity are hidden. Active, failed, interrupted or final-less turns retain their progress and diagnostic
@@ -214,8 +217,12 @@ current positions after reload. A live descendant does not serialize the whole c
 active root turn and another execution slot is available, the next root turn may start beside that descendant.
 Both still count against the shared execution-unit ceiling. A single dispatcher starts the oldest eligible
 request when its target root turn is idle and capacity is available; completion events and process startup both
-trigger reconciliation. If queued work remains past a short grace period because persisted root or subagent
-activity may be stale, the dispatcher performs a bounded authoritative `thread/read` reconciliation before waiting.
+trigger reconciliation. While any root turn or descendant remains projected active, a non-overlapping periodic
+reconciliation pass also checks authoritative `thread/read` state, bounded to 32 active descendants per pass,
+with a rotating cursor so later descendants cannot starve behind long-running earlier rows. A missed terminal
+event therefore cannot leave the chat apparently running until another user action. If queued work remains past
+a short grace period because persisted root or subagent activity may be stale, the dispatcher also performs this
+bounded authoritative reconciliation before waiting.
 Only a confirmed inactive native runtime releases the occupied projection; failed or mismatched reads stay fail
 closed. Reconciliation is throttled so a confirmed-live task does not cause one-second native polling, and an
 ineligible chat never prevents another eligible chat from using a free slot. Claiming and state transition are
@@ -317,9 +324,14 @@ composer. The account/logout row remains reachable inside the drawer.
 - SQLite stores the endpoint and its Web Push key material because the server needs them to deliver while no
   page is open. API responses expose only the configured public VAPID key and a boolean membership result;
   endpoints and private key material are never listed, audited or logged.
-- A unique terminal turn event creates at most one delivery per mapped subscription. A bounded durable queue
-  resumes after restart, retries transient failures with backoff and removes an endpoint after a push service
-  reports it gone. Delivery failures never change the Codex turn result.
+- A failed or interrupted root terminal event creates at most one status-specific delivery per mapped
+  subscription. A successful root result is deferred while any descendant is still active and is enqueued only
+  when the complete task tree is idle and no accepted follow-up is queued or starting, so the browser is never
+  told that work finished while agents continue.
+  The deferred in-process marker is deliberately fail-safe: a server restart may omit that optional completion
+  notification, but cannot turn it into a false one. The bounded durable delivery queue resumes after restart,
+  retries transient failures with backoff and removes an endpoint after a push service reports it gone. Delivery
+  failures never change the Codex turn result.
 - Payloads contain only an opaque chat identifier and a generic terminal result. They do not contain the chat
   name, prompts, answers, commands, tool output, filenames or attachment metadata. Clicking a
   notification focuses an existing same-origin page or opens the Web UI.

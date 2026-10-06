@@ -119,7 +119,10 @@ stopped from the Agents menu without interrupting the root turn or unrelated age
 queue card; cancellation never interrupts work that has already started, and an ambiguous start that requires
 review remains non-cancellable. Resource reconfiguration, draining and degraded-capacity
 states still fail closed instead of silently adding work. A rare interrupted start is shown as requiring review;
-it is reconciled against Codex and is never retried blindly.
+it is reconciled against Codex and is never retried blindly. An answer emitted before the whole turn finishes
+is shown as received while work continues; only a successful terminal turn is marked as the final answer.
+If the root finishes while descendants keep running, the header says so explicitly. Active execution state is
+also reconciled automatically, and a successful completion notification waits for the whole task tree to stop.
 
 A new host needs only:
 
