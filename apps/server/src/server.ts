@@ -780,6 +780,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const activeTurns = new Set<string>();
   const treeBusyThreads = new Set<string>();
   const deferredCompletionPushes = new Map<string, string>();
+  const pendingTurnStartThreads = new Map<string, number>();
   const nativeActiveThreads = new Set<string>();
   const nativeActivityVersions = new Map<string, number>();
   let nativeActivityVersion = 0;
@@ -848,7 +849,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       !turnId ||
       activeTurnIdForThread(threadId) !== null ||
       nativeActiveThreads.has(threadId) ||
-      repository.countActiveSubagentsForRoot(threadId) > 0
+      repository.countActiveSubagentsForRoot(threadId) > 0 ||
+      repository.hasOutstandingQueuedTurns(threadId) ||
+      (pendingTurnStartThreads.get(threadId) ?? 0) > 0
     )
       return;
     deferredCompletionPushes.delete(threadId);
@@ -875,6 +878,16 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   repository.resetActiveThreadRuntime();
   repository.resetActiveSubagentRuntime();
   let pendingTurnStarts = 0;
+  const beginPendingTurnStart = (threadId: string): void => {
+    pendingTurnStarts += 1;
+    pendingTurnStartThreads.set(threadId, (pendingTurnStartThreads.get(threadId) ?? 0) + 1);
+  };
+  const endPendingTurnStart = (threadId: string): void => {
+    pendingTurnStarts -= 1;
+    const remaining = (pendingTurnStartThreads.get(threadId) ?? 1) - 1;
+    if (remaining > 0) pendingTurnStartThreads.set(threadId, remaining);
+    else pendingTurnStartThreads.delete(threadId);
+  };
   let pendingThreadStarts = 0;
   let queuedTurnRetry: NodeJS.Timeout | null = null;
   let queuedTurnDispatch: Promise<void> | null = null;
@@ -969,6 +982,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   let serverClosing = false;
   let executionReconcileTimer: NodeJS.Timeout | null = null;
   let executionReconcileInFlight: Promise<void> | null = null;
+  let subagentReconcileOffset = 0;
   let lastHandledDisconnectGeneration = 0;
   let appServerDisconnectEpoch = 0;
   const upgradeDrainPath = dependencies.upgradeDrainPath ?? '/run/codex-web-ui/upgrade-drain';
@@ -1333,6 +1347,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const project = repository.getProject(existing.projectId);
     if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
     const cwd = await canonicalProjectPath(pathPolicy, project);
+    if (serverClosing) throw new Error('SERVER_CLOSING');
     const nativeVersionBeforeRead = nativeActivityVersions.get(existing.id) ?? null;
     let result = threadResponseSchema.parse(
       await appServer.request('thread/read', { threadId: existing.id, includeTurns }),
@@ -1345,6 +1360,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       liveActiveTurnId === null &&
       !Array.isArray(result.thread.turns)
     ) {
+      if (serverClosing) throw new Error('SERVER_CLOSING');
       result = threadResponseSchema.parse(
         await appServer.request('thread/read', { threadId: existing.id, includeTurns: true }),
       );
@@ -1358,6 +1374,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       if (recoveredTurnId) {
         liveActiveTurnId = recoveredTurnId;
       } else if (repository.listSubagents(existing.id).length > 0) {
+        if (serverClosing) throw new Error('SERVER_CLOSING');
         const confirmation = threadResponseSchema.parse(
           await appServer.request('thread/read', { threadId: existing.id, includeTurns: true }),
         );
@@ -1441,10 +1458,12 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const affectedRoots = new Set<string>();
     const reconciledSubagents = new Set<string>();
     for (const snapshot of activeTurnEntries()) {
+      if (serverClosing) return;
       const existing = repository.getThread(snapshot.threadId);
       if (!existing || activeTurnIdForThread(snapshot.threadId) !== snapshot.turnId) continue;
       try {
         const reconciled = await readThreadFromAppServer(existing, false, snapshot.turnId);
+        if (serverClosing) return;
         if (
           reconciled.thread.status === 'active' ||
           activeTurnIdForThread(snapshot.threadId) !== snapshot.turnId
@@ -1457,6 +1476,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           turnId: snapshot.turnId,
         });
       } catch {
+        if (serverClosing) return;
         repository.audit('turn.capacity_reconcile', 'failed', {
           threadId: snapshot.threadId,
           turnId: snapshot.turnId,
@@ -1464,15 +1484,18 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       }
     }
     for (const [threadId, expectedVersion] of [...nativeActivityVersions]) {
+      if (serverClosing) return;
       if (!nativeActiveThreads.has(threadId)) continue;
       const existing = repository.getThread(threadId);
       const project = existing && repository.getProject(existing.projectId);
       if (!existing || !project) continue;
       try {
         const cwd = await canonicalProjectPath(pathPolicy, project);
+        if (serverClosing) return;
         const result = threadResponseSchema.parse(
           await appServer.request('thread/read', { threadId, includeTurns: false }),
         );
+        if (serverClosing) return;
         if (result.thread.id !== threadId || result.thread.cwd !== cwd)
           throw new Error('NATIVE_THREAD_MISMATCH');
         if (statusType(result.thread.status) === 'active') continue;
@@ -1496,22 +1519,38 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           affectedRoots.add(threadId);
         }
       } catch {
+        if (serverClosing) return;
         repository.audit('turn.native_capacity_reconcile', 'failed', { threadId });
       }
     }
-    for (const snapshot of repository.listActiveSubagents().slice(0, 32)) {
+    if (serverClosing) return;
+    const activeSubagents = repository.listActiveSubagents();
+    const reconcileStart =
+      activeSubagents.length === 0 ? 0 : subagentReconcileOffset % activeSubagents.length;
+    const subagentsToReconcile = [
+      ...activeSubagents.slice(reconcileStart),
+      ...activeSubagents.slice(0, reconcileStart),
+    ].slice(0, 32);
+    subagentReconcileOffset =
+      activeSubagents.length === 0
+        ? 0
+        : (reconcileStart + subagentsToReconcile.length) % activeSubagents.length;
+    for (const snapshot of subagentsToReconcile) {
+      if (serverClosing) return;
       if (snapshot.status !== 'pendingInit' && snapshot.status !== 'running') continue;
       const rootThread = repository.getThread(snapshot.rootThreadId);
       const project = rootThread && repository.getProject(rootThread.projectId);
       if (!rootThread || !project) continue;
       try {
         const cwd = await canonicalProjectPath(pathPolicy, project);
+        if (serverClosing) return;
         const result = threadResponseSchema.parse(
           await appServer.request('thread/read', {
             threadId: snapshot.id,
             includeTurns: false,
           }),
         );
+        if (serverClosing) return;
         if (result.thread.id !== snapshot.id || result.thread.cwd !== cwd)
           throw new Error('SUBAGENT_THREAD_MISMATCH');
         if (statusType(result.thread.status) === 'active') continue;
@@ -1527,12 +1566,14 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           reconciledSubagents.add(snapshot.id);
         }
       } catch {
+        if (serverClosing) return;
         repository.audit('subagent.capacity_reconcile', 'failed', {
           rootThreadId: snapshot.rootThreadId,
           subagentId: snapshot.id,
         });
       }
     }
+    if (serverClosing) return;
     for (const rootThreadId of affectedRoots) {
       syncThreadExecutionStatus(rootThreadId);
       flushDeferredCompletionPush(rootThreadId);
@@ -1577,9 +1618,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     Math.max(10, dependencies.executionReconcileIntervalMs ?? 15_000),
   );
   const executionReconciliationNeeded = (): boolean =>
-    activeTurns.size > 0 ||
-    nativeActiveThreads.size > 0 ||
-    repository.countActiveSubagents() > 0;
+    activeTurns.size > 0 || nativeActiveThreads.size > 0 || repository.countActiveSubagents() > 0;
   const scheduleExecutionReconciliation = (): void => {
     if (serverClosing || executionReconcileTimer !== null) return;
     executionReconcileTimer = setTimeout(() => {
@@ -1591,7 +1630,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       }
       void reconcileStaleExecutionCapacity()
         .catch(() => {
-          repository.audit('execution.periodic_reconcile', 'failed', {});
+          if (!serverClosing) repository.audit('execution.periodic_reconcile', 'failed', {});
         })
         .finally(() => {
           scheduleExecutionReconciliation();
@@ -2209,7 +2248,6 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     unsubscribeLifecycle();
     await attachmentFileDeletionDrain?.catch(() => undefined);
     await queuedTurnDispatch?.catch(() => undefined);
-    await executionReconcileInFlight?.catch(() => undefined);
     await pushDispatcher?.close();
     await appServer.stop();
     repository.close();
@@ -2803,6 +2841,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           )
         ) {
           syncThreadExecutionStatus(id);
+          flushDeferredCompletionPush(id);
           const reconciled = repository.getSubagent(subagentId);
           const threadRuntime = threadRuntimePayload(id);
           if (reconciled)
@@ -3228,9 +3267,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       if (activeRootCount() + pendingTurnStarts >= config.maxConcurrentTurns)
         await reconcileStaleExecutionCapacity();
       if (activeRootCount() + pendingTurnStarts >= config.maxConcurrentTurns) return 'wait';
-      pendingTurnStarts += 1;
+      beginPendingTurnStart(record.threadId);
     } else {
-      pendingTurnStarts += 1;
+      beginPendingTurnStart(record.threadId);
       try {
         const capacity = await brokerSnapshot();
         const maximumExecutionUnits =
@@ -3247,18 +3286,18 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           activeExecutionUnits > maximumExecutionUnits ||
           capacity.capacity.memoryAvailableBytes < 512 * 1_024 * 1_024
         ) {
-          pendingTurnStarts -= 1;
+          endPendingTurnStart(record.threadId);
           return 'wait';
         }
       } catch {
-        pendingTurnStarts -= 1;
+        endPendingTurnStart(record.threadId);
         return 'wait';
       }
     }
 
     const claimed = repository.claimQueuedTurn(record.id);
     if (!claimed) {
-      pendingTurnStarts -= 1;
+      endPendingTurnStart(record.threadId);
       return 'wait';
     }
     const thread = repository.getThread(claimed.threadId);
@@ -3355,7 +3394,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       });
       return 'wait';
     } finally {
-      pendingTurnStarts -= 1;
+      endPendingTurnStart(record.threadId);
     }
   };
 
@@ -3591,7 +3630,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
       throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
     }
-    pendingTurnStarts += 1;
+    beginPendingTurnStart(id);
     let executionAgentLimit: number | undefined;
     if (dependencies.resourceBroker) {
       try {
@@ -3619,7 +3658,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
             'The host does not have enough free memory to start another task safely',
           );
       } catch (error) {
-        pendingTurnStarts -= 1;
+        endPendingTurnStart(id);
         if (error instanceof HttpError && error.code === 'RESOURCE_CAPACITY_EXHAUSTED') {
           const response = enqueueReservedTurn(id, input, hash);
           requestQueuedTurnDispatch();
@@ -3632,7 +3671,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const preset = input.permissionPreset ?? project.defaultPermissionPreset;
     const attachmentClaim = `pending:${input.idempotencyKey}`;
     if (!repository.claimAttachments(id, input.attachmentIds, attachmentClaim)) {
-      pendingTurnStarts -= 1;
+      endPendingTurnStart(id);
       repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
       throw new HttpError(409, 'ATTACHMENT_NOT_AVAILABLE');
     }
@@ -3699,7 +3738,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       }
       throw error;
     } finally {
-      pendingTurnStarts -= 1;
+      endPendingTurnStart(id);
     }
     const response = { data: { status: 'started' as const, turnId: result.turn.id } };
     if (attachments.length > 0)

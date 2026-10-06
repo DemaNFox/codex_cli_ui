@@ -8210,8 +8210,10 @@ describe('Codex routes', () => {
 
   it('defers a successful root completion push until the last live child is terminal', async () => {
     const sender = new FakePushSender();
-    const { app, appServer, repository, projectPath } =
-      await fixtureWithExecutionReconciliation(15_000, sender);
+    const { app, appServer, repository, projectPath } = await fixtureWithExecutionReconciliation(
+      15_000,
+      sender,
+    );
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const threadId = await createThread(app, project.id, session.headers);
@@ -8260,9 +8262,9 @@ describe('Codex routes', () => {
     await new Promise((resolve) => setImmediate(resolve));
     expect(repository.getThread(threadId)).toMatchObject({ status: 'active', activeTurnId: null });
     expect(sender.calls).toHaveLength(0);
-    expect(repository.database.prepare('SELECT COUNT(*) AS count FROM push_deliveries').get()).toEqual(
-      { count: 0 },
-    );
+    expect(
+      repository.database.prepare('SELECT COUNT(*) AS count FROM push_deliveries').get(),
+    ).toEqual({ count: 0 });
 
     const terminal = {
       method: 'item/completed' as const,
@@ -8289,8 +8291,10 @@ describe('Codex routes', () => {
 
   it('keeps interrupted root push status correct while a child remains live', async () => {
     const sender = new FakePushSender();
-    const { app, appServer, repository, projectPath } =
-      await fixtureWithExecutionReconciliation(15_000, sender);
+    const { app, appServer, repository, projectPath } = await fixtureWithExecutionReconciliation(
+      15_000,
+      sender,
+    );
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const threadId = await createThread(app, project.id, session.headers);
@@ -8334,10 +8338,241 @@ describe('Codex routes', () => {
     expect(repository.getThread(threadId)).toMatchObject({ status: 'active', activeTurnId: null });
   });
 
+  it('keeps deferred completion blocked by accepted queued work and an in-flight turn start', async () => {
+    const sender = new FakePushSender();
+    const { app, appServer, repository, projectPath } = await fixture(
+      1,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      sender,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    await app.inject({
+      method: 'PUT',
+      url: `/api/threads/${threadId}/push-subscriptions`,
+      headers: session.headers,
+      payload: {
+        endpoint: 'https://fcm.googleapis.com/follow-up-pending',
+        expirationTime: null,
+        keys: { p256dh: 'p'.repeat(65), auth: 'a'.repeat(24) },
+      },
+    });
+    const first = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'first task',
+        idempotencyKey: '33000000-0000-4000-8000-000000000001',
+      },
+    });
+    const firstTurnId = first.json<{ data: { turnId: string } }>().data.turnId;
+    const observedAt = new Date().toISOString();
+    repository.upsertSubagent({
+      id: 'child-before-follow-up',
+      rootThreadId: threadId,
+      parentThreadId: threadId,
+      agentPath: '/root/before-follow-up',
+      nickname: null,
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'running',
+      message: null,
+      startedAt: observedAt,
+      lastActivityAt: observedAt,
+      completedAt: null,
+    });
+    const followUp = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'accepted follow-up',
+        idempotencyKey: '33000000-0000-4000-8000-000000000002',
+      },
+    });
+    expect(followUp.json()).toMatchObject({ data: { status: 'queued' } });
+    const startGate = appServer.blockTurnStarts();
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: firstTurnId, status: 'completed', items: [] } },
+    });
+    appServer.emit({
+      method: 'item/completed',
+      params: {
+        threadId,
+        turnId: firstTurnId,
+        completedAtMs: Date.now() + 1_000,
+        item: {
+          type: 'subAgentActivity',
+          id: 'child-before-follow-up-terminal',
+          agentThreadId: 'child-before-follow-up',
+          agentPath: '/root/before-follow-up',
+          kind: 'completed',
+        },
+      },
+    });
+    expect(sender.calls).toHaveLength(0);
+    await startGate.entered;
+    expect(sender.calls).toHaveLength(0);
+    appServer.failTurnStartWith = new Error('APP_SERVER_REQUEST_FAILED');
+    startGate.release();
+
+    await vi.waitFor(() => {
+      expect(repository.listUnknownQueuedTurns()).toHaveLength(1);
+    });
+    expect(sender.calls).toHaveLength(0);
+  });
+
+  it('keeps deferred completion blocked by a direct in-flight follow-up start', async () => {
+    const sender = new FakePushSender();
+    const { app, appServer, repository, projectPath } = await fixtureWithExecutionReconciliation(
+      15_000,
+      sender,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    await app.inject({
+      method: 'PUT',
+      url: `/api/threads/${threadId}/push-subscriptions`,
+      headers: session.headers,
+      payload: {
+        endpoint: 'https://fcm.googleapis.com/direct-follow-up',
+        expirationTime: null,
+        keys: { p256dh: 'p'.repeat(65), auth: 'a'.repeat(24) },
+      },
+    });
+    const first = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'first direct task',
+        idempotencyKey: '34000000-0000-4000-8000-000000000001',
+      },
+    });
+    const firstTurnId = first.json<{ data: { turnId: string } }>().data.turnId;
+    const observedAt = new Date().toISOString();
+    repository.upsertSubagent({
+      id: 'child-before-direct-follow-up',
+      rootThreadId: threadId,
+      parentThreadId: threadId,
+      agentPath: '/root/before-direct-follow-up',
+      nickname: null,
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'running',
+      message: null,
+      startedAt: observedAt,
+      lastActivityAt: observedAt,
+      completedAt: null,
+    });
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: firstTurnId, status: 'completed', items: [] } },
+    });
+    const startGate = appServer.blockTurnStarts();
+    const followUp = app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'direct follow-up',
+        idempotencyKey: '34000000-0000-4000-8000-000000000002',
+      },
+    });
+    await startGate.entered;
+    appServer.emit({
+      method: 'item/completed',
+      params: {
+        threadId,
+        turnId: firstTurnId,
+        completedAtMs: Date.now() + 1_000,
+        item: {
+          type: 'subAgentActivity',
+          id: 'child-before-direct-follow-up-terminal',
+          agentThreadId: 'child-before-direct-follow-up',
+          agentPath: '/root/before-direct-follow-up',
+          kind: 'completed',
+        },
+      },
+    });
+    expect(sender.calls).toHaveLength(0);
+    startGate.release();
+    const response = await followUp;
+    const followUpTurnId = response.json<{ data: { turnId: string } }>().data.turnId;
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: followUpTurnId, status: 'completed', items: [] } },
+    });
+    await vi.waitFor(() => expect(sender.deliveries).toHaveLength(1));
+  });
+
+  it('flushes deferred completion when stop-child discovers the child already terminal', async () => {
+    const sender = new FakePushSender();
+    const { app, appServer, repository, projectPath } = await fixtureWithExecutionReconciliation(
+      15_000,
+      sender,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    await app.inject({
+      method: 'PUT',
+      url: `/api/threads/${threadId}/push-subscriptions`,
+      headers: session.headers,
+      payload: {
+        endpoint: 'https://fcm.googleapis.com/stop-terminal-child',
+        expirationTime: null,
+        keys: { p256dh: 'p'.repeat(65), auth: 'a'.repeat(24) },
+      },
+    });
+    appServer.addSubagentThread('stop-terminal-child', projectPath, 'idle');
+    const observedAt = new Date().toISOString();
+    repository.upsertSubagent({
+      id: 'stop-terminal-child',
+      rootThreadId: threadId,
+      parentThreadId: threadId,
+      agentPath: '/root/stop-terminal',
+      nickname: null,
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'running',
+      message: null,
+      startedAt: observedAt,
+      lastActivityAt: observedAt,
+      completedAt: null,
+    });
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: 'turn-before-stop', status: 'completed', items: [] } },
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/subagents/stop-terminal-child/interrupt`,
+      headers: session.headers,
+    });
+    expect(response.statusCode).toBe(409);
+    await vi.waitFor(() => expect(sender.deliveries).toHaveLength(1));
+    expect(sender.deliveries[0]?.payload).toEqual({ threadId, status: 'completed' });
+  });
+
   it('periodically reconciles a stale child without user input and never overlaps reads', async () => {
     const sender = new FakePushSender();
-    const { app, appServer, repository, projectPath } =
-      await fixtureWithExecutionReconciliation(20, sender);
+    const { app, appServer, repository, projectPath } = await fixtureWithExecutionReconciliation(
+      20,
+      sender,
+    );
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const threadId = await createThread(app, project.id, session.headers);
@@ -8378,7 +8613,10 @@ describe('Codex routes', () => {
         },
       },
     });
-    expect(repository.getThread(threadId)).toMatchObject({ status: 'active', activeTurnId: turnId });
+    expect(repository.getThread(threadId)).toMatchObject({
+      status: 'active',
+      activeTurnId: turnId,
+    });
     appServer.emit({
       method: 'turn/completed',
       params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
@@ -8411,6 +8649,92 @@ describe('Codex routes', () => {
       { timeout: 2_000 },
     );
     expect(sender.deliveries[0]?.payload).toEqual({ threadId, status: 'completed' });
+  });
+
+  it('round-robins periodic reconciliation beyond the first thirty-two live children', async () => {
+    const { app, appServer, repository, projectPath } =
+      await fixtureWithExecutionReconciliation(20);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const baseTime = Date.now() - 60_000;
+    for (let index = 0; index < 33; index += 1) {
+      const id = `round-robin-child-${String(index).padStart(2, '0')}`;
+      const status = index === 32 ? 'idle' : 'active';
+      appServer.addSubagentThread(id, projectPath, status);
+      const observedAt = new Date(baseTime + index).toISOString();
+      repository.upsertSubagent({
+        id,
+        rootThreadId: threadId,
+        parentThreadId: threadId,
+        agentPath: `/root/round-robin-${index}`,
+        nickname: null,
+        role: null,
+        model: null,
+        reasoningEffort: null,
+        status: 'running',
+        message: null,
+        startedAt: observedAt,
+        lastActivityAt: observedAt,
+        completedAt: null,
+      });
+    }
+
+    await vi.waitFor(
+      () => {
+        expect(repository.getSubagent('round-robin-child-32')).toMatchObject({
+          status: 'interrupted',
+        });
+      },
+      { timeout: 2_000 },
+    );
+    expect(
+      appServer.requests.some(
+        (request) =>
+          request.method === 'thread/read' &&
+          (request.params as { threadId?: string }).threadId === 'round-robin-child-32',
+      ),
+    ).toBe(true);
+  });
+
+  it('stops periodic reconciliation after the current read when the server closes', async () => {
+    const { app, appServer, repository, projectPath } =
+      await fixtureWithExecutionReconciliation(20);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const gate = appServer.blockThreadReads();
+    const observedAt = new Date().toISOString();
+    for (const id of ['shutdown-child-one', 'shutdown-child-two']) {
+      appServer.addSubagentThread(id, projectPath, 'active');
+      repository.upsertSubagent({
+        id,
+        rootThreadId: threadId,
+        parentThreadId: threadId,
+        agentPath: `/root/${id}`,
+        nickname: null,
+        role: null,
+        model: null,
+        reasoningEffort: null,
+        status: 'running',
+        message: null,
+        startedAt: observedAt,
+        lastActivityAt: observedAt,
+        completedAt: null,
+      });
+    }
+    await gate.entered;
+
+    const closeOutcome = await Promise.race([
+      app.close().then(() => 'closed' as const),
+      new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 250)),
+    ]);
+    expect(closeOutcome).toBe('closed');
+    gate.release();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(appServer.requests.filter((request) => request.method === 'thread/read')).toHaveLength(
+      1,
+    );
   });
 
   it('deduplicates safe terminal push delivery, retries transient errors and removes stale devices', async () => {
