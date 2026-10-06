@@ -278,6 +278,11 @@ export const api = {
         `/api/threads/${encodeURIComponent(threadId)}/subagents`,
       ),
     ),
+  interruptSubagent: (csrfToken: string, threadId: string, subagentId: string) =>
+    request<{ data: { interruptRequested: true } }>(
+      `/api/threads/${encodeURIComponent(threadId)}/subagents/${encodeURIComponent(subagentId)}/interrupt`,
+      { method: 'POST', csrfToken },
+    ),
   renameThread: async (csrfToken: string, threadId: string, name: string) =>
     unwrapData(
       await request<Thread | { data: Thread }>(`/api/threads/${encodeURIComponent(threadId)}`, {

@@ -210,10 +210,12 @@ that derived ceiling is rejected.
 Ordinary saturation of the effective root-turn ceiling is a scheduling state, not an admission error. The API
 persists the complete root-turn request in SQLite, including its idempotency key, runtime settings and attachment
 references, and returns a queued projection to the client. The selected chat displays pending requests and their
-current positions after reload. A single dispatcher starts the oldest eligible request when the target thread is
-idle and capacity is available; completion events and process startup both trigger reconciliation. If queued
-work remains without an eligible target past a short grace period because persisted root or subagent activity
-may be stale, the dispatcher performs a bounded authoritative `thread/read` reconciliation before waiting.
+current positions after reload. A live descendant does not serialize the whole chat: when the root thread has no
+active root turn and another execution slot is available, the next root turn may start beside that descendant.
+Both still count against the shared execution-unit ceiling. A single dispatcher starts the oldest eligible
+request when its target root turn is idle and capacity is available; completion events and process startup both
+trigger reconciliation. If queued work remains past a short grace period because persisted root or subagent
+activity may be stale, the dispatcher performs a bounded authoritative `thread/read` reconciliation before waiting.
 Only a confirmed inactive native runtime releases the occupied projection; failed or mismatched reads stay fail
 closed. Reconciliation is throttled so a confirmed-live task does not cause one-second native polling, and an
 ineligible chat never prevents another eligible chat from using a free slot. Claiming and state transition are
@@ -221,6 +223,11 @@ transactional so a retry, refresh or concurrent dispatcher cannot start the same
 switching, service draining, resource-policy changes and degraded-capacity conditions remain
 separate fail-closed states. Guidance sent to an already running turn continues to use the explicit steer path;
 the durable queue is only for new root turns.
+
+The authenticated subagent projection exposes an addressable interrupt action for each active descendant. The
+server verifies that the selected child belongs to the requested root, discovers its live turn through an
+authoritative `thread/read`, and sends `turn/interrupt` only for that exact child turn. An ambiguous interrupt
+does not optimistically mark the child terminal; normal lifecycle reconciliation remains authoritative.
 
 An authenticated operator may cancel a request only while its durable row is still `queued`. The cancellation
 removes the row and its exclusively claimed attachment records in one SQLite transaction, immediately releasing

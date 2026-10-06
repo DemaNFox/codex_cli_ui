@@ -2114,7 +2114,11 @@ describe('App', () => {
   });
 
   it('shows server-owned subagents for the selected chat', async () => {
-    installAuthenticatedApi();
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1/subagents/agent-1/interrupt' && init?.method === 'POST')
+        return jsonResponse({ data: { interruptRequested: true } }, 202);
+      return undefined;
+    });
     const user = userEvent.setup();
     render(<App />);
 
@@ -2123,6 +2127,14 @@ describe('App', () => {
     expect(screen.getByText('Верстальщик')).not.toBeNull();
     expect(screen.getByText('Адаптивный интерфейс')).not.toBeNull();
     expect(screen.getByText('Работает')).not.toBeNull();
+    await user.click(screen.getByRole('button', { name: 'Остановить агента Верстальщик' }));
+    expect((await screen.findByRole('status')).textContent).toContain(
+      'Запрос на остановку агента принят',
+    );
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/threads/thread-1/subagents/agent-1/interrupt',
+      expect.objectContaining({ method: 'POST' }),
+    );
   });
 
   it('starts a follow-up turn when only child agents remain active', async () => {

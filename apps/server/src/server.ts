@@ -135,6 +135,10 @@ const projectPatchSchema = z
   .refine((value) => Object.keys(value).length > 0);
 const threadPatchSchema = z.object({ name: z.string().trim().min(1).max(200) });
 const interruptBodySchema = z.object({ turnId: z.string().min(1).max(200) });
+const subagentParamsSchema = z.object({
+  id: z.string().min(1).max(200),
+  subagentId: z.string().min(1).max(200),
+});
 const threadStatusChangedSchema = z.object({
   threadId: z.string().min(1),
   status: z.object({ type: z.enum(['notLoaded', 'idle', 'active', 'systemError']) }).passthrough(),
@@ -1337,10 +1341,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       recoveredTurnId = activeTurnIdFromHistory(result.thread.turns);
       if (recoveredTurnId) {
         liveActiveTurnId = recoveredTurnId;
-      } else if (
-        repository.listSubagents(existing.id).length > 0 &&
-        repository.countActiveSubagentsForRoot(existing.id) === 0
-      ) {
+      } else if (repository.listSubagents(existing.id).length > 0) {
         const confirmation = threadResponseSchema.parse(
           await appServer.request('thread/read', { threadId: existing.id, includeTurns: true }),
         );
@@ -2704,6 +2705,85 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return { data: repository.listSubagents(id) };
   });
 
+  app.post('/api/threads/:id/subagents/:subagentId/interrupt', async (request, reply) => {
+    csrfGuard(auth, request);
+    const { id, subagentId } = subagentParamsSchema.parse(request.params);
+    const rootThread = repository.getThread(id);
+    const subagent = repository.getSubagent(subagentId);
+    if (!rootThread) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    if (!subagent || subagent.rootThreadId !== id || subagent.id === id)
+      throw new HttpError(404, 'SUBAGENT_NOT_FOUND');
+    if (subagent.status !== 'pendingInit' && subagent.status !== 'running')
+      throw new HttpError(409, 'SUBAGENT_NOT_ACTIVE');
+    const project = repository.getProject(rootThread.projectId);
+    if (!project) throw new HttpError(404, 'PROJECT_NOT_FOUND');
+
+    let activeTurnId: string | null;
+    try {
+      const cwd = await canonicalProjectPath(pathPolicy, project);
+      const result = threadResponseSchema.parse(
+        await appServer.request('thread/read', { threadId: subagentId, includeTurns: true }),
+      );
+      if (result.thread.id !== subagentId || result.thread.cwd !== cwd)
+        throw new Error('SUBAGENT_THREAD_MISMATCH');
+      activeTurnId = activeTurnIdFromHistory(result.thread.turns);
+      if (activeTurnId === null && statusType(result.thread.status) !== 'active') {
+        const observedAt = new Date().toISOString();
+        if (
+          repository.reconcileActiveSubagent(
+            subagent.id,
+            subagent.status,
+            subagent.lastActivityAt,
+            observedAt,
+          )
+        ) {
+          syncThreadExecutionStatus(id);
+          const reconciled = repository.getSubagent(subagentId);
+          const threadRuntime = threadRuntimePayload(id);
+          if (reconciled)
+            publish(
+              repository.appendEvent({
+                threadId: id,
+                turnId: null,
+                kind: 'subagent',
+                phase: 'state',
+                payload: { subagent: reconciled, ...(threadRuntime ? { threadRuntime } : {}) },
+              }),
+            );
+          requestQueuedTurnDispatch();
+        }
+        throw new HttpError(409, 'SUBAGENT_NOT_ACTIVE');
+      }
+    } catch (error) {
+      if (error instanceof HttpError) throw error;
+      repository.audit('subagent.interrupt', 'failed', { rootThreadId: id, subagentId });
+      throw new HttpError(502, 'SUBAGENT_STATE_UNAVAILABLE');
+    }
+    if (activeTurnId === null) throw new HttpError(409, 'SUBAGENT_TURN_UNKNOWN');
+
+    try {
+      await appServer.request('turn/interrupt', { threadId: subagentId, turnId: activeTurnId });
+    } catch {
+      repository.audit('subagent.interrupt', 'unknown', { rootThreadId: id, subagentId });
+      throw new HttpError(502, 'SUBAGENT_INTERRUPT_OUTCOME_UNKNOWN');
+    }
+    repository.audit('subagent.interrupt', 'succeeded', {
+      rootThreadId: id,
+      subagentId,
+      turnId: activeTurnId,
+    });
+    publish(
+      repository.appendEvent({
+        threadId: id,
+        turnId: activeTurnId,
+        kind: 'subagent',
+        phase: 'state',
+        payload: { subagent, interruptRequested: true },
+      }),
+    );
+    return reply.code(202).send({ data: { interruptRequested: true } });
+  });
+
   app.patch('/api/threads/:id', async (request) => {
     csrfGuard(auth, request);
     const id = parseId(request);
@@ -3050,9 +3130,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return (
       !repository.hasUnknownQueuedTurn(record.threadId) &&
       activeTurnIdForThread(record.threadId) === null &&
-      !nativeActiveThreads.has(record.threadId) &&
-      repository.countActiveSubagentsForRoot(record.threadId) === 0 &&
-      thread.status !== 'active'
+      !nativeActiveThreads.has(record.threadId)
     );
   };
 
@@ -3064,10 +3142,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (!Number.isFinite(queuedAt) || Date.now() - queuedAt < queuedEligibilityReconcileGraceMs)
       return false;
     return (
-      activeTurnIdForThread(record.threadId) !== null ||
-      nativeActiveThreads.has(record.threadId) ||
-      repository.countActiveSubagentsForRoot(record.threadId) > 0 ||
-      thread.status === 'active'
+      activeTurnIdForThread(record.threadId) !== null || nativeActiveThreads.has(record.threadId)
     );
   };
 
@@ -3411,10 +3486,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
     if (
       repository.listQueuedTurns().length > 0 ||
-      thread.status === 'active' ||
       activeTurnIdForThread(id) !== null ||
-      nativeActiveThreads.has(id) ||
-      repository.countActiveSubagentsForRoot(id) > 0
+      nativeActiveThreads.has(id)
     ) {
       const response = enqueueReservedTurn(id, input, hash);
       requestQueuedTurnDispatch();

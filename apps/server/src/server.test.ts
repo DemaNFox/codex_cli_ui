@@ -4711,6 +4711,86 @@ describe('Codex routes', () => {
     expect(repository.getThread(threadId)).toMatchObject({ status: 'active', activeTurnId: null });
   });
 
+  it('starts a root turn after detail reconciliation confirms active status belongs to a live child', async () => {
+    const broker = new FakeResourceBroker();
+    const { app, appServer, repository, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      broker,
+    );
+    const session = await login(app);
+    await new Promise((resolve) => setImmediate(resolve));
+    const limits = repository.getResourceLimits();
+    repository.setResourceLimitDesired(
+      { ...limits.desired, maxParallelAgents: 2 },
+      limits.version,
+      'applied',
+    );
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const observedAt = '2026-10-06T10:00:00.000Z';
+    appServer.addSubagentThread('live-detail-child', projectPath, 'active');
+    repository.upsertSubagent({
+      id: 'live-detail-child',
+      rootThreadId: threadId,
+      parentThreadId: threadId,
+      agentPath: '/root/live-detail-child',
+      nickname: 'Live child',
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'running',
+      message: null,
+      startedAt: observedAt,
+      lastActivityAt: observedAt,
+      completedAt: null,
+    });
+    appServer.setThreadUpdatedAt(threadId, Math.floor(Date.now() / 1_000) + 60);
+    appServer.setThreadStatus(threadId, 'active');
+    appServer.setThreadTurns(threadId, [
+      { id: 'turn-before-child', status: 'completed', items: [] },
+    ]);
+    repository.updateThreadRuntime(threadId, { status: 'active', activeTurnId: null });
+    appServer.restart();
+
+    const history = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(history.statusCode).toBe(200);
+    expect(history.json<{ data: Thread }>().data).toMatchObject({
+      status: 'active',
+      activeTurnId: null,
+    });
+    expect(
+      appServer.requests.filter(
+        (request) =>
+          request.method === 'thread/read' &&
+          (request.params as { threadId?: string }).threadId === threadId,
+      ),
+    ).toHaveLength(2);
+    expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
+      upgradeDrain: { activeTurns: 0, activeSubagents: 1, activeExecutionUnits: 1 },
+    });
+
+    const start = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'run beside the live child after opening the chat',
+        idempotencyKey: '22100000-0000-4000-8000-000000000001',
+      },
+    });
+
+    expect(start.statusCode).toBe(202);
+    expect(start.json()).toMatchObject({ data: { status: 'started' } });
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(1);
+  });
+
   it('recovers a fresh native active turn even when older terminal children remain', async () => {
     const { app, appServer, repository, projectPath } = await fixture();
     const session = await login(app);
@@ -5895,8 +5975,21 @@ describe('Codex routes', () => {
   });
 
   it('reconciles a stale subagent before dispatching queued work for its root thread', async () => {
-    const { app, appServer, repository, projectPath } = await fixture(2);
+    const broker = new FakeResourceBroker();
+    const { app, appServer, repository, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      broker,
+    );
     const session = await login(app);
+    await new Promise((resolve) => setImmediate(resolve));
+    const limits = repository.getResourceLimits();
+    repository.setResourceLimitDesired(
+      { ...limits.desired, maxParallelAgents: 1 },
+      limits.version,
+      'applied',
+    );
     const project = await createProject(app, projectPath, session.headers);
     const rootThreadId = await createThread(app, project.id, session.headers);
     const observedAt = '2026-10-05T10:00:00.000Z';
@@ -5928,7 +6021,7 @@ describe('Codex routes', () => {
     });
 
     expect(queued.statusCode).toBe(202);
-    expect(queued.json()).toMatchObject({ data: { status: 'queued' } });
+    expect(queued.json()).toMatchObject({ data: { status: 'started' } });
     await vi.waitFor(
       () => {
         expect(
@@ -5948,9 +6041,22 @@ describe('Codex routes', () => {
     expect(repository.listQueuedTurns(rootThreadId)).toHaveLength(0);
   });
 
-  it('keeps confirmed-live queued work blocked while another chat uses the free slot', async () => {
-    const { app, appServer, repository, projectPath } = await fixture(2);
+  it('starts a new root turn beside a live child and queues only after the shared ceiling is full', async () => {
+    const broker = new FakeResourceBroker();
+    const { app, appServer, repository, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      broker,
+    );
     const session = await login(app);
+    await new Promise((resolve) => setImmediate(resolve));
+    const limits = repository.getResourceLimits();
+    repository.setResourceLimitDesired(
+      { ...limits.desired, maxParallelAgents: 2 },
+      limits.version,
+      'applied',
+    );
     const project = await createProject(app, projectPath, session.headers);
     const blockedThreadId = await createThread(app, project.id, session.headers);
     const eligibleThreadId = await createThread(app, project.id, session.headers);
@@ -5972,30 +6078,19 @@ describe('Codex routes', () => {
       completedAt: null,
     });
 
-    const blocked = await app.inject({
+    const parallelRoot = await app.inject({
       method: 'POST',
       url: `/api/threads/${blockedThreadId}/turns`,
       headers: session.headers,
       payload: {
-        text: 'wait for the live child',
+        text: 'run beside the live child',
         idempotencyKey: '22000000-0000-4000-8000-000000000001',
       },
     });
-    expect(blocked.json()).toMatchObject({ data: { status: 'queued' } });
-    await vi.waitFor(
-      () => {
-        expect(
-          appServer.requests.filter(
-            (request) =>
-              request.method === 'thread/read' &&
-              (request.params as { threadId?: string }).threadId === 'live-queued-child',
-          ),
-        ).toHaveLength(1);
-      },
-      { timeout: 2_000 },
-    );
+    expect(parallelRoot.json()).toMatchObject({ data: { status: 'started' } });
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(1);
 
-    const eligible = await app.inject({
+    const saturated = await app.inject({
       method: 'POST',
       url: `/api/threads/${eligibleThreadId}/turns`,
       headers: session.headers,
@@ -6004,26 +6099,18 @@ describe('Codex routes', () => {
         idempotencyKey: '22000000-0000-4000-8000-000000000002',
       },
     });
-    expect(eligible.json()).toMatchObject({ data: { status: 'queued' } });
-    await vi.waitFor(
-      () => {
-        const starts = appServer.requests.filter((request) => request.method === 'turn/start');
-        expect(starts).toHaveLength(1);
-        expect(starts[0]?.params).toMatchObject({ threadId: eligibleThreadId });
-      },
-      { timeout: 2_000 },
-    );
+    expect(saturated.json()).toMatchObject({ data: { status: 'queued' } });
+    await vi.waitFor(() => {
+      expect(
+        appServer.requests.some(
+          (request) =>
+            request.method === 'thread/read' &&
+            (request.params as { threadId?: string }).threadId === 'live-queued-child',
+        ),
+      ).toBe(true);
+    });
     expect(repository.getSubagent('live-queued-child')).toMatchObject({ status: 'running' });
-    expect(repository.listQueuedTurns(blockedThreadId)).toHaveLength(1);
-
-    await new Promise((resolve) => setTimeout(resolve, 1_100));
-    expect(
-      appServer.requests.filter(
-        (request) =>
-          request.method === 'thread/read' &&
-          (request.params as { threadId?: string }).threadId === 'live-queued-child',
-      ),
-    ).toHaveLength(1);
+    expect(repository.listQueuedTurns(eligibleThreadId)).toHaveLength(1);
   });
 
   it('throttles queued runtime reconciliation from the end of a slow authoritative read', async () => {
@@ -6031,25 +6118,17 @@ describe('Codex routes', () => {
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const rootThreadId = await createThread(app, project.id, session.headers);
-    const observedAt = '2026-10-05T10:00:00.000Z';
-    appServer.addSubagentThread('slow-live-queued-child', projectPath, 'active');
-    repository.upsertSubagent({
-      id: 'slow-live-queued-child',
-      rootThreadId,
-      parentThreadId: rootThreadId,
-      agentPath: '/root/slow-live-queued-child',
-      nickname: null,
-      role: null,
-      model: null,
-      reasoningEffort: null,
-      status: 'running',
-      message: null,
-      startedAt: observedAt,
-      lastActivityAt: observedAt,
-      completedAt: null,
+    await app.inject({
+      method: 'POST',
+      url: `/api/threads/${rootThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'active root turn',
+        idempotencyKey: '22500000-0000-4000-8000-000000000000',
+      },
     });
     const gate = appServer.blockThreadReads();
-    await app.inject({
+    const queued = await app.inject({
       method: 'POST',
       url: `/api/threads/${rootThreadId}/turns`,
       headers: session.headers,
@@ -6058,6 +6137,7 @@ describe('Codex routes', () => {
         idempotencyKey: '22500000-0000-4000-8000-000000000001',
       },
     });
+    expect(queued.json()).toMatchObject({ data: { status: 'queued' } });
     await gate.entered;
 
     const futureNow = Date.now() + 20_000;
@@ -6069,7 +6149,7 @@ describe('Codex routes', () => {
           appServer.requests.filter(
             (request) =>
               request.method === 'thread/read' &&
-              (request.params as { threadId?: string }).threadId === 'slow-live-queued-child',
+              (request.params as { threadId?: string }).threadId === rootThreadId,
           ),
         ).toHaveLength(1);
       });
@@ -6078,10 +6158,9 @@ describe('Codex routes', () => {
         appServer.requests.filter(
           (request) =>
             request.method === 'thread/read' &&
-            (request.params as { threadId?: string }).threadId === 'slow-live-queued-child',
+            (request.params as { threadId?: string }).threadId === rootThreadId,
         ),
       ).toHaveLength(1);
-      expect(repository.getSubagent('slow-live-queued-child')).toMatchObject({ status: 'running' });
       expect(repository.listQueuedTurns(rootThreadId)).toHaveLength(1);
     } finally {
       nowSpy.mockRestore();
@@ -6089,8 +6168,21 @@ describe('Codex routes', () => {
   });
 
   it('keeps stale-looking queued work blocked when authoritative reconciliation fails', async () => {
-    const { app, appServer, repository, projectPath } = await fixture(2);
+    const broker = new FakeResourceBroker();
+    const { app, appServer, repository, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      broker,
+    );
     const session = await login(app);
+    await new Promise((resolve) => setImmediate(resolve));
+    const limits = repository.getResourceLimits();
+    repository.setResourceLimitDesired(
+      { ...limits.desired, maxParallelAgents: 1 },
+      limits.version,
+      'applied',
+    );
     const project = await createProject(app, projectPath, session.headers);
     const rootThreadId = await createThread(app, project.id, session.headers);
     const observedAt = '2026-10-05T10:00:00.000Z';
@@ -7769,6 +7861,56 @@ describe('Codex routes', () => {
     expect(body.data[0]).toMatchObject({ id: 'agent-1', status: 'running' });
     expect(body.data[0]!.message).toContain('[REDACTED]');
     expect(response.body).not.toContain('must never be persisted');
+  });
+
+  it('interrupts only the selected active subagent after authoritative turn discovery', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const rootThreadId = await createThread(app, project.id, session.headers);
+    const otherThreadId = await createThread(app, project.id, session.headers);
+    const observedAt = '2026-10-06T10:00:00.000Z';
+    appServer.addSubagentThread('agent-selected', projectPath, 'active');
+    appServer.setThreadTurns('agent-selected', [
+      { id: 'turn-agent-selected', status: 'inProgress', items: [] },
+    ]);
+    repository.upsertSubagent({
+      id: 'agent-selected',
+      rootThreadId,
+      parentThreadId: rootThreadId,
+      agentPath: '/root/agent-selected',
+      nickname: 'Selected worker',
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'running',
+      message: null,
+      startedAt: observedAt,
+      lastActivityAt: observedAt,
+      completedAt: null,
+    });
+
+    const foreign = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${otherThreadId}/subagents/agent-selected/interrupt`,
+      headers: session.headers,
+    });
+    expect(foreign.statusCode).toBe(404);
+    expect(
+      appServer.requests.filter((request) => request.method === 'turn/interrupt'),
+    ).toHaveLength(0);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${rootThreadId}/subagents/agent-selected/interrupt`,
+      headers: session.headers,
+    });
+    expect(response.statusCode).toBe(202);
+    expect(response.json()).toEqual({ data: { interruptRequested: true } });
+    expect(appServer.requests).toContainEqual({
+      method: 'turn/interrupt',
+      params: { threadId: 'agent-selected', turnId: 'turn-agent-selected' },
+    });
   });
 
   it('serializes concurrent resource updates and applies the newest stored version', async () => {

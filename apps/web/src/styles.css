@@ -2164,6 +2164,30 @@ button:disabled {
   border-radius: 0.65rem;
   background: #151a1e;
 }
+.subagent-card-heading,
+.subagent-card-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+}
+.subagent-card-heading {
+  justify-content: space-between;
+}
+.subagent-card-controls {
+  flex: 0 0 auto;
+}
+.subagent-interrupt {
+  min-height: 1.75rem;
+  padding: 0.25rem 0.5rem;
+  border-color: #6a3438;
+  color: #ffb3b6;
+  background: #2b1a1d;
+  font-size: 0.68rem;
+}
+.subagent-interrupt:hover:not(:disabled) {
+  border-color: #a94d54;
+  background: #3a2024;
+}
 .subagent-popover li strong,
 .subagent-popover li p,
 .subagent-popover li small {

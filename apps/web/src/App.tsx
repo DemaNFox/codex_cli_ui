@@ -2350,7 +2350,15 @@ function ResourceSettings({
   );
 }
 
-function SubagentMenu({ subagents }: { subagents: Subagent[] }) {
+function SubagentMenu({
+  subagents,
+  interruptingIds,
+  onInterrupt,
+}: {
+  subagents: Subagent[];
+  interruptingIds: ReadonlySet<string>;
+  onInterrupt: (subagentId: string) => void;
+}) {
   if (!subagents.length) return null;
   const statusLabel = (status: Subagent['status']) => {
     if (status === 'pendingInit') return 'Запускается';
@@ -2370,9 +2378,24 @@ function SubagentMenu({ subagents }: { subagents: Subagent[] }) {
   );
   const renderSubagent = (subagent: Subagent) => (
     <li key={subagent.id}>
-      <div>
+      <div className="subagent-card-heading">
         <strong>{subagent.nickname || subagent.agentPath || 'Агент'}</strong>
-        <span className={`subagent-status ${subagent.status}`}>{statusLabel(subagent.status)}</span>
+        <div className="subagent-card-controls">
+          <span className={`subagent-status ${subagent.status}`}>
+            {statusLabel(subagent.status)}
+          </span>
+          {(subagent.status === 'pendingInit' || subagent.status === 'running') && (
+            <button
+              type="button"
+              className="subagent-interrupt"
+              disabled={interruptingIds.has(subagent.id)}
+              aria-label={`Остановить агента ${subagent.nickname || subagent.agentPath || subagent.id}`}
+              onClick={() => onInterrupt(subagent.id)}
+            >
+              {interruptingIds.has(subagent.id) ? 'Останавливаем…' : 'Остановить'}
+            </button>
+          )}
+        </div>
       </div>
       {subagent.role && <p>{subagent.role}</p>}
       {subagent.message && <small>{subagent.message}</small>}
@@ -2949,6 +2972,9 @@ function Workspace({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
+  const [interruptingSubagentIds, setInterruptingSubagentIds] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [showScrollToLatest, setShowScrollToLatest] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const composerInputRef = useRef<HTMLTextAreaElement>(null);
@@ -3006,6 +3032,18 @@ function Workspace({
   const activeRootTurn = active && activeTurnId !== null;
   const subagentsOnlyActive = active && !activeTurnId && activeSubagentCount > 0;
   const activeTurnDuration = useActiveTurnDuration(events, activeTurnId, active);
+
+  useEffect(() => {
+    const activeIds = new Set(
+      subagents
+        .filter((subagent) => subagent.status === 'pendingInit' || subagent.status === 'running')
+        .map((subagent) => subagent.id),
+    );
+    setInterruptingSubagentIds((current) => {
+      const retained = new Set([...current].filter((id) => activeIds.has(id)));
+      return retained.size === current.size ? current : retained;
+    });
+  }, [subagents]);
 
   useLayoutEffect(() => {
     if (composerInputRef.current) fitComposerInput(composerInputRef.current);
@@ -4273,6 +4311,29 @@ function Workspace({
     }
   }
 
+  async function interruptSubagent(subagentId: string) {
+    const targetThreadId = threadId;
+    if (!targetThreadId || interruptingSubagentIds.has(subagentId)) return;
+    setInterruptingSubagentIds((current) => new Set(current).add(subagentId));
+    setError(null);
+    setActionNotice('Отправляем запрос на остановку агента…');
+    try {
+      await api.interruptSubagent(session.csrfToken, targetThreadId, subagentId);
+      if (attachmentThreadRef.current === targetThreadId)
+        setActionNotice('Запрос на остановку агента принят.');
+    } catch (cause) {
+      setInterruptingSubagentIds((current) => {
+        const next = new Set(current);
+        next.delete(subagentId);
+        return next;
+      });
+      if (attachmentThreadRef.current === targetThreadId) {
+        setActionNotice(null);
+        setError(errorMessage(cause));
+      }
+    }
+  }
+
   async function cancelQueuedTurn(queuedTurn: QueuedTurn) {
     const targetThreadId = threadId;
     if (!targetThreadId || queuedTurn.status !== 'queued') return;
@@ -4537,7 +4598,11 @@ function Workspace({
             </span>
           </div>
           <div className="toolbar-actions">
-            <SubagentMenu subagents={subagents} />
+            <SubagentMenu
+              subagents={subagents}
+              interruptingIds={interruptingSubagentIds}
+              onInterrupt={(subagentId) => void interruptSubagent(subagentId)}
+            />
             <button
               className={`icon-button push-notification-toggle ${pushNotificationState === 'subscribed' ? 'enabled' : ''}`}
               type="button"
