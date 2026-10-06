@@ -1102,6 +1102,115 @@ describe('App', () => {
     expect(document.activeElement).toBe(document.getElementById('turn-message-1'));
   });
 
+  it('keeps an early final answer visibly active until a successful turn completion', async () => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-active',
+        kind: 'user-message',
+        phase: 'completed',
+        payload: { text: 'Активная задача' },
+        createdAt: '2026-09-27T10:00:00.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-active',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Ещё выполняется проверка', messagePhase: 'commentary' },
+        createdAt: '2026-09-27T10:01:00.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-active',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Предварительный ответ', messagePhase: 'final_answer' },
+        createdAt: '2026-09-27T10:02:00.000Z',
+      },
+      {
+        id: 4,
+        threadId: 'thread-1',
+        turnId: 'turn-failed',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Ответ перед ошибкой', messagePhase: 'final_answer' },
+        createdAt: '2026-09-27T10:03:00.000Z',
+      },
+      {
+        id: 5,
+        threadId: 'thread-1',
+        turnId: 'turn-failed',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'failed' },
+        createdAt: '2026-09-27T10:03:01.000Z',
+      },
+      {
+        id: 6,
+        threadId: 'thread-1',
+        turnId: 'turn-interrupted',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Ответ перед остановкой', messagePhase: 'final_answer' },
+        createdAt: '2026-09-27T10:04:00.000Z',
+      },
+      {
+        id: 7,
+        threadId: 'thread-1',
+        turnId: 'turn-interrupted',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'interrupted' },
+        createdAt: '2026-09-27T10:04:01.000Z',
+      },
+    ];
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const activeAnswer = await screen.findByRole('article', {
+      name: 'Ответ получен · работа продолжается Codex',
+    });
+    expect(activeAnswer.textContent).toContain('Предварительный ответ');
+    expect(screen.getByText('Ещё выполняется проверка')).not.toBeNull();
+    expect(screen.queryByRole('article', { name: 'Итоговый ответ Codex' })).toBeNull();
+    expect(
+      screen.getByRole('article', {
+        name: 'Ответ получен · задача завершилась с ошибкой Codex',
+      }),
+    ).not.toBeNull();
+    expect(
+      screen.getByRole('article', { name: 'Ответ получен · работа остановлена Codex' }),
+    ).not.toBeNull();
+
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+    act(() =>
+      FakeEventSource.instances.at(-1)?.emit({
+        id: 8,
+        threadId: 'thread-1',
+        turnId: 'turn-active',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T10:05:00.000Z',
+      }),
+    );
+
+    const completedAnswer = await screen.findByRole('article', { name: 'Итоговый ответ Codex' });
+    expect(completedAnswer.textContent).toContain('Предварительный ответ');
+    expect(screen.queryByText('Ещё выполняется проверка')).toBeNull();
+    expect(
+      screen.queryByRole('article', { name: 'Ответ получен · работа продолжается Codex' }),
+    ).toBeNull();
+  });
+
   it('keeps the prompt and final answer for every completed turn', async () => {
     const events = [
       ...['one', 'two'].flatMap((suffix, index) => [
@@ -2407,7 +2516,7 @@ describe('App', () => {
         createdAt: '2026-09-29T00:00:03.000Z',
       }),
     );
-    await screen.findByText('Субагенты работают: 1');
+    await screen.findByText('Основной ответ готов · продолжают работать субагенты: 1');
     resolveReconciliation(jsonResponse({ data: thread, events: [], subagents: [] }));
 
     await waitFor(() =>
@@ -2523,7 +2632,9 @@ describe('App', () => {
         createdAt: '2026-09-29T00:00:00.000Z',
       }),
     );
-    expect(await screen.findByText('Субагенты работают: 1')).not.toBeNull();
+    expect(
+      await screen.findByText('Основной ответ готов · продолжают работать субагенты: 1'),
+    ).not.toBeNull();
 
     act(() =>
       FakeEventSource.instances.at(-1)?.emit({
@@ -2540,7 +2651,9 @@ describe('App', () => {
         createdAt: '2026-09-29T00:00:01.000Z',
       }),
     );
-    expect(screen.getByText('Субагенты работают: 1')).not.toBeNull();
+    expect(
+      screen.getByText('Основной ответ готов · продолжают работать субагенты: 1'),
+    ).not.toBeNull();
 
     act(() =>
       FakeEventSource.instances.at(-1)?.emit({

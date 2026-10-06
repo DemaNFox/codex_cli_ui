@@ -14,10 +14,19 @@ self.addEventListener('push', (event) => {
 
   const threadId = boundedText(payload.threadId, 128);
   const safeThreadId = threadId && /^[A-Za-z0-9._:-]+$/.test(threadId) ? threadId : null;
+  const status = boundedText(payload.status, 32);
+  const body =
+    status === 'completed'
+      ? 'Работа в чате завершена.'
+      : status === 'interrupted'
+        ? 'Работа в чате остановлена.'
+        : status === 'failed'
+          ? 'Работа в чате завершилась с ошибкой.'
+          : 'Состояние работы в чате изменилось.';
 
   event.waitUntil(
     self.registration.showNotification('Codex', {
-      body: 'Работа в чате завершена.',
+      body,
       tag: safeThreadId ? `codex-thread:${safeThreadId}` : 'codex-chat',
       data: { url: '/' },
     }),

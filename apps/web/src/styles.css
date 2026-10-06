@@ -794,6 +794,13 @@ button:disabled {
   background: linear-gradient(135deg, rgba(215, 255, 100, 0.075), rgba(20, 24, 28, 0.72));
   box-shadow: 0 0.75rem 2.5rem rgba(0, 0, 0, 0.14);
 }
+.message.agent.answer-in-progress {
+  padding: 0.9rem 1rem 1rem;
+  border: 1px solid rgba(105, 175, 255, 0.28);
+  border-left: 3px solid #69afff;
+  border-radius: 0.8rem;
+  background: linear-gradient(135deg, rgba(105, 175, 255, 0.07), rgba(20, 24, 28, 0.72));
+}
 .message-role {
   color: var(--muted);
   font-size: 0.68rem;
@@ -825,6 +832,24 @@ button:disabled {
   font-size: 0.68rem;
   font-weight: 750;
   letter-spacing: 0.02em;
+}
+.answer-state-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-right: auto;
+  padding: 0.18rem 0.45rem;
+  border-radius: 999px;
+  color: #a8d2ff;
+  background: rgba(105, 175, 255, 0.12);
+  font-size: 0.68rem;
+  font-weight: 750;
+  letter-spacing: 0.02em;
+}
+.answer-state-badge.failed,
+.answer-state-badge.interrupted {
+  color: #ffb8b8;
+  background: rgba(255, 108, 108, 0.12);
 }
 .generated-files {
   display: grid;

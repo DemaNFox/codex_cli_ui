@@ -528,10 +528,17 @@ function agentMessagePhase(event: SafeEvent): 'commentary' | 'final_answer' | nu
   return phase === 'commentary' || phase === 'final_answer' ? phase : null;
 }
 
-function successfullyCompletedTurnIds(events: readonly SafeEvent[]): Set<string> {
-  const completed = new Set<string>();
+type TurnCompletionState = 'completed' | 'failed' | 'interrupted';
+
+function turnCompletionStates(events: readonly SafeEvent[]): Map<string, TurnCompletionState> {
+  const states = new Map<string, TurnCompletionState>();
   for (const event of events) {
-    if (event.kind !== 'turn' || event.phase !== 'completed' || !event.turnId) continue;
+    if (
+      event.kind !== 'turn' ||
+      (event.phase !== 'completed' && event.phase !== 'failed') ||
+      !event.turnId
+    )
+      continue;
     const nestedTurn =
       event.payload.turn && typeof event.payload.turn === 'object'
         ? (event.payload.turn as Record<string, unknown>)
@@ -542,9 +549,11 @@ function successfullyCompletedTurnIds(events: readonly SafeEvent[]): Set<string>
         : typeof nestedTurn?.status === 'string'
           ? nestedTurn.status
           : null;
-    if (status !== 'failed' && status !== 'interrupted') completed.add(event.turnId);
+    if (status === 'interrupted') states.set(event.turnId, 'interrupted');
+    else if (status === 'failed' || event.phase === 'failed') states.set(event.turnId, 'failed');
+    else states.set(event.turnId, 'completed');
   }
-  return completed;
+  return states;
 }
 
 function eventTitle(event: SafeEvent): string {
@@ -1893,7 +1902,16 @@ function Transcript({
     }
     return output;
   }, [events]);
-  const completedTurnIds = useMemo(() => successfullyCompletedTurnIds(events), [events]);
+  const turnCompletionById = useMemo(() => turnCompletionStates(events), [events]);
+  const completedTurnIds = useMemo(
+    () =>
+      new Set(
+        [...turnCompletionById.entries()]
+          .filter(([, state]) => state === 'completed')
+          .map(([turnId]) => turnId),
+      ),
+    [turnCompletionById],
+  );
   const generatedFilesByTurnId = useMemo(() => {
     const filesByTurn = new Map<string, Map<string, true>>();
     for (const event of events) {
@@ -1919,7 +1937,9 @@ function Transcript({
     for (const event of displayEvents) {
       if (event.kind !== 'agent-message' || event.phase !== 'completed') continue;
       const messagePhase = agentMessagePhase(event);
-      if (messagePhase === 'final_answer') result.add(event.id);
+      if (messagePhase === 'final_answer' && event.turnId && completedTurnIds.has(event.turnId)) {
+        result.add(event.id);
+      }
       if (messagePhase === null && event.turnId && completedTurnIds.has(event.turnId)) {
         legacyCandidates.set(event.turnId, event.id);
       }
@@ -2057,6 +2077,21 @@ function Transcript({
             const attachments = attachmentsFrom(block.event);
             const text = eventText(block.event);
             const finalAnswer = finalAgentMessageIds.has(block.event.id);
+            const explicitAnswer = agentMessagePhase(block.event) === 'final_answer';
+            const incompleteAnswerState =
+              explicitAnswer && !finalAnswer && block.event.turnId
+                ? (turnCompletionById.get(block.event.turnId) ?? 'active')
+                : explicitAnswer && !finalAnswer
+                  ? 'active'
+                  : null;
+            const incompleteAnswerLabel =
+              incompleteAnswerState === 'failed'
+                ? 'Ответ получен · задача завершилась с ошибкой'
+                : incompleteAnswerState === 'interrupted'
+                  ? 'Ответ получен · работа остановлена'
+                  : incompleteAnswerState === 'active'
+                    ? 'Ответ получен · работа продолжается'
+                    : null;
             const generatedFiles =
               finalAnswer && block.event.turnId && completedTurnIds.has(block.event.turnId)
                 ? (generatedFilesByTurnId.get(block.event.turnId) ?? [])
@@ -2076,11 +2111,17 @@ function Transcript({
                   : undefined;
             return (
               <article
-                className={`message ${block.event.kind === 'user-message' ? 'user' : 'agent'}${finalAnswer ? ' final-answer' : ''}`}
+                className={`message ${block.event.kind === 'user-message' ? 'user' : 'agent'}${finalAnswer ? ' final-answer' : incompleteAnswerLabel ? ' answer-in-progress' : ''}`}
                 key={block.event.id}
                 id={turnAnchorId}
                 tabIndex={turnAnchorId ? -1 : undefined}
-                aria-label={finalAnswer ? 'Итоговый ответ Codex' : undefined}
+                aria-label={
+                  finalAnswer
+                    ? 'Итоговый ответ Codex'
+                    : incompleteAnswerLabel
+                      ? `${incompleteAnswerLabel} Codex`
+                      : undefined
+                }
               >
                 <div className="message-meta">
                   <span className="message-role">
@@ -2089,6 +2130,14 @@ function Transcript({
                   {finalAnswer && (
                     <span className="final-answer-badge">
                       <span aria-hidden="true">✓</span> Итоговый ответ
+                    </span>
+                  )}
+                  {incompleteAnswerLabel && (
+                    <span className={`answer-state-badge ${incompleteAnswerState}`} role="status">
+                      <span aria-hidden="true">
+                        {incompleteAnswerState === 'active' ? '◌' : '!'}
+                      </span>{' '}
+                      {incompleteAnswerLabel}
                     </span>
                   )}
                   <time className="event-time" dateTime={block.event.createdAt}>
@@ -4590,7 +4639,7 @@ function Workspace({
               <i />
               {active
                 ? subagentsOnlyActive
-                  ? `Субагенты работают: ${activeSubagentCount}`
+                  ? `Основной ответ готов · продолжают работать субагенты: ${activeSubagentCount}`
                   : `Codex работает${activeTurnDuration ? ` уже ${activeTurnDuration}` : ''}`
                 : streamState === 'offline'
                   ? 'Нет подключения'
