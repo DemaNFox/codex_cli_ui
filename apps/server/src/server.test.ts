@@ -39,6 +39,7 @@ import type { PushNotificationPayload, PushSender } from './push-notifications.j
 import type { PushSubscriptionInput } from '@codex-web/contracts';
 import { buildServer } from './server.js';
 import { createSseDelivery } from './sse.js';
+import type { ThreadTitleGenerator } from './thread-title-generator.js';
 
 /* eslint-disable @typescript-eslint/require-await -- fake protocol methods intentionally implement async production interfaces. */
 
@@ -647,6 +648,7 @@ async function fixture(
   codexUpdateStartupRetryMs?: number,
   configOverrides: Partial<Pick<ServerConfig, 'eventRetentionPerThread'>> = {},
   persistent?: { temp: string; appServer: FakeAppServer },
+  threadTitleGenerator?: ThreadTitleGenerator,
 ) {
   const temp = persistent?.temp ?? (await mkdtemp(path.join(os.tmpdir(), 'codex-web-server-')));
   const root = path.join(temp, 'projects');
@@ -710,6 +712,7 @@ async function fixture(
     ...(pushSender ? { pushSender } : {}),
     ...(accountLoginTimeoutMs === undefined ? {} : { accountLoginTimeoutMs }),
     ...(codexUpdateStartupRetryMs === undefined ? {} : { codexUpdateStartupRetryMs }),
+    ...(threadTitleGenerator ? { threadTitleGenerator } : {}),
   });
   openApps.push(app);
   await app.ready();
@@ -4312,6 +4315,131 @@ describe('Codex routes', () => {
       name: 'Native first topic',
       status: 'systemError',
     });
+  });
+
+  it('generates and persists a semantic name after the first completed task', async () => {
+    const generate = vi.fn(async () => 'Расхождение статистики передач');
+    const titleGenerator: ThreadTitleGenerator = { generate };
+    const { app, appServer, repository, projectPath } = await fixture(
+      2,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      titleGenerator,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const started = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Проверь как статистику по фильтру за 5 число показывает 22 передачи',
+        idempotencyKey: '11600000-0000-4000-8000-000000000001',
+      },
+    });
+    const turnId = started.json<{ data: { turnId: string } }>().data.turnId;
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+    });
+
+    await vi.waitFor(() => {
+      expect(repository.getThread(threadId)?.name).toBe('Расхождение статистики передач');
+    });
+    expect(generate).toHaveBeenCalledWith({
+      prompt: 'Проверь как статистику по фильтру за 5 число показывает 22 передачи',
+      model: 'gpt-test',
+    });
+    expect(appServer.requests).toContainEqual({
+      method: 'thread/name/set',
+      params: { threadId, name: 'Расхождение статистики передач' },
+    });
+    expect(repository.listEvents(threadId, 0)).toContainEqual(
+      expect.objectContaining({
+        kind: 'thread',
+        payload: { threadId, threadName: 'Расхождение статистики передач' },
+      }),
+    );
+
+    appServer.emit({
+      method: 'thread/name/updated',
+      params: { threadId, threadName: 'Проверь как статистику по фильтру' },
+    });
+    expect(repository.getThread(threadId)?.name).toBe('Расхождение статистики передач');
+  });
+
+  it('does not overwrite a manual rename while semantic title generation is running', async () => {
+    let finishTitle: (title: string | null) => void = () => undefined;
+    const generate = vi.fn(
+      () =>
+        new Promise<string | null>((resolve) => {
+          finishTitle = resolve;
+        }),
+    );
+    const { app, appServer, repository, projectPath } = await fixture(
+      2,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { generate },
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const started = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Проверь статистику передач за пятое число',
+        idempotencyKey: '11600000-0000-4000-8000-000000000002',
+      },
+    });
+    const turnId = started.json<{ data: { turnId: string } }>().data.turnId;
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: turnId, status: 'completed', items: [] } },
+    });
+    await vi.waitFor(() => expect(generate).toHaveBeenCalledOnce());
+
+    const renamed = await app.inject({
+      method: 'PATCH',
+      url: `/api/threads/${threadId}`,
+      headers: session.headers,
+      payload: { name: 'Проверка статистики' },
+    });
+    expect(renamed.statusCode).toBe(200);
+    finishTitle('Расхождение статистики передач');
+
+    await vi.waitFor(() => {
+      expect(repository.getThread(threadId)?.name).toBe('Проверка статистики');
+    });
+    expect(
+      appServer.requests.filter(
+        (request) =>
+          request.method === 'thread/name/set' &&
+          (request.params as { name?: string }).name === 'Расхождение статистики передач',
+      ),
+    ).toHaveLength(0);
   });
 
   it('keeps a confirmed live turn active across stale list and thread-status snapshots', async () => {

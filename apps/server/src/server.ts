@@ -105,6 +105,10 @@ import {
 } from './resource-broker.js';
 import { createSseDelivery } from './sse.js';
 import { normalizeSubagentNotification } from './subagents.js';
+import {
+  titleStillNeedsSemanticReplacement,
+  type ThreadTitleGenerator,
+} from './thread-title-generator.js';
 
 const idParamsSchema = z.object({ id: z.string().min(1).max(200) });
 const attachmentParamsSchema = z.object({
@@ -382,6 +386,7 @@ export interface ServerDependencies {
   readonly upgradeDrainPath?: string;
   readonly accountLoginTimeoutMs?: number;
   readonly codexUpdateStartupRetryMs?: number;
+  readonly threadTitleGenerator?: ThreadTitleGenerator;
 }
 
 function publicAttachment(record: AttachmentRecord): Attachment {
@@ -765,6 +770,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     ? new PushNotificationDispatcher(repository, dependencies.pushSender)
     : undefined;
   const sseListeners = new Map<string, Set<SseListener>>();
+  const titleGenerationAttempts = new Set<string>();
+  const manuallyNamedThreads = new Set<string>();
   const activeTurns = new Set<string>();
   const treeBusyThreads = new Set<string>();
   const nativeActiveThreads = new Set<string>();
@@ -1152,6 +1159,69 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
 
   const publish = (event: SafeEvent): void => {
     for (const listener of sseListeners.get(event.threadId) ?? []) listener(event);
+  };
+  const firstUserPromptForThread = (
+    threadId: string,
+  ): { text: string; turnId: string | null } | null => {
+    const event = repository
+      .listEvents(threadId, 0)
+      .find((candidate) => candidate.kind === 'user-message');
+    const text = event && typeof event.payload.text === 'string' ? event.payload.text.trim() : '';
+    return event && text.length > 0 ? { text, turnId: event.turnId } : null;
+  };
+  const generateInitialSemanticTitle = (threadId: string, turnId: string): void => {
+    const generator = dependencies.threadTitleGenerator;
+    if (!generator || titleGenerationAttempts.has(threadId) || manuallyNamedThreads.has(threadId))
+      return;
+    const firstUserMessage = firstUserPromptForThread(threadId);
+    const firstPrompt = firstUserMessage?.text ?? '';
+    const thread = repository.getThread(threadId);
+    if (
+      !thread ||
+      firstUserMessage?.turnId !== turnId ||
+      firstPrompt.length === 0 ||
+      !titleStillNeedsSemanticReplacement(thread.name, thread.preview, firstPrompt)
+    )
+      return;
+    titleGenerationAttempts.add(threadId);
+    void (async () => {
+      try {
+        const title = await generator.generate({
+          prompt: firstPrompt,
+          ...(thread.model ? { model: thread.model } : {}),
+        });
+        if (!title || titleStillNeedsSemanticReplacement(title, thread.preview, firstPrompt)) {
+          repository.audit('thread.title.generate', 'failed', {
+            threadId,
+            reason: title ? 'extractive' : 'empty',
+          });
+          return;
+        }
+        const current = repository.getThread(threadId);
+        if (
+          !current ||
+          manuallyNamedThreads.has(threadId) ||
+          !titleStillNeedsSemanticReplacement(current.name, current.preview, firstPrompt)
+        )
+          return;
+        await appServer.request('thread/name/set', { threadId, name: title });
+        if (repository.getThread(threadId)?.name !== title) {
+          repository.updateThreadRuntime(threadId, { name: title });
+          publish(
+            repository.appendEvent({
+              threadId,
+              turnId: null,
+              kind: 'thread',
+              phase: 'state',
+              payload: { threadId, threadName: title },
+            }),
+          );
+        }
+        repository.audit('thread.title.generate', 'succeeded', { threadId });
+      } catch {
+        repository.audit('thread.title.generate', 'failed', { threadId, reason: 'unavailable' });
+      }
+    })();
   };
 
   const requestAttachmentFileDeletionDrain = (): Promise<void> => {
@@ -1865,6 +1935,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           pushDispatcher?.enqueue(thread.id, normalized.turnId, terminalPushStatus(message));
       void applyPendingResourcesWhenIdle();
       requestQueuedTurnDispatch();
+      if (terminalPushStatus(message) === 'completed') {
+        const titleTimer = setTimeout(
+          () => generateInitialSemanticTitle(normalized.threadId, normalized.turnId!),
+          0,
+        );
+        titleTimer.unref();
+      }
     }
     if (message.method === 'thread/status/changed') {
       const status = threadStatusChangedSchema.safeParse(message.params);
@@ -1901,6 +1978,24 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
     if (message.method === 'thread/name/updated') {
       const name = threadNameUpdatedSchema.safeParse(message.params);
+      const current = repository.getThread(normalized.threadId);
+      if (
+        name.success &&
+        name.data.threadName !== undefined &&
+        current?.name === name.data.threadName
+      )
+        return;
+      const firstPrompt = firstUserPromptForThread(normalized.threadId)?.text;
+      if (
+        name.success &&
+        name.data.threadName !== undefined &&
+        current?.name &&
+        firstPrompt &&
+        !titleStillNeedsSemanticReplacement(current.name, current.preview, firstPrompt) &&
+        (name.data.threadName === null ||
+          titleStillNeedsSemanticReplacement(name.data.threadName, current.preview, firstPrompt))
+      )
+        return;
       if (name.success && name.data.threadName !== undefined)
         repository.updateThreadRuntime(normalized.threadId, { name: name.data.threadName });
     }
@@ -2616,6 +2711,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (!existing) throw new HttpError(404, 'THREAD_NOT_FOUND');
     const input = threadPatchSchema.parse(request.body);
     await appServer.request('thread/name/set', { threadId: id, name: input.name });
+    manuallyNamedThreads.add(id);
     const updated = repository.upsertThread({
       ...existing,
       name: input.name,

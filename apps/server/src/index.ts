@@ -10,6 +10,7 @@ import { UnixProjectPathBrokerClient } from './project-path-broker.js';
 import { WebPushSender } from './push-notifications.js';
 import { UnixResourceBrokerClient } from './resource-broker.js';
 import { buildServer } from './server.js';
+import { CodexThreadTitleGenerator } from './thread-title-generator.js';
 
 const config = loadConfig();
 const repository = new SqliteRepository(config.databasePath, config.eventRetentionPerThread);
@@ -50,6 +51,7 @@ const server = await buildServer({
   repository,
   pathPolicy,
   appServer,
+  threadTitleGenerator: new CodexThreadTitleGenerator(appServer),
   attachmentStore,
   resourceBroker,
   codexUpdateBroker,

@@ -284,9 +284,13 @@ actions and keeps a cross-project recent list. The project context menu exposes 
 to that project. Archived threads can be inspected and restored without mixing them into the active thread
 list. The transcript owns the scroll container while the composer remains in a fixed grid row.
 Thread menus allow a server-persisted manual rename. Until the operator renames it, the first native
-`thread/name/updated` notification from Codex supplies the topic name after the initial task. Open clients
-apply that notification immediately; background and visibility refreshes reconcile project/thread navigation
-changed from another device.
+`thread/name/updated` notification from Codex supplies the topic name after the initial task. If that name is
+missing or is only an extractive prefix of the first request, successful completion starts one bounded,
+ephemeral, low-effort app-server turn that returns a structured semantic title. This title task has read-only
+sandboxing, no network access or approvals, does not block the completed user turn and never replaces a name
+that changed while it was running. The result is written back through `thread/name/set`, persisted in the
+server projection and streamed to open clients. Background and visibility refreshes reconcile project/thread
+navigation changed from another device.
 Messages and visible execution stages render their persisted ISO event time in the browser's local timezone.
 The transcript follows new events only while the reader remains near its bottom. Scrolling upward exposes a
 floating jump control; newly streamed events keep that control visible instead of moving the reader, and the
