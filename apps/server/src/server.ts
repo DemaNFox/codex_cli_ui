@@ -391,6 +391,7 @@ export interface ServerDependencies {
   readonly accountLoginTimeoutMs?: number;
   readonly codexUpdateStartupRetryMs?: number;
   readonly threadTitleGenerator?: ThreadTitleGenerator;
+  readonly executionReconcileIntervalMs?: number;
 }
 
 function publicAttachment(record: AttachmentRecord): Attachment {
@@ -778,6 +779,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const manuallyNamedThreads = new Set<string>();
   const activeTurns = new Set<string>();
   const treeBusyThreads = new Set<string>();
+  const deferredCompletionPushes = new Map<string, string>();
   const nativeActiveThreads = new Set<string>();
   const nativeActivityVersions = new Map<string, number>();
   let nativeActivityVersion = 0;
@@ -839,6 +841,18 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   ): { status: Thread['status']; activeTurnId: string | null } | null => {
     const thread = repository.getThread(threadId);
     return thread ? { status: thread.status, activeTurnId: thread.activeTurnId } : null;
+  };
+  const flushDeferredCompletionPush = (threadId: string): void => {
+    const turnId = deferredCompletionPushes.get(threadId);
+    if (
+      !turnId ||
+      activeTurnIdForThread(threadId) !== null ||
+      nativeActiveThreads.has(threadId) ||
+      repository.countActiveSubagentsForRoot(threadId) > 0
+    )
+      return;
+    deferredCompletionPushes.delete(threadId);
+    pushDispatcher?.enqueue(threadId, turnId, 'completed');
   };
   const approvalGenerations = new Map<string, number>();
   const loadedThreadGenerations = new Map<string, number>();
@@ -953,6 +967,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   let attachmentFileDeletionDrain: Promise<void> | null = null;
   let attachmentFileDeletionDrainRequested = false;
   let serverClosing = false;
+  let executionReconcileTimer: NodeJS.Timeout | null = null;
+  let executionReconcileInFlight: Promise<void> | null = null;
   let lastHandledDisconnectGeneration = 0;
   let appServerDisconnectEpoch = 0;
   const upgradeDrainPath = dependencies.upgradeDrainPath ?? '/run/codex-web-ui/upgrade-drain';
@@ -1421,7 +1437,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return { thread, turns: result.thread.turns };
   };
 
-  const reconcileStaleExecutionCapacity = async (): Promise<void> => {
+  const runStaleExecutionCapacityReconciliation = async (): Promise<void> => {
     const affectedRoots = new Set<string>();
     const reconciledSubagents = new Set<string>();
     for (const snapshot of activeTurnEntries()) {
@@ -1483,7 +1499,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         repository.audit('turn.native_capacity_reconcile', 'failed', { threadId });
       }
     }
-    for (const snapshot of repository.listActiveSubagents()) {
+    for (const snapshot of repository.listActiveSubagents().slice(0, 32)) {
       if (snapshot.status !== 'pendingInit' && snapshot.status !== 'running') continue;
       const rootThread = repository.getThread(snapshot.rootThreadId);
       const project = rootThread && repository.getProject(rootThread.projectId);
@@ -1519,6 +1535,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
     for (const rootThreadId of affectedRoots) {
       syncThreadExecutionStatus(rootThreadId);
+      flushDeferredCompletionPush(rootThreadId);
       const threadRuntime = threadRuntimePayload(rootThreadId);
       if (threadRuntime)
         publish(
@@ -1545,6 +1562,42 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         }),
       );
     }
+  };
+
+  const reconcileStaleExecutionCapacity = (): Promise<void> => {
+    if (executionReconcileInFlight) return executionReconcileInFlight;
+    executionReconcileInFlight = runStaleExecutionCapacityReconciliation().finally(() => {
+      executionReconcileInFlight = null;
+    });
+    return executionReconcileInFlight;
+  };
+
+  const executionReconcileIntervalMs = Math.min(
+    60_000,
+    Math.max(10, dependencies.executionReconcileIntervalMs ?? 15_000),
+  );
+  const executionReconciliationNeeded = (): boolean =>
+    activeTurns.size > 0 ||
+    nativeActiveThreads.size > 0 ||
+    repository.countActiveSubagents() > 0;
+  const scheduleExecutionReconciliation = (): void => {
+    if (serverClosing || executionReconcileTimer !== null) return;
+    executionReconcileTimer = setTimeout(() => {
+      executionReconcileTimer = null;
+      if (serverClosing) return;
+      if (!appServer.ready || !executionReconciliationNeeded()) {
+        scheduleExecutionReconciliation();
+        return;
+      }
+      void reconcileStaleExecutionCapacity()
+        .catch(() => {
+          repository.audit('execution.periodic_reconcile', 'failed', {});
+        })
+        .finally(() => {
+          scheduleExecutionReconciliation();
+        });
+    }, executionReconcileIntervalMs);
+    executionReconcileTimer.unref();
   };
 
   const hydrateThreadHistory = async (existing: Thread): Promise<Thread> => {
@@ -1882,6 +1935,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       };
       const persisted = repository.upsertSubagent(subagent);
       syncThreadExecutionStatus(persisted.rootThreadId);
+      flushDeferredCompletionPush(persisted.rootThreadId);
       const threadRuntime = threadRuntimePayload(persisted.rootThreadId);
       publish(
         repository.appendEvent({
@@ -1931,9 +1985,15 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
               : { status: 'idle', activeTurnId: null },
           )
         : repository.getThread(normalized.threadId);
-      if (thread)
-        if (runtimeTurnEvent)
-          pushDispatcher?.enqueue(thread.id, normalized.turnId, terminalPushStatus(message));
+      if (thread && runtimeTurnEvent) {
+        const pushStatus = terminalPushStatus(message);
+        if (pushStatus === 'completed' && treeBusy)
+          deferredCompletionPushes.set(thread.id, normalized.turnId);
+        else {
+          deferredCompletionPushes.delete(thread.id);
+          pushDispatcher?.enqueue(thread.id, normalized.turnId, pushStatus);
+        }
+      }
       void applyPendingResourcesWhenIdle();
       requestQueuedTurnDispatch();
       if (terminalPushStatus(message) === 'completed') {
@@ -1972,6 +2032,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         );
         if (nextStatus !== 'active' && !preserveActive) {
           clearActiveTurns(normalized.threadId);
+          flushDeferredCompletionPush(normalized.threadId);
           void applyPendingResourcesWhenIdle();
           requestQueuedTurnDispatch();
         }
@@ -2038,6 +2099,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     activeTurns.clear();
     nativeActiveThreads.clear();
     treeBusyThreads.clear();
+    deferredCompletionPushes.clear();
     for (const threadId of repository.resetActiveThreadRuntime()) affectedRoots.add(threadId);
     repository.resetActiveSubagentRuntime();
     for (const approval of repository.listUnfinishedApprovals()) {
@@ -2133,6 +2195,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (dependencies.resourceBroker) void reconcileStartupResources();
     void requestAttachmentFileDeletionDrain();
     requestQueuedTurnDispatch();
+    scheduleExecutionReconciliation();
   });
   app.addHook('onClose', async () => {
     serverClosing = true;
@@ -2140,11 +2203,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (codexUpdateStartupRetry) clearTimeout(codexUpdateStartupRetry);
     if (attachmentFileDeletionRetry) clearTimeout(attachmentFileDeletionRetry);
     if (queuedTurnRetry) clearTimeout(queuedTurnRetry);
+    if (executionReconcileTimer) clearTimeout(executionReconcileTimer);
     clearAccountLoginTimer();
     unsubscribe();
     unsubscribeLifecycle();
     await attachmentFileDeletionDrain?.catch(() => undefined);
     await queuedTurnDispatch?.catch(() => undefined);
+    await executionReconcileInFlight?.catch(() => undefined);
     await pushDispatcher?.close();
     await appServer.stop();
     repository.close();
