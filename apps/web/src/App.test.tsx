@@ -19,6 +19,7 @@ const project = {
   defaultModel: 'gpt-test',
   defaultReasoningEffort: 'medium',
   defaultPermissionPreset: 'workspace-write',
+  archived: false,
   createdAt: '2026-09-27T10:00:00.000Z',
   updatedAt: '2026-09-27T10:00:00.000Z',
 };
@@ -265,7 +266,8 @@ function installAuthenticatedApi(
     const overridden = overrides?.(url, init);
     if (overridden) return Promise.resolve(overridden);
     if (url === '/api/auth/session') return Promise.resolve(jsonResponse(session));
-    if (url === '/api/projects') return Promise.resolve(jsonResponse([project]));
+    if (url === '/api/projects?archived=false') return Promise.resolve(jsonResponse([project]));
+    if (url === '/api/projects?archived=true') return Promise.resolve(jsonResponse([]));
     if (url === '/api/preferences/runtime')
       return Promise.resolve(
         jsonResponse({
@@ -851,7 +853,7 @@ describe('App', () => {
       if (url === '/api/auth/session')
         return Promise.resolve(jsonResponse({ message: 'unauthorized' }, 401));
       if (url === '/api/auth/login') return Promise.resolve(jsonResponse(session));
-      if (url === '/api/projects') return Promise.resolve(jsonResponse([project]));
+      if (url === '/api/projects?archived=false') return Promise.resolve(jsonResponse([project]));
       if (url === '/api/models') return Promise.resolve(jsonResponse(models));
       if (url === '/api/system/capabilities') return Promise.resolve(jsonResponse(capabilities));
       if (url === '/api/system/resource-limits')
@@ -3609,6 +3611,194 @@ describe('App', () => {
         expect.objectContaining({ method: 'POST' }),
       ),
     );
+  });
+
+  it('archives the selected project, removes its recent chats and selects the next project', async () => {
+    const secondProject = {
+      ...project,
+      id: '22222222-2222-4222-8222-222222222222',
+      name: 'Второй проект',
+      path: '/srv/projects/second',
+    };
+    const secondThread = {
+      ...thread,
+      id: 'thread-2',
+      projectId: secondProject.id,
+      name: 'Задача второго проекта',
+      updatedAt: '2026-09-27T11:00:00.000Z',
+    };
+    let archived = false;
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/projects?archived=false') {
+        return jsonResponse(archived ? [secondProject] : [project, secondProject]);
+      }
+      if (url === `/api/projects/${project.id}/archive` && init?.method === 'POST') {
+        archived = true;
+        return jsonResponse({ data: { ...project, archived: true } });
+      }
+      if (url.includes('/api/threads?')) {
+        return jsonResponse(
+          url.includes(encodeURIComponent(secondProject.id)) ? [secondThread] : [thread],
+        );
+      }
+      if (url === '/api/threads/thread-2') {
+        return jsonResponse({ data: secondThread, events: [] });
+      }
+      if (url === '/api/threads/thread-2/subagents') return jsonResponse({ data: [] });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findAllByText('Frontend task');
+
+    await user.click(screen.getByRole('button', { name: 'Меню проекта AI Chat Bot' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Архивировать проект' }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `/api/projects/${project.id}/archive`,
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    );
+    await screen.findAllByText('Задача второго проекта');
+    expect(screen.queryByRole('button', { name: 'Меню проекта AI Chat Bot' })).toBeNull();
+    expect(
+      within(screen.getByRole('navigation', { name: 'Недавние чаты' })).queryByText(
+        'Frontend task',
+      ),
+    ).toBeNull();
+  });
+
+  it('archives an unselected project without replacing the selected chat and filters recents', async () => {
+    const secondProject = {
+      ...project,
+      id: '22222222-2222-4222-8222-222222222222',
+      name: 'Старый проект',
+      path: '/srv/projects/old',
+    };
+    const secondThread = {
+      ...thread,
+      id: 'thread-2',
+      projectId: secondProject.id,
+      name: 'Старая задача',
+      updatedAt: '2026-09-27T11:00:00.000Z',
+    };
+    installAuthenticatedApi((url, init) => {
+      if (url === '/api/projects?archived=false') return jsonResponse([project, secondProject]);
+      if (url === `/api/projects/${secondProject.id}/archive` && init?.method === 'POST') {
+        return jsonResponse({ data: { ...secondProject, archived: true } });
+      }
+      if (url.includes('/api/threads?')) {
+        return jsonResponse(
+          url.includes(encodeURIComponent(secondProject.id)) ? [secondThread] : [thread],
+        );
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findAllByText('Старая задача');
+
+    await user.click(screen.getByRole('button', { name: 'Меню проекта Старый проект' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Архивировать проект' }));
+
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: 'Меню проекта Старый проект' })).toBeNull(),
+    );
+    expect(screen.getByRole('heading', { name: 'Frontend task' })).not.toBeNull();
+    expect(
+      within(screen.getByRole('navigation', { name: 'Недавние чаты' })).queryByText(
+        'Старая задача',
+      ),
+    ).toBeNull();
+  });
+
+  it('restores a project from the separate archive without loading its chats there', async () => {
+    const archivedProject = {
+      ...project,
+      id: '33333333-3333-4333-8333-333333333333',
+      name: 'Архивный проект',
+      path: '/srv/projects/archived',
+      archived: true,
+    };
+    let restored = false;
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/projects?archived=true') return jsonResponse([archivedProject]);
+      if (url === '/api/projects?archived=false') {
+        return jsonResponse(
+          restored ? [project, { ...archivedProject, archived: false }] : [project],
+        );
+      }
+      if (url === `/api/projects/${archivedProject.id}/unarchive` && init?.method === 'POST') {
+        restored = true;
+        return jsonResponse({ data: { ...archivedProject, archived: false } });
+      }
+      if (url.includes('/api/threads?') && url.includes(encodeURIComponent(archivedProject.id))) {
+        return jsonResponse([]);
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    const trigger = await screen.findByRole('button', { name: 'Открыть архив проектов' });
+    await user.click(trigger);
+
+    const dialog = await screen.findByRole('dialog', { name: 'Архив проектов' });
+    expect(within(dialog).getByText('Архивный проект')).not.toBeNull();
+    expect(
+      fetchMock.mock.calls.some(([input]) =>
+        requestUrl(input).includes(`projectId=${encodeURIComponent(archivedProject.id)}`),
+      ),
+    ).toBe(false);
+    await user.click(within(dialog).getByRole('button', { name: 'Восстановить' }));
+
+    await waitFor(() => expect(within(dialog).queryByText('Архивный проект')).toBeNull());
+    expect(screen.getByRole('button', { name: /^Архивный проект/ })).not.toBeNull();
+    await user.click(within(dialog).getByRole('button', { name: 'Закрыть архив проектов' }));
+    expect(screen.queryByRole('dialog', { name: 'Архив проектов' })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+  });
+
+  it('preserves a project when active work rejects archiving and shows bounded guidance', async () => {
+    installAuthenticatedApi((url, init) => {
+      if (url === `/api/projects/${project.id}/archive` && init?.method === 'POST') {
+        return jsonResponse(
+          { error: { code: 'PROJECT_HAS_ACTIVE_WORK', message: 'internal active work details' } },
+          409,
+        );
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findAllByText('Frontend task');
+
+    await user.click(screen.getByRole('button', { name: 'Меню проекта AI Chat Bot' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Архивировать проект' }));
+
+    expect(
+      await screen.findByText(
+        'В проекте есть выполняющиеся или ожидающие задачи. Дождитесь их завершения или остановите активные чаты, затем повторите архивирование.',
+      ),
+    ).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Меню проекта AI Chat Bot' })).not.toBeNull();
+    expect((await screen.findAllByText('Frontend task')).length).toBeGreaterThan(0);
+    expect(screen.queryByText('internal active work details')).toBeNull();
+  });
+
+  it('shows an empty archived-projects state and closes it with Escape', async () => {
+    installAuthenticatedApi();
+    const user = userEvent.setup();
+    render(<App />);
+    const trigger = await screen.findByRole('button', { name: 'Открыть архив проектов' });
+
+    await user.click(trigger);
+    const dialog = await screen.findByRole('dialog', { name: 'Архив проектов' });
+    expect(within(dialog).getByText('Архив проектов пуст.')).not.toBeNull();
+    await user.keyboard('{Escape}');
+
+    expect(screen.queryByRole('dialog', { name: 'Архив проектов' })).toBeNull();
+    expect(document.activeElement).toBe(trigger);
   });
 
   it('archives the selected chat and clears its stale composer context', async () => {

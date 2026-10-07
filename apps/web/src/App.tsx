@@ -455,6 +455,18 @@ function archiveErrorMessage(error: unknown, action: 'archive' | 'restore'): str
     : 'Не удалось подтвердить, что чат восстановлен. Обновите страницу и проверьте состояние чата перед повторной попыткой.';
 }
 
+function projectArchiveErrorMessage(error: unknown): string {
+  if (error instanceof ApiError) {
+    if (error.code === 'PROJECT_HAS_ACTIVE_WORK') {
+      return 'В проекте есть выполняющиеся или ожидающие задачи. Дождитесь их завершения или остановите активные чаты, затем повторите архивирование.';
+    }
+    if (error.code === 'PROJECT_ARCHIVED') {
+      return 'Проект уже архивирован. Откройте архив проектов, чтобы восстановить его.';
+    }
+  }
+  return 'Не удалось подтвердить, что проект архивирован. Обновите страницу и проверьте его состояние перед повторной попыткой.';
+}
+
 function queuedTurnCancelErrorMessage(error: unknown): string {
   if (error instanceof ApiError && (error.status === 404 || error.status === 409)) {
     return 'Не удалось отменить задачу: возможно, она уже запущена или исчезла из очереди. Карточка сохранена — обновите чат, чтобы сверить состояние.';
@@ -1222,6 +1234,15 @@ function NavigationSidebar({
   onRename,
   onBack,
   onCreate,
+  archivedProjectsOpen,
+  archivedProjects,
+  archivedProjectsLoading,
+  archivedProjectsError,
+  restoringProjectIds,
+  onOpenArchivedProjects,
+  onCloseArchivedProjects,
+  onArchiveProject,
+  onRestoreProject,
   onLogout,
   username,
   disabled,
@@ -1244,6 +1265,15 @@ function NavigationSidebar({
   onRename: (id: string, name: string) => Promise<void>;
   onBack: () => void;
   onCreate: (name: string, path: string) => Promise<void>;
+  archivedProjectsOpen: boolean;
+  archivedProjects: Project[];
+  archivedProjectsLoading: boolean;
+  archivedProjectsError: string | null;
+  restoringProjectIds: ReadonlySet<string>;
+  onOpenArchivedProjects: () => void;
+  onCloseArchivedProjects: () => void;
+  onArchiveProject: (id: string) => void;
+  onRestoreProject: (id: string) => void;
   onLogout: () => void;
   username: string;
   disabled: boolean;
@@ -1252,10 +1282,18 @@ function NavigationSidebar({
 }) {
   const [creating, setCreating] = useState(false);
   const [renameTarget, setRenameTarget] = useState<Thread | null>(null);
+  const archivedProjectsTriggerRef = useRef<HTMLButtonElement>(null);
+  const archivedProjectsWasOpenRef = useRef(false);
   const [expandedProjectId, setExpandedProjectId] = useState<string | null>(selectedProjectId);
   useEffect(() => {
     if (selectedProjectId) setExpandedProjectId(selectedProjectId);
   }, [selectedProjectId]);
+  useEffect(() => {
+    if (archivedProjectsWasOpenRef.current && !archivedProjectsOpen) {
+      archivedProjectsTriggerRef.current?.focus();
+    }
+    archivedProjectsWasOpenRef.current = archivedProjectsOpen;
+  }, [archivedProjectsOpen]);
 
   const threadRows = (items: Thread[], showProject: boolean, archivedRows = false) =>
     items.map((thread) => {
@@ -1338,14 +1376,26 @@ function NavigationSidebar({
         </button>
         <div className="section-heading">
           <span>Проекты</span>
-          <button
-            className="icon-button"
-            onClick={() => setCreating(true)}
-            aria-label="Добавить проект"
-            disabled={disabled}
-          >
-            ＋
-          </button>
+          <span className="section-heading-actions">
+            <button
+              ref={archivedProjectsTriggerRef}
+              className="icon-button"
+              onClick={onOpenArchivedProjects}
+              aria-label="Открыть архив проектов"
+              title="Архив проектов"
+              disabled={disabled}
+            >
+              ◫
+            </button>
+            <button
+              className="icon-button"
+              onClick={() => setCreating(true)}
+              aria-label="Добавить проект"
+              disabled={disabled}
+            >
+              ＋
+            </button>
+          </span>
         </div>
         {creating && (
           <CreateProjectForm
@@ -1389,16 +1439,27 @@ function NavigationSidebar({
                 </button>
                 <ContextMenu label={`Меню проекта ${project.name}`} disabled={disabled}>
                   {(close) => (
-                    <button
-                      role="menuitem"
-                      onClick={() => {
-                        close();
-                        setExpandedProjectId(project.id);
-                        onShowArchived(project.id);
-                      }}
-                    >
-                      Архивированные чаты
-                    </button>
+                    <>
+                      <button
+                        role="menuitem"
+                        onClick={() => {
+                          close();
+                          setExpandedProjectId(project.id);
+                          onShowArchived(project.id);
+                        }}
+                      >
+                        Архивированные чаты
+                      </button>
+                      <button
+                        role="menuitem"
+                        onClick={() => {
+                          close();
+                          onArchiveProject(project.id);
+                        }}
+                      >
+                        Архивировать проект
+                      </button>
+                    </>
                   )}
                 </ContextMenu>
               </div>
@@ -1451,7 +1512,123 @@ function NavigationSidebar({
           }}
         />
       )}
+      {archivedProjectsOpen && (
+        <ArchivedProjectsDialog
+          projects={archivedProjects}
+          loading={archivedProjectsLoading}
+          error={archivedProjectsError}
+          restoringProjectIds={restoringProjectIds}
+          onRestore={onRestoreProject}
+          onClose={onCloseArchivedProjects}
+        />
+      )}
     </aside>
+  );
+}
+
+function ArchivedProjectsDialog({
+  projects,
+  loading,
+  error,
+  restoringProjectIds,
+  onRestore,
+  onClose,
+}: {
+  projects: Project[];
+  loading: boolean;
+  error: string | null;
+  restoringProjectIds: ReadonlySet<string>;
+  onRestore: (id: string) => void;
+  onClose: () => void;
+}) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+
+  useEffect(() => closeRef.current?.focus(), []);
+
+  return createPortal(
+    <div
+      className="dialog-backdrop"
+      onMouseDown={(event) => event.target === event.currentTarget && onClose()}
+    >
+      <section
+        ref={dialogRef}
+        className="archived-projects-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="archived-projects-title"
+        aria-busy={loading}
+        tabIndex={-1}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape') onClose();
+          if (event.key !== 'Tab') return;
+          const controls = dialogRef.current?.querySelectorAll<HTMLElement>(
+            'button:not(:disabled), [href], input:not(:disabled), [tabindex]:not([tabindex="-1"])',
+          );
+          if (!controls?.length) return;
+          const first = controls[0];
+          const last = controls[controls.length - 1];
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last?.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first?.focus();
+          }
+        }}
+      >
+        <header>
+          <div>
+            <h2 id="archived-projects-title">Архив проектов</h2>
+            <p>Архивные проекты скрыты вместе со своими чатами из основной навигации.</p>
+          </div>
+          <button
+            ref={closeRef}
+            className="icon-button"
+            onClick={onClose}
+            aria-label="Закрыть архив проектов"
+          >
+            ×
+          </button>
+        </header>
+        {loading && (
+          <p className="empty-hint" role="status">
+            Загружаем архив проектов…
+          </p>
+        )}
+        {!loading && error && (
+          <div className="notice error" role="alert">
+            {error}
+          </div>
+        )}
+        {!loading && !error && !projects.length && (
+          <p className="empty-hint">Архив проектов пуст.</p>
+        )}
+        {!loading && !error && projects.length > 0 && (
+          <ul className="archived-project-list">
+            {projects.map((project) => {
+              const restoring = restoringProjectIds.has(project.id);
+              return (
+                <li key={project.id}>
+                  <span>
+                    <strong>{project.name}</strong>
+                    <small>{project.path}</small>
+                  </span>
+                  <button
+                    className="secondary"
+                    disabled={restoring}
+                    onClick={() => onRestore(project.id)}
+                  >
+                    {restoring ? 'Восстанавливаем…' : 'Восстановить'}
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </section>
+    </div>,
+    document.body,
   );
 }
 
@@ -2939,6 +3116,11 @@ function Workspace({
   onSignedOut: () => void;
 }) {
   const [projects, setProjects] = useState<Project[]>([]);
+  const [archivedProjects, setArchivedProjects] = useState<Project[]>([]);
+  const [archivedProjectsOpen, setArchivedProjectsOpen] = useState(false);
+  const [archivedProjectsLoading, setArchivedProjectsLoading] = useState(false);
+  const [archivedProjectsError, setArchivedProjectsError] = useState<string | null>(null);
+  const [restoringProjectIds, setRestoringProjectIds] = useState<Set<string>>(() => new Set());
   const [threads, setThreads] = useState<Thread[]>([]);
   const [recentThreads, setRecentThreads] = useState<Thread[]>([]);
   const [models, setModels] = useState<ModelOption[]>([]);
@@ -3960,6 +4142,68 @@ function Workspace({
     }
   }
 
+  async function openArchivedProjects() {
+    setArchivedProjectsOpen(true);
+    setArchivedProjectsLoading(true);
+    setArchivedProjectsError(null);
+    try {
+      setArchivedProjects(await api.projects(true));
+    } catch (cause) {
+      setArchivedProjectsError(`Не удалось загрузить архив проектов. ${errorMessage(cause)}`);
+    } finally {
+      setArchivedProjectsLoading(false);
+    }
+  }
+
+  async function archiveProject(id: string) {
+    try {
+      await api.archiveProject(session.csrfToken, id);
+    } catch (cause) {
+      setError(projectArchiveErrorMessage(cause));
+      return;
+    }
+
+    const remainingProjects = projects.filter((project) => project.id !== id);
+    setProjects(remainingProjects);
+    setRecentThreads((current) => current.filter((item) => item.projectId !== id));
+    if (projectId === id) {
+      setProjectId(remainingProjects[0]?.id ?? null);
+      setThreadId(null);
+      setThreads([]);
+      setArchiveView(false);
+    }
+  }
+
+  async function restoreProject(id: string) {
+    setRestoringProjectIds((current) => new Set(current).add(id));
+    setArchivedProjectsError(null);
+    try {
+      const restored = await api.unarchiveProject(session.csrfToken, id);
+      setArchivedProjects((current) => current.filter((project) => project.id !== id));
+      const activeProjects = await api
+        .projects(false)
+        .catch(() => [...projects.filter((project) => project.id !== restored.id), restored]);
+      setProjects(activeProjects);
+      await refreshRecentThreads(activeProjects).catch((cause: unknown) => {
+        setArchivedProjectsError(
+          `Проект восстановлен, но список недавних чатов обновится позже. ${errorMessage(cause)}`,
+        );
+      });
+    } catch (cause) {
+      setArchivedProjectsError(
+        cause instanceof ApiError && cause.code === 'PROJECT_ARCHIVED'
+          ? 'Проект пока остаётся в архиве. Повторите восстановление.'
+          : `Не удалось восстановить проект. ${errorMessage(cause)}`,
+      );
+    } finally {
+      setRestoringProjectIds((current) => {
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
+    }
+  }
+
   async function newThread(targetProjectId = projectId) {
     if (!targetProjectId) return;
     setBusy(true);
@@ -4576,6 +4820,15 @@ function Workspace({
         onRename={renameThread}
         onBack={() => setArchiveView(false)}
         onCreate={createProject}
+        archivedProjectsOpen={archivedProjectsOpen}
+        archivedProjects={archivedProjects}
+        archivedProjectsLoading={archivedProjectsLoading}
+        archivedProjectsError={archivedProjectsError}
+        restoringProjectIds={restoringProjectIds}
+        onOpenArchivedProjects={() => void openArchivedProjects()}
+        onCloseArchivedProjects={() => setArchivedProjectsOpen(false)}
+        onArchiveProject={(id) => void archiveProject(id)}
+        onRestoreProject={(id) => void restoreProject(id)}
         username={session.username}
         disabled={busy}
         mobileOpen={mobileNavigationOpen}

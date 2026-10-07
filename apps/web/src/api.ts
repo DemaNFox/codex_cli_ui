@@ -320,7 +320,10 @@ export const api = {
         },
       ),
     ),
-  projects: async () => asList(await request<Project[] | { data: Project[] }>('/api/projects')),
+  projects: async (archived = false) =>
+    asList(
+      await request<Project[] | { data: Project[] }>(`/api/projects?archived=${String(archived)}`),
+    ),
   createProject: async (csrfToken: string, input: { name: string; path: string }) =>
     unwrapData(
       await request<Project | { data: Project }>('/api/projects', {
@@ -328,6 +331,26 @@ export const api = {
         csrfToken,
         body: input,
       }),
+    ),
+  archiveProject: async (csrfToken: string, projectId: string) =>
+    unwrapData(
+      await request<Project | { data: Project }>(
+        `/api/projects/${encodeURIComponent(projectId)}/archive`,
+        {
+          method: 'POST',
+          csrfToken,
+        },
+      ),
+    ),
+  unarchiveProject: async (csrfToken: string, projectId: string) =>
+    unwrapData(
+      await request<Project | { data: Project }>(
+        `/api/projects/${encodeURIComponent(projectId)}/unarchive`,
+        {
+          method: 'POST',
+          csrfToken,
+        },
+      ),
     ),
   models: async () => asList(await request<ModelOption[] | { data: ModelOption[] }>('/api/models')),
   threads: async (projectId: string, archived = false) =>

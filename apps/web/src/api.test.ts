@@ -9,6 +9,7 @@ const project = {
   defaultModel: null,
   defaultReasoningEffort: null,
   defaultPermissionPreset: 'workspace-write' as const,
+  archived: false,
   createdAt: '2026-09-27T10:00:00.000Z',
   updatedAt: '2026-09-27T10:00:00.000Z',
 };
@@ -99,6 +100,10 @@ describe('api response envelopes', () => {
         const url =
           typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
         if (url === '/api/projects') return Promise.resolve(response({ data: project }));
+        if (url === `/api/projects/${project.id}/archive`)
+          return Promise.resolve(response({ data: { ...project, archived: true } }));
+        if (url === `/api/projects/${project.id}/unarchive`)
+          return Promise.resolve(response({ data: project }));
         if (url === '/api/preferences/runtime')
           return Promise.resolve(
             response({
@@ -132,6 +137,11 @@ describe('api response envelopes', () => {
     await expect(
       api.createProject('csrf', { name: 'Project', path: project.path }),
     ).resolves.toEqual(project);
+    await expect(api.archiveProject('csrf', project.id)).resolves.toEqual({
+      ...project,
+      archived: true,
+    });
+    await expect(api.unarchiveProject('csrf', project.id)).resolves.toEqual(project);
     await expect(
       api.startThread('csrf', {
         projectId: project.id,
@@ -161,6 +171,30 @@ describe('api response envelopes', () => {
     });
     await expect(api.resourceLimits()).resolves.toEqual(resourceLimits);
     await expect(api.subagents(thread.id)).resolves.toEqual([{ id: 'agent-1' }]);
+  });
+
+  it('requests active and archived projects separately', async () => {
+    const archivedProject = { ...project, archived: true };
+    const fetchMock = vi.fn((input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      return Promise.resolve(
+        response({ data: url.endsWith('archived=true') ? [archivedProject] : [project] }),
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.projects()).resolves.toEqual([project]);
+    await expect(api.projects(true)).resolves.toEqual([archivedProject]);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      '/api/projects?archived=false',
+      expect.objectContaining({ credentials: 'same-origin' }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/projects?archived=true',
+      expect.objectContaining({ credentials: 'same-origin' }),
+    );
   });
 
   it('sends versioned resource save and apply requests', async () => {

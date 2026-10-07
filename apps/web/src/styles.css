@@ -279,6 +279,11 @@ button:disabled {
   text-transform: uppercase;
   letter-spacing: 0.08em;
 }
+.section-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.2rem;
+}
 .new-chat-button {
   display: flex;
   align-items: center;
@@ -433,6 +438,60 @@ button:disabled {
   border-radius: 0.8rem;
   background: var(--panel);
   box-shadow: 0 1.2rem 3rem rgba(0, 0, 0, 0.5);
+}
+.archived-projects-dialog {
+  width: min(34rem, 100%);
+  min-width: 0;
+  max-height: calc(100dvh - 2rem);
+  padding: 1rem;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 0.8rem;
+  background: var(--panel);
+  box-shadow: 0 1.2rem 3rem rgba(0, 0, 0, 0.5);
+}
+.archived-projects-dialog > header,
+.archived-project-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+.archived-projects-dialog h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+.archived-projects-dialog header p {
+  margin: 0.35rem 0 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  line-height: 1.4;
+}
+.archived-project-list {
+  display: grid;
+  gap: 0.55rem;
+  margin: 1rem 0 0;
+  padding: 0;
+  list-style: none;
+}
+.archived-project-list li {
+  padding: 0.7rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 0.65rem;
+  background: #111519;
+}
+.archived-project-list li > span {
+  min-width: 0;
+}
+.archived-project-list strong,
+.archived-project-list small {
+  display: block;
+  overflow-wrap: anywhere;
+}
+.archived-project-list small {
+  margin-top: 0.2rem;
+  color: var(--muted);
+  font-size: 0.7rem;
 }
 .rename-dialog h2 {
   margin: 0 0 1rem;
@@ -2676,6 +2735,14 @@ button:disabled {
   .rename-dialog {
     width: 100%;
     max-width: 100%;
+  }
+  .archived-projects-dialog {
+    width: 100%;
+    max-width: 100%;
+  }
+  .archived-project-list li {
+    align-items: stretch;
+    flex-direction: column;
   }
   .account-login-dialog {
     width: 100%;
