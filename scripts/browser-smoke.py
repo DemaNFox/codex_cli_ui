@@ -37,6 +37,8 @@ def main() -> int:
     account_login_pending = False
     codex_update_state = "ready"
     queued_turn_visible = True
+    ambiguous_turn_visible = True
+    project_archived = False
     resource_snapshot = {
         "capacity": {
             "cpuCores": 8,
@@ -73,6 +75,8 @@ def main() -> int:
         nonlocal codex_update_state
         nonlocal resource_snapshot
         nonlocal queued_turn_visible
+        nonlocal ambiguous_turn_visible
+        nonlocal project_archived
         request = route.request
         parsed = urlparse(request.url)
         path = parsed.path
@@ -86,22 +90,63 @@ def main() -> int:
         elif path == "/api/auth/login":
             signed_in = True
             payload(route, 200, {"username": "owner", "csrfToken": "csrf-smoke"})
-        elif path == "/api/projects":
+        elif path == "/api/projects" and request.method == "GET":
+            wants_archived_project = query.get("archived", ["false"])[0] == "true"
             payload(
                 route,
                 200,
                 {
-                    "data": [
+                    "data": ([
                         {
                             "id": "p1",
                             "name": "Demo",
                             "path": "/srv/projects/demo",
+                            "archived": project_archived,
                             "defaultModel": "gpt-6-astra",
                             "defaultReasoningEffort": "high",
                             "defaultPermissionPreset": "workspace-write",
                             "createdAt": "2026-09-27T12:00:00.000Z",
+                            "updatedAt": "2026-09-27T12:00:00.000Z",
                         }
-                    ]
+                    ] if wants_archived_project == project_archived else [])
+                },
+            )
+        elif path == "/api/projects/p1/archive" and request.method == "POST":
+            project_archived = True
+            payload(
+                route,
+                200,
+                {
+                    "data": {
+                        "id": "p1",
+                        "name": "Demo",
+                        "path": "/srv/projects/demo",
+                        "archived": True,
+                        "defaultModel": "gpt-6-astra",
+                        "defaultReasoningEffort": "high",
+                        "defaultPermissionPreset": "workspace-write",
+                        "createdAt": "2026-09-27T12:00:00.000Z",
+                        "updatedAt": "2026-09-27T12:00:01.000Z",
+                    }
+                },
+            )
+        elif path == "/api/projects/p1/unarchive" and request.method == "POST":
+            project_archived = False
+            payload(
+                route,
+                200,
+                {
+                    "data": {
+                        "id": "p1",
+                        "name": "Demo",
+                        "path": "/srv/projects/demo",
+                        "archived": False,
+                        "defaultModel": "gpt-6-astra",
+                        "defaultReasoningEffort": "high",
+                        "defaultPermissionPreset": "workspace-write",
+                        "createdAt": "2026-09-27T12:00:00.000Z",
+                        "updatedAt": "2026-09-27T12:00:02.000Z",
+                    }
                 },
             )
         elif path == "/api/models":
@@ -515,6 +560,21 @@ def main() -> int:
                     "queuedTurns": (
                         [
                             {
+                                "id": 18,
+                                "threadId": "t1",
+                                "status": "needsReview",
+                                "position": None,
+                                "errorCode": "IDEMPOTENCY_OUTCOME_UNKNOWN",
+                                "textPreview": "Проверить спорный запуск без повторной отправки",
+                                "attachmentCount": 0,
+                                "createdAt": "2026-09-27T12:00:04.000Z",
+                            }
+                        ]
+                        if os.environ.get("CODEX_WEB_AMBIGUOUS_ONLY") == "1"
+                        and ambiguous_turn_visible
+                        else
+                        [
+                            {
                                 "id": 17,
                                 "threadId": "t1",
                                 "status": "queued",
@@ -538,6 +598,21 @@ def main() -> int:
                     "data": (
                         [
                             {
+                                "id": 18,
+                                "threadId": "t1",
+                                "status": "needsReview",
+                                "position": None,
+                                "errorCode": "IDEMPOTENCY_OUTCOME_UNKNOWN",
+                                "textPreview": "Проверить спорный запуск без повторной отправки",
+                                "attachmentCount": 0,
+                                "createdAt": "2026-09-27T12:00:04.000Z",
+                            }
+                        ]
+                        if os.environ.get("CODEX_WEB_AMBIGUOUS_ONLY") == "1"
+                        and ambiguous_turn_visible
+                        else
+                        [
+                            {
                                 "id": 17,
                                 "threadId": "t1",
                                 "status": "queued",
@@ -553,6 +628,14 @@ def main() -> int:
                     )
                 },
             )
+        elif (
+            path == "/api/threads/t1/queued-turns/18/reconcile"
+            and request.method == "POST"
+        ):
+            if request.headers.get("x-csrf-token") != "csrf-smoke":
+                raise AssertionError("queued turn reconciliation did not carry CSRF protection")
+            ambiguous_turn_visible = False
+            payload(route, 200, {"data": {"status": "resolved", "turnId": "turn-ambiguous"}})
         elif path == "/api/threads/t1/queued-turns/17" and request.method == "DELETE":
             if request.headers.get("x-csrf-token") != "csrf-smoke":
                 raise AssertionError("queued turn cancellation did not carry CSRF protection")
@@ -976,6 +1059,44 @@ def main() -> int:
         page.get_by_label("Пароль").fill("correct-horse-battery-staple")
         page.get_by_role("button", name="Войти").click()
         page.get_by_role("heading", name="Переносимый чат").wait_for()
+        page.set_viewport_size({"width": 1440, "height": 900})
+        page.get_by_label("Меню проекта Demo").click()
+        page.get_by_role("menuitem", name="Архивировать проект").click()
+        page.get_by_text("Добавьте первый проект на сервере.").wait_for()
+        if page.get_by_role("navigation", name="Недавние чаты").get_by_text(
+            "Переносимый чат"
+        ).count():
+            raise AssertionError("archived project remains in recent chats")
+        page.get_by_role("button", name="Открыть архив проектов").click()
+        project_archive = page.get_by_role("dialog", name="Архив проектов")
+        project_archive.get_by_text("Demo", exact=True).wait_for()
+        project_archive.get_by_role("button", name="Восстановить").click()
+        project_archive.get_by_text("Demo", exact=True).wait_for(state="detached")
+        project_archive.get_by_role("button", name="Закрыть архив проектов").click()
+        page.get_by_role("button", name="Открыть архив проектов").wait_for()
+        restored_project_button = page.locator(".project-button")
+        if restored_project_button.get_attribute("aria-expanded") != "true":
+            restored_project_button.click()
+        page.get_by_role("button", name="Открыть чат проекта Переносимый чат").click()
+        page.get_by_role("heading", name="Переносимый чат").wait_for()
+        if os.environ.get("CODEX_WEB_PROJECT_ARCHIVE_ONLY") == "1":
+            browser.close()
+            print("browser-smoke: project archive and restore passed")
+            return 0
+        if os.environ.get("CODEX_WEB_AMBIGUOUS_ONLY") == "1":
+            queued_region = page.get_by_role("region", name="Задачи в очереди")
+            queued_region.get_by_text("Требует проверки", exact=True).wait_for()
+            queued_region.get_by_role("button", name="Новый чат").wait_for()
+            queued_region.get_by_role("button", name="Проверить сейчас").click()
+            queued_region.wait_for(state="detached")
+            page.get_by_text(
+                "Запуск задачи найден в Codex. Чат обновлён; повторная отправка не выполнялась.",
+                exact=True,
+            ).wait_for()
+            browser.close()
+            print("browser-smoke: ambiguous turn reconciliation passed")
+            return 0
+        page.set_viewport_size({"width": 390, "height": 600})
         if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1":
             queued_region = page.get_by_role("region", name="Задачи в очереди")
             queued_region.get_by_text(

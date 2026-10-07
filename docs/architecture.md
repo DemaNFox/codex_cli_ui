@@ -261,18 +261,25 @@ never started again automatically. Recovery reads the authoritative Codex thread
 client message id: an existing native turn completes the queue record and attachment binding without another
 side effect. Absence from a read is not proof that an earlier request cannot still be applied, so the ambiguous
 outcome remains visible and fail closed; it cannot be retried, cancelled or archived through the normal UI
-until Codex supplies positive evidence that resolves it. New root turns and queued followers for that same
-thread are also held back so a late native turn cannot overtake a newer request; unrelated threads continue to
-use the available execution slots.
+until Codex supplies positive evidence that resolves it. The operator can request the same exact authoritative
+check immediately; a positive client-message match adopts the native turn atomically, while an absent match or
+failed read leaves the record unchanged and never calls `turn/start`. The card also offers a blank new chat in
+the same project so unrelated work can continue without resending or stopping the uncertain task. New root
+turns and queued followers for the affected thread remain held back so a late native turn cannot overtake a
+newer request; unrelated threads continue to use the available execution slots. Definite pre-send failures and
+explicit upstream rejections return the request to the queue; only transport outcomes that can have reached
+Codex enter `needsReview`.
 
 ## Initial API
 
 - `POST /api/auth/login`, `POST /api/auth/logout`, `GET /api/auth/session`
-- `GET/POST/PATCH/DELETE /api/projects`
+- `GET/POST/PATCH/DELETE /api/projects`; listing accepts an `archived` filter and
+  `POST /api/projects/:id/archive`, `POST /api/projects/:id/unarchive` preserve all chat history
 - `GET /api/models`
 - `GET/POST /api/threads`, `GET/PATCH /api/threads/:id`
 - `POST /api/threads/:id/archive`, `POST /api/threads/:id/unarchive`; listing accepts a project-scoped `archived` filter
 - `POST /api/threads/:id/turns`, `GET /api/threads/:id/queued-turns`,
+  `POST /api/threads/:id/queued-turns/:queuedTurnId/reconcile`,
   `DELETE /api/threads/:id/queued-turns/:queuedTurnId`,
   `POST /api/threads/:id/steer`, `POST /api/threads/:id/interrupt`
 - `POST /api/approvals/:id/resolve`
@@ -306,7 +313,11 @@ next turn after restore must resume the exact thread before it starts.
 The single navigation sidebar expands each project into its chat list, offers global and per-project new-chat
 actions and keeps a cross-project recent list. The project context menu exposes an archived-chat view scoped
 to that project. Archived threads can be inspected and restored without mixing them into the active thread
-list. The transcript owns the scroll container while the composer remains in a fixed grid row.
+list. A separate project archive hides an idle project and all of its chats from both active navigation and
+recent chats without changing or deleting their individual archive state. Restoring the project brings those
+same chats back. Archiving fails closed while any project chat has active, queued, dispatching, ambiguous or
+descendant work; archived projects cannot accept new work until restored. The transcript owns the scroll
+container while the composer remains in a fixed grid row.
 Thread menus allow a server-persisted manual rename. Until the operator renames it, the first native
 `thread/name/updated` notification from Codex supplies the topic name after the initial task. If that name is
 missing or is only an extractive prefix of the first request, successful completion starts one bounded,

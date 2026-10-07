@@ -19,7 +19,8 @@ It uses the official Codex app-server protocol over local stdio; the app-server 
 is never exposed publicly.
 
 The workspace uses one navigation sidebar: projects expand to their chats, each project has its own new-chat
-action and archived chats remain recoverable from the project menu. The composer stays pinned while a long
+action and archived chats remain recoverable from the project menu. Entire idle projects can also be archived
+to remove them and their chats from the working sidebar, then restored without deleting history. The composer stays pinned while a long
 transcript scrolls independently. `/status` opens safe Codex account limits plus two explicitly labelled usage
 scopes: an estimate for the selected chat and dated totals for all token activity on the signed-in account.
 Account totals distinguish today, the trailing 7 and 30 days and all available time; unavailable per-chat
@@ -119,7 +120,8 @@ that chat has no active root turn and a safe slot becomes available. Active suba
 do not block a new root task in the same chat when another slot is free. A selected active subagent can be
 stopped from the Agents menu without interrupting the root turn or unrelated agents. A task that is still waiting can be cancelled from its
 queue card; cancellation never interrupts work that has already started, and an ambiguous start that requires
-review remains non-cancellable. Resource reconfiguration, draining and degraded-capacity
+review remains non-cancellable. Its card can request an immediate authoritative check or open a blank new chat
+without resending the uncertain task. Resource reconfiguration, draining and degraded-capacity
 states still fail closed instead of silently adding work. A rare interrupted start is shown as requiring review;
 it is reconciled against Codex and is never retried blindly. An answer emitted before the whole turn finishes
 is shown as received while work continues; only a successful terminal turn is marked as the final answer.
