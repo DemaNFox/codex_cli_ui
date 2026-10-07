@@ -1622,9 +1622,9 @@ describe('Codex routes', () => {
     });
   });
 
-  it('streams the validated file handle when the project path is replaced before open', async () => {
+  it('rejects a parent-directory swap after project file validation', async () => {
     let beforeOpenCalls = 0;
-    let outsideFile = '';
+    let outsideDirectory = '';
     const { app, projectPath, root } = await fixture(
       2,
       undefined,
@@ -1642,18 +1642,23 @@ describe('Codex routes', () => {
       undefined,
       async (canonicalPath) => {
         beforeOpenCalls += 1;
-        await rename(canonicalPath, `${canonicalPath}.original`);
-        await symlink(outsideFile, canonicalPath, 'file');
+        const reports = path.dirname(canonicalPath);
+        await rename(reports, `${reports}.original`);
+        await symlink(outsideDirectory, reports, process.platform === 'win32' ? 'junction' : 'dir');
       },
     );
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const threadId = await createThread(app, project.id, session.headers);
-    const generatedFile = path.join(projectPath, 'report.md');
-    outsideFile = path.join(root, 'outside-secret.md');
+    const reports = path.join(projectPath, 'reports');
+    outsideDirectory = path.join(root, 'outside-reports');
+    await mkdir(reports);
+    await mkdir(outsideDirectory);
+    const generatedFile = path.join(reports, 'report.md');
+    const outsideFile = path.join(outsideDirectory, 'report.md');
     await writeFile(generatedFile, 'safe project file', 'utf8');
     await writeFile(outsideFile, 'outside secret', 'utf8');
-    const url = `/api/threads/${threadId}/project-files/download?path=report.md`;
+    const url = `/api/threads/${threadId}/project-files/download?path=reports%2Freport.md`;
 
     const available = await app.inject({
       method: 'HEAD',
