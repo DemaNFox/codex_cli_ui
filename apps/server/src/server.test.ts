@@ -7231,12 +7231,69 @@ describe('Codex routes', () => {
       state: 'completed',
       response: { data: { status: 'started', turnId: 'native-recovered-turn' } },
     });
+    expect(repository.getThread(threadId)).toMatchObject({ status: 'idle', activeTurnId: null });
     expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(0);
     expect(
       repository.database
         .prepare("SELECT outcome FROM audit_events WHERE action='turn.queue.reconcile.manual'")
         .get(),
     ).toEqual({ outcome: 'succeeded' });
+  });
+
+  it('projects recovered in-progress evidence before dispatching a queued follower', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const recoveredKey = '43000000-0000-4000-8000-000000000004';
+    const unknown = seedUnknownQueuedTurn(repository, threadId, recoveredKey, 'already running');
+    const followerKey = '43000000-0000-4000-8000-000000000005';
+    const followerHash = `hash:${followerKey}`;
+    repository.reserveIdempotent(`turn:${threadId}`, followerKey, followerHash);
+    const follower = repository.enqueueTurn({
+      threadId,
+      idempotencyKey: followerKey,
+      requestHash: followerHash,
+      request: { text: 'wait for recovered turn', attachmentIds: [], idempotencyKey: followerKey },
+      claimToken: `queued:${threadId}:${followerKey}`,
+    }).record;
+    appServer.setThreadTurns(threadId, [
+      {
+        id: 'native-running-turn',
+        status: 'inProgress',
+        items: [{ type: 'userMessage', clientId: recoveredKey, content: [] }],
+      },
+    ]);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/queued-turns/${unknown.id}/reconcile`,
+      headers: session.headers,
+    });
+    expect(response.json()).toEqual({
+      data: { status: 'resolved', turnId: 'native-running-turn' },
+    });
+    expect(repository.getThread(threadId)).toMatchObject({
+      status: 'active',
+      activeTurnId: 'native-running-turn',
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(repository.getQueuedTurn(follower.id)?.status).toBe('queued');
+    expect(
+      appServer.requests.filter(
+        (request) =>
+          request.method === 'turn/start' &&
+          (request.params as { clientUserMessageId?: string }).clientUserMessageId === followerKey,
+      ),
+    ).toHaveLength(0);
+
+    const archive = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/archive`,
+      headers: session.headers,
+    });
+    expect(archive.statusCode).toBe(409);
+    expect(archive.json()).toMatchObject({ error: { code: 'PROJECT_HAS_ACTIVE_WORK' } });
   });
 
   it('keeps an absent native queued turn in needs-review without retry or cross-thread access', async () => {

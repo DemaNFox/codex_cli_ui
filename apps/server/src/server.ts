@@ -716,13 +716,11 @@ function activeTurnIdFromHistory(turns: unknown): string | null {
 function queuedClientMessageEvidence(
   turns: unknown,
   clientUserMessageId: string,
-): { turnId: string | null; hasInProgressTurn: boolean } {
-  if (!Array.isArray(turns)) return { turnId: null, hasInProgressTurn: true };
-  let hasInProgressTurn = false;
+): { turnId: string | null; matchingTurnIsInProgress: boolean } {
+  if (!Array.isArray(turns)) return { turnId: null, matchingTurnIsInProgress: false };
   for (const turnValue of turns) {
     const turn = inputRecord(turnValue);
     if (!turn) continue;
-    if (turn.status === 'inProgress') hasInProgressTurn = true;
     if (!Array.isArray(turn.items)) continue;
     for (const itemValue of turn.items) {
       const item = inputRecord(itemValue);
@@ -731,10 +729,10 @@ function queuedClientMessageEvidence(
         item.clientId === clientUserMessageId &&
         typeof turn.id === 'string'
       )
-        return { turnId: turn.id, hasInProgressTurn };
+        return { turnId: turn.id, matchingTurnIsInProgress: turn.status === 'inProgress' };
     }
   }
-  return { turnId: null, hasInProgressTurn };
+  return { turnId: null, matchingTurnIsInProgress: false };
 }
 
 function turnStartWasDefinitelyNotAccepted(error: unknown): boolean {
@@ -3406,10 +3404,20 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     );
   };
 
-  const adoptUnknownQueuedTurn = (record: QueuedTurnRecord, turnId: string): boolean => {
+  const adoptUnknownQueuedTurn = (
+    record: QueuedTurnRecord,
+    turnId: string,
+    hasInProgressTurn: boolean,
+  ): boolean => {
     const attachments = record.request.attachmentIds
       .map((attachmentId) => repository.getAttachment(attachmentId))
       .filter((attachment): attachment is AttachmentRecord => attachment !== undefined);
+    if (hasInProgressTurn) {
+      setActiveTurn(record.threadId, turnId);
+      treeBusyThreads.delete(record.threadId);
+      clearNativeActive(record.threadId);
+      repository.updateThreadRuntime(record.threadId, { status: 'active', activeTurnId: turnId });
+    }
     if (!repository.completeQueuedTurn(record.id, turnId)) return false;
     publishQueueChanged(record.threadId);
     const userEvent = repository.appendEvent({
@@ -3658,7 +3666,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
             current.idempotencyKey,
           );
           if (evidence.turnId === null) return;
-          if (!adoptUnknownQueuedTurn(current, evidence.turnId)) return;
+          if (!adoptUnknownQueuedTurn(current, evidence.turnId, evidence.matchingTurnIsInProgress))
+            return;
           repository.audit('turn.queue.reconcile', 'succeeded', {
             threadId: record.threadId,
             queuedTurnId: record.id,
@@ -3771,7 +3780,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
             reason: 'notFound',
           });
         }
-        if (!adoptUnknownQueuedTurn(record, evidence.turnId))
+        if (!adoptUnknownQueuedTurn(record, evidence.turnId, evidence.matchingTurnIsInProgress))
           throw new HttpError(409, 'QUEUED_TURN_NOT_REVIEWABLE');
         repository.audit('turn.queue.reconcile.manual', 'succeeded', {
           threadId: params.id,
