@@ -872,11 +872,15 @@ button:disabled {
   padding: 0;
   list-style: none;
 }
-.generated-files a {
+.generated-files a,
+.generated-files .project-file-state {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 0.35rem;
   max-width: 100%;
+}
+.generated-files a {
   padding: 0.3rem 0.5rem;
   border: 1px solid var(--border);
   border-radius: 0.45rem;
@@ -895,6 +899,35 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.project-file-state {
+  max-width: 100%;
+}
+.project-file-status {
+  color: var(--muted);
+  font-size: 0.75em;
+}
+.project-file-state.unavailable .project-file-status,
+.project-file-state.error .project-file-status {
+  color: #ffb8b8;
+}
+.project-file-retry {
+  padding: 0.12rem 0.35rem;
+  border: 1px solid var(--border);
+  border-radius: 0.35rem;
+  color: #c9dcf5;
+  background: rgba(17, 20, 23, 0.72);
+  font: inherit;
+  cursor: pointer;
+}
+.project-file-retry:hover,
+.project-file-retry:focus-visible {
+  border-color: var(--accent);
+  color: var(--text);
+}
+.project-file-state a[aria-disabled='true'] {
+  cursor: wait;
+  opacity: 0.72;
 }
 .event-time {
   flex: 0 0 auto;

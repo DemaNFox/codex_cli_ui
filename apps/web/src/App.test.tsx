@@ -1325,6 +1325,57 @@ describe('App', () => {
     expect(link.getAttribute('download')).toBe('final report.pdf');
   });
 
+  it('reuses availability checks for generated-file fallbacks and hides a missing file link', async () => {
+    const events = [
+      {
+        id: 1,
+        threadId: 'thread-1',
+        turnId: 'turn-missing-file',
+        kind: 'file-change',
+        phase: 'completed',
+        payload: { changes: [{ path: 'reports/missing.md#summary', kind: 'add' }] },
+        createdAt: '2026-09-27T13:03:00.000Z',
+      },
+      {
+        id: 2,
+        threadId: 'thread-1',
+        turnId: 'turn-missing-file',
+        kind: 'agent-message',
+        phase: 'completed',
+        payload: { text: 'Проверка завершена.', messagePhase: 'final_answer' },
+        createdAt: '2026-09-27T13:03:01.000Z',
+      },
+      {
+        id: 3,
+        threadId: 'thread-1',
+        turnId: 'turn-missing-file',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T13:03:02.000Z',
+      },
+    ];
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events });
+      if (
+        url === '/api/threads/thread-1/project-files/download?path=reports%2Fmissing.md' &&
+        init?.method === 'HEAD'
+      )
+        return new Response(null, { status: 404 });
+      return undefined;
+    });
+
+    render(<App />);
+
+    const files = await screen.findByRole('region', { name: 'Созданные и изменённые файлы' });
+    expect(await within(files).findByText('Файл недоступен на сервере')).not.toBeNull();
+    expect(within(files).queryByRole('link')).toBeNull();
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/threads/thread-1/project-files/download?path=reports%2Fmissing.md',
+      { credentials: 'same-origin', method: 'HEAD' },
+    );
+  });
+
   it('shows fallback downloads only for files missing from the final-answer Markdown', async () => {
     const events = [
       {
@@ -1371,14 +1422,14 @@ describe('App', () => {
     render(<App />);
 
     const final = await screen.findByRole('article', { name: 'Итоговый ответ Codex' });
-    const explicitLink = within(final).getByRole('link', { name: 'report' });
+    const explicitLink = await within(final).findByRole('link', { name: 'report' });
     expect(explicitLink.getAttribute('href')).toBe(
       '/api/threads/thread-1/project-files/download?path=reports%2Ffinal.pdf',
     );
     const fallback = within(final).getByRole('region', {
       name: 'Созданные и изменённые файлы',
     });
-    expect(within(fallback).getAllByRole('link')).toHaveLength(1);
+    expect(await within(fallback).findAllByRole('link')).toHaveLength(1);
     expect(within(fallback).getByRole('link', { name: /reports\/extra\.csv/ })).not.toBeNull();
     expect(within(fallback).queryByText('reports/final.pdf')).toBeNull();
     expect(within(final).getAllByRole('link')).toHaveLength(2);

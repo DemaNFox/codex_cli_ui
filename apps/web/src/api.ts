@@ -117,6 +117,38 @@ export interface PushSubscriptionStatus {
   subscribed: boolean;
 }
 
+export function projectFileDownloadUrl(threadId: string, path: string): string {
+  return `/api/threads/${encodeURIComponent(threadId)}/project-files/download?path=${encodeURIComponent(path)}`;
+}
+
+async function projectFileAvailable(threadId: string, path: string): Promise<boolean> {
+  const response = await fetch(projectFileDownloadUrl(threadId, path), {
+    method: 'HEAD',
+    credentials: 'same-origin',
+  });
+  if (response.status === 404) return false;
+  if (!response.ok) {
+    throw new ApiError(`Не удалось проверить файл (${response.status})`, response.status);
+  }
+  return true;
+}
+
+async function downloadProjectFile(threadId: string, path: string): Promise<Blob> {
+  const response = await fetch(projectFileDownloadUrl(threadId, path), {
+    method: 'GET',
+    credentials: 'same-origin',
+  });
+  if (!response.ok) {
+    throw new ApiError(
+      response.status === 404
+        ? 'Файл больше недоступен на сервере'
+        : `Не удалось скачать файл (${response.status})`,
+      response.status,
+    );
+  }
+  return response.blob();
+}
+
 function uploadAttachment(
   csrfToken: string,
   threadId: string,
@@ -351,6 +383,8 @@ export const api = {
     ),
   uploadAttachment,
   transcribeAudio,
+  projectFileAvailable,
+  downloadProjectFile,
   steer: async (
     csrfToken: string,
     threadId: string,

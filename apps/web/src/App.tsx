@@ -23,6 +23,7 @@ import type {
 import { ApiError, api } from './api.js';
 import { AgentMessageContent } from './AgentMessageContent.js';
 import { ImagePreviewDialog } from './ImagePreviewDialog.js';
+import { normalizeProjectFilePath, ProjectFileDownload } from './ProjectFileDownload.js';
 import type {
   Attachment,
   Capability,
@@ -620,8 +621,6 @@ function fileChangePreview(item: Record<string, unknown>): string | null {
 }
 
 const FILE_CHANGE_REMOVAL_KINDS = new Set(['delete', 'deleted', 'remove', 'removed']);
-const FILE_PATH_SCHEME = /^[a-z][a-z\d+.-]*:/i;
-const EXTERNAL_FILE_LINK = /^(?:https?:)?\/\//i;
 const INLINE_MARKDOWN_LINK = /(!?)\[[^\]\r\n]*\]\(\s*(?:<([^>\r\n]+)>|([^\s)]+))/gu;
 const MARKDOWN_REFERENCE_DEFINITION =
   /^[ \t]{0,3}\[([^\]\r\n]+)\]:[ \t]*(?:<([^>\r\n]+)>|([^\s]+))/gmu;
@@ -630,36 +629,12 @@ const MAX_MARKDOWN_LINKS = 500;
 const MAX_MARKDOWN_REFERENCE_DEFINITIONS = 200;
 
 function generatedFilePath(value: unknown): string | null {
-  if (typeof value !== 'string' || !value || value !== value.trim()) return null;
-  if (
-    value.startsWith('/') ||
-    value.startsWith('\\') ||
-    FILE_PATH_SCHEME.test(value) ||
-    [...value].some((character) => {
-      const code = character.charCodeAt(0);
-      return code <= 31 || code === 127;
-    })
-  )
-    return null;
-  const segments = value.replaceAll('\\', '/').split('/');
-  if (segments.some((segment) => segment === '..')) return null;
-  const normalized = segments.filter((segment) => segment && segment !== '.').join('/');
-  return normalized || null;
+  return normalizeProjectFilePath(value);
 }
 
 function explicitGeneratedFilePath(href: string): string | null {
-  if (
-    href.startsWith('/') ||
-    href.startsWith('#') ||
-    EXTERNAL_FILE_LINK.test(href) ||
-    FILE_PATH_SCHEME.test(href)
-  )
-    return null;
-  try {
-    return generatedFilePath(decodeURIComponent(href));
-  } catch {
-    return null;
-  }
+  if (href.startsWith('/') || href.startsWith('#') || /^(?:https?:)?\/\//iu.test(href)) return null;
+  return normalizeProjectFilePath(href);
 }
 
 function markdownReferenceLabel(value: string): string {
@@ -873,17 +848,12 @@ function GeneratedFileLinks({ threadId, paths }: { threadId: string; paths: read
       <span className="generated-files-label">Файлы</span>
       <ul>
         {paths.map((path) => {
-          const name = path.split('/').at(-1) ?? path;
           return (
             <li key={path}>
-              <a
-                href={`/api/threads/${encodeURIComponent(threadId)}/project-files/download?path=${encodeURIComponent(path)}`}
-                download={name}
-                title="Скачать файл из проекта"
-              >
+              <ProjectFileDownload threadId={threadId} path={path}>
                 <span aria-hidden="true">↓</span>
                 <span>{path}</span>
-              </a>
+              </ProjectFileDownload>
             </li>
           );
         })}

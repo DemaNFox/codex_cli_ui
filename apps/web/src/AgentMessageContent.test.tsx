@@ -1,7 +1,24 @@
-import { render, screen, within } from '@testing-library/react';
-import { describe, expect, it } from 'vitest';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AgentMessageContent } from './AgentMessageContent.js';
+
+const createObjectUrlMock = vi.fn(() => 'blob:project-file');
+
+beforeEach(() => {
+  vi.restoreAllMocks();
+  vi.stubGlobal('fetch', vi.fn());
+  vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
+  createObjectUrlMock.mockClear();
+  Object.defineProperty(URL, 'createObjectURL', {
+    configurable: true,
+    value: createObjectUrlMock,
+  });
+  Object.defineProperty(URL, 'revokeObjectURL', {
+    configurable: true,
+    value: vi.fn(),
+  });
+});
 
 describe('AgentMessageContent', () => {
   it('renders CommonMark structure and GFM task lists', () => {
@@ -73,7 +90,8 @@ describe('AgentMessageContent', () => {
     expect(screen.getByText('Unsafe').closest('a')).toBeNull();
   });
 
-  it('turns relative result links into authenticated project-file downloads', () => {
+  it('turns a confirmed relative result into an authenticated project-file download', async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 204 }));
     render(
       <AgentMessageContent
         text={
@@ -83,12 +101,97 @@ describe('AgentMessageContent', () => {
       />,
     );
 
-    const download = screen.getByRole('link', { name: 'Скачать отчёт' });
+    expect(screen.getByRole('status').textContent).toContain('Проверка файла');
+    const download = await screen.findByRole('link', { name: 'Скачать отчёт' });
     expect(download.getAttribute('href')).toBe(
       '/api/threads/thread-1/project-files/download?path=reports%2F%D0%B8%D1%82%D0%BE%D0%B3%D0%BE%D0%B2%D1%8B%D0%B9%20%D0%B0%D1%83%D0%B4%D0%B8%D1%82.md',
     );
     expect(download.getAttribute('download')).toBe('итоговый аудит.md');
     expect(download.getAttribute('title')).toBe('Скачать файл из проекта');
     expect(screen.getByRole('link', { name: 'Раздел' }).getAttribute('href')).toBe('#summary');
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/threads/thread-1/project-files/download?path=reports%2F%D0%B8%D1%82%D0%BE%D0%B3%D0%BE%D0%B2%D1%8B%D0%B9%20%D0%B0%D1%83%D0%B4%D0%B8%D1%82.md',
+      { credentials: 'same-origin', method: 'HEAD' },
+    );
+  });
+
+  it('does not present a missing project file as a download link', async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 404 }));
+    render(<AgentMessageContent text="[Отчёт](reports/missing.md)" threadId="thread-1" />);
+
+    expect(await screen.findByText('Файл недоступен на сервере')).not.toBeNull();
+    expect(screen.queryByRole('link', { name: 'Отчёт' })).toBeNull();
+  });
+
+  it('reports when a file disappears after availability was confirmed', async () => {
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response(null, { status: 404 }));
+    render(<AgentMessageContent text="[Отчёт](reports/vanished.md)" threadId="thread-1" />);
+
+    fireEvent.click(await screen.findByRole('link', { name: 'Отчёт' }));
+
+    expect(await screen.findByText('Файл недоступен на сервере')).not.toBeNull();
+    expect(screen.queryByRole('link', { name: 'Отчёт' })).toBeNull();
+  });
+
+  it('guards a busy download from duplicate clicks', async () => {
+    let finishDownload!: (response: Response) => void;
+    const pendingDownload = new Promise<Response>((resolve) => {
+      finishDownload = resolve;
+    });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockReturnValueOnce(pendingDownload);
+    render(<AgentMessageContent text="[Отчёт](reports/final.md)" threadId="thread-1" />);
+
+    const link = await screen.findByRole('link', { name: 'Отчёт' });
+    fireEvent.click(link);
+    fireEvent.click(link);
+
+    expect(link.getAttribute('aria-busy')).toBe('true');
+    expect(screen.getByRole('status').textContent).toContain('Скачивание');
+    expect(fetch).toHaveBeenCalledTimes(2);
+
+    finishDownload(new Response(new Blob(['ready']), { status: 200 }));
+    await waitFor(() => expect(link.getAttribute('aria-busy')).toBeNull());
+    expect(createObjectUrlMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('offers a retry after a network availability error', async () => {
+    vi.mocked(fetch)
+      .mockRejectedValueOnce(new TypeError('offline'))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    render(<AgentMessageContent text="[Отчёт](reports/final.md)" threadId="thread-1" />);
+
+    expect(await screen.findByRole('alert')).not.toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Повторить' }));
+    expect(await screen.findByRole('link', { name: 'Отчёт' })).not.toBeNull();
+  });
+
+  it('normalizes query and fragment suffixes while rejecting unsafe relative paths', async () => {
+    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 204 }));
+    render(
+      <AgentMessageContent
+        text={
+          '[Отчёт](reports/report.md?download=1#section) [Traversal](../secret.txt) [Encoded](%2e%2e/secret.txt) [Scheme](file:secret.txt) [Root](/help) [Fragment](#part) [External](https://example.test/report)'
+        }
+        threadId="thread-1"
+      />,
+    );
+
+    const report = await screen.findByRole('link', { name: 'Отчёт' });
+    expect(report.getAttribute('href')).toBe(
+      '/api/threads/thread-1/project-files/download?path=reports%2Freport.md',
+    );
+    expect(screen.getByText('Traversal').closest('a')).toBeNull();
+    expect(screen.getByText('Encoded').closest('a')).toBeNull();
+    expect(screen.getByText('Scheme').closest('a')).toBeNull();
+    expect(screen.getByRole('link', { name: 'Root' }).getAttribute('href')).toBe('/help');
+    expect(screen.getByRole('link', { name: 'Fragment' }).getAttribute('href')).toBe('#part');
+    expect(screen.getByRole('link', { name: 'External' }).getAttribute('href')).toBe(
+      'https://example.test/report',
+    );
+    expect(fetch).toHaveBeenCalledTimes(1);
   });
 });

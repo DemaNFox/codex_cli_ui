@@ -1,35 +1,9 @@
 import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
+import { normalizeProjectFilePath, ProjectFileDownload } from './ProjectFileDownload.js';
+
 const EXTERNAL_WEB_URL = /^(?:https?:)?\/\//i;
-const URI_SCHEME = /^[a-z][a-z\d+.-]*:/i;
-
-function projectFileDownload(
-  threadId: string | undefined,
-  href: string,
-): { url: string; name: string } | null {
-  if (
-    !threadId ||
-    href.startsWith('/') ||
-    href.startsWith('#') ||
-    EXTERNAL_WEB_URL.test(href) ||
-    URI_SCHEME.test(href)
-  )
-    return null;
-  let decodedHref: string;
-  try {
-    decodedHref = decodeURIComponent(href);
-  } catch {
-    return null;
-  }
-  const name = decodedHref.split(/[\\/]/).at(-1)?.trim();
-  if (!name) return null;
-  return {
-    url: `/api/threads/${encodeURIComponent(threadId)}/project-files/download?path=${encodeURIComponent(decodedHref)}`,
-    name,
-  };
-}
-
 const staticMarkdownComponents: Components = {
   img: ({ node, alt }) => {
     void node;
@@ -52,16 +26,26 @@ export function AgentMessageContent({ text, threadId }: { text: string; threadId
       void node;
       if (!href) return <span>{children}</span>;
       const external = EXTERNAL_WEB_URL.test(href);
-      const download = projectFileDownload(threadId, href);
+      const preserved = external || href.startsWith('/') || href.startsWith('#');
+      if (!preserved && threadId) {
+        const projectPath = normalizeProjectFilePath(href);
+        if (!projectPath) return <span>{children}</span>;
+        return (
+          <ProjectFileDownload
+            threadId={threadId}
+            path={projectPath}
+            className="generated-file-link"
+          >
+            {children}
+          </ProjectFileDownload>
+        );
+      }
       return (
         <a
           {...props}
-          className={download ? 'generated-file-link' : props.className}
-          href={download?.url ?? href}
-          download={download?.name}
+          href={href}
           rel={external ? 'noopener noreferrer' : undefined}
           target={external ? '_blank' : undefined}
-          title={download ? 'Скачать файл из проекта' : props.title}
         >
           {children}
         </a>
