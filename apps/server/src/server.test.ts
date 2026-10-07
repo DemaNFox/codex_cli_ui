@@ -676,6 +676,7 @@ async function fixture(
   persistent?: { temp: string; appServer: FakeAppServer },
   threadTitleGenerator?: ThreadTitleGenerator,
   executionReconcileIntervalMs?: number,
+  beforeProjectFileOpenForTest?: (canonicalPath: string) => void | Promise<void>,
 ) {
   const temp = persistent?.temp ?? (await mkdtemp(path.join(os.tmpdir(), 'codex-web-server-')));
   const root = path.join(temp, 'projects');
@@ -741,6 +742,7 @@ async function fixture(
     ...(codexUpdateStartupRetryMs === undefined ? {} : { codexUpdateStartupRetryMs }),
     ...(threadTitleGenerator ? { threadTitleGenerator } : {}),
     ...(executionReconcileIntervalMs === undefined ? {} : { executionReconcileIntervalMs }),
+    ...(beforeProjectFileOpenForTest === undefined ? {} : { beforeProjectFileOpenForTest }),
   });
   openApps.push(app);
   await app.ready();
@@ -1618,6 +1620,59 @@ describe('Codex routes', () => {
     expect(removedAfterHead.json()).toMatchObject({
       error: { code: 'PROJECT_FILE_NOT_FOUND' },
     });
+  });
+
+  it('streams the validated file handle when the project path is replaced before open', async () => {
+    let beforeOpenCalls = 0;
+    let outsideFile = '';
+    const { app, projectPath, root } = await fixture(
+      2,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      async (canonicalPath) => {
+        beforeOpenCalls += 1;
+        await rename(canonicalPath, `${canonicalPath}.original`);
+        await symlink(outsideFile, canonicalPath, 'file');
+      },
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const generatedFile = path.join(projectPath, 'report.md');
+    outsideFile = path.join(root, 'outside-secret.md');
+    await writeFile(generatedFile, 'safe project file', 'utf8');
+    await writeFile(outsideFile, 'outside secret', 'utf8');
+    const url = `/api/threads/${threadId}/project-files/download?path=report.md`;
+
+    const available = await app.inject({
+      method: 'HEAD',
+      url,
+      headers: { cookie: session.cookie },
+    });
+    expect(available.statusCode).toBe(200);
+    expect(beforeOpenCalls).toBe(0);
+
+    const downloaded = await app.inject({
+      method: 'GET',
+      url,
+      headers: { cookie: session.cookie },
+    });
+    expect(beforeOpenCalls).toBe(1);
+    expect(downloaded.statusCode).toBe(404);
+    expect(downloaded.body).not.toContain('outside secret');
+    expect(downloaded.body).not.toContain(outsideFile);
+    expect(downloaded.json()).toMatchObject({ error: { code: 'PROJECT_FILE_NOT_FOUND' } });
   });
 
   it('keeps attachment metadata retryable when filesystem deletion fails', async () => {

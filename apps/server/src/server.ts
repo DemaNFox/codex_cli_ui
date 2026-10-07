@@ -45,9 +45,10 @@ import {
 import cookie from '@fastify/cookie';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { createHash, randomUUID } from 'node:crypto';
-import { createReadStream, lstatSync } from 'node:fs';
-import { realpath, stat } from 'node:fs/promises';
+import { constants as fsConstants, lstatSync, type BigIntStats } from 'node:fs';
+import { open, realpath, stat, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import { z } from 'zod';
 
 import type { AppServerClient, AppServerInbound, AppServerLifecycleEvent } from './app-server.js';
@@ -392,6 +393,8 @@ export interface ServerDependencies {
   readonly codexUpdateStartupRetryMs?: number;
   readonly threadTitleGenerator?: ThreadTitleGenerator;
   readonly executionReconcileIntervalMs?: number;
+  /** Test-only seam for deterministic replacement-race coverage. */
+  readonly beforeProjectFileOpenForTest?: (canonicalPath: string) => void | Promise<void>;
 }
 
 function publicAttachment(record: AttachmentRecord): Attachment {
@@ -541,7 +544,13 @@ function pathIsInside(root: string, candidate: string): boolean {
 async function downloadableProjectFile(
   projectRoot: string,
   requestedPath: string,
-): Promise<{ canonical: string; name: string; size: number }> {
+): Promise<{
+  canonical: string;
+  projectRoot: string;
+  name: string;
+  size: number;
+  identity: { device: bigint; inode: bigint; changedAt: bigint };
+}> {
   if (
     requestedPath.includes('\0') ||
     path.posix.isAbsolute(requestedPath) ||
@@ -555,16 +564,79 @@ async function downloadableProjectFile(
     throw new HttpError(404, 'PROJECT_FILE_NOT_FOUND');
   }
   if (!pathIsInside(projectRoot, canonical)) throw new HttpError(404, 'PROJECT_FILE_NOT_FOUND');
-  let metadata: Awaited<ReturnType<typeof stat>>;
+  let metadata: BigIntStats;
   try {
-    metadata = await stat(canonical);
+    metadata = await stat(canonical, { bigint: true });
   } catch {
     throw new HttpError(404, 'PROJECT_FILE_NOT_FOUND');
   }
   if (!metadata.isFile()) throw new HttpError(400, 'PROJECT_FILE_NOT_DOWNLOADABLE');
-  if (metadata.size > MAX_PROJECT_FILE_DOWNLOAD_BYTES)
+  if (metadata.size > BigInt(MAX_PROJECT_FILE_DOWNLOAD_BYTES))
     throw new HttpError(413, 'PROJECT_FILE_TOO_LARGE');
-  return { canonical, name: path.basename(canonical), size: metadata.size };
+  return {
+    canonical,
+    projectRoot,
+    name: path.basename(canonical),
+    size: Number(metadata.size),
+    identity: { device: metadata.dev, inode: metadata.ino, changedAt: metadata.ctimeNs },
+  };
+}
+
+async function openDownloadableProjectFile(
+  file: Awaited<ReturnType<typeof downloadableProjectFile>>,
+): Promise<{ handle: FileHandle; size: number }> {
+  let handle: FileHandle;
+  try {
+    handle = await open(file.canonical, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+  } catch {
+    throw new HttpError(404, 'PROJECT_FILE_NOT_FOUND');
+  }
+  try {
+    const metadata = await handle.stat({ bigint: true });
+    if (
+      metadata.dev !== file.identity.device ||
+      metadata.ino !== file.identity.inode ||
+      metadata.ctimeNs !== file.identity.changedAt
+    )
+      throw new HttpError(404, 'PROJECT_FILE_NOT_FOUND');
+    if (process.platform === 'linux') {
+      let openedCanonical: string;
+      try {
+        openedCanonical = await realpath(`/proc/self/fd/${handle.fd}`);
+      } catch {
+        throw new HttpError(404, 'PROJECT_FILE_NOT_FOUND');
+      }
+      if (!pathIsInside(file.projectRoot, openedCanonical))
+        throw new HttpError(404, 'PROJECT_FILE_NOT_FOUND');
+    }
+    if (!metadata.isFile()) throw new HttpError(400, 'PROJECT_FILE_NOT_DOWNLOADABLE');
+    if (metadata.size > BigInt(MAX_PROJECT_FILE_DOWNLOAD_BYTES))
+      throw new HttpError(413, 'PROJECT_FILE_TOO_LARGE');
+    return { handle, size: Number(metadata.size) };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(404, 'PROJECT_FILE_NOT_FOUND');
+  }
+}
+
+function projectFileReadStream(handle: FileHandle, size: number): Readable {
+  return Readable.from(
+    (async function* () {
+      let position = 0;
+      try {
+        while (position < size) {
+          const buffer = Buffer.allocUnsafe(Math.min(64 * 1_024, size - position));
+          const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
+          if (bytesRead === 0) break;
+          position += bytesRead;
+          yield buffer.subarray(0, bytesRead);
+        }
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
+    })(),
+  );
 }
 
 function redactAttachmentStorage(value: unknown, storageRoot: string): unknown {
@@ -3089,12 +3161,19 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
 
   app.get('/api/threads/:id/project-files/download', async (request, reply) => {
     const { file, threadId } = await resolveProjectFileDownload(request);
-    repository.audit('project-file.download', 'succeeded', {
-      threadId,
-      size: file.size,
-    });
-    setProjectFileDownloadHeaders(reply, file);
-    return reply.send(createReadStream(file.canonical));
+    await dependencies.beforeProjectFileOpenForTest?.(file.canonical);
+    const opened = await openDownloadableProjectFile(file);
+    try {
+      repository.audit('project-file.download', 'succeeded', {
+        threadId,
+        size: opened.size,
+      });
+      setProjectFileDownloadHeaders(reply, { ...file, size: opened.size });
+      return reply.send(projectFileReadStream(opened.handle, opened.size));
+    } catch (error) {
+      await opened.handle.close().catch(() => undefined);
+      throw error;
+    }
   });
 
   const requirePushThread = (request: FastifyRequest): string => {
