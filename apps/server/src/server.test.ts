@@ -628,6 +628,47 @@ class SelectiveFailRemoveAttachmentStore extends AttachmentStore {
   }
 }
 
+class BlockingWriteAttachmentStore extends AttachmentStore {
+  readonly written: Promise<{
+    projectId: string;
+    threadId: string;
+    storageName: string;
+  }>;
+  private readonly writeGate: Promise<void>;
+  private signalWritten!: (value: {
+    projectId: string;
+    threadId: string;
+    storageName: string;
+  }) => void;
+  private releaseWrite!: () => void;
+
+  constructor(root: string) {
+    super(root);
+    this.written = new Promise((resolve) => {
+      this.signalWritten = resolve;
+    });
+    this.writeGate = new Promise((resolve) => {
+      this.releaseWrite = resolve;
+    });
+  }
+
+  release(): void {
+    this.releaseWrite();
+  }
+
+  override async write(
+    projectId: string,
+    threadId: string,
+    name: string,
+    bytes: Buffer,
+  ): Promise<{ id: string; storageName: string }> {
+    const stored = await super.write(projectId, threadId, name, bytes);
+    this.signalWritten({ projectId, threadId, storageName: stored.storageName });
+    await this.writeGate;
+    return stored;
+  }
+}
+
 class FakeAudioTranscriptionClient implements AudioTranscriptionClient {
   readonly uploads: TranscriptionUpload[] = [];
 
@@ -2324,6 +2365,20 @@ describe('Codex routes', () => {
     });
     expect(newTurn.statusCode).toBe(409);
     expect(newTurn.json()).toMatchObject({ error: { code: 'PROJECT_ARCHIVED' } });
+    const blockedUpload = multipartFile(
+      'blocked.txt',
+      'text/plain',
+      Buffer.from('must not be stored'),
+    );
+    const newAttachment = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${activeListThreadId}/attachments`,
+      headers: { ...session.headers, 'content-type': blockedUpload.contentType },
+      payload: blockedUpload.body,
+    });
+    expect(newAttachment.statusCode).toBe(409);
+    expect(newAttachment.json()).toMatchObject({ error: { code: 'PROJECT_ARCHIVED' } });
+    expect(repository.listAttachments(activeListThreadId)).toHaveLength(0);
 
     const restored = await app.inject({
       method: 'POST',
@@ -2346,6 +2401,47 @@ describe('Codex routes', () => {
       { action: 'project.archive', outcome: 'succeeded' },
       { action: 'project.unarchive', outcome: 'succeeded' },
     ]);
+  });
+
+  it('removes an uploaded file when its project is archived before attachment persistence', async () => {
+    let attachmentStore!: BlockingWriteAttachmentStore;
+    const { app, projectPath, repository } = await fixture(
+      2,
+      undefined,
+      (root) => (attachmentStore = new BlockingWriteAttachmentStore(root)),
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const upload = multipartFile('race.txt', 'text/plain', Buffer.from('archive wins'));
+    const uploading = app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/attachments`,
+      headers: { ...session.headers, 'content-type': upload.contentType },
+      payload: upload.body,
+    });
+    const stored = await attachmentStore.written;
+
+    const archived = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/archive`,
+      headers: session.headers,
+    });
+    expect(archived.statusCode).toBe(200);
+    attachmentStore.release();
+
+    const response = await uploading;
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: { code: 'PROJECT_ARCHIVED' } });
+    expect(repository.listAttachments(threadId)).toHaveLength(0);
+    await expect(
+      attachmentStore.read(stored.projectId, stored.threadId, stored.storageName),
+    ).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(
+      repository.database
+        .prepare("SELECT COUNT(*) AS count FROM audit_events WHERE action='attachment.upload'")
+        .get(),
+    ).toEqual({ count: 0 });
   });
 
   it.each([

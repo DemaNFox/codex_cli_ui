@@ -3169,11 +3169,15 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       if (thread.archived) throw new HttpError(409, 'THREAD_ARCHIVED');
       const project = repository.getProject(thread.projectId);
       if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+      requireProjectWorkAllowed(project);
       if (!Buffer.isBuffer(request.body)) throw new HttpError(400, 'MULTIPART_FILE_REQUIRED');
       const contentType = request.headers['content-type'];
       if (typeof contentType !== 'string') throw new HttpError(415, 'ATTACHMENT_TYPE_REQUIRED');
       const upload = parseSingleFileMultipart(contentType, request.body);
       const record = await attachmentStore.withThreadLock(id, async () => {
+        const currentProject = repository.getProject(thread.projectId);
+        if (!currentProject) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+        requireProjectWorkAllowed(currentProject);
         if (
           repository.attachmentBytesForThread(id) + upload.bytes.length >
           MAX_THREAD_ATTACHMENT_BYTES
@@ -3181,6 +3185,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           throw new HttpError(413, 'THREAD_ATTACHMENT_STORAGE_EXHAUSTED');
         const stored = await attachmentStore.write(project.id, id, upload.name, upload.bytes);
         try {
+          const projectAfterWrite = repository.getProject(thread.projectId);
+          if (!projectAfterWrite) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+          requireProjectWorkAllowed(projectAfterWrite);
           return repository.createAttachment({
             ...stored,
             threadId: id,
