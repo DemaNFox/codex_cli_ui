@@ -87,12 +87,15 @@ Browser
   final answer omits a link, the transcript also presents completed file-change paths as authenticated project
   downloads. Both paths first check current availability through `HEAD` and use the same download component.
   A missing, moved, deleted or never-created path is rendered as unavailable in the transcript. Files up to
-  16 MiB use a controlled `GET`, so deletion between the check and download produces bounded in-chat guidance
-  instead of a browser download-manager failure; confirmed larger or unknown-size files use the browser's
-  streaming path to avoid buffering them in Web UI memory. The canonical project checks remain authoritative: both methods
-  resolve against the thread's registered canonical project directory, reject absolute paths, traversal,
-  symlink escape, directories and files above 100 MiB, disable caching, and serve successful content with
-  `nosniff`. A query or fragment on a safe relative Markdown link is not part of the project path.
+  16 MiB use a controlled `GET`, whose own response size is checked before buffering, so deletion or growth
+  between the availability check and download produces bounded in-chat guidance instead of a browser
+  download-manager failure or an unexpectedly large Blob. Confirmed larger or unknown-size files use the
+  browser's streaming path after an explicit click. The canonical project checks remain authoritative: both
+  methods resolve against the thread's registered canonical project directory, reject absolute paths,
+  traversal, symlink escape, directories and files above 100 MiB, disable caching, and serve successful content
+  with `nosniff`. `GET` reads only from the same file handle whose identity and canonical boundary were checked,
+  closing path-replacement races. A query or fragment on a safe relative Markdown link is not part of the
+  project path.
   External, root-relative and fragment-only links retain their normal link behavior.
 
 ## Voice transcription
