@@ -43,7 +43,7 @@ import {
   type PushSubscriptionInput,
 } from '@codex-web/contracts';
 import cookie from '@fastify/cookie';
-import Fastify, { type FastifyInstance, type FastifyRequest } from 'fastify';
+import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
 import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream, lstatSync } from 'node:fs';
 import { realpath, stat } from 'node:fs/promises';
@@ -3058,7 +3058,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return { data: repository.listAttachments(id).map(publicAttachment) };
   });
 
-  app.get('/api/threads/:id/project-files/download', async (request, reply) => {
+  const resolveProjectFileDownload = async (request: FastifyRequest) => {
     auth.authenticate(request);
     const id = parseId(request);
     const query = projectFileQuerySchema.parse(request.query);
@@ -3068,13 +3068,32 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
     const projectRoot = await canonicalProjectPath(pathPolicy, project);
     const file = await downloadableProjectFile(projectRoot, query.path);
-    repository.audit('project-file.download', 'succeeded', {
-      threadId: id,
-      size: file.size,
-    });
+    return { file, threadId: id };
+  };
+
+  const setProjectFileDownloadHeaders = (
+    reply: FastifyReply,
+    file: Awaited<ReturnType<typeof downloadableProjectFile>>,
+  ) => {
+    reply.header('Cache-Control', 'private, no-store');
     reply.header('Content-Type', 'application/octet-stream');
     reply.header('Content-Length', String(file.size));
     reply.header('Content-Disposition', safeContentDisposition(file.name, false));
+  };
+
+  app.head('/api/threads/:id/project-files/download', async (request, reply) => {
+    const { file } = await resolveProjectFileDownload(request);
+    setProjectFileDownloadHeaders(reply, file);
+    return reply.code(200).send();
+  });
+
+  app.get('/api/threads/:id/project-files/download', async (request, reply) => {
+    const { file, threadId } = await resolveProjectFileDownload(request);
+    repository.audit('project-file.download', 'succeeded', {
+      threadId,
+      size: file.size,
+    });
+    setProjectFileDownloadHeaders(reply, file);
     return reply.send(createReadStream(file.canonical));
   });
 
