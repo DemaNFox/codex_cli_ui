@@ -3795,8 +3795,14 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     ) {
       await reconcileStaleExecutionCapacity();
       const currentProject = repository.getProject(project.id);
-      if (!currentProject) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
-      requireProjectWorkAllowed(currentProject);
+      if (!currentProject) {
+        repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
+        throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+      }
+      if (currentProject.archived) {
+        repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
+        requireProjectWorkAllowed(currentProject);
+      }
     }
     if (
       !dependencies.resourceBroker &&

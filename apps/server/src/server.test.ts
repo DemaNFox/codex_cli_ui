@@ -2529,6 +2529,25 @@ describe('Codex routes', () => {
           (request.params as { threadId?: string }).threadId === targetThreadId,
       ),
     ).toHaveLength(0);
+
+    const restored = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${archivedProject.id}/unarchive`,
+      headers: session.headers,
+    });
+    expect(restored.statusCode).toBe(200);
+    const retried = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${targetThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'must not be queued after archive',
+        idempotencyKey: '00000000-0000-4000-8000-000000000207',
+      },
+    });
+    expect(retried.statusCode).toBe(202);
+    expect(retried.json()).toMatchObject({ data: { status: 'queued' } });
+    expect(repository.listQueuedTurns(targetThreadId)).toHaveLength(1);
   });
 
   it('does not let a stale active-thread list overwrite a concurrent archive', async () => {
