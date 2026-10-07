@@ -2242,6 +2242,295 @@ describe('Codex routes', () => {
     expect(appServer.requests.map((item) => item.method)).toContain('thread/unarchive');
   });
 
+  it('archives and restores a project without mutating native threads or stored chat state', async () => {
+    const { app, appServer, projectPath, repository } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const activeListThreadId = await createThread(app, project.id, session.headers);
+    const archivedListThreadId = await createThread(app, project.id, session.headers);
+    repository.setThreadArchived(archivedListThreadId, true);
+    repository.appendEvent({
+      threadId: activeListThreadId,
+      turnId: 'turn-history',
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'preserved history' },
+    });
+    const nativeArchiveCallsBefore = appServer.requests.filter(
+      (request) => request.method === 'thread/archive' || request.method === 'thread/unarchive',
+    ).length;
+
+    const missingCsrf = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/archive`,
+      headers: { origin: 'https://codex.test', cookie: session.cookie },
+    });
+    expect(missingCsrf.statusCode).toBe(403);
+
+    const archived = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/archive`,
+      headers: session.headers,
+    });
+    expect(archived.statusCode).toBe(200);
+    expect(archived.json()).toMatchObject({ data: { id: project.id, archived: true } });
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/api/projects',
+          headers: { cookie: session.cookie },
+        })
+      )
+        .json<{ data: { id: string }[] }>()
+        .data.map((item) => item.id),
+    ).not.toContain(project.id);
+    expect(
+      (
+        await app.inject({
+          method: 'GET',
+          url: '/api/projects?archived=true',
+          headers: { cookie: session.cookie },
+        })
+      ).json<{ data: { id: string }[] }>().data,
+    ).toEqual([expect.objectContaining({ id: project.id })]);
+    expect(repository.getThread(activeListThreadId)?.archived).toBe(false);
+    expect(repository.getThread(archivedListThreadId)?.archived).toBe(true);
+    expect(repository.listEvents(activeListThreadId, 0)).toContainEqual(
+      expect.objectContaining({ turnId: 'turn-history', payload: { text: 'preserved history' } }),
+    );
+    expect(
+      appServer.requests.filter(
+        (request) => request.method === 'thread/archive' || request.method === 'thread/unarchive',
+      ),
+    ).toHaveLength(nativeArchiveCallsBefore);
+
+    const newThread = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(newThread.statusCode).toBe(409);
+    expect(newThread.json()).toMatchObject({ error: { code: 'PROJECT_ARCHIVED' } });
+    const newTurn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${activeListThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'must not resume',
+        idempotencyKey: '00000000-0000-4000-8000-000000000201',
+      },
+    });
+    expect(newTurn.statusCode).toBe(409);
+    expect(newTurn.json()).toMatchObject({ error: { code: 'PROJECT_ARCHIVED' } });
+
+    const restored = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/unarchive`,
+      headers: session.headers,
+    });
+    expect(restored.statusCode).toBe(200);
+    expect(restored.json()).toMatchObject({ data: { id: project.id, archived: false } });
+    expect(repository.getThread(activeListThreadId)?.archived).toBe(false);
+    expect(repository.getThread(archivedListThreadId)?.archived).toBe(true);
+    expect(repository.listEvents(activeListThreadId, 0)).toContainEqual(
+      expect.objectContaining({ turnId: 'turn-history', payload: { text: 'preserved history' } }),
+    );
+    const audits = repository.database
+      .prepare(
+        "SELECT action,outcome FROM audit_events WHERE action IN ('project.archive','project.unarchive') ORDER BY id",
+      )
+      .all() as unknown as { action: string; outcome: string }[];
+    expect(audits).toEqual([
+      { action: 'project.archive', outcome: 'succeeded' },
+      { action: 'project.unarchive', outcome: 'succeeded' },
+    ]);
+  });
+
+  it.each([
+    ['active root status', 'active'],
+    ['active turn id', 'activeTurnId'],
+    ['queued turn', 'queued'],
+    ['dispatching turn', 'dispatching'],
+    ['unknown turn outcome', 'unknown'],
+    ['pending descendant', 'pendingInit'],
+    ['running descendant', 'running'],
+  ] as const)('rejects project archive with %s', async (_label, state) => {
+    const { app, projectPath, repository } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    if (state === 'active') repository.updateThreadRuntime(threadId, { status: 'active' });
+    else if (state === 'activeTurnId')
+      repository.updateThreadRuntime(threadId, { activeTurnId: 'turn-active' });
+    else if (state === 'pendingInit' || state === 'running')
+      repository.upsertSubagent({
+        id: `child-${state}`,
+        rootThreadId: threadId,
+        parentThreadId: threadId,
+        agentPath: `/root/child-${state}`,
+        nickname: null,
+        role: null,
+        model: null,
+        reasoningEffort: null,
+        status: state,
+        message: null,
+        startedAt: '2026-10-07T00:00:00.000Z',
+        lastActivityAt: '2026-10-07T00:00:00.000Z',
+        completedAt: null,
+      });
+    else {
+      const idempotencyKey = `00000000-0000-4000-8000-00000000020${state === 'queued' ? '2' : state === 'dispatching' ? '3' : '4'}`;
+      const requestHash = `hash-${state}`;
+      expect(
+        repository.reserveIdempotent(`turn:${threadId}`, idempotencyKey, requestHash),
+      ).toMatchObject({
+        reserved: true,
+      });
+      const queued = repository.enqueueTurn({
+        threadId,
+        idempotencyKey,
+        requestHash,
+        request: {
+          text: state,
+          attachmentIds: [],
+          approvalPolicy: 'on-request',
+          idempotencyKey,
+        },
+        claimToken: `claim-${state}`,
+      }).record;
+      if (state !== 'queued') repository.claimQueuedTurn(queued.id);
+      if (state === 'unknown') repository.markQueuedTurnUnknown(queued.id, 'OUTCOME_UNKNOWN');
+    }
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/archive`,
+      headers: session.headers,
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json()).toMatchObject({ error: { code: 'PROJECT_HAS_ACTIVE_WORK' } });
+    expect(repository.getProject(project.id)?.archived).toBe(false);
+    const audit = repository.database
+      .prepare(
+        "SELECT outcome,metadata_json FROM audit_events WHERE action='project.archive' ORDER BY id DESC LIMIT 1",
+      )
+      .get() as { outcome: string; metadata_json: string };
+    expect(audit.outcome).toBe('rejected');
+    expect(JSON.parse(audit.metadata_json)).toEqual({
+      projectId: project.id,
+      reason: 'active_work',
+    });
+  });
+
+  it('rejects project archive while a thread or turn start is in flight', async () => {
+    const { app, appServer, projectPath, repository } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+
+    const threadGate = appServer.blockThreadStarts();
+    const startingThread = app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    await threadGate.entered;
+    const duringThreadStart = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/archive`,
+      headers: session.headers,
+    });
+    expect(duringThreadStart.statusCode).toBe(409);
+    expect(duringThreadStart.json()).toMatchObject({
+      error: { code: 'PROJECT_HAS_ACTIVE_WORK' },
+    });
+    threadGate.release();
+    const threadResponse = await startingThread;
+    expect(threadResponse.statusCode).toBe(201);
+    const threadId = threadResponse.json<{ data: { id: string } }>().data.id;
+
+    const turnGate = appServer.blockTurnStarts();
+    const startingTurn = app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'in flight',
+        idempotencyKey: '00000000-0000-4000-8000-000000000205',
+      },
+    });
+    await turnGate.entered;
+    const duringTurnStart = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${project.id}/archive`,
+      headers: session.headers,
+    });
+    expect(duringTurnStart.statusCode).toBe(409);
+    expect(duringTurnStart.json()).toMatchObject({
+      error: { code: 'PROJECT_HAS_ACTIVE_WORK' },
+    });
+    expect(repository.getProject(project.id)?.archived).toBe(false);
+    turnGate.release();
+    expect((await startingTurn).statusCode).toBe(202);
+  });
+
+  it('does not enqueue a turn after its project is archived during capacity reconciliation', async () => {
+    const { app, appServer, projectPath, root, repository } = await fixture(1);
+    const session = await login(app);
+    const busyProject = await createProject(app, projectPath, session.headers);
+    const archivedProjectPath = path.join(root, 'archive-during-reconcile');
+    await mkdir(archivedProjectPath, { recursive: true });
+    const archivedProject = await createProject(app, archivedProjectPath, session.headers);
+    const busyThreadId = await createThread(app, busyProject.id, session.headers);
+    const targetThreadId = await createThread(app, archivedProject.id, session.headers);
+    expect(
+      (
+        await app.inject({
+          method: 'POST',
+          url: `/api/threads/${busyThreadId}/turns`,
+          headers: session.headers,
+          payload: {
+            text: 'occupy capacity',
+            idempotencyKey: '00000000-0000-4000-8000-000000000206',
+          },
+        })
+      ).statusCode,
+    ).toBe(202);
+
+    const readGate = appServer.blockThreadReads();
+    const startingTurn = app.inject({
+      method: 'POST',
+      url: `/api/threads/${targetThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'must not be queued after archive',
+        idempotencyKey: '00000000-0000-4000-8000-000000000207',
+      },
+    });
+    await readGate.entered;
+    const archived = await app.inject({
+      method: 'POST',
+      url: `/api/projects/${archivedProject.id}/archive`,
+      headers: session.headers,
+    });
+    expect(archived.statusCode).toBe(200);
+    readGate.release();
+
+    const result = await startingTurn;
+    expect(result.statusCode).toBe(409);
+    expect(result.json()).toMatchObject({ error: { code: 'PROJECT_ARCHIVED' } });
+    expect(repository.listQueuedTurns(targetThreadId)).toHaveLength(0);
+    expect(
+      appServer.requests.filter(
+        (request) =>
+          request.method === 'turn/start' &&
+          (request.params as { threadId?: string }).threadId === targetThreadId,
+      ),
+    ).toHaveLength(0);
+  });
+
   it('does not let a stale active-thread list overwrite a concurrent archive', async () => {
     const { app, appServer, projectPath, repository } = await fixture();
     const session = await login(app);
@@ -5699,6 +5988,56 @@ describe('Codex routes', () => {
         updatedAt: '2026-10-06T00:01:00.000Z',
       },
     ]);
+    migrated.close();
+  });
+
+  it('migrates existing projects as active and preserves their metadata', async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-project-archive-migration-'));
+    const databasePath = path.join(temp, 'legacy.sqlite3');
+    const legacy = new DatabaseSync(databasePath);
+    legacy.exec(`
+      CREATE TABLE projects (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        path TEXT NOT NULL UNIQUE,
+        default_model TEXT,
+        default_reasoning_effort TEXT,
+        default_permission_preset TEXT NOT NULL CHECK(default_permission_preset IN ('read-only','workspace-write','full-access')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      INSERT INTO projects(
+        id,name,path,default_model,default_reasoning_effort,default_permission_preset,created_at,updated_at
+      ) VALUES(
+        '00000000-0000-4000-8000-000000000301','Legacy','/srv/projects/legacy',
+        'gpt-test','high','workspace-write','2026-10-01T00:00:00.000Z','2026-10-02T00:00:00.000Z'
+      );
+    `);
+    legacy.close();
+
+    const migrated = new SqliteRepository(databasePath, 1_000);
+    const columns = migrated.database.prepare('PRAGMA table_info(projects)').all() as unknown as {
+      name: string;
+      dflt_value: string | null;
+    }[];
+    expect(columns).toContainEqual(expect.objectContaining({ name: 'archived', dflt_value: '0' }));
+    expect(migrated.listProjects()).toEqual([
+      expect.objectContaining({
+        id: '00000000-0000-4000-8000-000000000301',
+        name: 'Legacy',
+        archived: false,
+        defaultModel: 'gpt-test',
+        defaultReasoningEffort: 'high',
+        defaultPermissionPreset: 'workspace-write',
+      }),
+    ]);
+    expect(migrated.listProjects(true)).toEqual([]);
+    const index = migrated.database
+      .prepare("SELECT sql FROM sqlite_master WHERE type='index' AND name='projects_archived_idx'")
+      .get() as { sql: string };
+    expect(index.sql.replaceAll(/\s+/gu, '').toLowerCase()).toContain(
+      'onprojects(archived,namecollatenocase,id)',
+    );
     migrated.close();
   });
 

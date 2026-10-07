@@ -11,6 +11,8 @@ import {
   codexVersionDiscoverySchema,
   capabilitySchema,
   pushSubscriptionSchema,
+  projectListQuerySchema,
+  projectSchema,
   resolvePermissionRequestSchema,
   resolveUserInputRequestSchema,
   resourceLimitPolicySchema,
@@ -69,6 +71,25 @@ describe('contracts', () => {
   });
   it('rejects traversal-like empty project values before filesystem policy', () => {
     expect(createProjectRequestSchema.safeParse({ name: '', path: '' }).success).toBe(false);
+  });
+
+  it('requires project archive state and strictly parses the project list filter', () => {
+    expect(
+      projectSchema.safeParse({
+        id: '00000000-0000-4000-8000-000000000001',
+        name: 'Demo',
+        path: '/srv/projects/demo',
+        archived: false,
+        defaultModel: null,
+        defaultReasoningEffort: null,
+        defaultPermissionPreset: 'workspace-write',
+        createdAt: '2026-10-07T00:00:00.000Z',
+        updatedAt: '2026-10-07T00:00:00.000Z',
+      }).success,
+    ).toBe(true);
+    expect(projectListQuerySchema.parse({})).toEqual({ archived: false });
+    expect(projectListQuerySchema.parse({ archived: 'true' })).toEqual({ archived: true });
+    expect(projectListQuerySchema.safeParse({ archived: '1' }).success).toBe(false);
   });
 
   it('requires an idempotency key for a turn', () => {

@@ -11,6 +11,7 @@ import {
   createProjectRequestSchema,
   loginRequestSchema,
   modelOptionSchema,
+  projectListQuerySchema,
   resolvePermissionRequestSchema,
   resolveApprovalRequestSchema,
   resolveUserInputRequestSchema,
@@ -995,6 +996,17 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     flushDeferredCompletionPush(threadId);
   };
   let pendingThreadStarts = 0;
+  const pendingThreadStartProjects = new Map<string, number>();
+  const beginPendingThreadStart = (projectId: string): void => {
+    pendingThreadStarts += 1;
+    pendingThreadStartProjects.set(projectId, (pendingThreadStartProjects.get(projectId) ?? 0) + 1);
+  };
+  const endPendingThreadStart = (projectId: string): void => {
+    pendingThreadStarts -= 1;
+    const remaining = (pendingThreadStartProjects.get(projectId) ?? 1) - 1;
+    if (remaining > 0) pendingThreadStartProjects.set(projectId, remaining);
+    else pendingThreadStartProjects.delete(projectId);
+  };
   let queuedTurnRetry: NodeJS.Timeout | null = null;
   let queuedTurnDispatch: Promise<void> | null = null;
   let queuedTurnDispatchRequested = false;
@@ -2676,9 +2688,28 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
   });
 
+  const requireProjectWorkAllowed = <T extends { archived: boolean }>(project: T): T => {
+    if (project.archived) throw new HttpError(409, 'PROJECT_ARCHIVED');
+    return project;
+  };
+  const projectHasActiveWork = (projectId: string): boolean => {
+    if (repository.projectHasActiveWork(projectId)) return true;
+    if ((pendingThreadStartProjects.get(projectId) ?? 0) > 0) return true;
+    return repository
+      .listProjectThreadIds(projectId)
+      .some(
+        (threadId) =>
+          (pendingTurnStartThreads.get(threadId) ?? 0) > 0 ||
+          activeTurnIdForThread(threadId) !== null ||
+          nativeActiveThreads.has(threadId) ||
+          uncertainTurnStartThreads.has(threadId),
+      );
+  };
+
   app.get('/api/projects', (request) => {
     auth.authenticate(request);
-    return { data: repository.listProjects() };
+    const query = projectListQuerySchema.parse(request.query);
+    return { data: repository.listProjects(query.archived) };
   });
 
   app.post('/api/projects', async (request, reply) => {
@@ -2724,6 +2755,24 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     repository.audit('project.delete', 'succeeded', { projectId: id });
     return reply.code(204).send();
   });
+
+  const setProjectArchive = (request: FastifyRequest, archived: boolean): { data: Project } => {
+    csrfGuard(auth, request);
+    const id = parseId(request);
+    const project = repository.getProject(id);
+    if (!project) throw new HttpError(404, 'PROJECT_NOT_FOUND');
+    const action = archived ? 'project.archive' : 'project.unarchive';
+    if (archived && projectHasActiveWork(id)) {
+      repository.audit(action, 'rejected', { projectId: id, reason: 'active_work' });
+      throw new HttpError(409, 'PROJECT_HAS_ACTIVE_WORK');
+    }
+    const updated =
+      project.archived === archived ? project : repository.setProjectArchived(id, archived)!;
+    repository.audit(action, 'succeeded', { projectId: id });
+    return { data: updated };
+  };
+  app.post('/api/projects/:id/archive', (request) => setProjectArchive(request, true));
+  app.post('/api/projects/:id/unarchive', (request) => setProjectArchive(request, false));
 
   app.get('/api/models', async (request) => {
     auth.authenticate(request);
@@ -2826,10 +2875,11 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const input = startThreadRequestSchema.parse(request.body);
     const project = repository.getProject(input.projectId);
     if (!project) throw new HttpError(404, 'PROJECT_NOT_FOUND');
+    requireProjectWorkAllowed(project);
     if (codexUpdateInterlocked || upgradeDrainRequested())
       throw new HttpError(503, 'SERVICE_DRAINING');
     if (accountLoginInterlocked) throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
-    pendingThreadStarts += 1;
+    beginPendingThreadStart(project.id);
     try {
       const cwd = await canonicalProjectPath(pathPolicy, project);
       const preset = input.permissionPreset ?? project.defaultPermissionPreset;
@@ -2875,7 +2925,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       });
       return reply.code(201).send({ data: thread });
     } finally {
-      pendingThreadStarts -= 1;
+      endPendingThreadStart(project.id);
     }
   });
 
@@ -3447,6 +3497,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         repository.requeueTurn(claimed.id);
         return 'wait';
       }
+      requireProjectWorkAllowed(project);
       const resumeCwd = await canonicalProjectPath(pathPolicy, project);
       if (loadedThreadGenerations.get(thread.id) !== appServer.generation) {
         if (!repository.isThreadHistoryHydrated(thread.id)) await hydrateThreadHistory(thread);
@@ -3689,6 +3740,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       throw new HttpError(409, 'QUEUED_TURN_OUTCOME_UNKNOWN');
     const project = repository.getProject(thread.projectId);
     if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+    requireProjectWorkAllowed(project);
     if (new Set(input.attachmentIds).size !== input.attachmentIds.length)
       throw new HttpError(400, 'ATTACHMENT_IDS_DUPLICATED');
     const attachments = input.attachmentIds.map((attachmentId) => {
@@ -3742,6 +3794,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       activeRootCount() + pendingTurnStarts >= config.maxConcurrentTurns
     ) {
       await reconcileStaleExecutionCapacity();
+      const currentProject = repository.getProject(project.id);
+      if (!currentProject) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+      requireProjectWorkAllowed(currentProject);
     }
     if (
       !dependencies.resourceBroker &&

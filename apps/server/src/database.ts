@@ -29,6 +29,7 @@ interface ProjectRow {
   id: string;
   name: string;
   path: string;
+  archived: number;
   default_model: string | null;
   default_reasoning_effort: string | null;
   default_permission_preset: Project['defaultPermissionPreset'];
@@ -246,6 +247,7 @@ function projectFromRow(row: ProjectRow): Project {
     id: row.id,
     name: row.name,
     path: row.path,
+    archived: row.archived === 1,
     defaultModel: row.default_model,
     defaultReasoningEffort: row.default_reasoning_effort,
     defaultPermissionPreset: row.default_permission_preset,
@@ -345,6 +347,7 @@ export class SqliteRepository {
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
         path TEXT NOT NULL UNIQUE,
+        archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1)),
         default_model TEXT,
         default_reasoning_effort TEXT,
         default_permission_preset TEXT NOT NULL CHECK(default_permission_preset IN ('read-only','workspace-write','full-access')),
@@ -554,12 +557,26 @@ export class SqliteRepository {
         PRIMARY KEY(thread_id, turn_id, subscription_id)
       );
     `);
+    this.migrateProjectArchived();
     this.migrateApprovalResolvingState();
     this.migrateIdempotencyState();
     this.migrateThreadActiveTurn();
     this.migrateAttachmentFileDeletionDueTime();
     this.recoverInterruptedQueuedTurns();
     this.enforcePushStorageBounds();
+  }
+
+  private migrateProjectArchived(): void {
+    const columns = this.database.prepare('PRAGMA table_info(projects)').all() as unknown as {
+      name: string;
+    }[];
+    if (!columns.some((column) => column.name === 'archived'))
+      this.database.exec(
+        'ALTER TABLE projects ADD COLUMN archived INTEGER NOT NULL DEFAULT 0 CHECK(archived IN (0,1))',
+      );
+    this.database.exec(
+      'CREATE INDEX IF NOT EXISTS projects_archived_idx ON projects(archived,name COLLATE NOCASE,id)',
+    );
   }
 
   private recoverInterruptedQueuedTurns(): void {
@@ -1133,11 +1150,11 @@ export class SqliteRepository {
     this.database.prepare('DELETE FROM login_attempts WHERE attempt_key=?').run(key);
   }
 
-  listProjects(): Project[] {
+  listProjects(archived = false): Project[] {
     return (
       this.database
-        .prepare('SELECT * FROM projects ORDER BY name COLLATE NOCASE,id')
-        .all() as unknown as ProjectRow[]
+        .prepare('SELECT * FROM projects WHERE archived=? ORDER BY name COLLATE NOCASE,id')
+        .all(archived ? 1 : 0) as unknown as ProjectRow[]
     ).map(projectFromRow);
   }
 
@@ -1147,7 +1164,7 @@ export class SqliteRepository {
     return row && projectFromRow(row);
   }
 
-  createProject(input: Omit<Project, 'id' | 'createdAt' | 'updatedAt'>): Project {
+  createProject(input: Omit<Project, 'id' | 'archived' | 'createdAt' | 'updatedAt'>): Project {
     const id = randomUUID();
     const now = new Date().toISOString();
     this.database
@@ -1166,6 +1183,48 @@ export class SqliteRepository {
         now,
       );
     return this.getProject(id)!;
+  }
+
+  setProjectArchived(id: string, archived: boolean): Project | undefined {
+    const now = new Date().toISOString();
+    this.database
+      .prepare('UPDATE projects SET archived=?,updated_at=? WHERE id=?')
+      .run(archived ? 1 : 0, now, id);
+    return this.getProject(id);
+  }
+
+  projectHasActiveWork(projectId: string): boolean {
+    return (
+      this.database
+        .prepare(
+          `SELECT 1
+           FROM threads t
+           WHERE t.project_id=? AND (
+             t.status='active' OR t.active_turn_id IS NOT NULL OR
+             EXISTS(
+               SELECT 1 FROM queued_turns q
+               WHERE q.thread_id=t.id AND q.status IN ('queued','dispatching','unknown')
+             ) OR
+             EXISTS(
+               SELECT 1 FROM subagents s
+               WHERE s.root_thread_id=t.id AND s.id<>s.root_thread_id
+                 AND s.status IN ('pendingInit','running')
+             )
+           )
+           LIMIT 1`,
+        )
+        .get(projectId) !== undefined
+    );
+  }
+
+  listProjectThreadIds(projectId: string): string[] {
+    return (
+      this.database
+        .prepare('SELECT id FROM threads WHERE project_id=?')
+        .all(projectId) as unknown as {
+        id: string;
+      }[]
+    ).map((row) => row.id);
   }
 
   updateProject(

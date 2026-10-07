@@ -170,6 +170,7 @@ export const projectSchema = z.object({
   id: z.string().uuid(),
   name: z.string().min(1).max(120),
   path: z.string().min(1),
+  archived: z.boolean(),
   defaultModel: z.string().nullable(),
   defaultReasoningEffort: z.string().nullable(),
   defaultPermissionPreset: permissionPresetSchema,
@@ -177,6 +178,13 @@ export const projectSchema = z.object({
   updatedAt: z.string().datetime(),
 });
 export type Project = z.infer<typeof projectSchema>;
+
+export const projectListQuerySchema = z.object({
+  archived: z
+    .enum(['true', 'false'])
+    .default('false')
+    .transform((value) => value === 'true'),
+});
 
 export const createProjectRequestSchema = z.object({
   name: z.string().trim().min(1).max(120),
