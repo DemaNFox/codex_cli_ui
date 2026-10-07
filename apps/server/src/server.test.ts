@@ -494,6 +494,9 @@ class FakeResourceBroker implements ResourceBroker {
   failApply = false;
   private applyGate: Promise<void> | null = null;
   private signalApply: (() => void) | null = null;
+  private snapshotGate: Promise<void> | null = null;
+  private signalSnapshot: (() => void) | null = null;
+  failNextSnapshot = false;
   current: BrokerResourceSnapshot = {
     capacity: {
       cpuQuotaPercent: 800,
@@ -524,7 +527,30 @@ class FakeResourceBroker implements ResourceBroker {
     return { entered: enteredPromise, release };
   }
 
+  blockSnapshots(): { entered: Promise<void>; release: () => void } {
+    let release!: () => void;
+    let entered!: () => void;
+    this.snapshotGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const enteredPromise = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    this.signalSnapshot = entered;
+    return { entered: enteredPromise, release };
+  }
+
   async snapshot(): Promise<BrokerResourceSnapshot> {
+    this.signalSnapshot?.();
+    this.signalSnapshot = null;
+    if (this.snapshotGate) {
+      await this.snapshotGate;
+      this.snapshotGate = null;
+    }
+    if (this.failNextSnapshot) {
+      this.failNextSnapshot = false;
+      throw new Error('broker snapshot failed');
+    }
     return this.current;
   }
 
@@ -8516,6 +8542,180 @@ describe('Codex routes', () => {
     await vi.waitFor(() => expect(sender.deliveries).toHaveLength(1));
   });
 
+  it('flushes deferred completion after a pre-start failure clears the thread counter', async () => {
+    const sender = new FakePushSender();
+    const broker = new FakeResourceBroker();
+    const { app, appServer, repository, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      broker,
+      undefined,
+      sender,
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    await app.inject({
+      method: 'PUT',
+      url: `/api/threads/${threadId}/push-subscriptions`,
+      headers: session.headers,
+      payload: {
+        endpoint: 'https://fcm.googleapis.com/pre-start-failure',
+        expirationTime: null,
+        keys: { p256dh: 'p'.repeat(65), auth: 'a'.repeat(24) },
+      },
+    });
+    const first = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'first broker task',
+        idempotencyKey: '35000000-0000-4000-8000-000000000001',
+      },
+    });
+    const firstTurnId = first.json<{ data: { turnId: string } }>().data.turnId;
+    const observedAt = new Date().toISOString();
+    repository.upsertSubagent({
+      id: 'child-before-pre-start-failure',
+      rootThreadId: threadId,
+      parentThreadId: threadId,
+      agentPath: '/root/pre-start-failure',
+      nickname: null,
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'running',
+      message: null,
+      startedAt: observedAt,
+      lastActivityAt: observedAt,
+      completedAt: null,
+    });
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: firstTurnId, status: 'completed', items: [] } },
+    });
+    const snapshotGate = broker.blockSnapshots();
+    const followUp = app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'fail before turn start',
+        idempotencyKey: '35000000-0000-4000-8000-000000000002',
+      },
+    });
+    await snapshotGate.entered;
+    appServer.emit({
+      method: 'item/completed',
+      params: {
+        threadId,
+        turnId: firstTurnId,
+        completedAtMs: Date.now() + 1_000,
+        item: {
+          type: 'subAgentActivity',
+          id: 'child-before-pre-start-failure-terminal',
+          agentThreadId: 'child-before-pre-start-failure',
+          agentPath: '/root/pre-start-failure',
+          kind: 'completed',
+        },
+      },
+    });
+    expect(sender.calls).toHaveLength(0);
+    broker.failNextSnapshot = true;
+    snapshotGate.release();
+    expect((await followUp).statusCode).toBe(500);
+    await vi.waitFor(() => expect(sender.deliveries).toHaveLength(1));
+    expect(sender.deliveries[0]?.payload).toEqual({ threadId, status: 'completed' });
+  });
+
+  it('flushes deferred completion after the accepted follow-up is cancelled', async () => {
+    const sender = new FakePushSender();
+    const { app, appServer, repository, projectPath, upgradeDrainPath } =
+      await fixtureWithExecutionReconciliation(15_000, sender);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    await app.inject({
+      method: 'PUT',
+      url: `/api/threads/${threadId}/push-subscriptions`,
+      headers: session.headers,
+      payload: {
+        endpoint: 'https://fcm.googleapis.com/cancel-follow-up',
+        expirationTime: null,
+        keys: { p256dh: 'p'.repeat(65), auth: 'a'.repeat(24) },
+      },
+    });
+    const first = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'first queued-cancel task',
+        idempotencyKey: '36000000-0000-4000-8000-000000000001',
+      },
+    });
+    const firstTurnId = first.json<{ data: { turnId: string } }>().data.turnId;
+    const observedAt = new Date().toISOString();
+    repository.upsertSubagent({
+      id: 'child-before-queue-cancel',
+      rootThreadId: threadId,
+      parentThreadId: threadId,
+      agentPath: '/root/queue-cancel',
+      nickname: null,
+      role: null,
+      model: null,
+      reasoningEffort: null,
+      status: 'running',
+      message: null,
+      startedAt: observedAt,
+      lastActivityAt: observedAt,
+      completedAt: null,
+    });
+    const queued = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'cancel this follow-up',
+        idempotencyKey: '36000000-0000-4000-8000-000000000002',
+      },
+    });
+    const queuedTurnId = queued.json<{ data: { queuedTurn: { id: number } } }>().data.queuedTurn.id;
+    await writeFile(upgradeDrainPath, 'drain');
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: firstTurnId, status: 'completed', items: [] } },
+    });
+    appServer.emit({
+      method: 'item/completed',
+      params: {
+        threadId,
+        turnId: firstTurnId,
+        completedAtMs: Date.now() + 1_000,
+        item: {
+          type: 'subAgentActivity',
+          id: 'child-before-queue-cancel-terminal',
+          agentThreadId: 'child-before-queue-cancel',
+          agentPath: '/root/queue-cancel',
+          kind: 'completed',
+        },
+      },
+    });
+    expect(sender.calls).toHaveLength(0);
+
+    const cancelled = await app.inject({
+      method: 'DELETE',
+      url: `/api/threads/${threadId}/queued-turns/${queuedTurnId}`,
+      headers: session.headers,
+    });
+    expect(cancelled.statusCode).toBe(204);
+    await vi.waitFor(() => expect(sender.deliveries).toHaveLength(1));
+    expect(sender.deliveries[0]?.payload).toEqual({ threadId, status: 'completed' });
+  });
+
   it('flushes deferred completion when stop-child discovers the child already terminal', async () => {
     const sender = new FakePushSender();
     const { app, appServer, repository, projectPath } = await fixtureWithExecutionReconciliation(
@@ -8735,6 +8935,41 @@ describe('Codex routes', () => {
     expect(appServer.requests.filter((request) => request.method === 'thread/read')).toHaveLength(
       1,
     );
+  });
+
+  it('does not mutate root runtime after a blocked root read is released during shutdown', async () => {
+    const { app, appServer, projectPath } = await fixtureWithExecutionReconciliation(20);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const started = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'blocked root reconciliation',
+        idempotencyKey: '37000000-0000-4000-8000-000000000001',
+      },
+    });
+    expect(started.statusCode).toBe(202);
+    appServer.setThreadStatus(threadId, 'idle');
+    const gate = appServer.blockThreadReads();
+    await gate.entered;
+
+    const closeOutcome = await Promise.race([
+      app.close().then(() => 'closed' as const),
+      new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 250)),
+    ]);
+    expect(closeOutcome).toBe('closed');
+    gate.release();
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(
+      appServer.requests.filter(
+        (request) =>
+          request.method === 'thread/read' &&
+          (request.params as { threadId?: string }).threadId === threadId,
+      ),
+    ).toHaveLength(1);
   });
 
   it('deduplicates safe terminal push delivery, retries transient errors and removes stale devices', async () => {

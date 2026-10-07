@@ -781,6 +781,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const treeBusyThreads = new Set<string>();
   const deferredCompletionPushes = new Map<string, string>();
   const pendingTurnStartThreads = new Map<string, number>();
+  const uncertainTurnStartThreads = new Set<string>();
   const nativeActiveThreads = new Set<string>();
   const nativeActivityVersions = new Map<string, number>();
   let nativeActivityVersion = 0;
@@ -851,7 +852,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       nativeActiveThreads.has(threadId) ||
       repository.countActiveSubagentsForRoot(threadId) > 0 ||
       repository.hasOutstandingQueuedTurns(threadId) ||
-      (pendingTurnStartThreads.get(threadId) ?? 0) > 0
+      (pendingTurnStartThreads.get(threadId) ?? 0) > 0 ||
+      uncertainTurnStartThreads.has(threadId)
     )
       return;
     deferredCompletionPushes.delete(threadId);
@@ -887,6 +889,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const remaining = (pendingTurnStartThreads.get(threadId) ?? 1) - 1;
     if (remaining > 0) pendingTurnStartThreads.set(threadId, remaining);
     else pendingTurnStartThreads.delete(threadId);
+    flushDeferredCompletionPush(threadId);
   };
   let pendingThreadStarts = 0;
   let queuedTurnRetry: NodeJS.Timeout | null = null;
@@ -1352,6 +1355,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     let result = threadResponseSchema.parse(
       await appServer.request('thread/read', { threadId: existing.id, includeTurns }),
     );
+    if (serverClosing) throw new Error('SERVER_CLOSING');
     if (result.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
     let liveActiveTurnId = activeTurnIdForThread(existing.id);
     let authoritativeStatus = statusType(result.thread.status);
@@ -1364,6 +1368,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       result = threadResponseSchema.parse(
         await appServer.request('thread/read', { threadId: existing.id, includeTurns: true }),
       );
+      if (serverClosing) throw new Error('SERVER_CLOSING');
       if (result.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
       authoritativeStatus = statusType(result.thread.status);
     }
@@ -1378,6 +1383,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         const confirmation = threadResponseSchema.parse(
           await appServer.request('thread/read', { threadId: existing.id, includeTurns: true }),
         );
+        if (serverClosing) throw new Error('SERVER_CLOSING');
         if (confirmation.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
         const confirmationTurnId = activeTurnIdFromHistory(confirmation.thread.turns);
         const stableNativeSnapshot =
@@ -1998,6 +2004,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (normalized.phase === 'delta') return;
     let runtimeTurnEvent = true;
     if (message.method === 'turn/started' && normalized.turnId) {
+      uncertainTurnStartThreads.delete(normalized.threadId);
       setActiveTurn(normalized.threadId, normalized.turnId);
       treeBusyThreads.delete(normalized.threadId);
       clearNativeActive(normalized.threadId);
@@ -2007,6 +2014,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       });
     }
     if (message.method === 'turn/completed' && normalized.turnId) {
+      uncertainTurnStartThreads.delete(normalized.threadId);
       const currentTurnId =
         repository.getThread(normalized.threadId)?.activeTurnId ??
         activeTurnIdForThread(normalized.threadId);
@@ -2139,6 +2147,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     nativeActiveThreads.clear();
     treeBusyThreads.clear();
     deferredCompletionPushes.clear();
+    uncertainTurnStartThreads.clear();
     for (const threadId of repository.resetActiveThreadRuntime()) affectedRoots.add(threadId);
     repository.resetActiveSubagentRuntime();
     for (const approval of repository.listUnfinishedApprovals()) {
@@ -3534,6 +3543,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       attachmentCount: result.attachments.length,
     });
     publishQueueChanged(params.id);
+    flushDeferredCompletionPush(params.id);
     requestQueuedTurnDispatch();
     return reply.code(204).send();
   });
@@ -3658,21 +3668,22 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
             'The host does not have enough free memory to start another task safely',
           );
       } catch (error) {
-        endPendingTurnStart(id);
         if (error instanceof HttpError && error.code === 'RESOURCE_CAPACITY_EXHAUSTED') {
           const response = enqueueReservedTurn(id, input, hash);
+          endPendingTurnStart(id);
           requestQueuedTurnDispatch();
           return reply.code(202).send(response);
         }
         repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
+        endPendingTurnStart(id);
         throw error;
       }
     }
     const preset = input.permissionPreset ?? project.defaultPermissionPreset;
     const attachmentClaim = `pending:${input.idempotencyKey}`;
     if (!repository.claimAttachments(id, input.attachmentIds, attachmentClaim)) {
-      endPendingTurnStart(id);
       repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
+      endPendingTurnStart(id);
       throw new HttpError(409, 'ATTACHMENT_NOT_AVAILABLE');
     }
     let result: z.infer<typeof turnResponseSchema>;
@@ -3728,11 +3739,14 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           sandboxPolicy: sandboxPolicy(preset, turnCwd),
         }),
       );
+      uncertainTurnStartThreads.delete(id);
       setActiveTurn(id, result.turn.id);
       repository.updateThreadRuntime(id, { status: 'active', activeTurnId: result.turn.id });
     } catch (error) {
-      if (turnStartIssued) repository.markIdempotentUnknown(operation, input.idempotencyKey, hash);
-      else {
+      if (turnStartIssued) {
+        uncertainTurnStartThreads.add(id);
+        repository.markIdempotentUnknown(operation, input.idempotencyKey, hash);
+      } else {
         repository.releasePendingIdempotent(operation, input.idempotencyKey, hash);
         repository.releaseAttachmentClaims(id, attachmentClaim);
       }
