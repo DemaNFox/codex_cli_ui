@@ -37,7 +37,7 @@ import { ProjectPathPolicy } from './path-policy.js';
 import type { BrokerResourceSnapshot, ResourceBroker } from './resource-broker.js';
 import type { PushNotificationPayload, PushSender } from './push-notifications.js';
 import type { PushSubscriptionInput } from '@codex-web/contracts';
-import { buildServer } from './server.js';
+import { buildServer, projectFileReadStream } from './server.js';
 import { createSseDelivery } from './sse.js';
 import type { ThreadTitleGenerator } from './thread-title-generator.js';
 
@@ -1678,6 +1678,37 @@ describe('Codex routes', () => {
     expect(downloaded.body).not.toContain('outside secret');
     expect(downloaded.body).not.toContain(outsideFile);
     expect(downloaded.json()).toMatchObject({ error: { code: 'PROJECT_FILE_NOT_FOUND' } });
+  });
+
+  it('closes a project file handle exactly once when its stream is destroyed before reading', async () => {
+    const handle = {
+      read: vi.fn(),
+      close: vi.fn(async () => undefined),
+    } as unknown as Parameters<typeof projectFileReadStream>[0];
+    const stream = projectFileReadStream(handle, 128);
+    const closed = new Promise<void>((resolve) => stream.once('close', resolve));
+
+    stream.destroy();
+    stream.destroy();
+    await closed;
+
+    expect(handle.read).not.toHaveBeenCalled();
+    expect(handle.close).toHaveBeenCalledTimes(1);
+  });
+
+  it('closes an empty project file handle without attempting a read', async () => {
+    const handle = {
+      read: vi.fn(),
+      close: vi.fn(async () => undefined),
+    } as unknown as Parameters<typeof projectFileReadStream>[0];
+    const stream = projectFileReadStream(handle, 0);
+    const closed = new Promise<void>((resolve) => stream.once('close', resolve));
+
+    stream.resume();
+    await closed;
+
+    expect(handle.read).not.toHaveBeenCalled();
+    expect(handle.close).toHaveBeenCalledTimes(1);
   });
 
   it('keeps attachment metadata retryable when filesystem deletion fails', async () => {

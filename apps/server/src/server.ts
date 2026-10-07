@@ -620,23 +620,54 @@ async function openDownloadableProjectFile(
   }
 }
 
-function projectFileReadStream(handle: FileHandle, size: number): Readable {
-  return Readable.from(
-    (async function* () {
-      let position = 0;
-      try {
-        while (position < size) {
-          const buffer = Buffer.allocUnsafe(Math.min(64 * 1_024, size - position));
-          const { bytesRead } = await handle.read(buffer, 0, buffer.length, position);
-          if (bytesRead === 0) break;
-          position += bytesRead;
-          yield buffer.subarray(0, bytesRead);
-        }
-      } finally {
-        await handle.close().catch(() => undefined);
+export function projectFileReadStream(
+  handle: Pick<FileHandle, 'read' | 'close'>,
+  size: number,
+): Readable {
+  let position = 0;
+  let reading = false;
+  let closePromise: Promise<void> | undefined;
+  const closeOnce = () => (closePromise ??= handle.close());
+  return new Readable({
+    autoDestroy: true,
+    read() {
+      if (reading) return;
+      if (position >= size) {
+        this.push(null);
+        return;
       }
-    })(),
-  );
+      reading = true;
+      const buffer = Buffer.allocUnsafe(Math.min(64 * 1_024, size - position));
+      void handle.read(buffer, 0, buffer.length, position).then(
+        ({ bytesRead }) => {
+          reading = false;
+          if (this.destroyed) return;
+          if (bytesRead === 0) {
+            this.push(null);
+            return;
+          }
+          position += bytesRead;
+          this.push(buffer.subarray(0, bytesRead));
+        },
+        (error: unknown) => {
+          reading = false;
+          this.destroy(error instanceof Error ? error : new Error('Project file read failed'));
+        },
+      );
+    },
+    destroy(error, callback) {
+      void closeOnce().then(
+        () => callback(error),
+        (closeError: unknown) =>
+          callback(
+            error ??
+              (closeError instanceof Error
+                ? closeError
+                : new Error('Project file handle close failed')),
+          ),
+      );
+    },
+  });
 }
 
 function redactAttachmentStorage(value: unknown, storageRoot: string): unknown {
@@ -3163,15 +3194,16 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const { file, threadId } = await resolveProjectFileDownload(request);
     await dependencies.beforeProjectFileOpenForTest?.(file.canonical);
     const opened = await openDownloadableProjectFile(file);
+    const stream = projectFileReadStream(opened.handle, opened.size);
     try {
       repository.audit('project-file.download', 'succeeded', {
         threadId,
         size: opened.size,
       });
       setProjectFileDownloadHeaders(reply, { ...file, size: opened.size });
-      return reply.send(projectFileReadStream(opened.handle, opened.size));
+      return reply.send(stream);
     } catch (error) {
-      await opened.handle.close().catch(() => undefined);
+      stream.destroy();
       throw error;
     }
   });
