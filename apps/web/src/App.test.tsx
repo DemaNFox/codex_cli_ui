@@ -732,6 +732,157 @@ describe('App', () => {
       ),
     ).not.toBeNull();
     expect(within(queue).queryByRole('button', { name: /повтор|отмен/i })).toBeNull();
+    expect(within(queue).getByRole('button', { name: 'Проверить сейчас' })).not.toBeNull();
+    expect(within(queue).getByRole('button', { name: 'Новый чат' })).not.toBeNull();
+  });
+
+  it('shows reconciliation progress once and refreshes the resolved thread and queue', async () => {
+    const queuedTurn = {
+      id: 13,
+      threadId: thread.id,
+      status: 'needsReview' as const,
+      position: null,
+      errorCode: 'IDEMPOTENCY_OUTCOME_UNKNOWN',
+      textPreview: 'Найди уже запущенную задачу',
+      attachmentCount: 0,
+      createdAt: '2026-10-04T10:10:00.000Z',
+    };
+    let finishReconciliation!: (response: Response) => void;
+    const reconciliationResponse = new Promise<Response>((resolve) => {
+      finishReconciliation = resolve;
+    });
+    let reconciled = false;
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({
+          data: thread,
+          events: [],
+          queuedTurns: reconciled ? [] : [queuedTurn],
+        });
+      if (url === '/api/threads/thread-1/queued-turns/13/reconcile' && init?.method === 'POST')
+        return reconciliationResponse;
+      if (url === '/api/threads/thread-1/queued-turns')
+        return jsonResponse({ data: reconciled ? [] : [queuedTurn] });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const queue = await screen.findByRole('region', { name: 'Задачи в очереди' });
+    await user.click(within(queue).getByRole('button', { name: 'Проверить сейчас' }));
+
+    const busyButton = within(queue).getByRole('button', { name: 'Проверяем…' });
+    expect(busyButton.hasAttribute('disabled')).toBe(true);
+    expect(busyButton.getAttribute('aria-busy')).toBe('true');
+    await user.click(busyButton);
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input, init]) =>
+          requestUrl(input) === '/api/threads/thread-1/queued-turns/13/reconcile' &&
+          init?.method === 'POST',
+      ),
+    ).toHaveLength(1);
+
+    reconciled = true;
+    finishReconciliation(jsonResponse({ data: { status: 'resolved', turnId: 'turn-confirmed' } }));
+
+    expect(
+      await screen.findByText(
+        'Запуск задачи найден в Codex. Чат обновлён; повторная отправка не выполнялась.',
+      ),
+    ).not.toBeNull();
+    await waitFor(() =>
+      expect(screen.queryByRole('region', { name: 'Задачи в очереди' })).toBeNull(),
+    );
+    expect(
+      fetchMock.mock.calls.some(
+        ([input]) => requestUrl(input) === '/api/threads/thread-1/queued-turns',
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps an unresolved ambiguous task visible and explicitly confirms no retry', async () => {
+    const queuedTurn = {
+      id: 14,
+      threadId: thread.id,
+      status: 'needsReview' as const,
+      position: null,
+      errorCode: 'IDEMPOTENCY_OUTCOME_UNKNOWN',
+      textPreview: 'Пока не найденная задача',
+      attachmentCount: 0,
+      createdAt: '2026-10-04T10:11:00.000Z',
+    };
+    installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [], queuedTurns: [queuedTurn] });
+      if (url === '/api/threads/thread-1/queued-turns/14/reconcile' && init?.method === 'POST') {
+        return jsonResponse({ data: { status: 'stillNeedsReview', reason: 'notFound' } });
+      }
+      if (url === '/api/threads/thread-1/queued-turns') return jsonResponse({ data: [queuedTurn] });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const queue = await screen.findByRole('region', { name: 'Задачи в очереди' });
+    await user.click(within(queue).getByRole('button', { name: 'Проверить сейчас' }));
+
+    expect(
+      await screen.findByText(
+        'Codex пока не подтвердил запуск этой задачи. Она не отправлена повторно и остаётся на проверке.',
+      ),
+    ).not.toBeNull();
+    expect(within(queue).getByText(queuedTurn.textPreview)).not.toBeNull();
+    expect(within(queue).getByRole('button', { name: 'Проверить сейчас' })).not.toBeNull();
+  });
+
+  it('opens a fresh blank chat without resending or stopping the ambiguous task', async () => {
+    const queuedTurn = {
+      id: 15,
+      threadId: thread.id,
+      status: 'needsReview' as const,
+      position: null,
+      errorCode: 'IDEMPOTENCY_OUTCOME_UNKNOWN',
+      textPreview: 'Оставить в старом чате',
+      attachmentCount: 0,
+      createdAt: '2026-10-04T10:12:00.000Z',
+    };
+    const blankThread = {
+      ...thread,
+      id: 'thread-blank',
+      name: null,
+      preview: '',
+      createdAt: '2026-10-04T10:13:00.000Z',
+      updatedAt: '2026-10-04T10:13:00.000Z',
+    };
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [], queuedTurns: [queuedTurn] });
+      if (url === '/api/threads' && init?.method === 'POST')
+        return jsonResponse({ data: blankThread });
+      if (url === '/api/threads/thread-blank')
+        return jsonResponse({ data: blankThread, events: [], queuedTurns: [] });
+      if (url === '/api/threads/thread-blank/subagents') return jsonResponse({ data: [] });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const queue = await screen.findByRole('region', { name: 'Задачи в очереди' });
+    await user.click(within(queue).getByRole('button', { name: 'Новый чат' }));
+
+    expect(await screen.findByRole('heading', { name: 'Новый чат' })).not.toBeNull();
+    expect(
+      await screen.findByText(
+        'Открыт новый чат. Спорная задача осталась в предыдущем чате: она не отправлена повторно и не остановлена.',
+      ),
+    ).not.toBeNull();
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input, init]) =>
+          /\/turns$|\/interrupt$|\/reconcile$/.test(requestUrl(input)) && init?.method === 'POST',
+      ),
+    ).toHaveLength(0);
   });
 
   it('shows a clear unavailable state when server push is not configured', async () => {

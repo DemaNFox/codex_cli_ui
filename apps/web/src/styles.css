@@ -1065,10 +1065,14 @@ button:disabled {
 }
 .queued-turn-actions {
   display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
   justify-content: flex-end;
   margin-top: 0.15rem;
 }
-.queued-turn-cancel {
+.queued-turn-cancel,
+.queued-turn-check,
+.queued-turn-new-chat {
   max-width: 100%;
   min-height: 2rem;
   padding: 0.35rem 0.65rem;
@@ -1079,13 +1083,30 @@ button:disabled {
   font-size: 0.78rem;
   font-weight: 650;
 }
+.queued-turn-check {
+  border-color: rgba(255, 202, 122, 0.5);
+  color: #ffe0a8;
+  background: rgba(255, 190, 93, 0.12);
+}
+.queued-turn-new-chat {
+  border-color: rgba(159, 181, 205, 0.38);
+  color: #d8e5f3;
+  background: rgba(159, 181, 205, 0.1);
+}
 .queued-turn-cancel:hover:not(:disabled) {
   border-color: rgba(255, 180, 178, 0.62);
   background: rgba(255, 113, 111, 0.18);
 }
+.queued-turn-check:hover:not(:disabled),
+.queued-turn-new-chat:hover:not(:disabled) {
+  border-color: rgba(255, 220, 167, 0.7);
+  background: rgba(255, 190, 93, 0.2);
+}
 @media (max-width: 640px) {
   .queued-turn-actions,
-  .queued-turn-cancel {
+  .queued-turn-cancel,
+  .queued-turn-check,
+  .queued-turn-new-chat {
     width: 100%;
   }
 }

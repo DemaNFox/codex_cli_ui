@@ -10,6 +10,7 @@ import type {
   PermissionPreset,
   Project,
   QueuedTurn,
+  ReconcileQueuedTurnResult,
   ResolveUserInputRequest,
   ResourceLimitPolicy,
   ResourceLimitSnapshot,
@@ -438,6 +439,11 @@ export const api = {
       `/api/threads/${encodeURIComponent(threadId)}/queued-turns/${encodeURIComponent(String(queuedTurnId))}`,
       { method: 'DELETE', csrfToken },
     ),
+  reconcileQueuedTurn: (csrfToken: string, threadId: string, queuedTurnId: number) =>
+    request<ReconcileQueuedTurnResult | { data: ReconcileQueuedTurnResult }>(
+      `/api/threads/${encodeURIComponent(threadId)}/queued-turns/${encodeURIComponent(String(queuedTurnId))}/reconcile`,
+      { method: 'POST', csrfToken },
+    ).then(unwrapData),
   uploadAttachment,
   transcribeAudio,
   projectFileAvailable,

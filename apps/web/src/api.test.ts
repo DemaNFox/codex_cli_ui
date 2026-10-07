@@ -197,6 +197,23 @@ describe('api response envelopes', () => {
     );
   });
 
+  it('reconciles an ambiguous queued turn with CSRF protection', async () => {
+    const fetchMock = vi.fn<typeof fetch>(() =>
+      Promise.resolve(response({ data: { status: 'resolved', turnId: 'turn-found' } })),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.reconcileQueuedTurn('csrf', thread.id, 9)).resolves.toEqual({
+      status: 'resolved',
+      turnId: 'turn-found',
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/threads/thread-1/queued-turns/9/reconcile',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf');
+  });
+
   it('sends versioned resource save and apply requests', async () => {
     const fetchMock = vi.fn(() => Promise.resolve(response({ data: resourceLimits })));
     vi.stubGlobal('fetch', fetchMock);

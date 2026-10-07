@@ -474,6 +474,13 @@ function queuedTurnCancelErrorMessage(error: unknown): string {
   return 'Не удалось отменить задачу. Карточка сохранена — повторите попытку или обновите чат.';
 }
 
+function queuedTurnReconcileErrorMessage(error: unknown): string {
+  if (error instanceof ApiError && (error.status === 404 || error.status === 409)) {
+    return 'Состояние задачи уже изменилось. Она не отправлена повторно — обновите чат, чтобы увидеть актуальный результат.';
+  }
+  return 'Не удалось проверить задачу в Codex. Она не отправлена повторно и остаётся на проверке.';
+}
+
 function queuedTurnKey(threadId: string, queuedTurnId: number): string {
   return `${threadId}:${queuedTurnId}`;
 }
@@ -3167,6 +3174,9 @@ function Workspace({
   const [cancellingQueuedTurnKeys, setCancellingQueuedTurnKeys] = useState<Set<string>>(
     () => new Set(),
   );
+  const [reconcilingQueuedTurnKeys, setReconcilingQueuedTurnKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [queuedAttachments, setQueuedAttachments] = useState<QueuedAttachment[]>([]);
   const [previewImage, setPreviewImage] = useState<PreviewImage | null>(null);
   const [threadAttachmentBytes, setThreadAttachmentBytes] = useState(0);
@@ -3201,7 +3211,9 @@ function Workspace({
   const preferencesWriteRef = useRef<Promise<void>>(Promise.resolve());
   const sendInFlightRef = useRef(false);
   const queuedTurnCancellationsRef = useRef(new Set<string>());
+  const queuedTurnReconciliationsRef = useRef(new Set<string>());
   const cancelledQueuedTurnKeysRef = useRef(new Set<string>());
+  const nextThreadNoticeRef = useRef<string | null>(null);
   const navigationEpochRef = useRef(0);
   const subagentsRef = useRef<Subagent[]>(subagents);
   subagentsRef.current = subagents;
@@ -3300,7 +3312,8 @@ function Workspace({
 
   useEffect(() => {
     setLocallyResolvedRequests(new Set());
-    setActionNotice(null);
+    setActionNotice(nextThreadNoticeRef.current);
+    nextThreadNoticeRef.current = null;
     setShowScrollToLatest(false);
     followingLatestRef.current = true;
     userScrollIntentRef.current = false;
@@ -4261,8 +4274,8 @@ function Workspace({
     }
   }
 
-  async function newThread(targetProjectId = projectId) {
-    if (!targetProjectId) return;
+  async function newThread(targetProjectId = projectId, navigationNotice?: string) {
+    if (!targetProjectId) return false;
     setBusy(true);
     try {
       const thread = await api.startThread(session.csrfToken, {
@@ -4277,9 +4290,12 @@ function Workspace({
       setArchiveView(false);
       setThreads((current) => (targetProjectId === projectId ? [thread, ...current] : [thread]));
       setRecentThreads((current) => [thread, ...current.filter((item) => item.id !== thread.id)]);
+      nextThreadNoticeRef.current = navigationNotice ?? null;
       setThreadId(thread.id);
+      return true;
     } catch (cause) {
       setError(errorMessage(cause));
+      return false;
     } finally {
       setBusy(false);
     }
@@ -4696,6 +4712,81 @@ function Workspace({
     }
   }
 
+  async function reconcileQueuedTurn(queuedTurn: QueuedTurn) {
+    const targetThreadId = threadId;
+    if (!targetThreadId || queuedTurn.status !== 'needsReview') return;
+    const reconciliationKey = queuedTurnKey(targetThreadId, queuedTurn.id);
+    if (queuedTurnReconciliationsRef.current.has(reconciliationKey)) return;
+    queuedTurnReconciliationsRef.current.add(reconciliationKey);
+    setReconcilingQueuedTurnKeys((current) => new Set(current).add(reconciliationKey));
+    setError(null);
+    setActionNotice(null);
+    try {
+      const result = await api.reconcileQueuedTurn(
+        session.csrfToken,
+        targetThreadId,
+        queuedTurn.id,
+      );
+      if (attachmentThreadRef.current !== targetThreadId) return;
+      if (result.status === 'stillNeedsReview') {
+        setActionNotice(
+          result.reason === 'readFailed'
+            ? 'Не удалось получить актуальное состояние Codex. Задача не отправлена повторно и остаётся на проверке.'
+            : 'Codex пока не подтвердил запуск этой задачи. Она не отправлена повторно и остаётся на проверке.',
+        );
+        return;
+      }
+
+      setQueuedTurns((current) => current.filter((item) => item.id !== queuedTurn.id));
+      setActionNotice(
+        'Запуск задачи найден в Codex. Чат обновлён; повторная отправка не выполнялась.',
+      );
+      try {
+        const [history, nextQueuedTurns] = await Promise.all([
+          api.thread(targetThreadId),
+          api.queuedTurns(targetThreadId),
+        ]);
+        if (attachmentThreadRef.current !== targetThreadId) return;
+        setThreads((current) =>
+          current.map((item) => (item.id === targetThreadId ? history.data : item)),
+        );
+        setRecentThreads((current) =>
+          current.map((item) => (item.id === targetThreadId ? history.data : item)),
+        );
+        mergeEvents(history.events, targetThreadId);
+        setServerTurnNavigation(history.turnNavigation ?? null);
+        setQueuedTurns(nextQueuedTurns);
+      } catch {
+        if (attachmentThreadRef.current === targetThreadId) {
+          setActionNotice(
+            'Запуск задачи найден в Codex. Повторной отправки не было; полная история обновится автоматически.',
+          );
+        }
+      }
+    } catch (cause) {
+      if (attachmentThreadRef.current === targetThreadId) {
+        setActionNotice(null);
+        setError(queuedTurnReconcileErrorMessage(cause));
+      }
+    } finally {
+      queuedTurnReconciliationsRef.current.delete(reconciliationKey);
+      setReconcilingQueuedTurnKeys((current) => {
+        const next = new Set(current);
+        next.delete(reconciliationKey);
+        return next;
+      });
+    }
+  }
+
+  function openFreshChatForAmbiguousTurn() {
+    const targetProjectId = selectedThread?.projectId ?? projectId;
+    if (!targetProjectId) return;
+    void newThread(
+      targetProjectId,
+      'Открыт новый чат. Спорная задача осталась в предыдущем чате: она не отправлена повторно и не остановлена.',
+    );
+  }
+
   async function openStatus() {
     setShowDiagnostics(true);
     setCodexUpdateDiscoveryBusy(true);
@@ -5024,6 +5115,9 @@ function Workspace({
                   const cancelling =
                     threadId !== null &&
                     cancellingQueuedTurnKeys.has(queuedTurnKey(threadId, queuedTurn.id));
+                  const reconciling =
+                    threadId !== null &&
+                    reconcilingQueuedTurnKeys.has(queuedTurnKey(threadId, queuedTurn.id));
                   return (
                     <article
                       className={`queued-turn-card ${queuedTurn.status === 'needsReview' ? 'needs-review' : ''}`}
@@ -5054,6 +5148,25 @@ function Workspace({
                             Сервер потерял подтверждение запуска, продолжает сверку с Codex и не
                             будет повторять задачу вслепую.
                           </small>
+                          <div className="queued-turn-actions">
+                            <button
+                              type="button"
+                              className="queued-turn-check"
+                              disabled={reconciling || busy}
+                              aria-busy={reconciling}
+                              onClick={() => void reconcileQueuedTurn(queuedTurn)}
+                            >
+                              {reconciling ? 'Проверяем…' : 'Проверить сейчас'}
+                            </button>
+                            <button
+                              type="button"
+                              className="queued-turn-new-chat"
+                              disabled={reconciling || busy}
+                              onClick={openFreshChatForAmbiguousTurn}
+                            >
+                              Новый чат
+                            </button>
+                          </div>
                         </div>
                       )}
                       {queuedTurn.status === 'queued' && (
