@@ -18,6 +18,7 @@ import {
   resourceLimitSnapshotSchema,
   pushSubscriptionSchema,
   pushSubscriptionStatusRequestSchema,
+  reconcileQueuedTurnResultSchema,
   startThreadRequestSchema,
   startTurnRequestSchema,
   startTurnResultSchema,
@@ -52,7 +53,12 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import { z } from 'zod';
 
-import type { AppServerClient, AppServerInbound, AppServerLifecycleEvent } from './app-server.js';
+import {
+  AppServerRequestError,
+  type AppServerClient,
+  type AppServerInbound,
+  type AppServerLifecycleEvent,
+} from './app-server.js';
 import { CodexUpdateBrokerError, type CodexUpdateBroker } from './codex-update-broker.js';
 import type { CodexVersionChecker } from './codex-version-checker.js';
 import {
@@ -729,6 +735,13 @@ function queuedClientMessageEvidence(
     }
   }
   return { turnId: null, hasInProgressTurn };
+}
+
+function turnStartWasDefinitelyNotAccepted(error: unknown): boolean {
+  return (
+    error instanceof AppServerRequestError &&
+    (error.failureKind === 'notSent' || error.failureKind === 'rejected')
+  );
 }
 
 function dateFromSeconds(value: number): string {
@@ -3393,6 +3406,31 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     );
   };
 
+  const adoptUnknownQueuedTurn = (record: QueuedTurnRecord, turnId: string): boolean => {
+    const attachments = record.request.attachmentIds
+      .map((attachmentId) => repository.getAttachment(attachmentId))
+      .filter((attachment): attachment is AttachmentRecord => attachment !== undefined);
+    if (!repository.completeQueuedTurn(record.id, turnId)) return false;
+    publishQueueChanged(record.threadId);
+    const userEvent = repository.appendEvent({
+      threadId: record.threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: sanitizeEventPayload(
+        { text: record.request.text, attachments: attachments.map(publicAttachment) },
+        config.maxEventBytes,
+      ),
+    });
+    appendTurnNavigation({
+      threadId: record.threadId,
+      turnId,
+      label: normalizeTurnNavigationLabel(record.request.text, config.maxEventBytes),
+    });
+    publish(userEvent);
+    return true;
+  };
+
   const enqueueReservedTurn = (
     threadId: string,
     input: z.infer<typeof startTurnRequestSchema>,
@@ -3579,16 +3617,20 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         queuedTurnId: claimed.id,
       });
       return 'started';
-    } catch {
-      if (turnStartIssued) {
+    } catch (error) {
+      if (turnStartIssued && !turnStartWasDefinitelyNotAccepted(error)) {
         repository.markQueuedTurnUnknown(claimed.id, 'IDEMPOTENCY_OUTCOME_UNKNOWN');
         publishQueueChanged(claimed.threadId);
         requestQueuedTurnDispatch();
       } else repository.requeueTurn(claimed.id);
-      repository.audit('turn.queue.dispatch', turnStartIssued ? 'unknown' : 'deferred', {
-        threadId: claimed.threadId,
-        queuedTurnId: claimed.id,
-      });
+      repository.audit(
+        'turn.queue.dispatch',
+        turnStartIssued && !turnStartWasDefinitelyNotAccepted(error) ? 'unknown' : 'deferred',
+        {
+          threadId: claimed.threadId,
+          queuedTurnId: claimed.id,
+        },
+      );
       return 'wait';
     } finally {
       endPendingTurnStart(record.threadId);
@@ -3598,52 +3640,37 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const reconcileUnknownQueuedTurns = async (): Promise<void> => {
     for (const record of repository.listUnknownQueuedTurns()) {
       if (serverClosing || !appServer.ready) return;
-      const thread = repository.getThread(record.threadId);
-      if (!thread) continue;
-      try {
-        const read = threadResponseSchema.parse(
-          await appServer.request('thread/read', {
+      await attachmentStore.withThreadLock(record.threadId, async () => {
+        const current = repository.getQueuedTurn(record.id);
+        if (!current || current.threadId !== record.threadId || current.status !== 'unknown')
+          return;
+        const thread = repository.getThread(record.threadId);
+        if (!thread) return;
+        try {
+          const read = threadResponseSchema.parse(
+            await appServer.request('thread/read', {
+              threadId: record.threadId,
+              includeTurns: true,
+            }),
+          );
+          const evidence = queuedClientMessageEvidence(
+            inputRecord(read.thread)?.turns,
+            current.idempotencyKey,
+          );
+          if (evidence.turnId === null) return;
+          if (!adoptUnknownQueuedTurn(current, evidence.turnId)) return;
+          repository.audit('turn.queue.reconcile', 'succeeded', {
             threadId: record.threadId,
-            includeTurns: true,
-          }),
-        );
-        const evidence = queuedClientMessageEvidence(
-          inputRecord(read.thread)?.turns,
-          record.idempotencyKey,
-        );
-        if (evidence.turnId === null) continue;
-        const attachments = record.request.attachmentIds
-          .map((attachmentId) => repository.getAttachment(attachmentId))
-          .filter((attachment): attachment is AttachmentRecord => attachment !== undefined);
-        if (!repository.completeQueuedTurn(record.id, evidence.turnId)) continue;
-        publishQueueChanged(record.threadId);
-        const userEvent = repository.appendEvent({
-          threadId: record.threadId,
-          turnId: evidence.turnId,
-          kind: 'user-message',
-          phase: 'completed',
-          payload: sanitizeEventPayload(
-            { text: record.request.text, attachments: attachments.map(publicAttachment) },
-            config.maxEventBytes,
-          ),
-        });
-        appendTurnNavigation({
-          threadId: record.threadId,
-          turnId: evidence.turnId,
-          label: normalizeTurnNavigationLabel(record.request.text, config.maxEventBytes),
-        });
-        publish(userEvent);
-        repository.audit('turn.queue.reconcile', 'succeeded', {
-          threadId: record.threadId,
-          queuedTurnId: record.id,
-          turnId: evidence.turnId,
-        });
-      } catch {
-        repository.audit('turn.queue.reconcile', 'deferred', {
-          threadId: record.threadId,
-          queuedTurnId: record.id,
-        });
-      }
+            queuedTurnId: record.id,
+            turnId: evidence.turnId,
+          });
+        } catch {
+          repository.audit('turn.queue.reconcile', 'deferred', {
+            threadId: record.threadId,
+            queuedTurnId: record.id,
+          });
+        }
+      });
     }
   };
 
@@ -3709,6 +3736,69 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const id = parseId(request);
     if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
     return { data: repository.listVisibleQueuedTurns(id).map(publicQueuedTurn) };
+  });
+
+  app.post('/api/threads/:id/queued-turns/:queuedTurnId/reconcile', async (request) => {
+    csrfGuard(auth, request);
+    const params = queuedTurnParamsSchema.parse(request.params);
+    const thread = repository.getThread(params.id);
+    if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    const project = repository.getProject(thread.projectId);
+    if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+    const result = await attachmentStore.withThreadLock(params.id, async () => {
+      const record = repository.getQueuedTurn(params.queuedTurnId);
+      if (!record || record.threadId !== params.id)
+        throw new HttpError(404, 'QUEUED_TURN_NOT_FOUND');
+      if (record.status !== 'unknown') throw new HttpError(409, 'QUEUED_TURN_NOT_REVIEWABLE');
+      try {
+        const read = threadResponseSchema.parse(
+          await appServer.request('thread/read', {
+            threadId: params.id,
+            includeTurns: true,
+          }),
+        );
+        const evidence = queuedClientMessageEvidence(
+          inputRecord(read.thread)?.turns,
+          record.idempotencyKey,
+        );
+        if (evidence.turnId === null) {
+          repository.audit('turn.queue.reconcile.manual', 'not_found', {
+            threadId: params.id,
+            queuedTurnId: params.queuedTurnId,
+          });
+          return reconcileQueuedTurnResultSchema.parse({
+            status: 'stillNeedsReview',
+            reason: 'notFound',
+          });
+        }
+        if (!adoptUnknownQueuedTurn(record, evidence.turnId))
+          throw new HttpError(409, 'QUEUED_TURN_NOT_REVIEWABLE');
+        repository.audit('turn.queue.reconcile.manual', 'succeeded', {
+          threadId: params.id,
+          queuedTurnId: params.queuedTurnId,
+          turnId: evidence.turnId,
+        });
+        return reconcileQueuedTurnResultSchema.parse({
+          status: 'resolved',
+          turnId: evidence.turnId,
+        });
+      } catch (error) {
+        if (error instanceof HttpError) throw error;
+        repository.audit('turn.queue.reconcile.manual', 'deferred', {
+          threadId: params.id,
+          queuedTurnId: params.queuedTurnId,
+        });
+        return reconcileQueuedTurnResultSchema.parse({
+          status: 'stillNeedsReview',
+          reason: 'readFailed',
+        });
+      }
+    });
+    if (result.status === 'resolved') {
+      flushDeferredCompletionPush(params.id);
+      requestQueuedTurnDispatch();
+    }
+    return { data: result };
   });
 
   app.delete('/api/threads/:id/queued-turns/:queuedTurnId', async (request, reply) => {
@@ -3941,7 +4031,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       setActiveTurn(id, result.turn.id);
       repository.updateThreadRuntime(id, { status: 'active', activeTurnId: result.turn.id });
     } catch (error) {
-      if (turnStartIssued) {
+      if (turnStartIssued && !turnStartWasDefinitelyNotAccepted(error)) {
         uncertainTurnStartThreads.add(id);
         repository.markIdempotentUnknown(operation, input.idempotencyKey, hash);
       } else {

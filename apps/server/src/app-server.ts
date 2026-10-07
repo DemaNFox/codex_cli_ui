@@ -110,6 +110,18 @@ interface JsonRpcResponse {
   readonly error?: { readonly code?: unknown; readonly message?: unknown };
 }
 
+export type AppServerRequestFailureKind = 'notSent' | 'rejected' | 'ambiguous';
+
+export class AppServerRequestError extends Error {
+  constructor(
+    readonly failureKind: AppServerRequestFailureKind,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'AppServerRequestError';
+  }
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -215,7 +227,7 @@ export class CodexAppServerSupervisor implements AppServerClient {
     this.stopping = true;
     if (this.restartTimer) clearTimeout(this.restartTimer);
     this.restartTimer = null;
-    this.rejectAll(new Error('APP_SERVER_STOPPED'));
+    this.rejectAll(new AppServerRequestError('ambiguous', 'APP_SERVER_STOPPED'));
     const child = this.child;
     this.child = null;
     this.initialized = false;
@@ -244,7 +256,7 @@ export class CodexAppServerSupervisor implements AppServerClient {
 
   async request(method: string, params: unknown): Promise<unknown> {
     if (!ALLOWED_REQUESTS.has(method)) throw new Error('APP_SERVER_METHOD_NOT_ALLOWED');
-    if (!this.ready) throw new Error('APP_SERVER_UNAVAILABLE');
+    if (!this.ready) throw new AppServerRequestError('notSent', 'APP_SERVER_UNAVAILABLE');
     return this.sendRequest(method, params);
   }
 
@@ -286,7 +298,7 @@ export class CodexAppServerSupervisor implements AppServerClient {
       this.detachLineReader = null;
       if (this.child === child) this.child = null;
       this.initialized = false;
-      this.rejectAll(new Error('APP_SERVER_EXITED'));
+      this.rejectAll(new AppServerRequestError('ambiguous', 'APP_SERVER_EXITED'));
       if (!this.stopping) {
         this.scheduleRestart();
         if (wasInitialized)
@@ -321,7 +333,7 @@ export class CodexAppServerSupervisor implements AppServerClient {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error('APP_SERVER_REQUEST_TIMEOUT'));
+        reject(new AppServerRequestError('ambiguous', 'APP_SERVER_REQUEST_TIMEOUT'));
       }, this.options.requestTimeoutMs ?? 30_000);
       this.pending.set(id, { resolve, reject, timeout });
       try {
@@ -329,7 +341,12 @@ export class CodexAppServerSupervisor implements AppServerClient {
       } catch (error) {
         clearTimeout(timeout);
         this.pending.delete(id);
-        reject(error instanceof Error ? error : new Error('APP_SERVER_WRITE_FAILED'));
+        reject(
+          new AppServerRequestError(
+            'notSent',
+            error instanceof Error ? error.message : 'APP_SERVER_WRITE_FAILED',
+          ),
+        );
       }
     });
   }
@@ -362,7 +379,7 @@ export class CodexAppServerSupervisor implements AppServerClient {
     clearTimeout(pending.timeout);
     this.pending.delete(message.id);
     if (message.error) {
-      pending.reject(new Error('APP_SERVER_REQUEST_FAILED'));
+      pending.reject(new AppServerRequestError('rejected', 'APP_SERVER_REQUEST_FAILED'));
     } else {
       pending.resolve(message.result);
     }
@@ -420,7 +437,7 @@ export class CodexAppServerSocketClient implements AppServerClient {
     this.stopping = true;
     if (this.restartTimer) clearTimeout(this.restartTimer);
     this.restartTimer = null;
-    this.rejectAll(new Error('APP_SERVER_STOPPED'));
+    this.rejectAll(new AppServerRequestError('ambiguous', 'APP_SERVER_STOPPED'));
     const socket = this.socket;
     this.socket = null;
     this.initialized = false;
@@ -449,7 +466,7 @@ export class CodexAppServerSocketClient implements AppServerClient {
 
   async request(method: string, params: unknown): Promise<unknown> {
     if (!ALLOWED_REQUESTS.has(method)) throw new Error('APP_SERVER_METHOD_NOT_ALLOWED');
-    if (!this.ready) throw new Error('APP_SERVER_UNAVAILABLE');
+    if (!this.ready) throw new AppServerRequestError('notSent', 'APP_SERVER_UNAVAILABLE');
     return this.sendRequest(method, params);
   }
 
@@ -492,7 +509,7 @@ export class CodexAppServerSocketClient implements AppServerClient {
       this.detachLineReader = null;
       this.socket = null;
       this.initialized = false;
-      this.rejectAll(new Error('APP_SERVER_EXITED'));
+      this.rejectAll(new AppServerRequestError('ambiguous', 'APP_SERVER_EXITED'));
       if (!this.stopping) {
         this.scheduleRestart();
         if (wasInitialized)
@@ -535,7 +552,7 @@ export class CodexAppServerSocketClient implements AppServerClient {
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error('APP_SERVER_REQUEST_TIMEOUT'));
+        reject(new AppServerRequestError('ambiguous', 'APP_SERVER_REQUEST_TIMEOUT'));
       }, this.options.requestTimeoutMs ?? 30_000);
       this.pending.set(id, { resolve, reject, timeout });
       try {
@@ -543,7 +560,12 @@ export class CodexAppServerSocketClient implements AppServerClient {
       } catch (error) {
         clearTimeout(timeout);
         this.pending.delete(id);
-        reject(error instanceof Error ? error : new Error('APP_SERVER_WRITE_FAILED'));
+        reject(
+          new AppServerRequestError(
+            'notSent',
+            error instanceof Error ? error.message : 'APP_SERVER_WRITE_FAILED',
+          ),
+        );
       }
     });
   }
@@ -576,7 +598,7 @@ export class CodexAppServerSocketClient implements AppServerClient {
     clearTimeout(pending.timeout);
     this.pending.delete(message.id);
     if (message.error) {
-      pending.reject(new Error('APP_SERVER_REQUEST_FAILED'));
+      pending.reject(new AppServerRequestError('rejected', 'APP_SERVER_REQUEST_FAILED'));
     } else {
       pending.resolve(message.result);
     }

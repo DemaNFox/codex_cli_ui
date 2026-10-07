@@ -17,6 +17,7 @@ import { afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import {
   INITIALIZED_NOTIFICATION,
   INITIALIZE_PARAMS,
+  AppServerRequestError,
   CodexAppServerSocketClient,
   CodexAppServerSupervisor,
   buildCodexEnvironment,
@@ -866,6 +867,26 @@ async function createThread(
   });
   expect(response.statusCode).toBe(201);
   return response.json<{ data: { id: string } }>().data.id;
+}
+
+function seedUnknownQueuedTurn(
+  repository: SqliteRepository,
+  threadId: string,
+  idempotencyKey: string,
+  text = 'possibly delivered',
+) {
+  const requestHashValue = `hash:${idempotencyKey}`;
+  repository.reserveIdempotent(`turn:${threadId}`, idempotencyKey, requestHashValue);
+  const queued = repository.enqueueTurn({
+    threadId,
+    idempotencyKey,
+    requestHash: requestHashValue,
+    request: { text, attachmentIds: [], idempotencyKey },
+    claimToken: `queued:${threadId}:${idempotencyKey}`,
+  }).record;
+  expect(repository.claimQueuedTurn(queued.id)).toBeDefined();
+  expect(repository.markQueuedTurnUnknown(queued.id, 'IDEMPOTENCY_OUTCOME_UNKNOWN')).toBe(true);
+  return queued;
 }
 
 function multipartFile(
@@ -7174,6 +7195,117 @@ describe('Codex routes', () => {
     expect(repository.getQueuedTurn(queued.id)?.status).toBe('unknown');
   });
 
+  it('manually reconciles exact native client-message evidence without another turn start', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const key = '43000000-0000-4000-8000-000000000001';
+    const queued = seedUnknownQueuedTurn(repository, threadId, key, 'recover exact turn');
+    appServer.setThreadTurns(threadId, [
+      {
+        id: 'native-recovered-turn',
+        status: 'completed',
+        items: [{ type: 'userMessage', clientId: key, content: [] }],
+      },
+    ]);
+
+    const rejectedWithoutCsrf = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/queued-turns/${queued.id}/reconcile`,
+      headers: { origin: 'https://codex.test', cookie: session.cookie },
+    });
+    expect(rejectedWithoutCsrf.statusCode).toBe(403);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/queued-turns/${queued.id}/reconcile`,
+      headers: session.headers,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      data: { status: 'resolved', turnId: 'native-recovered-turn' },
+    });
+    expect(repository.getQueuedTurn(queued.id)).toBeUndefined();
+    expect(repository.getIdempotent(`turn:${threadId}`, key)).toMatchObject({
+      state: 'completed',
+      response: { data: { status: 'started', turnId: 'native-recovered-turn' } },
+    });
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(0);
+    expect(
+      repository.database
+        .prepare("SELECT outcome FROM audit_events WHERE action='turn.queue.reconcile.manual'")
+        .get(),
+    ).toEqual({ outcome: 'succeeded' });
+  });
+
+  it('keeps an absent native queued turn in needs-review without retry or cross-thread access', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const otherThreadId = await createThread(app, project.id, session.headers);
+    const queued = seedUnknownQueuedTurn(
+      repository,
+      threadId,
+      '43000000-0000-4000-8000-000000000002',
+    );
+
+    const wrongThread = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${otherThreadId}/queued-turns/${queued.id}/reconcile`,
+      headers: session.headers,
+    });
+    expect(wrongThread.statusCode).toBe(404);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/queued-turns/${queued.id}/reconcile`,
+      headers: session.headers,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      data: { status: 'stillNeedsReview', reason: 'notFound' },
+    });
+    expect(repository.getQueuedTurn(queued.id)?.status).toBe('unknown');
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(0);
+    expect(
+      repository.database
+        .prepare("SELECT outcome FROM audit_events WHERE action='turn.queue.reconcile.manual'")
+        .get(),
+    ).toEqual({ outcome: 'not_found' });
+  });
+
+  it('keeps a queued turn in needs-review when authoritative native read fails', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const queued = seedUnknownQueuedTurn(
+      repository,
+      threadId,
+      '43000000-0000-4000-8000-000000000003',
+    );
+    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_TIMEOUT');
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/queued-turns/${queued.id}/reconcile`,
+      headers: session.headers,
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      data: { status: 'stillNeedsReview', reason: 'readFailed' },
+    });
+    expect(repository.getQueuedTurn(queued.id)?.status).toBe('unknown');
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(0);
+    expect(
+      repository.database
+        .prepare("SELECT outcome FROM audit_events WHERE action='turn.queue.reconcile.manual'")
+        .get(),
+    ).toEqual({ outcome: 'deferred' });
+  });
+
   it('rejects queue overflow without consuming the idempotency key', async () => {
     const { app, repository, projectPath } = await fixture(1);
     const session = await login(app);
@@ -7813,6 +7945,89 @@ describe('Codex routes', () => {
       error: { code: 'IDEMPOTENCY_OUTCOME_UNKNOWN' },
     });
     expect(appServer.requests.filter((item) => item.method === 'turn/start')).toHaveLength(1);
+  });
+
+  it('releases a definitely rejected turn start so the same request can be retried', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const payload = {
+      text: 'retry explicit rejection',
+      idempotencyKey: '55555555-5555-4555-8555-555555555556',
+    };
+    appServer.failTurnStartWith = new AppServerRequestError(
+      'rejected',
+      'APP_SERVER_REQUEST_FAILED',
+    );
+
+    const rejected = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload,
+    });
+    expect(rejected.statusCode).toBe(500);
+    expect(repository.getIdempotent(`turn:${threadId}`, payload.idempotencyKey)).toBeUndefined();
+
+    const retry = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload,
+    });
+    expect(retry.statusCode).toBe(202);
+    expect(retry.json()).toMatchObject({ data: { status: 'started' } });
+    expect(appServer.requests.filter((item) => item.method === 'turn/start')).toHaveLength(2);
+  });
+
+  it('requeues and retries a dispatched turn when Codex explicitly rejects it', async () => {
+    const { app, appServer, repository, projectPath } = await fixture(1);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const activeThreadId = await createThread(app, project.id, session.headers);
+    const queuedThreadId = await createThread(app, project.id, session.headers);
+    await app.inject({
+      method: 'POST',
+      url: `/api/threads/${activeThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'occupy capacity',
+        idempotencyKey: '55555555-5555-4555-8555-555555555557',
+      },
+    });
+    const queuedKey = '55555555-5555-4555-8555-555555555558';
+    const accepted = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/turns`,
+      headers: session.headers,
+      payload: { text: 'retry from queue', idempotencyKey: queuedKey },
+    });
+    const queuedId = accepted.json<{ data: { queuedTurn: { id: number } } }>().data.queuedTurn.id;
+    appServer.failTurnStartWith = new AppServerRequestError(
+      'rejected',
+      'APP_SERVER_REQUEST_FAILED',
+    );
+
+    appServer.setThreadStatus(activeThreadId, 'idle');
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: activeThreadId, turn: { id: 'turn-1' } },
+    });
+    await vi.waitFor(() => {
+      expect(
+        appServer.requests.filter(
+          (item) =>
+            item.method === 'turn/start' &&
+            (item.params as { clientUserMessageId?: string }).clientUserMessageId === queuedKey,
+        ),
+      ).toHaveLength(2);
+    });
+    expect(repository.getQueuedTurn(queuedId)).toBeUndefined();
+    expect(repository.getIdempotent(`turn:${queuedThreadId}`, queuedKey)).toMatchObject({
+      state: 'completed',
+    });
+    expect(repository.listUnknownQueuedTurns()).toHaveLength(0);
   });
 
   it('rejects stale approvals after restart and safely reuses rpc request ids', async () => {

@@ -5,6 +5,7 @@ import {
   createProjectRequestSchema,
   attachmentSchema,
   queuedTurnSchema,
+  reconcileQueuedTurnResultSchema,
   startTurnResultSchema,
   codexAccountLoginSchema,
   codexUpdateSnapshotSchema,
@@ -68,6 +69,24 @@ describe('contracts', () => {
         createdAt: '2026-10-04T00:00:00.000Z',
       }),
     ).toMatchObject({ status: 'needsReview', position: null });
+  });
+
+  it('discriminates resolved and unresolved queued turn reconciliation', () => {
+    expect(reconcileQueuedTurnResultSchema.parse({ status: 'resolved', turnId: 'turn-1' })).toEqual(
+      { status: 'resolved', turnId: 'turn-1' },
+    );
+    expect(
+      reconcileQueuedTurnResultSchema.parse({
+        status: 'stillNeedsReview',
+        reason: 'notFound',
+      }),
+    ).toEqual({ status: 'stillNeedsReview', reason: 'notFound' });
+    expect(
+      reconcileQueuedTurnResultSchema.safeParse({
+        status: 'stillNeedsReview',
+        reason: 'retry',
+      }).success,
+    ).toBe(false);
   });
   it('rejects traversal-like empty project values before filesystem policy', () => {
     expect(createProjectRequestSchema.safeParse({ name: '', path: '' }).success).toBe(false);
