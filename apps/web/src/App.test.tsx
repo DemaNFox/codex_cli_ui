@@ -1318,7 +1318,7 @@ describe('App', () => {
 
     const final = await screen.findByRole('article', { name: 'Итоговый ответ Codex' });
     expect(within(final).getByText('Готово.')).not.toBeNull();
-    const link = within(final).getByRole('link', { name: /reports\/final report\.pdf/ });
+    const link = await within(final).findByRole('link', { name: /reports\/final report\.pdf/ });
     expect(link.getAttribute('href')).toBe(
       '/api/threads/thread-1/project-files/download?path=reports%2Ffinal%20report.pdf',
     );
@@ -1372,7 +1372,7 @@ describe('App', () => {
     expect(within(files).queryByRole('link')).toBeNull();
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/threads/thread-1/project-files/download?path=reports%2Fmissing.md',
-      { credentials: 'same-origin', method: 'HEAD' },
+      expect.objectContaining({ credentials: 'same-origin', method: 'HEAD' }),
     );
   });
 
@@ -1489,9 +1489,9 @@ describe('App', () => {
     render(<App />);
 
     const final = await screen.findByRole('article', { name: 'Итоговый ответ Codex' });
-    expect(within(final).getByRole('link', { name: 'report' })).not.toBeNull();
-    expect(within(final).getByRole('link', { name: 'summary' })).not.toBeNull();
-    expect(within(final).getByRole('link', { name: 'notes' })).not.toBeNull();
+    expect(await within(final).findByRole('link', { name: 'report' })).not.toBeNull();
+    expect(await within(final).findByRole('link', { name: 'summary' })).not.toBeNull();
+    expect(await within(final).findByRole('link', { name: 'notes' })).not.toBeNull();
     const fallback = within(final).getByRole('region', {
       name: 'Созданные и изменённые файлы',
     });

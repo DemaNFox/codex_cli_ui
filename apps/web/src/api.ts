@@ -121,22 +121,42 @@ export function projectFileDownloadUrl(threadId: string, path: string): string {
   return `/api/threads/${encodeURIComponent(threadId)}/project-files/download?path=${encodeURIComponent(path)}`;
 }
 
-async function projectFileAvailable(threadId: string, path: string): Promise<boolean> {
+export interface ProjectFileAvailability {
+  available: boolean;
+  sizeBytes: number | null;
+}
+
+async function projectFileAvailable(
+  threadId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<ProjectFileAvailability> {
   const response = await fetch(projectFileDownloadUrl(threadId, path), {
     method: 'HEAD',
     credentials: 'same-origin',
+    ...(signal ? { signal } : {}),
   });
-  if (response.status === 404) return false;
+  if (response.status === 404) return { available: false, sizeBytes: null };
   if (!response.ok) {
     throw new ApiError(`Не удалось проверить файл (${response.status})`, response.status);
   }
-  return true;
+  const contentLength = response.headers.get('Content-Length');
+  const parsedLength = contentLength === null ? Number.NaN : Number(contentLength);
+  return {
+    available: true,
+    sizeBytes: Number.isSafeInteger(parsedLength) && parsedLength >= 0 ? parsedLength : null,
+  };
 }
 
-async function downloadProjectFile(threadId: string, path: string): Promise<Blob> {
+async function downloadProjectFile(
+  threadId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<Blob> {
   const response = await fetch(projectFileDownloadUrl(threadId, path), {
     method: 'GET',
     credentials: 'same-origin',
+    ...(signal ? { signal } : {}),
   });
   if (!response.ok) {
     throw new ApiError(

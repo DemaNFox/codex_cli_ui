@@ -3,6 +3,8 @@ import { type MouseEvent, type ReactNode, useCallback, useEffect, useRef, useSta
 import { ApiError, api, projectFileDownloadUrl } from './api.js';
 
 const URI_SCHEME = /^[a-z][a-z\d+.-]*:/i;
+export const CONTROLLED_PROJECT_FILE_MAX_BYTES = 16 * 1024 * 1024;
+export const PROJECT_FILE_OBJECT_URL_REVOKE_MS = 60_000;
 
 export function normalizeProjectFilePath(value: unknown): string | null {
   if (typeof value !== 'string' || !value || value !== value.trim()) return null;
@@ -55,29 +57,40 @@ export function ProjectFileDownload({
   title?: string;
 }) {
   const [availability, setAvailability] = useState<Availability>('checking');
+  const [sizeBytes, setSizeBytes] = useState<number | null>(null);
   const [downloading, setDownloading] = useState(false);
   const downloadInFlight = useRef(false);
-  const availabilityRequest = useRef(0);
+  const availabilityAbort = useRef<AbortController | null>(null);
+  const downloadAbort = useRef<AbortController | null>(null);
+  const mounted = useRef(true);
   const name = projectFileName(path);
 
   const checkAvailability = useCallback(() => {
-    const requestId = ++availabilityRequest.current;
+    availabilityAbort.current?.abort();
+    const controller = new AbortController();
+    availabilityAbort.current = controller;
     setAvailability('checking');
+    setSizeBytes(null);
     void api
-      .projectFileAvailable(threadId, path)
-      .then((available) => {
-        if (availabilityRequest.current === requestId)
-          setAvailability(available ? 'available' : 'unavailable');
+      .projectFileAvailable(threadId, path, controller.signal)
+      .then((result) => {
+        if (!mounted.current || controller.signal.aborted) return;
+        setSizeBytes(result.sizeBytes);
+        setAvailability(result.available ? 'available' : 'unavailable');
       })
-      .catch(() => {
-        if (availabilityRequest.current === requestId) setAvailability('error');
+      .catch((error: unknown) => {
+        if (!mounted.current || controller.signal.aborted || isAbortError(error)) return;
+        setAvailability('error');
       });
   }, [path, threadId]);
 
   useEffect(() => {
+    mounted.current = true;
     checkAvailability();
     return () => {
-      availabilityRequest.current += 1;
+      mounted.current = false;
+      availabilityAbort.current?.abort();
+      downloadAbort.current?.abort();
     };
   }, [checkAvailability]);
 
@@ -86,12 +99,17 @@ export function ProjectFileDownload({
   };
 
   const download = async (event: MouseEvent<HTMLAnchorElement>) => {
+    const controlledDownload = sizeBytes !== null && sizeBytes <= CONTROLLED_PROJECT_FILE_MAX_BYTES;
+    if (!controlledDownload) return;
     event.preventDefault();
     if (downloadInFlight.current) return;
+    const controller = new AbortController();
+    downloadAbort.current = controller;
     downloadInFlight.current = true;
     setDownloading(true);
     try {
-      const blob = await api.downloadProjectFile(threadId, path);
+      const blob = await api.downloadProjectFile(threadId, path, controller.signal);
+      if (!mounted.current || controller.signal.aborted) return;
       const objectUrl = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = objectUrl;
@@ -100,12 +118,15 @@ export function ProjectFileDownload({
       document.body.append(anchor);
       anchor.click();
       anchor.remove();
-      queueMicrotask(() => URL.revokeObjectURL(objectUrl));
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), PROJECT_FILE_OBJECT_URL_REVOKE_MS);
     } catch (error) {
+      if (!mounted.current || controller.signal.aborted || isAbortError(error)) return;
       setAvailability(error instanceof ApiError && error.status === 404 ? 'unavailable' : 'error');
     } finally {
-      downloadInFlight.current = false;
-      setDownloading(false);
+      if (downloadAbort.current === controller) {
+        downloadInFlight.current = false;
+        if (mounted.current && !controller.signal.aborted) setDownloading(false);
+      }
     }
   };
 
@@ -122,6 +143,9 @@ export function ProjectFileDownload({
       <span className="project-file-state unavailable" role="status" aria-live="polite">
         <span>{children}</span>
         <span className="project-file-status">Файл недоступен на сервере</span>
+        <button type="button" className="project-file-retry" onClick={retry}>
+          Проверить снова
+        </button>
       </span>
     );
   }
@@ -157,4 +181,8 @@ export function ProjectFileDownload({
       ) : null}
     </span>
   );
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError';
 }

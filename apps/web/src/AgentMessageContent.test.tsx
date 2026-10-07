@@ -1,22 +1,31 @@
-import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AgentMessageContent } from './AgentMessageContent.js';
 
 const createObjectUrlMock = vi.fn(() => 'blob:project-file');
+const revokeObjectUrlMock = vi.fn();
+
+function availableHead(sizeBytes = 128): Response {
+  return new Response(null, {
+    status: 204,
+    headers: { 'Content-Length': String(sizeBytes) },
+  });
+}
 
 beforeEach(() => {
   vi.restoreAllMocks();
   vi.stubGlobal('fetch', vi.fn());
   vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined);
   createObjectUrlMock.mockClear();
+  revokeObjectUrlMock.mockClear();
   Object.defineProperty(URL, 'createObjectURL', {
     configurable: true,
     value: createObjectUrlMock,
   });
   Object.defineProperty(URL, 'revokeObjectURL', {
     configurable: true,
-    value: vi.fn(),
+    value: revokeObjectUrlMock,
   });
 });
 
@@ -91,7 +100,7 @@ describe('AgentMessageContent', () => {
   });
 
   it('turns a confirmed relative result into an authenticated project-file download', async () => {
-    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 204 }));
+    vi.mocked(fetch).mockResolvedValue(availableHead());
     render(
       <AgentMessageContent
         text={
@@ -111,21 +120,25 @@ describe('AgentMessageContent', () => {
     expect(screen.getByRole('link', { name: 'Раздел' }).getAttribute('href')).toBe('#summary');
     expect(fetch).toHaveBeenCalledWith(
       '/api/threads/thread-1/project-files/download?path=reports%2F%D0%B8%D1%82%D0%BE%D0%B3%D0%BE%D0%B2%D1%8B%D0%B9%20%D0%B0%D1%83%D0%B4%D0%B8%D1%82.md',
-      { credentials: 'same-origin', method: 'HEAD' },
+      expect.objectContaining({ credentials: 'same-origin', method: 'HEAD' }),
     );
   });
 
   it('does not present a missing project file as a download link', async () => {
-    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 404 }));
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(new Response(null, { status: 404 }))
+      .mockResolvedValueOnce(availableHead());
     render(<AgentMessageContent text="[Отчёт](reports/missing.md)" threadId="thread-1" />);
 
     expect(await screen.findByText('Файл недоступен на сервере')).not.toBeNull();
     expect(screen.queryByRole('link', { name: 'Отчёт' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Проверить снова' }));
+    expect(await screen.findByRole('link', { name: 'Отчёт' })).not.toBeNull();
   });
 
   it('reports when a file disappears after availability was confirmed', async () => {
     vi.mocked(fetch)
-      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(availableHead())
       .mockResolvedValueOnce(new Response(null, { status: 404 }));
     render(<AgentMessageContent text="[Отчёт](reports/vanished.md)" threadId="thread-1" />);
 
@@ -140,9 +153,7 @@ describe('AgentMessageContent', () => {
     const pendingDownload = new Promise<Response>((resolve) => {
       finishDownload = resolve;
     });
-    vi.mocked(fetch)
-      .mockResolvedValueOnce(new Response(null, { status: 204 }))
-      .mockReturnValueOnce(pendingDownload);
+    vi.mocked(fetch).mockResolvedValueOnce(availableHead()).mockReturnValueOnce(pendingDownload);
     render(<AgentMessageContent text="[Отчёт](reports/final.md)" threadId="thread-1" />);
 
     const link = await screen.findByRole('link', { name: 'Отчёт' });
@@ -153,15 +164,21 @@ describe('AgentMessageContent', () => {
     expect(screen.getByRole('status').textContent).toContain('Скачивание');
     expect(fetch).toHaveBeenCalledTimes(2);
 
+    const timeoutSpy = vi.spyOn(window, 'setTimeout');
     finishDownload(new Response(new Blob(['ready']), { status: 200 }));
     await waitFor(() => expect(link.getAttribute('aria-busy')).toBeNull());
     expect(createObjectUrlMock).toHaveBeenCalledTimes(1);
+    const revokeCall = timeoutSpy.mock.calls.find((call) => call[1] === 60_000);
+    expect(revokeCall).toBeDefined();
+    const revoke = revokeCall?.[0];
+    if (typeof revoke === 'function') revoke();
+    expect(revokeObjectUrlMock).toHaveBeenCalledWith('blob:project-file');
   });
 
   it('offers a retry after a network availability error', async () => {
     vi.mocked(fetch)
       .mockRejectedValueOnce(new TypeError('offline'))
-      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+      .mockResolvedValueOnce(availableHead());
     render(<AgentMessageContent text="[Отчёт](reports/final.md)" threadId="thread-1" />);
 
     expect(await screen.findByRole('alert')).not.toBeNull();
@@ -170,11 +187,11 @@ describe('AgentMessageContent', () => {
   });
 
   it('normalizes query and fragment suffixes while rejecting unsafe relative paths', async () => {
-    vi.mocked(fetch).mockResolvedValue(new Response(null, { status: 204 }));
+    vi.mocked(fetch).mockResolvedValue(availableHead());
     render(
       <AgentMessageContent
         text={
-          '[Отчёт](reports/report.md?download=1#section) [Traversal](../secret.txt) [Encoded](%2e%2e/secret.txt) [Scheme](file:secret.txt) [Root](/help) [Fragment](#part) [External](https://example.test/report)'
+          '[Отчёт](reports/report.md?download=1#section) [Traversal](../secret.txt) [Encoded](%2e%2e/secret.txt) [Unsafe](javascript:alert(1)) [Mail](mailto:test@example.test) [Root](/help) [Fragment](#part) [External](https://example.test/report)'
         }
         threadId="thread-1"
       />,
@@ -186,12 +203,78 @@ describe('AgentMessageContent', () => {
     );
     expect(screen.getByText('Traversal').closest('a')).toBeNull();
     expect(screen.getByText('Encoded').closest('a')).toBeNull();
-    expect(screen.getByText('Scheme').closest('a')).toBeNull();
+    expect(screen.getByText('Unsafe').closest('a')).toBeNull();
+    expect(screen.getByRole('link', { name: 'Mail' }).getAttribute('href')).toBe(
+      'mailto:test@example.test',
+    );
     expect(screen.getByRole('link', { name: 'Root' }).getAttribute('href')).toBe('/help');
     expect(screen.getByRole('link', { name: 'Fragment' }).getAttribute('href')).toBe('#part');
     expect(screen.getByRole('link', { name: 'External' }).getAttribute('href')).toBe(
       'https://example.test/report',
     );
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves availability and a busy download across a parent rerender', async () => {
+    let finishDownload!: (response: Response) => void;
+    const pendingDownload = new Promise<Response>((resolve) => {
+      finishDownload = resolve;
+    });
+    vi.mocked(fetch).mockResolvedValueOnce(availableHead()).mockReturnValueOnce(pendingDownload);
+    const { rerender } = render(
+      <AgentMessageContent text="Готово: [Отчёт](reports/final.md)" threadId="thread-1" />,
+    );
+
+    const link = await screen.findByRole('link', { name: 'Отчёт' });
+    fireEvent.click(link);
+    rerender(
+      <AgentMessageContent text="Обновлено: [Отчёт](reports/final.md)" threadId="thread-1" />,
+    );
+
+    const rerenderedLink = screen.getByRole('link', { name: 'Отчёт' });
+    expect(rerenderedLink.getAttribute('aria-busy')).toBe('true');
+    expect(fetch).toHaveBeenCalledTimes(2);
+
+    finishDownload(new Response(new Blob(['ready']), { status: 200 }));
+    await waitFor(() => expect(rerenderedLink.getAttribute('aria-busy')).toBeNull());
+  });
+
+  it('aborts a pending controlled download on unmount without creating an object URL', async () => {
+    let finishDownload!: (response: Response) => void;
+    let downloadSignal: AbortSignal | undefined;
+    const pendingDownload = new Promise<Response>((resolve) => {
+      finishDownload = resolve;
+    });
+    vi.mocked(fetch)
+      .mockResolvedValueOnce(availableHead())
+      .mockImplementationOnce((_input, init) => {
+        downloadSignal = init?.signal ?? undefined;
+        return pendingDownload;
+      });
+    const { unmount } = render(
+      <AgentMessageContent text="[Отчёт](reports/final.md)" threadId="thread-1" />,
+    );
+
+    fireEvent.click(await screen.findByRole('link', { name: 'Отчёт' }));
+    unmount();
+    expect(downloadSignal?.aborted).toBe(true);
+
+    await act(async () => {
+      finishDownload(new Response(new Blob(['late']), { status: 200 }));
+      await pendingDownload;
+    });
+    expect(createObjectUrlMock).not.toHaveBeenCalled();
+  });
+
+  it('keeps confirmed large files on the browser streaming path without a Blob GET', async () => {
+    vi.mocked(fetch).mockResolvedValue(availableHead(16 * 1024 * 1024 + 1));
+    render(<AgentMessageContent text="[Архив](reports/large.zip)" threadId="thread-1" />);
+
+    const link = await screen.findByRole('link', { name: 'Архив' });
+    link.addEventListener('click', (event) => event.preventDefault());
+    fireEvent.click(link);
+
+    expect(fetch).toHaveBeenCalledTimes(1);
+    expect(createObjectUrlMock).not.toHaveBeenCalled();
   });
 });

@@ -1,9 +1,11 @@
+import { useMemo } from 'react';
 import ReactMarkdown, { defaultUrlTransform, type Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 import { normalizeProjectFilePath, ProjectFileDownload } from './ProjectFileDownload.js';
 
 const EXTERNAL_WEB_URL = /^(?:https?:)?\/\//i;
+const URI_SCHEME = /^[a-z][a-z\d+.-]*:/i;
 const staticMarkdownComponents: Components = {
   img: ({ node, alt }) => {
     void node;
@@ -20,38 +22,42 @@ const staticMarkdownComponents: Components = {
 };
 
 export function AgentMessageContent({ text, threadId }: { text: string; threadId?: string }) {
-  const markdownComponents: Components = {
-    ...staticMarkdownComponents,
-    a: ({ node, href, children, ...props }) => {
-      void node;
-      if (!href) return <span>{children}</span>;
-      const external = EXTERNAL_WEB_URL.test(href);
-      const preserved = external || href.startsWith('/') || href.startsWith('#');
-      if (!preserved && threadId) {
-        const projectPath = normalizeProjectFilePath(href);
-        if (!projectPath) return <span>{children}</span>;
+  const markdownComponents = useMemo<Components>(
+    () => ({
+      ...staticMarkdownComponents,
+      a: ({ node, href, children, ...props }) => {
+        void node;
+        if (!href) return <span>{children}</span>;
+        const external = EXTERNAL_WEB_URL.test(href);
+        const preserved =
+          external || href.startsWith('/') || href.startsWith('#') || URI_SCHEME.test(href);
+        if (!preserved && threadId) {
+          const projectPath = normalizeProjectFilePath(href);
+          if (!projectPath) return <span>{children}</span>;
+          return (
+            <ProjectFileDownload
+              threadId={threadId}
+              path={projectPath}
+              className="generated-file-link"
+            >
+              {children}
+            </ProjectFileDownload>
+          );
+        }
         return (
-          <ProjectFileDownload
-            threadId={threadId}
-            path={projectPath}
-            className="generated-file-link"
+          <a
+            {...props}
+            href={href}
+            rel={external ? 'noopener noreferrer' : undefined}
+            target={external ? '_blank' : undefined}
           >
             {children}
-          </ProjectFileDownload>
+          </a>
         );
-      }
-      return (
-        <a
-          {...props}
-          href={href}
-          rel={external ? 'noopener noreferrer' : undefined}
-          target={external ? '_blank' : undefined}
-        >
-          {children}
-        </a>
-      );
-    },
-  };
+      },
+    }),
+    [threadId],
+  );
   return (
     <div className="message-text markdown-content">
       <ReactMarkdown
