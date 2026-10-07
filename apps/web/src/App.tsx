@@ -1286,8 +1286,11 @@ function NavigationSidebar({
   const archivedProjectsWasOpenRef = useRef(false);
   const [expandedProjectId, setExpandedProjectId] = useState<string | null>(selectedProjectId);
   useEffect(() => {
-    if (selectedProjectId) setExpandedProjectId(selectedProjectId);
-  }, [selectedProjectId]);
+    setExpandedProjectId((current) => {
+      if (selectedProjectId) return selectedProjectId;
+      return current && projects.some((project) => project.id === current) ? current : null;
+    });
+  }, [projects, selectedProjectId]);
   useEffect(() => {
     if (archivedProjectsWasOpenRef.current && !archivedProjectsOpen) {
       archivedProjectsTriggerRef.current?.focus();
@@ -3199,6 +3202,7 @@ function Workspace({
   const sendInFlightRef = useRef(false);
   const queuedTurnCancellationsRef = useRef(new Set<string>());
   const cancelledQueuedTurnKeysRef = useRef(new Set<string>());
+  const navigationEpochRef = useRef(0);
   const subagentsRef = useRef<Subagent[]>(subagents);
   subagentsRef.current = subagents;
   const [locallyResolvedRequests, setLocallyResolvedRequests] = useState<Set<string>>(
@@ -3233,6 +3237,11 @@ function Workspace({
   const activeRootTurn = active && activeTurnId !== null;
   const subagentsOnlyActive = active && !activeTurnId && activeSubagentCount > 0;
   const activeTurnDuration = useActiveTurnDuration(events, activeTurnId, active);
+
+  function invalidateNavigationRequests(): number {
+    navigationEpochRef.current += 1;
+    return navigationEpochRef.current;
+  }
 
   useEffect(() => {
     const activeIds = new Set(
@@ -3931,8 +3940,11 @@ function Workspace({
   }
 
   useEffect(() => {
+    const navigationEpoch = navigationEpochRef.current;
+    let cancelled = false;
     void Promise.all([api.projects(), api.models(), api.capabilities(), api.runtimePreferences()])
       .then(([projectList, modelList, systemCapability, preferences]) => {
+        if (cancelled || navigationEpoch !== navigationEpochRef.current) return;
         setProjects(projectList);
         setModels(modelList);
         setCapability(systemCapability);
@@ -3949,15 +3961,21 @@ function Workspace({
         setEffort(preferredEffort);
         setPermission(preferences.permissionPreset);
         setApprovalPolicy(preferences.approvalPolicy);
-        void refreshRecentThreads(projectList).catch((cause: unknown) =>
+        void refreshRecentThreads(projectList, navigationEpoch).catch((cause: unknown) =>
           setError(errorMessage(cause)),
         );
       })
-      .catch((cause: unknown) => setError(errorMessage(cause)));
+      .catch((cause: unknown) => {
+        if (!cancelled && navigationEpoch === navigationEpochRef.current)
+          setError(errorMessage(cause));
+      });
     void api
       .resourceLimits()
       .then(setResourceLimits)
       .catch((cause: unknown) => setResourceError(errorMessage(cause)));
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   useEffect(() => {
@@ -3966,16 +3984,25 @@ function Workspace({
       setThreadId(null);
       return;
     }
+    const navigationEpoch = navigationEpochRef.current;
+    let cancelled = false;
     setError(null);
     void api
       .threads(projectId, archiveView)
       .then((items) => {
+        if (cancelled || navigationEpoch !== navigationEpochRef.current) return;
         setThreads(items);
         setThreadId((current) =>
           items.some((item) => item.id === current) ? current : (items[0]?.id ?? null),
         );
       })
-      .catch((cause: unknown) => setError(errorMessage(cause)));
+      .catch((cause: unknown) => {
+        if (!cancelled && navigationEpoch === navigationEpochRef.current)
+          setError(errorMessage(cause));
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [projectId, archiveView]);
 
   useEffect(() => {
@@ -3985,6 +4012,7 @@ function Workspace({
     const refreshServerNavigation = async () => {
       if (refreshing || document.visibilityState === 'hidden') return;
       refreshing = true;
+      const navigationEpoch = navigationEpochRef.current;
       try {
         const [projectList, resourceSnapshot, threadSubagents] = await Promise.all([
           api.projects(),
@@ -3994,15 +4022,34 @@ function Workspace({
         const activeThreads = await Promise.all(
           projectList.map((project) => api.threads(project.id, false)),
         );
+        const selectedIndex = projectList.findIndex((project) => project.id === projectId);
         const archivedThreads =
-          archiveView && projectId ? await api.threads(projectId, true) : null;
-        if (cancelled) return;
+          selectedIndex >= 0 && archiveView && projectId
+            ? await api.threads(projectId, true)
+            : null;
+        if (cancelled || navigationEpoch !== navigationEpochRef.current) return;
         setProjects(projectList);
         if (resourceSnapshot) setResourceLimits(resourceSnapshot);
         if (threadSubagents) setSubagents((current) => mergeSubagents(current, threadSubagents));
-        const selectedIndex = projectList.findIndex((project) => project.id === projectId);
-        if (selectedIndex >= 0)
-          setThreads(archiveView ? (archivedThreads ?? []) : (activeThreads[selectedIndex] ?? []));
+        if (selectedIndex < 0) {
+          invalidateNavigationRequests();
+          const nextThreads = activeThreads[0] ?? [];
+          setProjectId(projectList[0]?.id ?? null);
+          setArchiveView(false);
+          setThreads(nextThreads);
+          setThreadId(nextThreads[0]?.id ?? null);
+          setComposer('');
+        } else {
+          const nextThreads = archiveView
+            ? (archivedThreads ?? [])
+            : (activeThreads[selectedIndex] ?? []);
+          setThreads(nextThreads);
+          setThreadId((current) =>
+            nextThreads.some((item) => item.id === current)
+              ? current
+              : (nextThreads[0]?.id ?? null),
+          );
+        }
         setRecentThreads(
           activeThreads
             .flat()
@@ -4109,7 +4156,11 @@ function Workspace({
 
   async function refreshThreads(selectId?: string | null) {
     if (!projectId) return;
-    const items = await api.threads(projectId, archiveView);
+    const navigationEpoch = navigationEpochRef.current;
+    const requestedProjectId = projectId;
+    const requestedArchiveView = archiveView;
+    const items = await api.threads(requestedProjectId, requestedArchiveView);
+    if (navigationEpoch !== navigationEpochRef.current) return;
     setThreads(items);
     setThreadId((current) => {
       if (selectId === null) return null;
@@ -4118,10 +4169,14 @@ function Workspace({
     });
   }
 
-  async function refreshRecentThreads(sourceProjects = projects) {
+  async function refreshRecentThreads(
+    sourceProjects = projects,
+    navigationEpoch = navigationEpochRef.current,
+  ) {
     const projectThreads = await Promise.all(
       sourceProjects.map((project) => api.threads(project.id, false)),
     );
+    if (navigationEpoch !== navigationEpochRef.current) return;
     setRecentThreads(
       projectThreads
         .flat()
@@ -4133,6 +4188,7 @@ function Workspace({
   async function createProject(name: string, path: string) {
     try {
       const project = await api.createProject(session.csrfToken, { name, path });
+      invalidateNavigationRequests();
       setProjects((current) => [...current, project]);
       setProjectId(project.id);
       setArchiveView(false);
@@ -4163,6 +4219,7 @@ function Workspace({
       return;
     }
 
+    invalidateNavigationRequests();
     const remainingProjects = projects.filter((project) => project.id !== id);
     setProjects(remainingProjects);
     setRecentThreads((current) => current.filter((item) => item.projectId !== id));
@@ -4215,6 +4272,7 @@ function Workspace({
         permissionPreset: permission,
         approvalPolicy,
       });
+      invalidateNavigationRequests();
       setProjectId(targetProjectId);
       setArchiveView(false);
       setThreads((current) => (targetProjectId === projectId ? [thread, ...current] : [thread]));
@@ -4234,6 +4292,7 @@ function Workspace({
       setError(archiveErrorMessage(cause, 'archive'));
       return;
     }
+    invalidateNavigationRequests();
     setThreads((current) => current.filter((item) => item.id !== id));
     setRecentThreads((current) => current.filter((item) => item.id !== id));
     const archivedSelection = threadId === id;
@@ -4255,6 +4314,7 @@ function Workspace({
       setError(archiveErrorMessage(cause, 'restore'));
       return;
     }
+    invalidateNavigationRequests();
     setThreads((current) => current.filter((item) => item.id !== id));
     const restoredSelection = threadId === id;
     if (restoredSelection) setThreadId(null);
@@ -4793,11 +4853,13 @@ function Workspace({
         selectedThreadId={threadId}
         archived={archiveView}
         onSelectProject={(id) => {
+          invalidateNavigationRequests();
           setProjectId(id);
           setArchiveView(false);
           setMobileNavigationOpen(false);
         }}
         onSelectThread={(nextProjectId, nextThreadId) => {
+          invalidateNavigationRequests();
           setProjectId(nextProjectId);
           setArchiveView(false);
           setThreadId(nextThreadId);
@@ -4812,13 +4874,17 @@ function Workspace({
           void newThread(id);
         }}
         onShowArchived={(id) => {
+          invalidateNavigationRequests();
           setProjectId(id);
           setArchiveView(true);
         }}
         onArchive={(id) => void archiveThread(id)}
         onRestore={(id) => void restoreThread(id)}
         onRename={renameThread}
-        onBack={() => setArchiveView(false)}
+        onBack={() => {
+          invalidateNavigationRequests();
+          setArchiveView(false);
+        }}
         onCreate={createProject}
         archivedProjectsOpen={archivedProjectsOpen}
         archivedProjects={archivedProjects}

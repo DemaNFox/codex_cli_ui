@@ -3757,6 +3757,15 @@ describe('App', () => {
     await user.click(within(dialog).getByRole('button', { name: 'Закрыть архив проектов' }));
     expect(screen.queryByRole('dialog', { name: 'Архив проектов' })).toBeNull();
     expect(document.activeElement).toBe(trigger);
+
+    await user.click(screen.getByRole('button', { name: /^Архивный проект/ }));
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.some(([input]) =>
+          requestUrl(input).includes(`projectId=${encodeURIComponent(archivedProject.id)}`),
+        ),
+      ).toBe(true),
+    );
   });
 
   it('preserves a project when active work rejects archiving and shows bounded guidance', async () => {
@@ -4048,6 +4057,106 @@ describe('App', () => {
     });
 
     expect((await screen.findAllByText('Изменено с телефона')).length).toBeGreaterThan(0);
+  });
+
+  it('leaves a project archived on another device and closes its stale chat context', async () => {
+    const secondProject = {
+      ...project,
+      id: '22222222-2222-4222-8222-222222222222',
+      name: 'Второй проект',
+      path: '/srv/projects/second',
+    };
+    const secondThread = {
+      ...thread,
+      id: 'thread-2',
+      projectId: secondProject.id,
+      name: 'Задача второго проекта',
+      updatedAt: '2026-09-27T11:00:00.000Z',
+    };
+    let remotelyArchived = false;
+    installAuthenticatedApi((url) => {
+      if (url === '/api/projects?archived=false') {
+        return jsonResponse(remotelyArchived ? [secondProject] : [project, secondProject]);
+      }
+      if (url.includes('/api/threads?')) {
+        return jsonResponse(
+          url.includes(encodeURIComponent(secondProject.id)) ? [secondThread] : [thread],
+        );
+      }
+      if (url === '/api/threads/thread-2') {
+        return jsonResponse({ data: secondThread, events: [] });
+      }
+      if (url === '/api/threads/thread-2/subagents') return jsonResponse({ data: [] });
+      return undefined;
+    });
+    render(<App />);
+    await screen.findAllByText('Frontend task');
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+    const archivedThreadStream = FakeEventSource.instances.at(-1);
+    fireEvent.change(screen.getByLabelText('Сообщение Codex'), {
+      target: { value: 'Черновик старого проекта' },
+    });
+
+    remotelyArchived = true;
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+
+    expect(await screen.findByRole('heading', { name: 'Задача второго проекта' })).not.toBeNull();
+    expect(screen.queryByRole('button', { name: 'Меню проекта AI Chat Bot' })).toBeNull();
+    expect(screen.getByLabelText<HTMLTextAreaElement>('Сообщение Codex').value).toBe('');
+    await waitFor(() => expect(archivedThreadStream?.close).toHaveBeenCalled());
+  });
+
+  it('ignores a delayed thread response from a project after it is archived', async () => {
+    const secondProject = {
+      ...project,
+      id: '22222222-2222-4222-8222-222222222222',
+      name: 'Второй проект',
+      path: '/srv/projects/second',
+    };
+    const secondThread = {
+      ...thread,
+      id: 'thread-2',
+      projectId: secondProject.id,
+      name: 'Задача второго проекта',
+      updatedAt: '2026-09-27T11:00:00.000Z',
+    };
+    const delayedResolvers: Array<(response: Response) => void> = [];
+    let archived = false;
+    installAuthenticatedApi((url, init) => {
+      if (url === '/api/projects?archived=false') {
+        return jsonResponse(archived ? [secondProject] : [project, secondProject]);
+      }
+      if (url === `/api/projects/${project.id}/archive` && init?.method === 'POST') {
+        archived = true;
+        return jsonResponse({ data: { ...project, archived: true } });
+      }
+      if (url.includes('/api/threads?') && url.includes(encodeURIComponent(project.id))) {
+        return new Promise<Response>((resolve) => delayedResolvers.push(resolve));
+      }
+      if (url.includes('/api/threads?') && url.includes(encodeURIComponent(secondProject.id))) {
+        return jsonResponse([secondThread]);
+      }
+      if (url === '/api/threads/thread-2') {
+        return jsonResponse({ data: secondThread, events: [] });
+      }
+      if (url === '/api/threads/thread-2/subagents') return jsonResponse({ data: [] });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByRole('button', { name: 'Меню проекта AI Chat Bot' });
+
+    await user.click(screen.getByRole('button', { name: 'Меню проекта AI Chat Bot' }));
+    await user.click(screen.getByRole('menuitem', { name: 'Архивировать проект' }));
+    expect(await screen.findByRole('heading', { name: 'Задача второго проекта' })).not.toBeNull();
+
+    act(() => {
+      for (const resolve of delayedResolvers) resolve(jsonResponse([thread]));
+    });
+    await waitFor(() => expect(screen.queryByText('Frontend task')).toBeNull());
+    expect(screen.getByRole('heading', { name: 'Задача второго проекта' })).not.toBeNull();
   });
 
   it('resolves an approval and removes it after the completion event', async () => {
