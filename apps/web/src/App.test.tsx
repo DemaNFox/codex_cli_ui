@@ -1430,7 +1430,7 @@ describe('App', () => {
       name: 'Созданные и изменённые файлы',
     });
     expect(await within(fallback).findAllByRole('link')).toHaveLength(1);
-    expect(within(fallback).getByRole('link', { name: /reports\/extra\.csv/ })).not.toBeNull();
+    expect(await within(fallback).findByRole('link', { name: /reports\/extra\.csv/ })).not.toBeNull();
     expect(within(fallback).queryByText('reports/final.pdf')).toBeNull();
     expect(within(final).getAllByRole('link')).toHaveLength(2);
   });
@@ -1495,8 +1495,8 @@ describe('App', () => {
     const fallback = within(final).getByRole('region', {
       name: 'Созданные и изменённые файлы',
     });
-    expect(within(fallback).getAllByRole('link')).toHaveLength(1);
-    expect(within(fallback).getByRole('link', { name: /reports\/extra\.csv/ })).not.toBeNull();
+    expect(await within(fallback).findAllByRole('link')).toHaveLength(1);
+    expect(await within(fallback).findByRole('link', { name: /reports\/extra\.csv/ })).not.toBeNull();
     expect(fallback.textContent).not.toContain('reports/final.pdf');
     expect(fallback.textContent).not.toContain('reports/summary.csv');
     expect(fallback.textContent).not.toContain('reports/notes.txt');
@@ -1547,8 +1547,8 @@ describe('App', () => {
     const fallback = within(final).getByRole('region', {
       name: 'Созданные и изменённые файлы',
     });
-    expect(within(fallback).getAllByRole('link')).toHaveLength(1);
-    expect(within(fallback).getByRole('link', { name: /reports\/final\.pdf/ })).not.toBeNull();
+    expect(await within(fallback).findAllByRole('link')).toHaveLength(1);
+    expect(await within(fallback).findByRole('link', { name: /reports\/final\.pdf/ })).not.toBeNull();
   });
 
   it.each([
@@ -1598,7 +1598,7 @@ describe('App', () => {
     const fallback = within(final).getByRole('region', {
       name: 'Созданные и изменённые файлы',
     });
-    expect(within(fallback).getByRole('link', { name: /reports\/final\.pdf/ })).not.toBeNull();
+    expect(await within(fallback).findByRole('link', { name: /reports\/final\.pdf/ })).not.toBeNull();
     expect(within(final).queryByRole('link', { name: 'report' })).toBeNull();
   });
 
