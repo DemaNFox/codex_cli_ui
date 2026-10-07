@@ -45,6 +45,8 @@ class ManagedBlockTest(unittest.TestCase):
         self.assertIn("project-relative Markdown links", updated)
         self.assertIn("If you create a\nrequested archive, link the archive too", updated)
         self.assertIn("Do not link arbitrary host files", updated)
+        self.assertIn("verify that every\nlinked deliverable still exists", updated)
+        self.assertIn("instead of emitting a broken link", updated)
         self.assertTrue(updated.startswith("# Personal\n\nKeep me.\n"))
 
     def test_rejects_malformed_or_duplicate_markers(self) -> None:

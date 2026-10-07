@@ -85,10 +85,15 @@ Browser
   out. On narrow screens the same rail becomes horizontally scrollable.
 - Relative Markdown links emitted by Codex are presented as generated project-file downloads. If a completed
   final answer omits a link, the transcript also presents completed file-change paths as authenticated project
-  downloads. Both paths use the same backend route, whose canonical project checks remain authoritative: it
-  resolves the requested file against the thread's registered canonical project directory, rejects absolute
-  paths, traversal, symlink escape, directories and files above 100 MiB, and always serves an attachment with
-  `nosniff`. External, root-relative and fragment links retain their normal link behavior.
+  downloads. Both paths first check current availability through `HEAD` and use the same download component.
+  A missing, moved, deleted or never-created path is rendered as unavailable in the transcript. Files up to
+  16 MiB use a controlled `GET`, so deletion between the check and download produces bounded in-chat guidance
+  instead of a browser download-manager failure; confirmed larger or unknown-size files use the browser's
+  streaming path to avoid buffering them in Web UI memory. The canonical project checks remain authoritative: both methods
+  resolve against the thread's registered canonical project directory, reject absolute paths, traversal,
+  symlink escape, directories and files above 100 MiB, disable caching, and serve successful content with
+  `nosniff`. A query or fragment on a safe relative Markdown link is not part of the project path.
+  External, root-relative and fragment-only links retain their normal link behavior.
 
 ## Voice transcription
 
@@ -174,7 +179,9 @@ The installer writes a bounded managed block into the runner's global `CODEX_HOM
 content. It tells Codex that the Web UI runner is already executing on the physical target host and must use
 local commands instead of SSHing to a loopback, current-hostname or same-host address. It also instructs Codex
 to include project-relative Markdown links for user-requested deliverables created in the current project and
-to link a requested archive when one is created, without exposing arbitrary host files. An explicit migration to
+to link a requested archive when one is created, without exposing arbitrary host files. Immediately before the
+final answer Codex must verify that each linked deliverable remains a regular file inside the current project;
+otherwise it reports that the file was not saved instead of emitting a broken link. An explicit migration to
 host-admin drains work, preserves SQLite, copies the complete Codex home without merging profiles, keeps a
 root-only rollback source until health succeeds and then changes only the app-server runner identity/unit.
 Because Codex persists absolute rollout paths in `state_5.sqlite`, migration and subsequent package activation

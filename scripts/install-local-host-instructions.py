@@ -37,7 +37,9 @@ a different remote host.
 When you create files in the current project as user-requested deliverables, include
 project-relative Markdown links to those files in your final answer. If you create a
 requested archive, link the archive too. Do not link arbitrary host files or files
-outside the current project.
+outside the current project. Immediately before the final answer, verify that every
+linked deliverable still exists as a regular file inside the current project. If it
+does not, say that the deliverable was not saved instead of emitting a broken link.
 {END_MARKER}"""
 
 

@@ -475,6 +475,7 @@ def main() -> int:
                                     "| Вчера | 196 | 114 | Подтверждение ещё не получено |\n"
                                     "| Сегодня | 150 | 82 | Проверка и повторная отправка |"
                                     "\n\n[Скачать отчёт](reports/audit.md)"
+                                    " · [Скачать пропавший отчёт](reports/missing.md)"
                                     "\n\n```text\nvery-long-code-value-without-breaks-0123456789-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ-0123456789-abcdefghijklmnopqrstuvwxyz-ABCDEFGHIJKLMNOPQRSTUVWXYZ\n```"
                                     if index == 2
                                     else f"Историческое сообщение {index}: длинный чат остаётся прокручиваемым."
@@ -690,9 +691,27 @@ def main() -> int:
             )
         elif path == "/api/threads/t1/attachments" and request.method == "GET":
             payload(route, 200, {"data": []})
+        elif path == "/api/threads/t1/project-files/download" and request.method == "HEAD":
+            requested_file = parse_qs(parsed.query).get("path")
+            if requested_file == ["reports/audit.md"]:
+                route.fulfill(
+                    status=200,
+                    headers={
+                        "content-type": "application/octet-stream",
+                        "content-length": str(len("# Audit ready\n")),
+                        "content-disposition": 'attachment; filename="audit.md"',
+                        "x-content-type-options": "nosniff",
+                        "cache-control": "private, no-store",
+                    },
+                    body="",
+                )
+            elif requested_file == ["reports/missing.md"]:
+                route.fulfill(status=404, body="")
+            else:
+                route.fulfill(status=400, body="")
         elif path == "/api/threads/t1/project-files/download" and request.method == "GET":
             if parse_qs(parsed.query).get("path") != ["reports/audit.md"]:
-                payload(route, 400, {"error": {"code": "PROJECT_FILE_PATH_INVALID"}})
+                payload(route, 404, {"error": {"code": "PROJECT_FILE_NOT_FOUND"}})
             else:
                 route.fulfill(
                     status=200,
@@ -1260,6 +1279,20 @@ def main() -> int:
         generated_file = final_answer.get_by_role("link", name="Скачать отчёт")
         if generated_file.get_attribute("download") != "audit.md":
             raise AssertionError("generated project file is not marked as a download")
+        unavailable_file = final_answer.get_by_text("Файл недоступен на сервере")
+        unavailable_file.wait_for()
+        if final_answer.get_by_role("link", name="Скачать пропавший отчёт").count():
+            raise AssertionError("missing generated file is still presented as a download link")
+        with page.expect_download() as generated_download:
+            generated_file.click()
+        if generated_download.value.suggested_filename != "audit.md":
+            raise AssertionError(
+                f"generated download filename changed: {generated_download.value.suggested_filename}"
+            )
+        if os.environ.get("CODEX_WEB_GENERATED_FILES_ONLY") == "1":
+            browser.close()
+            print("browser-smoke: generated file availability and controlled download passed")
+            return 0
         if page.get_by_text("Промежуточный отчёт, который должен скрыться после завершения.").count():
             raise AssertionError("completed turn commentary remains visible after its final answer")
         turn_navigation = page.get_by_role("navigation", name="Переходы по задачам")

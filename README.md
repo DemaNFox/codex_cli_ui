@@ -8,7 +8,9 @@ from any browser. Images and common project files can be attached both when star
 an active turn by selecting, pasting or dropping them into the composer; image analysis is delegated to Codex and stored uploads remain inside the bounded
 application state. The managed runner guidance asks Codex to include project-relative Markdown links for
 user-requested deliverables, including a requested archive when one is created. Relative file links in Codex
-answers download generated files from the registered project through an authenticated, traversal-safe route.
+answers are checked against the registered project before they are offered as downloads. Available files are
+downloaded through an authenticated, traversal-safe route; stale, removed or never-created paths are labelled
+as unavailable in the chat instead of being handed to the browser as broken downloads.
 As a fallback when a completed answer omits such a link, the UI presents its completed file-change paths as
 authenticated project downloads; the backend's canonical project checks remain authoritative. Agent messages render safe GitHub-flavored Markdown, including
 responsive tables and code blocks, while raw HTML remains inert. An optional microphone control records a bounded clip in the browser,
