@@ -4249,12 +4249,13 @@ function Workspace({
     setArchivedProjectsError(null);
     try {
       const restored = await api.unarchiveProject(session.csrfToken, id);
+      const navigationEpoch = invalidateNavigationRequests();
       setArchivedProjects((current) => current.filter((project) => project.id !== id));
       const activeProjects = await api
         .projects(false)
         .catch(() => [...projects.filter((project) => project.id !== restored.id), restored]);
       setProjects(activeProjects);
-      await refreshRecentThreads(activeProjects).catch((cause: unknown) => {
+      await refreshRecentThreads(activeProjects, navigationEpoch).catch((cause: unknown) => {
         setArchivedProjectsError(
           `Проект восстановлен, но список недавних чатов обновится позже. ${errorMessage(cause)}`,
         );

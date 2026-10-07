@@ -3919,6 +3919,71 @@ describe('App', () => {
     );
   });
 
+  it('keeps a restored project when an older navigation refresh finishes later', async () => {
+    const archivedProject = {
+      ...project,
+      id: '33333333-3333-4333-8333-333333333333',
+      name: 'Архивный проект',
+      path: '/srv/projects/archived',
+      archived: true,
+    };
+    let restored = false;
+    let delayNextActiveProjects = false;
+    let resolveOldRefresh: ((response: Response) => void) | null = null;
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/projects?archived=true') return jsonResponse([archivedProject]);
+      if (url === '/api/projects?archived=false') {
+        if (delayNextActiveProjects) {
+          delayNextActiveProjects = false;
+          return new Promise<Response>((resolve) => {
+            resolveOldRefresh = resolve;
+          });
+        }
+        return jsonResponse(
+          restored ? [project, { ...archivedProject, archived: false }] : [project],
+        );
+      }
+      if (url === `/api/projects/${archivedProject.id}/unarchive` && init?.method === 'POST') {
+        restored = true;
+        return jsonResponse({ data: { ...archivedProject, archived: false } });
+      }
+      if (url.includes('/api/threads?') && url.includes(encodeURIComponent(archivedProject.id))) {
+        return jsonResponse([]);
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    const trigger = await screen.findByRole('button', { name: 'Открыть архив проектов' });
+    await user.click(trigger);
+    const dialog = await screen.findByRole('dialog', { name: 'Архив проектов' });
+
+    delayNextActiveProjects = true;
+    act(() => {
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    await waitFor(() => expect(resolveOldRefresh).not.toBeNull());
+
+    await user.click(within(dialog).getByRole('button', { name: 'Восстановить' }));
+    await waitFor(() => expect(within(dialog).queryByText('Архивный проект')).toBeNull());
+    expect(screen.getByRole('button', { name: /^Архивный проект/ })).not.toBeNull();
+
+    const activeProjectThreadReadsBeforeRelease = fetchMock.mock.calls.filter(([input]) =>
+      requestUrl(input).includes(`projectId=${encodeURIComponent(project.id)}`),
+    ).length;
+    act(() => {
+      resolveOldRefresh?.(jsonResponse([project]));
+    });
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(([input]) =>
+          requestUrl(input).includes(`projectId=${encodeURIComponent(project.id)}`),
+        ).length,
+      ).toBeGreaterThan(activeProjectThreadReadsBeforeRelease),
+    );
+    expect(screen.getByRole('button', { name: /^Архивный проект/ })).not.toBeNull();
+  });
+
   it('preserves a project when active work rejects archiving and shows bounded guidance', async () => {
     installAuthenticatedApi((url, init) => {
       if (url === `/api/projects/${project.id}/archive` && init?.method === 'POST') {
