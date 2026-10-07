@@ -126,6 +126,17 @@ export interface ProjectFileAvailability {
   sizeBytes: number | null;
 }
 
+export const CONTROLLED_PROJECT_FILE_MAX_BYTES = 16 * 1024 * 1024;
+
+export type ProjectFileDownloadResult =
+  { kind: 'downloaded'; blob: Blob } | { kind: 'streaming-required' };
+
+function boundedContentLength(response: Response): number | null {
+  const contentLength = response.headers.get('Content-Length');
+  const parsedLength = contentLength === null ? Number.NaN : Number(contentLength);
+  return Number.isSafeInteger(parsedLength) && parsedLength >= 0 ? parsedLength : null;
+}
+
 async function projectFileAvailable(
   threadId: string,
   path: string,
@@ -140,11 +151,9 @@ async function projectFileAvailable(
   if (!response.ok) {
     throw new ApiError(`Не удалось проверить файл (${response.status})`, response.status);
   }
-  const contentLength = response.headers.get('Content-Length');
-  const parsedLength = contentLength === null ? Number.NaN : Number(contentLength);
   return {
     available: true,
-    sizeBytes: Number.isSafeInteger(parsedLength) && parsedLength >= 0 ? parsedLength : null,
+    sizeBytes: boundedContentLength(response),
   };
 }
 
@@ -152,7 +161,7 @@ async function downloadProjectFile(
   threadId: string,
   path: string,
   signal?: AbortSignal,
-): Promise<Blob> {
+): Promise<ProjectFileDownloadResult> {
   const response = await fetch(projectFileDownloadUrl(threadId, path), {
     method: 'GET',
     credentials: 'same-origin',
@@ -166,7 +175,12 @@ async function downloadProjectFile(
       response.status,
     );
   }
-  return response.blob();
+  const sizeBytes = boundedContentLength(response);
+  if (sizeBytes === null || sizeBytes > CONTROLLED_PROJECT_FILE_MAX_BYTES) {
+    await response.body?.cancel();
+    return { kind: 'streaming-required' };
+  }
+  return { kind: 'downloaded', blob: await response.blob() };
 }
 
 function uploadAttachment(

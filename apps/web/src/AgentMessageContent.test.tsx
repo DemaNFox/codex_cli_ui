@@ -13,6 +13,13 @@ function availableHead(sizeBytes = 128): Response {
   });
 }
 
+function controlledDownload(body = 'ready'): Response {
+  return new Response(new Blob([body]), {
+    status: 200,
+    headers: { 'Content-Length': String(new Blob([body]).size) },
+  });
+}
+
 beforeEach(() => {
   vi.restoreAllMocks();
   vi.stubGlobal('fetch', vi.fn());
@@ -165,7 +172,7 @@ describe('AgentMessageContent', () => {
     expect(fetch).toHaveBeenCalledTimes(2);
 
     const timeoutSpy = vi.spyOn(window, 'setTimeout');
-    finishDownload(new Response(new Blob(['ready']), { status: 200 }));
+    finishDownload(controlledDownload());
     await waitFor(() => expect(link.getAttribute('aria-busy')).toBeNull());
     expect(createObjectUrlMock).toHaveBeenCalledTimes(1);
     const revokeCall = timeoutSpy.mock.calls.find((call) => call[1] === 60_000);
@@ -235,7 +242,7 @@ describe('AgentMessageContent', () => {
     expect(rerenderedLink.getAttribute('aria-busy')).toBe('true');
     expect(fetch).toHaveBeenCalledTimes(2);
 
-    finishDownload(new Response(new Blob(['ready']), { status: 200 }));
+    finishDownload(controlledDownload());
     await waitFor(() => expect(rerenderedLink.getAttribute('aria-busy')).toBeNull());
   });
 
@@ -276,5 +283,29 @@ describe('AgentMessageContent', () => {
 
     expect(fetch).toHaveBeenCalledTimes(1);
     expect(createObjectUrlMock).not.toHaveBeenCalled();
+  });
+
+  it('switches to explicit streaming when GET is larger than its small HEAD result', async () => {
+    const getResponse = new Response(new Blob(['header mismatch']), {
+      status: 200,
+      headers: { 'Content-Length': String(16 * 1024 * 1024 + 1) },
+    });
+    const blobSpy = vi.spyOn(getResponse, 'blob');
+    vi.mocked(fetch).mockResolvedValueOnce(availableHead(128)).mockResolvedValueOnce(getResponse);
+    render(<AgentMessageContent text="[Архив](reports/result.zip)" threadId="thread-1" />);
+
+    const link = await screen.findByRole('link', { name: 'Архив' });
+    fireEvent.click(link);
+
+    expect(
+      await screen.findByText('Для этого файла требуется потоковое скачивание — нажмите ещё раз'),
+    ).not.toBeNull();
+    expect(blobSpy).not.toHaveBeenCalled();
+    expect(createObjectUrlMock).not.toHaveBeenCalled();
+    expect(fetch).toHaveBeenCalledTimes(2);
+
+    link.addEventListener('click', (event) => event.preventDefault());
+    fireEvent.click(link);
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });

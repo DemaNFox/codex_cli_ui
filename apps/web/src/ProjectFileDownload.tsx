@@ -1,9 +1,9 @@
 import { type MouseEvent, type ReactNode, useCallback, useEffect, useRef, useState } from 'react';
 
-import { ApiError, api, projectFileDownloadUrl } from './api.js';
+import { ApiError, api, CONTROLLED_PROJECT_FILE_MAX_BYTES, projectFileDownloadUrl } from './api.js';
 
 const URI_SCHEME = /^[a-z][a-z\d+.-]*:/i;
-export const CONTROLLED_PROJECT_FILE_MAX_BYTES = 16 * 1024 * 1024;
+export { CONTROLLED_PROJECT_FILE_MAX_BYTES } from './api.js';
 export const PROJECT_FILE_OBJECT_URL_REVOKE_MS = 60_000;
 
 export function normalizeProjectFilePath(value: unknown): string | null {
@@ -59,6 +59,7 @@ export function ProjectFileDownload({
   const [availability, setAvailability] = useState<Availability>('checking');
   const [sizeBytes, setSizeBytes] = useState<number | null>(null);
   const [downloading, setDownloading] = useState(false);
+  const [streamingRequired, setStreamingRequired] = useState(false);
   const downloadInFlight = useRef(false);
   const availabilityAbort = useRef<AbortController | null>(null);
   const downloadAbort = useRef<AbortController | null>(null);
@@ -71,6 +72,7 @@ export function ProjectFileDownload({
     availabilityAbort.current = controller;
     setAvailability('checking');
     setSizeBytes(null);
+    setStreamingRequired(false);
     void api
       .projectFileAvailable(threadId, path, controller.signal)
       .then((result) => {
@@ -99,7 +101,8 @@ export function ProjectFileDownload({
   };
 
   const download = async (event: MouseEvent<HTMLAnchorElement>) => {
-    const controlledDownload = sizeBytes !== null && sizeBytes <= CONTROLLED_PROJECT_FILE_MAX_BYTES;
+    const controlledDownload =
+      !streamingRequired && sizeBytes !== null && sizeBytes <= CONTROLLED_PROJECT_FILE_MAX_BYTES;
     if (!controlledDownload) return;
     event.preventDefault();
     if (downloadInFlight.current) return;
@@ -108,8 +111,13 @@ export function ProjectFileDownload({
     downloadInFlight.current = true;
     setDownloading(true);
     try {
-      const blob = await api.downloadProjectFile(threadId, path, controller.signal);
+      const result = await api.downloadProjectFile(threadId, path, controller.signal);
       if (!mounted.current || controller.signal.aborted) return;
+      if (result.kind === 'streaming-required') {
+        setStreamingRequired(true);
+        return;
+      }
+      const { blob } = result;
       const objectUrl = URL.createObjectURL(blob);
       const anchor = document.createElement('a');
       anchor.href = objectUrl;
@@ -177,6 +185,10 @@ export function ProjectFileDownload({
       {downloading ? (
         <span className="project-file-status" role="status" aria-live="polite">
           Скачивание…
+        </span>
+      ) : streamingRequired ? (
+        <span className="project-file-status" role="status" aria-live="polite">
+          Для этого файла требуется потоковое скачивание — нажмите ещё раз
         </span>
       ) : null}
     </span>

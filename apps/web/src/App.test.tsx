@@ -1748,7 +1748,7 @@ describe('App', () => {
 
     const files = await screen.findByRole('region', { name: 'Созданные и изменённые файлы' });
     expect(within(files).getAllByRole('link')).toHaveLength(1);
-    expect(within(files).getByRole('link', { name: /output\/kept\.txt/ })).not.toBeNull();
+    expect(await within(files).findByRole('link', { name: /output\/kept\.txt/ })).not.toBeNull();
     expect(files.textContent).not.toContain('deleted.txt');
     expect(files.textContent).not.toContain('secret.txt');
     expect(files.textContent).not.toContain('example.test');
