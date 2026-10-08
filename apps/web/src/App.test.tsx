@@ -1851,7 +1851,7 @@ describe('App', () => {
     render(<App />);
 
     const final = await screen.findByRole('article', { name: 'Итоговый ответ Codex' });
-    expect(within(final).getByRole('link', { name: 'report' })).not.toBeNull();
+    expect(await within(final).findByRole('link', { name: 'report' })).not.toBeNull();
     expect(
       within(final).queryByRole('region', { name: 'Созданные и изменённые файлы' }),
     ).toBeNull();
@@ -1908,7 +1908,7 @@ describe('App', () => {
     render(<App />);
 
     const files = await screen.findByRole('region', { name: 'Созданные и изменённые файлы' });
-    expect(within(files).getAllByRole('link')).toHaveLength(1);
+    expect(await within(files).findAllByRole('link')).toHaveLength(1);
     expect(await within(files).findByRole('link', { name: /output\/kept\.txt/ })).not.toBeNull();
     expect(files.textContent).not.toContain('deleted.txt');
     expect(files.textContent).not.toContain('secret.txt');
