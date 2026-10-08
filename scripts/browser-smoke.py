@@ -41,6 +41,19 @@ def main() -> int:
     thread_detail_reads = 0
     outage_released = False
     project_archived = False
+    auto_rate_limit_reset = {
+        "supported": True,
+        "accountBinding": "a" * 64,
+        "enabled": False,
+        "availableCount": 2,
+        "state": "idle",
+        "version": 1,
+        "updatedAt": "2026-10-08T10:00:00.000Z",
+        "lastOutcome": None,
+        "lastOutcomeAt": None,
+        "resumedTaskCount": 0,
+        "message": None,
+    }
     resource_snapshot = {
         "capacity": {
             "cpuCores": 8,
@@ -81,6 +94,7 @@ def main() -> int:
         nonlocal thread_detail_reads
         nonlocal outage_released
         nonlocal project_archived
+        nonlocal auto_rate_limit_reset
         request = route.request
         parsed = urlparse(request.url)
         path = parsed.path
@@ -218,6 +232,7 @@ def main() -> int:
                             "secondary": None,
                         }
                     ],
+                    "rateLimitReset": auto_rate_limit_reset,
                     "usage": {
                         "summary": {
                             "lifetimeTokens": 123456,
@@ -260,6 +275,27 @@ def main() -> int:
                     "warnings": [],
                 },
             )
+        elif path == "/api/system/rate-limit-reset" and request.method == "PUT":
+            requested = request.post_data_json
+            if requested != {
+                "enabled": True,
+                "expectedVersion": auto_rate_limit_reset["version"],
+                "accountBinding": auto_rate_limit_reset["accountBinding"],
+            }:
+                raise AssertionError(
+                    f"automatic rate-limit reset request is invalid: {requested}"
+                )
+            auto_rate_limit_reset = {
+                **auto_rate_limit_reset,
+                "enabled": True,
+                "availableCount": 1,
+                "version": auto_rate_limit_reset["version"] + 1,
+                "updatedAt": "2026-10-08T10:01:00.000Z",
+                "lastOutcome": "reset",
+                "lastOutcomeAt": "2026-10-08T10:01:00.000Z",
+                "resumedTaskCount": 2,
+            }
+            payload(route, 200, {"data": auto_rate_limit_reset})
         elif path == "/api/system/codex-account/login" and request.method == "POST":
             if request.post_data_json != {"type": "chatgptDeviceCode"}:
                 raise AssertionError("account login did not use the bounded device-code request")
@@ -1298,7 +1334,7 @@ def main() -> int:
         active_composer = page.get_by_label("Уточнение для активной задачи")
         active_composer.fill("Учти приложенный файл")
         page.get_by_role("button", name="Направить задачу").click()
-        page.get_by_text("Уточнение принято активной задачей.", exact=True).wait_for()
+        page.get_by_text("Уточнение принято активной задачей.", exact=False).wait_for()
         if not active_turn_attachment_uploaded:
             raise AssertionError("active-turn attachment was not uploaded before steer")
         if active_turn_steer != {
@@ -1574,6 +1610,22 @@ def main() -> int:
         page.get_by_text("31% использовано · 300 мин.").wait_for()
         page.get_by_text("multi-agent-orchestrator", exact=True).wait_for()
         diagnostics = page.get_by_label("Статус Codex")
+        auto_reset = diagnostics.get_by_role(
+            "checkbox",
+            name="Автоматически использовать сохранённый сброс, когда лимит Codex остановит задачу",
+        )
+        if auto_reset.is_checked():
+            raise AssertionError("automatic rate-limit reset is not off by default")
+        diagnostics.get_by_text("Доступно сохранённых сбросов: 2", exact=True).wait_for()
+        diagnostics.get_by_text(
+            "Сброс будет потрачен только после подтверждённой остановки из-за лимита.",
+            exact=False,
+        ).wait_for()
+        auto_reset.click()
+        diagnostics.get_by_text("Доступно сохранённых сбросов: 1", exact=True).wait_for()
+        if not auto_reset.is_checked():
+            raise AssertionError("automatic rate-limit reset did not reflect the saved setting")
+        diagnostics.get_by_text("Сброс применён · продолжено задач: 2", exact=True).wait_for()
         current_chat_usage = diagnostics.get_by_role("heading", name="Текущий чат").locator("..")
         current_chat_usage.get_by_text("Переносимый чат", exact=True).wait_for()
         current_chat_usage.get_by_text("Оценка Codex по этому чату", exact=True).wait_for()
@@ -1837,6 +1889,13 @@ def main() -> int:
             or resource_box["x"] + resource_box["width"] > 390
         ):
             raise AssertionError("mobile resource settings are outside the viewport")
+        auto_reset_box = page.locator(".auto-rate-limit-reset").bounding_box()
+        if (
+            not auto_reset_box
+            or auto_reset_box["x"] < 0
+            or auto_reset_box["x"] + auto_reset_box["width"] > 390
+        ):
+            raise AssertionError("mobile automatic reset settings are outside the viewport")
         for label in (
             "Лимит CPU, ядер",
             "Лимит памяти, ГБ",

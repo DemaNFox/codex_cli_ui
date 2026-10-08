@@ -26,6 +26,7 @@ import { ImagePreviewDialog } from './ImagePreviewDialog.js';
 import { normalizeProjectFilePath, ProjectFileDownload } from './ProjectFileDownload.js';
 import type {
   Attachment,
+  AutoRateLimitResetSnapshot,
   Capability,
   CodexAccountLogin,
   CodexUpdateSnapshot,
@@ -2556,6 +2557,111 @@ function ResourceSettings({
   );
 }
 
+const AUTO_RESET_STATE_LABELS: Record<AutoRateLimitResetSnapshot['state'], string> = {
+  idle: 'Готово',
+  waiting: 'Задачи ожидают сброса',
+  redeeming: 'Применяем сохранённый сброс…',
+  recovering: 'Возобновляем задачи…',
+  failed: 'Автоматический сброс не выполнен',
+};
+
+function AutoRateLimitResetSettings({
+  snapshot,
+  busy,
+  error,
+  onSave,
+}: {
+  snapshot: AutoRateLimitResetSnapshot;
+  busy: boolean;
+  error: string | null;
+  onSave: (enabled: boolean) => Promise<void>;
+}) {
+  const descriptionId = 'auto-rate-limit-reset-description';
+  const availableText =
+    snapshot.availableCount === null
+      ? 'Количество сбросов временно недоступно'
+      : snapshot.availableCount === 0
+        ? 'Сохранённых сбросов нет'
+        : `Доступно сохранённых сбросов: ${snapshot.availableCount.toLocaleString('ru')}`;
+  const outcomeText =
+    snapshot.lastOutcome === 'reset'
+      ? `Сброс применён · продолжено задач: ${snapshot.resumedTaskCount.toLocaleString('ru')}`
+      : snapshot.lastOutcome === 'alreadyRedeemed'
+        ? `Сброс уже был применён · продолжено задач: ${snapshot.resumedTaskCount.toLocaleString('ru')}`
+        : snapshot.lastOutcome === 'noCredit'
+          ? 'Сбросов нет — задачи остаются в ожидании.'
+          : snapshot.lastOutcome === 'nothingToReset'
+            ? 'Подходящих для сброса окон сейчас нет.'
+            : snapshot.lastOutcome === 'failed'
+              ? 'Не удалось применить сброс — задачи остаются в ожидании.'
+              : null;
+  const failure = snapshot.state === 'failed' || snapshot.lastOutcome === 'failed';
+
+  return (
+    <section className="auto-rate-limit-reset" aria-labelledby="auto-rate-limit-reset-title">
+      <div className="auto-rate-limit-reset-heading">
+        <div>
+          <h3 id="auto-rate-limit-reset-title">Автоматический сброс лимитов</h3>
+          <small>Настройка действует только для текущего аккаунта Codex.</small>
+        </div>
+        <span className={`auto-rate-limit-reset-state ${snapshot.state}`} role="status">
+          {AUTO_RESET_STATE_LABELS[snapshot.state]}
+        </span>
+      </div>
+      <label className="auto-rate-limit-reset-control">
+        <input
+          type="checkbox"
+          checked={snapshot.enabled}
+          disabled={!snapshot.supported || busy}
+          aria-describedby={descriptionId}
+          onChange={(event) => void onSave(event.currentTarget.checked)}
+        />
+        <span>
+          Автоматически использовать сохранённый сброс, когда лимит Codex остановит задачу
+        </span>
+      </label>
+      <p id={descriptionId} className="auto-rate-limit-reset-warning">
+        Сброс будет потрачен только после подтверждённой остановки из-за лимита. Он действует на
+        весь аккаунт, сбрасывает подходящие окна и может изменить дату следующего недельного сброса.
+      </p>
+      {!snapshot.supported && (
+        <p className="auto-rate-limit-reset-note">
+          Автоматический сброс доступен только для поддерживаемого аккаунта ChatGPT.
+        </p>
+      )}
+      <p className="auto-rate-limit-reset-availability">{availableText}</p>
+      {busy && (
+        <p className="auto-rate-limit-reset-notice" role="status" aria-live="polite">
+          Сохраняем настройку…
+        </p>
+      )}
+      {outcomeText && (
+        <p
+          className={`auto-rate-limit-reset-notice ${failure ? 'error' : 'success'}`}
+          role={failure ? 'alert' : 'status'}
+          aria-live={failure ? 'assertive' : 'polite'}
+        >
+          {outcomeText}
+        </p>
+      )}
+      {snapshot.message && !outcomeText && (
+        <p
+          className={`auto-rate-limit-reset-notice ${failure ? 'error' : ''}`}
+          role={failure ? 'alert' : 'status'}
+          aria-live={failure ? 'assertive' : 'polite'}
+        >
+          {snapshot.message}
+        </p>
+      )}
+      {error && (
+        <p className="auto-rate-limit-reset-notice error" role="alert">
+          {error}
+        </p>
+      )}
+    </section>
+  );
+}
+
 function SubagentMenu({
   subagents,
   interruptingIds,
@@ -2661,10 +2767,13 @@ function Diagnostics({
   resourceLimits,
   resourceBusy,
   resourceError,
+  autoRateLimitResetBusy,
+  autoRateLimitResetError,
   thread,
   onRefreshResources,
   onSaveResources,
   onApplyResources,
+  onSaveAutoRateLimitReset,
   onStartAccountLogin,
   onApplyCodexUpdate,
   onCheckCodexUpdate,
@@ -2681,10 +2790,13 @@ function Diagnostics({
   resourceLimits: ResourceLimitSnapshot | null;
   resourceBusy: boolean;
   resourceError: string | null;
+  autoRateLimitResetBusy: boolean;
+  autoRateLimitResetError: string | null;
   thread: Thread | null;
   onRefreshResources: () => void;
   onSaveResources: (desired: ResourceLimitPolicy) => Promise<void>;
   onApplyResources: () => Promise<void>;
+  onSaveAutoRateLimitReset: (enabled: boolean) => Promise<void>;
   onStartAccountLogin: () => void;
   onApplyCodexUpdate: () => void;
   onCheckCodexUpdate: () => void;
@@ -2835,6 +2947,12 @@ function Diagnostics({
             onRefresh={onRefreshResources}
             onSave={onSaveResources}
             onApply={onApplyResources}
+          />
+          <AutoRateLimitResetSettings
+            snapshot={capability.rateLimitReset}
+            busy={autoRateLimitResetBusy}
+            error={autoRateLimitResetError}
+            onSave={onSaveAutoRateLimitReset}
           />
           <h3>Лимиты аккаунта</h3>
           {capability.rateLimits?.length ? (
@@ -3146,6 +3264,8 @@ function Workspace({
   const [resourceLimits, setResourceLimits] = useState<ResourceLimitSnapshot | null>(null);
   const [resourceBusy, setResourceBusy] = useState(false);
   const [resourceError, setResourceError] = useState<string | null>(null);
+  const [autoRateLimitResetBusy, setAutoRateLimitResetBusy] = useState(false);
+  const [autoRateLimitResetError, setAutoRateLimitResetError] = useState<string | null>(null);
   const [subagents, setSubagents] = useState<Subagent[]>([]);
   const [serverTurnNavigation, setServerTurnNavigation] = useState<TurnNavigationEntry[] | null>(
     null,
@@ -5037,6 +5157,27 @@ function Workspace({
     }
   }
 
+  async function saveAutoRateLimitReset(enabled: boolean) {
+    const snapshot = capability?.rateLimitReset;
+    if (!snapshot?.supported || !snapshot.accountBinding || autoRateLimitResetBusy) return;
+    setAutoRateLimitResetBusy(true);
+    setAutoRateLimitResetError(null);
+    try {
+      const next = await api.updateAutoRateLimitReset(session.csrfToken, {
+        enabled,
+        expectedVersion: snapshot.version,
+        accountBinding: snapshot.accountBinding,
+      });
+      setCapability((current) => (current ? { ...current, rateLimitReset: next } : current));
+    } catch (cause) {
+      setAutoRateLimitResetError(
+        `${errorMessage(cause)} Настройка не изменена — обновите статус и повторите попытку.`,
+      );
+    } finally {
+      setAutoRateLimitResetBusy(false);
+    }
+  }
+
   async function resolveApproval(
     approvalId: string,
     decision: 'accept' | 'acceptForSession' | 'decline' | 'cancel',
@@ -5698,10 +5839,13 @@ function Workspace({
           resourceLimits={resourceLimits}
           resourceBusy={resourceBusy}
           resourceError={resourceError}
+          autoRateLimitResetBusy={autoRateLimitResetBusy}
+          autoRateLimitResetError={autoRateLimitResetError}
           thread={selectedThread}
           onRefreshResources={() => void refreshResourceLimits()}
           onSaveResources={saveResourceLimits}
           onApplyResources={applyResourceLimits}
+          onSaveAutoRateLimitReset={saveAutoRateLimitReset}
           onStartAccountLogin={() => void startAccountLogin()}
           onApplyCodexUpdate={() => void applyCodexUpdate()}
           onCheckCodexUpdate={() => void checkCodexUpdate()}

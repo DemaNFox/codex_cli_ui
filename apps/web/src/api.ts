@@ -1,5 +1,6 @@
 import type {
   Attachment,
+  AutoRateLimitResetSnapshot,
   ApprovalPolicy,
   Capability,
   CodexAccountLogin,
@@ -288,6 +289,20 @@ export const api = {
         csrfToken,
         body: input,
       }),
+    ),
+  updateAutoRateLimitReset: async (
+    csrfToken: string,
+    input: { enabled: boolean; expectedVersion: number; accountBinding: string },
+  ) =>
+    unwrapData(
+      await request<AutoRateLimitResetSnapshot | { data: AutoRateLimitResetSnapshot }>(
+        '/api/system/rate-limit-reset',
+        {
+          method: 'PUT',
+          csrfToken,
+          body: input,
+        },
+      ),
     ),
   resourceLimits: async () =>
     unwrapData(
@@ -613,6 +628,7 @@ export const api = {
 
 export type {
   Attachment,
+  AutoRateLimitResetSnapshot,
   Capability,
   CodexAccountLogin,
   CodexUpdateSnapshot,

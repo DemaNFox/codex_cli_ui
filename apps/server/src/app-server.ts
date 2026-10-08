@@ -83,6 +83,7 @@ const ALLOWED_REQUESTS = new Set([
   'account/login/start',
   'account/read',
   'account/rateLimits/read',
+  'account/rateLimitResetCredit/consume',
   'account/usage/read',
   'model/list',
   'skills/list',

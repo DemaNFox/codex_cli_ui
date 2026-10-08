@@ -1,5 +1,6 @@
 import type {
   Attachment,
+  AutoRateLimitResetSnapshot,
   PendingApproval,
   Project,
   ResourceLimitPolicy,
@@ -97,6 +98,18 @@ interface QueuedTurnRow {
   dismissed_at: string | null;
   created_at: string;
   updated_at: string;
+  source: QueuedTurnRecord['source'];
+  origin_turn_id: string | null;
+  account_fingerprint: string | null;
+  blocked: number;
+}
+
+interface TurnExecutionIntentRow {
+  turn_id: string;
+  thread_id: string;
+  request_json: string;
+  account_fingerprint: string | null;
+  created_at: string;
 }
 
 interface SubagentRow {
@@ -201,6 +214,33 @@ export interface QueuedTurnRecord {
   dismissedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  source: 'user' | 'rate-limit-continuation';
+  originTurnId: string | null;
+  accountFingerprint: string | null;
+  blocked: boolean;
+}
+
+export interface StoredAutoRateLimitReset {
+  enabled: boolean;
+  availableCount: number | null;
+  state: AutoRateLimitResetSnapshot['state'];
+  version: number;
+  updatedAt: string;
+  lastOutcome: AutoRateLimitResetSnapshot['lastOutcome'];
+  lastOutcomeAt: string | null;
+  resumedTaskCount: number;
+  message: string | null;
+}
+
+export interface RateLimitResetAttempt {
+  accountFingerprint: string;
+  idempotencyKey: string;
+  creditId: string | null;
+  state: 'pending' | 'redeeming' | 'recovering' | 'succeeded' | 'terminal';
+  outcome: AutoRateLimitResetSnapshot['lastOutcome'];
+  attempts: number;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export const MAX_QUEUED_TURNS = 128;
@@ -218,6 +258,10 @@ function queuedTurnFromRow(row: QueuedTurnRow): QueuedTurnRecord {
     dismissedAt: row.dismissed_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
+    source: row.source,
+    originTurnId: row.origin_turn_id,
+    accountFingerprint: row.account_fingerprint,
+    blocked: row.blocked === 1,
   };
 }
 
@@ -505,11 +549,47 @@ export class SqliteRepository {
         status TEXT NOT NULL CHECK(status IN ('queued','dispatching','unknown','failed')),
         error_code TEXT,
         dismissed_at TEXT,
+        source TEXT NOT NULL DEFAULT 'user' CHECK(source IN ('user','rate-limit-continuation')),
+        origin_turn_id TEXT,
+        account_fingerprint TEXT,
+        blocked INTEGER NOT NULL DEFAULT 0 CHECK(blocked IN (0,1)),
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(thread_id,idempotency_key)
       );
       CREATE INDEX IF NOT EXISTS queued_turns_fifo_idx ON queued_turns(status,id);
+
+      CREATE TABLE IF NOT EXISTS turn_execution_intents (
+        turn_id TEXT PRIMARY KEY,
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        request_json TEXT NOT NULL,
+        account_fingerprint TEXT,
+        created_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS auto_rate_limit_reset_preferences (
+        account_fingerprint TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
+        available_count INTEGER CHECK(available_count IS NULL OR available_count >= 0),
+        state TEXT NOT NULL DEFAULT 'idle' CHECK(state IN ('idle','waiting','redeeming','recovering','failed')),
+        version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0),
+        updated_at TEXT NOT NULL,
+        last_outcome TEXT CHECK(last_outcome IS NULL OR last_outcome IN ('reset','alreadyRedeemed','nothingToReset','noCredit','failed')),
+        last_outcome_at TEXT,
+        resumed_task_count INTEGER NOT NULL DEFAULT 0 CHECK(resumed_task_count >= 0),
+        message TEXT
+      );
+
+      CREATE TABLE IF NOT EXISTS rate_limit_reset_attempts (
+        account_fingerprint TEXT PRIMARY KEY,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        credit_id TEXT,
+        state TEXT NOT NULL CHECK(state IN ('pending','redeeming','recovering','succeeded','terminal')),
+        outcome TEXT CHECK(outcome IS NULL OR outcome IN ('reset','alreadyRedeemed','nothingToReset','noCredit','failed')),
+        attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
 
       CREATE TABLE IF NOT EXISTS audit_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -567,6 +647,11 @@ export class SqliteRepository {
     this.migrateThreadActiveTurn();
     this.migrateAttachmentFileDeletionDueTime();
     this.migrateQueuedTurnDismissal();
+    this.migrateQueuedTurnRecoveryColumns();
+    this.migrateTurnExecutionIntentAccount();
+    this.database.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS queued_turn_recovery_origin_idx ON queued_turns(thread_id,origin_turn_id) WHERE source='rate-limit-continuation' AND origin_turn_id IS NOT NULL",
+    );
     this.recoverInterruptedQueuedTurns();
     this.enforcePushStorageBounds();
   }
@@ -590,6 +675,40 @@ export class SqliteRepository {
     }[];
     if (!columns.some((column) => column.name === 'dismissed_at'))
       this.database.exec('ALTER TABLE queued_turns ADD COLUMN dismissed_at TEXT');
+  }
+
+  private migrateQueuedTurnRecoveryColumns(): void {
+    const columns = this.database.prepare('PRAGMA table_info(queued_turns)').all() as unknown as {
+      name: string;
+    }[];
+    if (!columns.some((column) => column.name === 'source'))
+      this.database.exec(
+        "ALTER TABLE queued_turns ADD COLUMN source TEXT NOT NULL DEFAULT 'user' CHECK(source IN ('user','rate-limit-continuation'))",
+      );
+    if (!columns.some((column) => column.name === 'origin_turn_id'))
+      this.database.exec('ALTER TABLE queued_turns ADD COLUMN origin_turn_id TEXT');
+    if (!columns.some((column) => column.name === 'account_fingerprint'))
+      this.database.exec('ALTER TABLE queued_turns ADD COLUMN account_fingerprint TEXT');
+    if (!columns.some((column) => column.name === 'blocked'))
+      this.database.exec(
+        'ALTER TABLE queued_turns ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0 CHECK(blocked IN (0,1))',
+      );
+  }
+
+  private migrateTurnExecutionIntentAccount(): void {
+    const columns = this.database
+      .prepare('PRAGMA table_info(turn_execution_intents)')
+      .all() as unknown as { name: string }[];
+    if (!columns.some((column) => column.name === 'account_fingerprint'))
+      this.database.exec('ALTER TABLE turn_execution_intents ADD COLUMN account_fingerprint TEXT');
+    this.database.exec(`
+      DELETE FROM turn_execution_intents
+      WHERE turn_id NOT IN (
+        SELECT active_turn_id FROM threads WHERE active_turn_id IS NOT NULL
+      ) AND turn_id NOT IN (
+        SELECT origin_turn_id FROM queued_turns WHERE origin_turn_id IS NOT NULL
+      );
+    `);
   }
 
   private recoverInterruptedQueuedTurns(): void {
@@ -1321,6 +1440,222 @@ export class SqliteRepository {
     return this.getRuntimePreferences();
   }
 
+  getAutoRateLimitReset(accountFingerprint: string): StoredAutoRateLimitReset {
+    const row = this.database
+      .prepare('SELECT * FROM auto_rate_limit_reset_preferences WHERE account_fingerprint=?')
+      .get(accountFingerprint) as
+      | {
+          enabled: number;
+          available_count: number | null;
+          state: StoredAutoRateLimitReset['state'];
+          version: number;
+          updated_at: string;
+          last_outcome: StoredAutoRateLimitReset['lastOutcome'];
+          last_outcome_at: string | null;
+          resumed_task_count: number;
+          message: string | null;
+        }
+      | undefined;
+    return row
+      ? {
+          enabled: row.enabled === 1,
+          availableCount: row.available_count,
+          state: row.state,
+          version: row.version,
+          updatedAt: row.updated_at,
+          lastOutcome: row.last_outcome,
+          lastOutcomeAt: row.last_outcome_at,
+          resumedTaskCount: row.resumed_task_count,
+          message: row.message,
+        }
+      : {
+          enabled: false,
+          availableCount: null,
+          state: 'idle',
+          version: 0,
+          updatedAt: new Date(0).toISOString(),
+          lastOutcome: null,
+          lastOutcomeAt: null,
+          resumedTaskCount: 0,
+          message: null,
+        };
+  }
+
+  hasEnabledAutoRateLimitReset(): boolean {
+    return (
+      this.database
+        .prepare('SELECT 1 FROM auto_rate_limit_reset_preferences WHERE enabled=1 LIMIT 1')
+        .get() !== undefined
+    );
+  }
+
+  setAutoRateLimitResetEnabled(
+    accountFingerprint: string,
+    enabled: boolean,
+    expectedVersion: number,
+  ): StoredAutoRateLimitReset | undefined {
+    const now = new Date().toISOString();
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const existing = this.database
+        .prepare(
+          'SELECT version FROM auto_rate_limit_reset_preferences WHERE account_fingerprint=?',
+        )
+        .get(accountFingerprint) as { version: number } | undefined;
+      let changed = 0;
+      if (!existing && expectedVersion === 0)
+        changed = Number(
+          this.database
+            .prepare(
+              `INSERT INTO auto_rate_limit_reset_preferences(account_fingerprint,enabled,available_count,state,version,updated_at,last_outcome,last_outcome_at,resumed_task_count,message)
+               VALUES(?,?,NULL,'idle',1,?,NULL,NULL,0,NULL)`,
+            )
+            .run(accountFingerprint, enabled ? 1 : 0, now).changes,
+        );
+      else if (existing)
+        changed = Number(
+          this.database
+            .prepare(
+              `UPDATE auto_rate_limit_reset_preferences
+               SET enabled=?,version=version+1,updated_at=?,state=CASE WHEN ?=0 THEN 'idle' ELSE state END,
+                   message=CASE WHEN ?=0 THEN NULL ELSE message END
+               WHERE account_fingerprint=? AND version=?`,
+            )
+            .run(
+              enabled ? 1 : 0,
+              now,
+              enabled ? 1 : 0,
+              enabled ? 1 : 0,
+              accountFingerprint,
+              expectedVersion,
+            ).changes,
+        );
+      if (changed !== 1) {
+        this.database.exec('ROLLBACK');
+        return undefined;
+      }
+      this.database.exec('COMMIT');
+      return this.getAutoRateLimitReset(accountFingerprint);
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  updateAutoRateLimitResetState(
+    accountFingerprint: string,
+    input: {
+      availableCount?: number | null;
+      state?: StoredAutoRateLimitReset['state'];
+      lastOutcome?: StoredAutoRateLimitReset['lastOutcome'];
+      recordOutcome?: boolean;
+      resumedTaskCountDelta?: number;
+      message?: string | null;
+    },
+  ): StoredAutoRateLimitReset {
+    const current = this.getAutoRateLimitReset(accountFingerprint);
+    const now = new Date().toISOString();
+    this.database
+      .prepare(
+        `INSERT INTO auto_rate_limit_reset_preferences(account_fingerprint,enabled,available_count,state,version,updated_at,last_outcome,last_outcome_at,resumed_task_count,message)
+         VALUES(?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(account_fingerprint) DO UPDATE SET
+           available_count=excluded.available_count,state=excluded.state,updated_at=excluded.updated_at,
+           last_outcome=excluded.last_outcome,last_outcome_at=excluded.last_outcome_at,
+           resumed_task_count=excluded.resumed_task_count,message=excluded.message`,
+      )
+      .run(
+        accountFingerprint,
+        current.enabled ? 1 : 0,
+        input.availableCount === undefined ? current.availableCount : input.availableCount,
+        input.state ?? current.state,
+        current.version,
+        now,
+        input.recordOutcome ? (input.lastOutcome ?? null) : current.lastOutcome,
+        input.recordOutcome ? now : current.lastOutcomeAt,
+        current.resumedTaskCount + (input.resumedTaskCountDelta ?? 0),
+        input.message === undefined ? current.message : input.message,
+      );
+    return this.getAutoRateLimitReset(accountFingerprint);
+  }
+
+  getRateLimitResetAttempt(accountFingerprint: string): RateLimitResetAttempt | undefined {
+    const row = this.database
+      .prepare('SELECT * FROM rate_limit_reset_attempts WHERE account_fingerprint=?')
+      .get(accountFingerprint) as
+      | {
+          account_fingerprint: string;
+          idempotency_key: string;
+          credit_id: string | null;
+          state: RateLimitResetAttempt['state'];
+          outcome: RateLimitResetAttempt['outcome'];
+          attempts: number;
+          created_at: string;
+          updated_at: string;
+        }
+      | undefined;
+    return row
+      ? {
+          accountFingerprint: row.account_fingerprint,
+          idempotencyKey: row.idempotency_key,
+          creditId: row.credit_id,
+          state: row.state,
+          outcome: row.outcome,
+          attempts: row.attempts,
+          createdAt: row.created_at,
+          updatedAt: row.updated_at,
+        }
+      : undefined;
+  }
+
+  beginRateLimitResetAttempt(
+    accountFingerprint: string,
+    creditId: string | null,
+  ): RateLimitResetAttempt {
+    const current = this.getRateLimitResetAttempt(accountFingerprint);
+    if (current && ['pending', 'redeeming', 'recovering'].includes(current.state)) return current;
+    const now = new Date().toISOString();
+    this.database
+      .prepare(
+        `INSERT INTO rate_limit_reset_attempts(account_fingerprint,idempotency_key,credit_id,state,outcome,attempts,created_at,updated_at)
+         VALUES(?,?,?,'pending',NULL,0,?,?)
+         ON CONFLICT(account_fingerprint) DO UPDATE SET idempotency_key=excluded.idempotency_key,
+           credit_id=excluded.credit_id,state='pending',outcome=NULL,attempts=0,
+           created_at=excluded.created_at,updated_at=excluded.updated_at`,
+      )
+      .run(accountFingerprint, randomUUID(), creditId, now, now);
+    return this.getRateLimitResetAttempt(accountFingerprint)!;
+  }
+
+  setRateLimitResetAttemptState(
+    accountFingerprint: string,
+    idempotencyKey: string,
+    state: RateLimitResetAttempt['state'],
+    outcome: RateLimitResetAttempt['outcome'] = null,
+    incrementAttempts = false,
+  ): RateLimitResetAttempt | undefined {
+    const result = this.database
+      .prepare(
+        `UPDATE rate_limit_reset_attempts SET state=?,outcome=?,
+         attempts=attempts+?,updated_at=? WHERE account_fingerprint=? AND idempotency_key=?`,
+      )
+      .run(
+        state,
+        outcome,
+        incrementAttempts ? 1 : 0,
+        new Date().toISOString(),
+        accountFingerprint,
+        idempotencyKey,
+      );
+    return result.changes === 1 ? this.getRateLimitResetAttempt(accountFingerprint) : undefined;
+  }
+
+  clearRateLimitResetAttempt(accountFingerprint: string): void {
+    this.database
+      .prepare('DELETE FROM rate_limit_reset_attempts WHERE account_fingerprint=?')
+      .run(accountFingerprint);
+  }
+
   getResourceLimits(): StoredResourceLimits {
     this.database
       .prepare(
@@ -1577,18 +1912,20 @@ export class SqliteRepository {
     return this.getThread(id);
   }
 
-  resetActiveThreadRuntime(): string[] {
-    const threadIds = (
+  resetActiveThreadRuntime(): Array<{ threadId: string; turnId: string | null }> {
+    const interrupted = (
       this.database
-        .prepare("SELECT id FROM threads WHERE active_turn_id IS NOT NULL OR status='active'")
-        .all() as unknown as Array<{ id: string }>
-    ).map((row) => row.id);
+        .prepare(
+          "SELECT id AS thread_id,active_turn_id AS turn_id FROM threads WHERE active_turn_id IS NOT NULL OR status='active'",
+        )
+        .all() as unknown as Array<{ thread_id: string; turn_id: string | null }>
+    ).map((row) => ({ threadId: row.thread_id, turnId: row.turn_id }));
     this.database
       .prepare(
         "UPDATE threads SET status=CASE WHEN status='active' THEN 'notLoaded' ELSE status END,active_turn_id=NULL WHERE active_turn_id IS NOT NULL OR status='active'",
       )
       .run();
-    return threadIds;
+    return interrupted;
   }
 
   createAttachment(input: Omit<AttachmentRecord, 'turnId' | 'createdAt'>): AttachmentRecord {
@@ -1689,6 +2026,243 @@ export class SqliteRepository {
       this.database
         .prepare('UPDATE attachments SET turn_id=NULL WHERE thread_id=? AND turn_id=?')
         .run(threadId, claimToken).changes,
+    );
+  }
+
+  recordTurnExecutionIntent(
+    turnId: string,
+    threadId: string,
+    request: StartTurnRequest,
+    accountFingerprint: string | null = null,
+  ): void {
+    this.database
+      .prepare(
+        `INSERT INTO turn_execution_intents(turn_id,thread_id,request_json,account_fingerprint,created_at)
+         VALUES(?,?,?,?,?) ON CONFLICT(turn_id) DO NOTHING`,
+      )
+      .run(turnId, threadId, JSON.stringify(request), accountFingerprint, new Date().toISOString());
+  }
+
+  deleteTurnExecutionIntent(turnId: string, threadId: string): boolean {
+    return (
+      this.database
+        .prepare('DELETE FROM turn_execution_intents WHERE turn_id=? AND thread_id=?')
+        .run(turnId, threadId).changes === 1
+    );
+  }
+
+  enqueueRateLimitContinuation(input: {
+    threadId: string;
+    originTurnId: string;
+    accountFingerprint?: string | null;
+    text: string;
+  }): { record: QueuedTurnRecord; created: boolean } | undefined {
+    const existing = this.database
+      .prepare(
+        "SELECT * FROM queued_turns WHERE thread_id=? AND origin_turn_id=? AND source='rate-limit-continuation'",
+      )
+      .get(input.threadId, input.originTurnId) as QueuedTurnRow | undefined;
+    if (existing) return { record: queuedTurnFromRow(existing), created: false };
+    const intent = this.database
+      .prepare('SELECT * FROM turn_execution_intents WHERE turn_id=? AND thread_id=?')
+      .get(input.originTurnId, input.threadId) as TurnExecutionIntentRow | undefined;
+    if (!intent?.account_fingerprint) return undefined;
+    const original = JSON.parse(intent.request_json) as StartTurnRequest;
+    const request: StartTurnRequest = {
+      text: input.text,
+      attachmentIds: [],
+      ...(original.model === undefined ? {} : { model: original.model }),
+      ...(original.reasoningEffort === undefined
+        ? {}
+        : { reasoningEffort: original.reasoningEffort }),
+      ...(original.permissionPreset === undefined
+        ? {}
+        : { permissionPreset: original.permissionPreset }),
+      ...(original.approvalPolicy === undefined ? {} : { approvalPolicy: original.approvalPolicy }),
+      idempotencyKey: randomUUID(),
+    };
+    const requestJson = JSON.stringify(request);
+    const requestHash = createHash('sha256').update(requestJson).digest('hex');
+    const operation = `turn:${input.threadId}`;
+    const claimToken = `queued:${input.threadId}:${request.idempotencyKey}`;
+    const now = new Date().toISOString();
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const duplicate = this.database
+        .prepare(
+          "SELECT * FROM queued_turns WHERE thread_id=? AND origin_turn_id=? AND source='rate-limit-continuation'",
+        )
+        .get(input.threadId, input.originTurnId) as QueuedTurnRow | undefined;
+      if (duplicate) {
+        this.database.exec('COMMIT');
+        return { record: queuedTurnFromRow(duplicate), created: false };
+      }
+      const count = this.database
+        .prepare(
+          "SELECT COUNT(*) AS count FROM queued_turns WHERE status IN ('queued','dispatching')",
+        )
+        .get() as { count: number };
+      if (count.count >= MAX_QUEUED_TURNS) throw new TurnQueueStorageLimitError();
+      this.database
+        .prepare(
+          `INSERT INTO idempotency(operation,key,request_hash,state,response_json,created_at,updated_at)
+           VALUES(?,?,?,'pending',NULL,?,?)`,
+        )
+        .run(operation, request.idempotencyKey, requestHash, now, now);
+      const inserted = this.database
+        .prepare(
+          `INSERT INTO queued_turns(thread_id,idempotency_key,request_hash,request_json,claim_token,status,error_code,dismissed_at,source,origin_turn_id,account_fingerprint,blocked,created_at,updated_at)
+           VALUES(?,?,?,?,?,'queued',NULL,NULL,'rate-limit-continuation',?,?,1,?,?)`,
+        )
+        .run(
+          input.threadId,
+          request.idempotencyKey,
+          requestHash,
+          requestJson,
+          claimToken,
+          input.originTurnId,
+          input.accountFingerprint ?? intent.account_fingerprint,
+          now,
+          now,
+        );
+      const id = Number(inserted.lastInsertRowid);
+      const response = {
+        data: {
+          status: 'queued',
+          queuedTurn: {
+            id,
+            threadId: input.threadId,
+            status: 'queued',
+            position: 1,
+            textPreview: request.text.slice(0, 240),
+            attachmentCount: 0,
+            createdAt: now,
+          },
+        },
+      };
+      this.database
+        .prepare(
+          `UPDATE idempotency SET state='completed',response_json=?,updated_at=?
+           WHERE operation=? AND key=? AND request_hash=? AND state='pending'`,
+        )
+        .run(JSON.stringify(response), now, operation, request.idempotencyKey, requestHash);
+      this.database
+        .prepare('DELETE FROM turn_execution_intents WHERE turn_id=? AND thread_id=?')
+        .run(input.originTurnId, input.threadId);
+      this.database.exec('COMMIT');
+      return { record: this.getQueuedTurn(id)!, created: true };
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  releaseRateLimitContinuations(accountFingerprint: string): number {
+    return Number(
+      this.database
+        .prepare(
+          "UPDATE queued_turns SET blocked=0,updated_at=? WHERE source='rate-limit-continuation' AND account_fingerprint=? AND blocked=1 AND status='queued'",
+        )
+        .run(new Date().toISOString(), accountFingerprint).changes,
+    );
+  }
+
+  completeRateLimitRecovery(
+    accountFingerprint: string,
+    input: { availableCount: number | null; outcome: 'reset' | 'alreadyRedeemed' | null },
+  ): number {
+    const now = new Date().toISOString();
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const released = Number(
+        this.database
+          .prepare(
+            "UPDATE queued_turns SET blocked=0,updated_at=? WHERE source='rate-limit-continuation' AND account_fingerprint=? AND blocked=1 AND status='queued'",
+          )
+          .run(now, accountFingerprint).changes,
+      );
+      this.database
+        .prepare(
+          `UPDATE auto_rate_limit_reset_preferences
+           SET available_count=?,state='idle',updated_at=?,
+               last_outcome=COALESCE(?,last_outcome),
+               last_outcome_at=CASE WHEN ? IS NULL THEN last_outcome_at ELSE ? END,
+               resumed_task_count=resumed_task_count+?,message=NULL
+           WHERE account_fingerprint=?`,
+        )
+        .run(
+          input.availableCount,
+          now,
+          input.outcome,
+          input.outcome,
+          now,
+          released,
+          accountFingerprint,
+        );
+      this.database
+        .prepare('DELETE FROM rate_limit_reset_attempts WHERE account_fingerprint=?')
+        .run(accountFingerprint);
+      this.database.exec('COMMIT');
+      return released;
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  bindBlockedRateLimitContinuations(accountFingerprint: string): number {
+    return Number(
+      this.database
+        .prepare(
+          "UPDATE queued_turns SET account_fingerprint=?,updated_at=? WHERE source='rate-limit-continuation' AND blocked=1 AND account_fingerprint IS NULL AND status='queued'",
+        )
+        .run(accountFingerprint, new Date().toISOString()).changes,
+    );
+  }
+
+  discardBlockedRateLimitContinuations(accountFingerprint: string | null): number {
+    const predicate =
+      accountFingerprint === null ? 'account_fingerprint IS NULL' : 'account_fingerprint=?';
+    const args = accountFingerprint === null ? [] : [accountFingerprint];
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const rows = this.database
+        .prepare(
+          `SELECT thread_id,idempotency_key,request_hash FROM queued_turns
+           WHERE source='rate-limit-continuation' AND blocked=1 AND status='queued' AND ${predicate}`,
+        )
+        .all(...args) as unknown as Array<{
+        thread_id: string;
+        idempotency_key: string;
+        request_hash: string;
+      }>;
+      const removeIdempotency = this.database.prepare(
+        'DELETE FROM idempotency WHERE operation=? AND key=? AND request_hash=?',
+      );
+      for (const row of rows)
+        removeIdempotency.run(`turn:${row.thread_id}`, row.idempotency_key, row.request_hash);
+      const removed = this.database
+        .prepare(
+          `DELETE FROM queued_turns
+           WHERE source='rate-limit-continuation' AND blocked=1 AND status='queued' AND ${predicate}`,
+        )
+        .run(...args).changes;
+      this.database.exec('COMMIT');
+      return Number(removed);
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  hasBlockedRateLimitContinuations(accountFingerprint?: string): boolean {
+    return (
+      this.database
+        .prepare(
+          `SELECT 1 FROM queued_turns WHERE source='rate-limit-continuation' AND blocked=1
+           ${accountFingerprint === undefined ? '' : 'AND account_fingerprint=?'} LIMIT 1`,
+        )
+        .get(...(accountFingerprint === undefined ? [] : [accountFingerprint])) !== undefined
     );
   }
 
@@ -2005,6 +2579,27 @@ export class SqliteRepository {
     );
   }
 
+  setQueuedTurnAccountFingerprint(id: number, accountFingerprint: string | null): boolean {
+    return (
+      this.database
+        .prepare(
+          "UPDATE queued_turns SET account_fingerprint=?,updated_at=? WHERE id=? AND status='dispatching'",
+        )
+        .run(accountFingerprint, new Date().toISOString(), id).changes === 1
+    );
+  }
+
+  reblockRateLimitContinuation(id: number): boolean {
+    return (
+      this.database
+        .prepare(
+          `UPDATE queued_turns SET status='queued',blocked=1,error_code=NULL,updated_at=?
+           WHERE id=? AND status='dispatching' AND source='rate-limit-continuation'`,
+        )
+        .run(new Date().toISOString(), id).changes === 1
+    );
+  }
+
   markQueuedTurnUnknown(id: number, errorCode: string): boolean {
     const record = this.getQueuedTurn(id);
     if (!record || record.status !== 'dispatching') return false;
@@ -2029,13 +2624,23 @@ export class SqliteRepository {
     }
   }
 
-  completeQueuedTurn(id: number, turnId: string): boolean {
+  completeQueuedTurn(
+    id: number,
+    turnId: string,
+    accountFingerprint: string | null = null,
+  ): boolean {
     const record = this.getQueuedTurn(id);
     if (!record || (record.status !== 'dispatching' && record.status !== 'unknown')) return false;
     const now = new Date().toISOString();
     const response = { data: { status: 'started', turnId } };
     this.database.exec('BEGIN IMMEDIATE');
     try {
+      this.database
+        .prepare(
+          `INSERT INTO turn_execution_intents(turn_id,thread_id,request_json,account_fingerprint,created_at)
+           VALUES(?,?,?,?,?) ON CONFLICT(turn_id) DO NOTHING`,
+        )
+        .run(turnId, record.threadId, JSON.stringify(record.request), accountFingerprint, now);
       if (record.request.attachmentIds.length > 0)
         this.database
           .prepare('UPDATE attachments SET turn_id=? WHERE thread_id=? AND turn_id=?')
