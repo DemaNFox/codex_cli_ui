@@ -38,6 +38,8 @@ def main() -> int:
     codex_update_state = "ready"
     queued_turn_visible = True
     ambiguous_turn_visible = True
+    thread_detail_reads = 0
+    outage_released = False
     project_archived = False
     resource_snapshot = {
         "capacity": {
@@ -76,6 +78,8 @@ def main() -> int:
         nonlocal resource_snapshot
         nonlocal queued_turn_visible
         nonlocal ambiguous_turn_visible
+        nonlocal thread_detail_reads
+        nonlocal outage_released
         nonlocal project_archived
         request = route.request
         parsed = urlparse(request.url)
@@ -457,6 +461,22 @@ def main() -> int:
                 },
             )
         elif path == "/api/threads/t1" and request.method == "GET":
+            thread_detail_reads += 1
+            if (
+                os.environ.get("CODEX_WEB_OUTAGE_ONLY") == "1"
+                and not outage_released
+            ):
+                payload(
+                    route,
+                    503,
+                    {
+                        "error": {
+                            "code": "APP_SERVER_UNAVAILABLE",
+                            "message": "Codex временно недоступен",
+                        }
+                    },
+                )
+                return
             payload(
                 route,
                 200,
@@ -634,8 +654,24 @@ def main() -> int:
         ):
             if request.headers.get("x-csrf-token") != "csrf-smoke":
                 raise AssertionError("queued turn reconciliation did not carry CSRF protection")
-            ambiguous_turn_visible = False
-            payload(route, 200, {"data": {"status": "resolved", "turnId": "turn-ambiguous"}})
+            action = request.post_data_json.get("action")
+            if action == "dismissLocal":
+                ambiguous_turn_visible = False
+                payload(route, 200, {"data": {"status": "dismissed"}})
+            elif action == "check":
+                payload(
+                    route,
+                    200,
+                    {
+                        "data": {
+                            "status": "stillNeedsReview",
+                            "reason": "notFound",
+                            "canDismissLocal": True,
+                        }
+                    },
+                )
+            else:
+                raise AssertionError(f"unexpected queued turn reconciliation action: {action}")
         elif path == "/api/threads/t1/queued-turns/17" and request.method == "DELETE":
             if request.headers.get("x-csrf-token") != "csrf-smoke":
                 raise AssertionError("queued turn cancellation did not carry CSRF protection")
@@ -1059,6 +1095,24 @@ def main() -> int:
         page.get_by_label("Пароль").fill("correct-horse-battery-staple")
         page.get_by_role("button", name="Войти").click()
         page.get_by_role("heading", name="Переносимый чат").wait_for()
+        if os.environ.get("CODEX_WEB_OUTAGE_ONLY") == "1":
+            page.get_by_text("Чат временно недоступен", exact=True).wait_for()
+            if page.get_by_text("Что будем делать?", exact=True).count():
+                raise AssertionError("selected chat outage rendered the new-chat welcome state")
+            outage_released = True
+            page.get_by_role("button", name="Повторить загрузку").click()
+            page.get_by_text("Проверить активную задачу", exact=True).wait_for()
+            page.get_by_text("Чат временно недоступен", exact=True).wait_for(
+                state="detached"
+            )
+            overflow = page.locator(".chat-panel").evaluate(
+                "element => element.scrollWidth - element.clientWidth"
+            )
+            if overflow > 1:
+                raise AssertionError(f"outage recovery introduced horizontal overflow: {overflow}")
+            browser.close()
+            print("browser-smoke: selected chat outage recovery passed")
+            return 0
         page.set_viewport_size({"width": 1440, "height": 900})
         page.get_by_label("Меню проекта Demo").click()
         page.get_by_role("menuitem", name="Архивировать проект").click()
@@ -1088,13 +1142,19 @@ def main() -> int:
             queued_region.get_by_text("Требует проверки", exact=True).wait_for()
             queued_region.get_by_role("button", name="Новый чат").wait_for()
             queued_region.get_by_role("button", name="Проверить сейчас").click()
+            queued_region.get_by_role(
+                "button", name="Скрыть локальную запись"
+            ).wait_for()
+            queued_region.get_by_role(
+                "button", name="Скрыть локальную запись"
+            ).click()
             queued_region.wait_for(state="detached")
             page.get_by_text(
-                "Запуск задачи найден в Codex. Чат обновлён; повторная отправка не выполнялась.",
+                "Запись скрыта локально. Чат можно архивировать, но возможная задача Codex не была остановлена.",
                 exact=True,
             ).wait_for()
             browser.close()
-            print("browser-smoke: ambiguous turn reconciliation passed")
+            print("browser-smoke: ambiguous turn local dismissal passed")
             return 0
         page.set_viewport_size({"width": 390, "height": 600})
         if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1":

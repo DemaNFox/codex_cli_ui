@@ -442,7 +442,12 @@ export const api = {
   reconcileQueuedTurn: (csrfToken: string, threadId: string, queuedTurnId: number) =>
     request<ReconcileQueuedTurnResult | { data: ReconcileQueuedTurnResult }>(
       `/api/threads/${encodeURIComponent(threadId)}/queued-turns/${encodeURIComponent(String(queuedTurnId))}/reconcile`,
-      { method: 'POST', csrfToken },
+      { method: 'POST', csrfToken, body: { action: 'check' } },
+    ).then(unwrapData),
+  dismissAmbiguousQueuedTurn: (csrfToken: string, threadId: string, queuedTurnId: number) =>
+    request<ReconcileQueuedTurnResult | { data: ReconcileQueuedTurnResult }>(
+      `/api/threads/${encodeURIComponent(threadId)}/queued-turns/${encodeURIComponent(String(queuedTurnId))}/reconcile`,
+      { method: 'POST', csrfToken, body: { action: 'dismissLocal' } },
     ).then(unwrapData),
   uploadAttachment,
   transcribeAudio,

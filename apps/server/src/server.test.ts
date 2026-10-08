@@ -4143,6 +4143,26 @@ describe('Codex routes', () => {
     expect(response.json()).toMatchObject({ error: { code: 'APP_SERVER_CWD_MISMATCH' } });
   });
 
+  it('serves persisted chat navigation during a transient app-server list outage', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.failNextRequestWith = new AppServerRequestError('notSent', 'APP_SERVER_UNAVAILABLE');
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({
+      data: [expect.objectContaining({ id: threadId, projectId: project.id, archived: false })],
+      nextCursor: null,
+    });
+  });
+
   it('returns safe journal history instead of raw app-server turns', async () => {
     const { app, appServer, projectPath } = await fixture();
     const session = await login(app);
@@ -5860,6 +5880,30 @@ describe('Codex routes', () => {
     expect(replay.json()).toEqual(saved.json());
   });
 
+  it('passes the selected model to the next new root turn', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'use selected model',
+        model: 'gpt-5.6-sol',
+        reasoningEffort: 'medium',
+        idempotencyKey: '44000000-0000-4000-8000-000000000001',
+      },
+    });
+
+    expect(response.statusCode).toBe(202);
+    expect(
+      appServer.requests.find((request) => request.method === 'turn/start')?.params,
+    ).toMatchObject({ model: 'gpt-5.6-sol', effort: 'medium' });
+  });
+
   it('drains only new turns and reports pending plus active work in health', async () => {
     const { app, appServer, projectPath, upgradeDrainPath } = await fixture();
     const session = await login(app);
@@ -7221,6 +7265,7 @@ describe('Codex routes', () => {
       method: 'POST',
       url: `/api/threads/${threadId}/queued-turns/${queued.id}/reconcile`,
       headers: session.headers,
+      payload: { action: 'dismissLocal' },
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({
@@ -7238,6 +7283,93 @@ describe('Codex routes', () => {
         .prepare("SELECT outcome FROM audit_events WHERE action='turn.queue.reconcile.manual'")
         .get(),
     ).toEqual({ outcome: 'succeeded' });
+  });
+
+  it('allows an absent ambiguous start to be hidden locally without claiming native cancellation', async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-queue-local-dismiss-'));
+    const appServer = new FakeAppServer();
+    const first = await fixture(
+      1,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      { temp, appServer },
+    );
+    const firstSession = await login(first.app);
+    const project = await createProject(first.app, first.projectPath, firstSession.headers);
+    const threadId = await createThread(first.app, project.id, firstSession.headers);
+    const key = '43000000-0000-4000-8000-000000000006';
+    const queued = seedUnknownQueuedTurn(first.repository, threadId, key, 'safe to discard later');
+    await first.app.close();
+    openApps.splice(openApps.indexOf(first.app), 1);
+
+    const second = await fixture(
+      1,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      { temp, appServer },
+    );
+    const session = await login(second.app);
+
+    const checked = await second.app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/queued-turns/${queued.id}/reconcile`,
+      headers: session.headers,
+      payload: { action: 'check' },
+    });
+    expect(checked.statusCode).toBe(200);
+    expect(checked.json()).toEqual({
+      data: { status: 'stillNeedsReview', reason: 'notFound', canDismissLocal: true },
+    });
+
+    const cancelled = await second.app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/queued-turns/${queued.id}/reconcile`,
+      headers: session.headers,
+      payload: { action: 'dismissLocal' },
+    });
+    expect(cancelled.statusCode).toBe(200);
+    expect(cancelled.json()).toEqual({ data: { status: 'dismissed' } });
+    const dismissed = second.repository.getQueuedTurn(queued.id);
+    expect(dismissed?.status).toBe('unknown');
+    expect(typeof dismissed?.dismissedAt).toBe('string');
+    expect(second.repository.getIdempotent(`turn:${threadId}`, key)).toMatchObject({
+      state: 'unknown',
+    });
+    expect(
+      appServer.requests.filter(
+        (request) => request.method === 'turn/start' || request.method === 'turn/interrupt',
+      ),
+    ).toHaveLength(0);
+    const readsAfterDismiss = appServer.requests.filter(
+      (request) => request.method === 'thread/read',
+    ).length;
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(appServer.requests.filter((request) => request.method === 'thread/read')).toHaveLength(
+      readsAfterDismiss,
+    );
+
+    const archive = await second.app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/archive`,
+      headers: session.headers,
+    });
+    expect(archive.statusCode).toBe(200);
   });
 
   it('projects recovered in-progress evidence before dispatching a queued follower', async () => {
@@ -7322,7 +7454,7 @@ describe('Codex routes', () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({
-      data: { status: 'stillNeedsReview', reason: 'notFound' },
+      data: { status: 'stillNeedsReview', reason: 'notFound', canDismissLocal: true },
     });
     expect(repository.getQueuedTurn(queued.id)?.status).toBe('unknown');
     expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(0);
@@ -7352,7 +7484,7 @@ describe('Codex routes', () => {
     });
     expect(response.statusCode).toBe(200);
     expect(response.json()).toEqual({
-      data: { status: 'stillNeedsReview', reason: 'readFailed' },
+      data: { status: 'stillNeedsReview', reason: 'readFailed', canDismissLocal: false },
     });
     expect(repository.getQueuedTurn(queued.id)?.status).toBe('unknown');
     expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(0);
@@ -7931,7 +8063,7 @@ describe('Codex routes', () => {
     expect(appServer.requests.filter((item) => item.method === 'turn/start')).toHaveLength(0);
   });
 
-  it('serves hydrated journal history when a post-restart metadata refresh fails', async () => {
+  it('serves hydrated journal history when a post-restart metadata refresh is unavailable', async () => {
     const { app, appServer, repository, projectPath } = await fixture();
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
@@ -7952,7 +8084,7 @@ describe('Codex routes', () => {
     });
 
     appServer.restart();
-    appServer.failNextRequestWith = new Error('thread/read unavailable');
+    appServer.failNextRequestWith = new AppServerRequestError('notSent', 'APP_SERVER_UNAVAILABLE');
     const response = await app.inject({
       method: 'GET',
       url: `/api/threads/${thread.id}`,
@@ -7965,6 +8097,47 @@ describe('Codex routes', () => {
       events: [{ kind: 'warning', payload: { message: 'retained safe history' } }],
     });
     expect(appServer.requests.filter((item) => item.method === 'thread/read')).toHaveLength(1);
+  });
+
+  it('does not mask a rejected thread history request as an offline fallback', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    repository.database.prepare('DELETE FROM thread_history_state WHERE thread_id=?').run(threadId);
+    appServer.restart();
+    appServer.failNextRequestWith = new AppServerRequestError(
+      'rejected',
+      'APP_SERVER_REQUEST_FAILED',
+    );
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toMatchObject({ error: { code: 'INTERNAL_ERROR' } });
+  });
+
+  it('does not mask a rejected native thread list as cached navigation', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    appServer.failNextRequestWith = new AppServerRequestError(
+      'rejected',
+      'APP_SERVER_REQUEST_FAILED',
+    );
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${encodeURIComponent(project.id)}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(500);
+    expect(response.json()).toMatchObject({ error: { code: 'INTERNAL_ERROR' } });
   });
 
   it('marks an ambiguous turn/start failure unknown and never retries it', async () => {
