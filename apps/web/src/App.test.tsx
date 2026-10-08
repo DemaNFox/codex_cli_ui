@@ -79,6 +79,19 @@ const capabilities = {
       secondary: null,
     },
   ],
+  rateLimitReset: {
+    supported: true,
+    accountBinding: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+    enabled: false,
+    availableCount: 2,
+    state: 'idle' as const,
+    version: 1,
+    updatedAt: '2026-10-08T10:00:00.000Z',
+    lastOutcome: null,
+    lastOutcomeAt: null,
+    resumedTaskCount: 0,
+    message: null,
+  },
   usage: {
     summary: {
       lifetimeTokens: 123456,
@@ -4781,6 +4794,130 @@ describe('App', () => {
     expect(screen.getAllByText('1.2.3').length).toBeGreaterThan(0);
     expect(screen.getByText('Подготовленное обновление отсутствует.')).not.toBeNull();
     expect(screen.queryByRole('button', { name: 'Обновить Codex' })).toBeNull();
+  });
+
+  it('saves the account-wide automatic rate-limit reset without optimistic UI state', async () => {
+    let resolveUpdate: ((response: Response) => void) | undefined;
+    const updateResponse = new Promise<Response>((resolve) => {
+      resolveUpdate = resolve;
+    });
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/system/rate-limit-reset' && init?.method === 'PUT') {
+        return updateResponse;
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    const diagnostics = await screen.findByRole('complementary', { name: 'Статус Codex' });
+    const checkbox = within(diagnostics).getByRole('checkbox', {
+      name: 'Автоматически использовать сохранённый сброс, когда лимит Codex остановит задачу',
+    });
+    expect((checkbox as HTMLInputElement).checked).toBe(false);
+    expect((checkbox as HTMLInputElement).disabled).toBe(false);
+    expect(within(diagnostics).getByText('Доступно сохранённых сбросов: 2')).not.toBeNull();
+    expect(
+      within(diagnostics).getByText(
+        'Сброс будет потрачен только после подтверждённой остановки из-за лимита. Он действует на весь аккаунт, сбрасывает подходящие окна и может изменить дату следующего недельного сброса.',
+      ),
+    ).not.toBeNull();
+
+    await user.click(checkbox);
+    expect((checkbox as HTMLInputElement).checked).toBe(false);
+    expect((checkbox as HTMLInputElement).disabled).toBe(true);
+    expect(within(diagnostics).getByText('Сохраняем настройку…')).not.toBeNull();
+    const updateCall = fetchMock.mock.calls.find(
+      ([input]) => requestUrl(input) === '/api/system/rate-limit-reset',
+    );
+    expect(updateCall?.[1]).toEqual(
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({
+          enabled: true,
+          expectedVersion: 1,
+          accountBinding: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        }),
+      }),
+    );
+    expect(new Headers(updateCall?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf-token');
+
+    resolveUpdate?.(
+      jsonResponse({
+        data: {
+          ...capabilities.rateLimitReset,
+          enabled: true,
+          availableCount: 1,
+          version: 2,
+          updatedAt: '2026-10-08T10:01:00.000Z',
+          lastOutcome: 'reset',
+          lastOutcomeAt: '2026-10-08T10:01:00.000Z',
+          resumedTaskCount: 3,
+        },
+      }),
+    );
+    await waitFor(() => expect((checkbox as HTMLInputElement).checked).toBe(true));
+    expect((checkbox as HTMLInputElement).disabled).toBe(false);
+    expect(within(diagnostics).getByText('Доступно сохранённых сбросов: 1')).not.toBeNull();
+    expect(within(diagnostics).getByText('Сброс применён · продолжено задач: 3')).not.toBeNull();
+  });
+
+  it('keeps zero-credit automation available and exposes a safe failure state', async () => {
+    installAuthenticatedApi((url) => {
+      if (url !== '/api/system/capabilities?threadId=thread-1') return undefined;
+      return jsonResponse({
+        ...capabilities,
+        rateLimitReset: {
+          ...capabilities.rateLimitReset,
+          availableCount: 0,
+          state: 'failed',
+          lastOutcome: 'failed',
+          message: 'internal detail must not replace safe copy',
+        },
+      });
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    const checkbox = screen.getByRole('checkbox', {
+      name: 'Автоматически использовать сохранённый сброс, когда лимит Codex остановит задачу',
+    });
+    expect((checkbox as HTMLInputElement).disabled).toBe(false);
+    expect(screen.getByText('Сохранённых сбросов нет')).not.toBeNull();
+    expect(screen.getByRole('alert').textContent).toBe(
+      'Не удалось применить сброс — задачи остаются в ожидании.',
+    );
+  });
+
+  it('disables automatic reset when the account does not support it', async () => {
+    installAuthenticatedApi((url) => {
+      if (url !== '/api/system/capabilities?threadId=thread-1') return undefined;
+      return jsonResponse({
+        ...capabilities,
+        rateLimitReset: {
+          ...capabilities.rateLimitReset,
+          supported: false,
+          availableCount: null,
+        },
+      });
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    expect(
+      screen.getByRole<HTMLInputElement>('checkbox', {
+        name: 'Автоматически использовать сохранённый сброс, когда лимит Codex остановит задачу',
+      }).disabled,
+    ).toBe(true);
+    expect(screen.getByText('Количество сбросов временно недоступно')).not.toBeNull();
+    expect(
+      screen.getByText(
+        'Автоматический сброс доступен только для поддерживаемого аккаунта ChatGPT.',
+      ),
+    ).not.toBeNull();
   });
 
   it('separates current-chat estimates from account usage across local calendar periods', async () => {

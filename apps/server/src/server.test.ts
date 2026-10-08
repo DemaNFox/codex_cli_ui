@@ -7,6 +7,7 @@ import {
 } from '@codex-web/contracts';
 import { hash } from 'argon2';
 import { EventEmitter } from 'node:events';
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, rename, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createNetServer } from 'node:net';
 import os from 'node:os';
@@ -66,6 +67,8 @@ class FakeAppServer implements AppServerClient {
   private signalThreadStart: (() => void) | null = null;
   private threadListGate: Promise<void> | null = null;
   private signalThreadList: (() => void) | null = null;
+  private resetCreditGate: Promise<void> | null = null;
+  private signalResetCredit: (() => void) | null = null;
   private failArchiveAfterMutation = false;
   private failArchiveReconciliationList = false;
   private readonly archivedThreadIds = new Set<string>();
@@ -91,6 +94,24 @@ class FakeAppServer implements AppServerClient {
     verificationUrl: 'https://auth.openai.com/codex/device',
   };
   threadUsageResponse: unknown = null;
+  rateLimitsResponse: unknown = {
+    accountId: 'private-account-id',
+    ordinaryUsageAllowed: true,
+    rateLimitResetCredits: { availableCount: 0, credits: [] },
+    rateLimits: { limitId: 'legacy', primary: { usedPercent: 99 } },
+    rateLimitsByLimitId: {
+      codex: {
+        limitId: 'codex',
+        limitName: 'Codex',
+        planType: 'plus',
+        primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1_800_000_000 },
+        secondary: null,
+        credits: { balance: 'secret' },
+      },
+    },
+  };
+  resetCreditOutcome: 'reset' | 'nothingToReset' | 'noCredit' | 'alreadyRedeemed' = 'reset';
+  afterResetRateLimitsResponse: unknown = null;
 
   blockTurnStarts(): { entered: Promise<void>; release: () => void } {
     let releaseGate!: () => void;
@@ -102,6 +123,19 @@ class FakeAppServer implements AppServerClient {
       signalEntered = resolve;
     });
     this.signalTurnStart = signalEntered;
+    return { entered, release: releaseGate };
+  }
+
+  blockResetCreditConsume(): { entered: Promise<void>; release: () => void } {
+    let releaseGate!: () => void;
+    let signalEntered!: () => void;
+    this.resetCreditGate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve;
+    });
+    this.signalResetCredit = signalEntered;
     return { entered, release: releaseGate };
   }
 
@@ -415,23 +449,16 @@ class FakeAppServer implements AppServerClient {
     if (method === 'account/read') return { account: this.account, requiresOpenaiAuth: true };
     if (method === 'account/rateLimits/read') {
       if (this.failAccountStatusReads) throw new Error('unsupported status method');
-      return {
-        accountId: 'private-account-id',
-        rateLimits: {
-          limitId: 'legacy',
-          primary: { usedPercent: 99 },
-        },
-        rateLimitsByLimitId: {
-          codex: {
-            limitId: 'codex',
-            limitName: 'Codex',
-            planType: 'plus',
-            primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1_800_000_000 },
-            secondary: null,
-            credits: { balance: 'secret' },
-          },
-        },
-      };
+      return this.rateLimitsResponse;
+    }
+    if (method === 'account/rateLimitResetCredit/consume') {
+      this.signalResetCredit?.();
+      this.signalResetCredit = null;
+      if (this.resetCreditGate) await this.resetCreditGate;
+      this.resetCreditGate = null;
+      if (this.afterResetRateLimitsResponse !== null)
+        this.rateLimitsResponse = this.afterResetRateLimitsResponse;
+      return { outcome: this.resetCreditOutcome };
     }
     if (method === 'account/usage/read') {
       const requestedThreadId =
@@ -938,6 +965,11 @@ describe('security and repository boundary', () => {
     await expect(supervisor.request('account/usage/read', null)).rejects.toThrow(
       'APP_SERVER_UNAVAILABLE',
     );
+    await expect(
+      supervisor.request('account/rateLimitResetCredit/consume', {
+        idempotencyKey: '0199ee8d-239b-7000-8000-000000000001',
+      }),
+    ).rejects.toThrow('APP_SERVER_UNAVAILABLE');
     await expect(
       supervisor.request('account/login/start', { type: 'chatgptDeviceCode' }),
     ).rejects.toThrow('APP_SERVER_UNAVAILABLE');
@@ -2954,6 +2986,682 @@ describe('Codex routes', () => {
       sourceKinds: ['cli', 'vscode', 'appServer', 'exec'],
     });
     expect(appServer.requests.filter((item) => item.method === 'thread/list')).toHaveLength(2);
+  });
+
+  it('stores automatic reset consent per account with versioned compare-and-set', async () => {
+    const { app, appServer } = await fixture();
+    const session = await login(app);
+    const initial = await app.inject({
+      method: 'GET',
+      url: '/api/system/capabilities',
+      headers: { cookie: session.cookie },
+    });
+    expect(initial.statusCode).toBe(200);
+    const accountBinding = initial.json<{ rateLimitReset: { accountBinding: string } }>()
+      .rateLimitReset.accountBinding;
+    expect(initial.json()).toMatchObject({
+      rateLimitReset: {
+        supported: true,
+        enabled: false,
+        availableCount: 0,
+        state: 'idle',
+        version: 0,
+      },
+    });
+
+    const enabled = await app.inject({
+      method: 'PUT',
+      url: '/api/system/rate-limit-reset',
+      headers: session.headers,
+      payload: { enabled: true, expectedVersion: 0, accountBinding },
+    });
+    expect(enabled.statusCode).toBe(200);
+    expect(enabled.json()).toMatchObject({
+      data: { supported: true, enabled: true, version: 1 },
+    });
+    expect(enabled.body).not.toContain('private-account-id');
+
+    const stale = await app.inject({
+      method: 'PUT',
+      url: '/api/system/rate-limit-reset',
+      headers: session.headers,
+      payload: { enabled: false, expectedVersion: 0, accountBinding },
+    });
+    expect(stale.statusCode).toBe(409);
+    expect(stale.json()).toEqual({
+      error: {
+        code: 'RATE_LIMIT_RESET_VERSION_CONFLICT',
+        message: 'RATE_LIMIT_RESET_VERSION_CONFLICT',
+      },
+    });
+
+    appServer.rateLimitsResponse = {
+      ...(appServer.rateLimitsResponse as Record<string, unknown>),
+      accountId: 'different-private-account-id',
+    };
+    const switched = await app.inject({
+      method: 'GET',
+      url: '/api/system/capabilities',
+      headers: { cookie: session.cookie },
+    });
+    expect(switched.statusCode).toBe(200);
+    expect(switched.json()).toMatchObject({
+      rateLimitReset: { supported: true, enabled: false, version: 0 },
+    });
+    expect(switched.body).not.toContain('different-private-account-id');
+    const staleAccount = await app.inject({
+      method: 'PUT',
+      url: '/api/system/rate-limit-reset',
+      headers: session.headers,
+      payload: { enabled: true, expectedVersion: 0, accountBinding },
+    });
+    expect(staleAccount.statusCode).toBe(409);
+    expect(staleAccount.json<{ error: { code: string } }>().error.code).toBe(
+      'RATE_LIMIT_RESET_ACCOUNT_CHANGED',
+    );
+  });
+
+  it('persists an account-bound quota continuation across restart and discards it while opt-in is off', async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-rate-limit-reset-'));
+    const databasePath = path.join(temp, 'codex-web.sqlite3');
+    const first = new SqliteRepository(databasePath, 1_000);
+    const project = first.createProject({
+      name: 'Demo',
+      path: path.join(temp, 'demo'),
+      defaultModel: 'gpt-6.1-sol',
+      defaultReasoningEffort: 'high',
+      defaultPermissionPreset: 'workspace-write',
+    });
+    const now = new Date().toISOString();
+    first.upsertThread({
+      id: 'thread-rate-limit',
+      projectId: project.id,
+      name: null,
+      preview: '',
+      model: null,
+      status: 'idle',
+      activeTurnId: null,
+      archived: false,
+      instructionSources: [],
+      createdAt: now,
+      updatedAt: now,
+    });
+    const accountFingerprint = createHash('sha256').update('private-account-id').digest('hex');
+    first.recordTurnExecutionIntent(
+      'turn-rate-limit',
+      'thread-rate-limit',
+      {
+        text: 'Original task',
+        attachmentIds: [],
+        model: 'gpt-6.1-sol',
+        reasoningEffort: 'high',
+        permissionPreset: 'workspace-write',
+        approvalPolicy: 'on-request',
+        idempotencyKey: '00000000-0000-4000-8000-000000000071',
+      },
+      accountFingerprint,
+    );
+    expect(
+      first.enqueueRateLimitContinuation({
+        threadId: 'thread-rate-limit',
+        originTurnId: 'turn-rate-limit',
+        text: 'Continue safely.',
+      })?.created,
+    ).toBe(true);
+    expect(first.hasBlockedRateLimitContinuations()).toBe(true);
+    first.close();
+
+    const restarted = new SqliteRepository(databasePath, 1_000);
+    expect(restarted.hasBlockedRateLimitContinuations()).toBe(true);
+    expect(restarted.discardBlockedRateLimitContinuations(accountFingerprint)).toBe(1);
+    expect(restarted.hasBlockedRateLimitContinuations()).toBe(false);
+    expect(restarted.listQueuedTurns()).toEqual([]);
+    restarted.close();
+  });
+
+  it('consumes one earned reset and releases one deduplicated continuation after authoritative recovery', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const blockedLimits = {
+      accountId: 'private-account-id',
+      ordinaryUsageAllowed: false,
+      rateLimitResetCredits: {
+        availableCount: 1,
+        credits: [
+          {
+            id: 'private-credit-id',
+            resetType: 'codexRateLimits',
+            status: 'available',
+            grantedAt: 1_700_000_000,
+            expiresAt: null,
+          },
+        ],
+      },
+      rateLimits: {
+        limitId: 'codex',
+        rateLimitReachedType: 'rate_limit_reached',
+        primary: { usedPercent: 100 },
+      },
+      rateLimitsByLimitId: null,
+    };
+    appServer.rateLimitsResponse = blockedLimits;
+    appServer.afterResetRateLimitsResponse = {
+      ...blockedLimits,
+      ordinaryUsageAllowed: true,
+      rateLimitResetCredits: { availableCount: 0, credits: [] },
+      rateLimits: { limitId: 'codex', rateLimitReachedType: null, primary: { usedPercent: 0 } },
+    };
+    const accountBinding = (
+      await app.inject({
+        method: 'GET',
+        url: '/api/system/capabilities',
+        headers: { cookie: session.cookie },
+      })
+    ).json<{ rateLimitReset: { accountBinding: string } }>().rateLimitReset.accountBinding;
+    const enabled = await app.inject({
+      method: 'PUT',
+      url: '/api/system/rate-limit-reset',
+      headers: session.headers,
+      payload: { enabled: true, expectedVersion: 0, accountBinding },
+    });
+    expect(enabled.statusCode).toBe(200);
+    repository.recordTurnExecutionIntent(
+      'failed-limit-turn',
+      threadId,
+      {
+        text: 'Finish the original task',
+        attachmentIds: [],
+        model: 'gpt-6.1-sol',
+        reasoningEffort: 'high',
+        permissionPreset: 'workspace-write',
+        approvalPolicy: 'on-request',
+        idempotencyKey: '00000000-0000-4000-8000-000000000072',
+      },
+      createHash('sha256').update('private-account-id').digest('hex'),
+    );
+    const failed = {
+      method: 'turn/completed' as const,
+      params: {
+        threadId,
+        turn: {
+          id: 'failed-limit-turn',
+          status: 'failed',
+          error: { codexErrorInfo: 'usageLimitExceeded' },
+        },
+      },
+    };
+    appServer.emit(failed);
+    appServer.emit(failed);
+
+    await vi.waitFor(() => {
+      expect(
+        appServer.requests.filter(
+          (request) => request.method === 'account/rateLimitResetCredit/consume',
+        ),
+      ).toHaveLength(1);
+      expect(
+        appServer.requests.filter(
+          (request) =>
+            request.method === 'turn/start' &&
+            JSON.stringify(request.params).includes('Продолжи незавершённую работу'),
+        ),
+      ).toHaveLength(1);
+    });
+    expect(repository.listQueuedTurns()).toEqual([]);
+    const capabilities = await app.inject({
+      method: 'GET',
+      url: '/api/system/capabilities',
+      headers: { cookie: session.cookie },
+    });
+    expect(capabilities.json()).toMatchObject({
+      rateLimitReset: {
+        enabled: true,
+        state: 'idle',
+        availableCount: 0,
+        lastOutcome: 'reset',
+        resumedTaskCount: 1,
+      },
+    });
+    expect(capabilities.body).not.toContain('private-credit-id');
+  });
+
+  it('finishes an issued reset with the same key when the preference is disabled in flight', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const blockedLimits = {
+      accountId: 'private-account-id',
+      ordinaryUsageAllowed: false,
+      rateLimitResetCredits: { availableCount: 1, credits: null },
+      rateLimits: {
+        limitId: 'codex',
+        rateLimitReachedType: 'rate_limit_reached',
+        primary: { usedPercent: 100 },
+      },
+      rateLimitsByLimitId: null,
+    };
+    appServer.rateLimitsResponse = blockedLimits;
+    appServer.afterResetRateLimitsResponse = {
+      ...blockedLimits,
+      ordinaryUsageAllowed: true,
+      rateLimitResetCredits: { availableCount: 0, credits: [] },
+      rateLimits: { limitId: 'codex', rateLimitReachedType: null, primary: { usedPercent: 0 } },
+    };
+    const accountBinding = (
+      await app.inject({
+        method: 'GET',
+        url: '/api/system/capabilities',
+        headers: { cookie: session.cookie },
+      })
+    ).json<{ rateLimitReset: { accountBinding: string } }>().rateLimitReset.accountBinding;
+    expect(
+      (
+        await app.inject({
+          method: 'PUT',
+          url: '/api/system/rate-limit-reset',
+          headers: session.headers,
+          payload: { enabled: true, expectedVersion: 0, accountBinding },
+        })
+      ).statusCode,
+    ).toBe(200);
+    repository.recordTurnExecutionIntent(
+      'failed-inflight-reset',
+      threadId,
+      {
+        text: 'Finish safely',
+        attachmentIds: [],
+        approvalPolicy: 'on-request',
+        idempotencyKey: '00000000-0000-4000-8000-000000000073',
+      },
+      createHash('sha256').update('private-account-id').digest('hex'),
+    );
+    const consume = appServer.blockResetCreditConsume();
+    appServer.emit({
+      method: 'turn/completed',
+      params: {
+        threadId,
+        turn: {
+          id: 'failed-inflight-reset',
+          status: 'failed',
+          error: { codexErrorInfo: 'rateLimitExceeded' },
+        },
+      },
+    });
+    await consume.entered;
+
+    const loginDuringRecovery = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/login',
+      headers: session.headers,
+      payload: { type: 'chatgptDeviceCode' },
+    });
+    expect(loginDuringRecovery.statusCode).toBe(409);
+    expect(loginDuringRecovery.json()).toMatchObject({
+      error: { code: 'CODEX_ACCOUNT_LOGIN_BUSY' },
+    });
+
+    const disabled = await app.inject({
+      method: 'PUT',
+      url: '/api/system/rate-limit-reset',
+      headers: session.headers,
+      payload: { enabled: false, expectedVersion: 1, accountBinding },
+    });
+    expect(disabled.statusCode).toBe(200);
+    expect(disabled.json()).toMatchObject({ data: { enabled: false, version: 2 } });
+    consume.release();
+
+    await vi.waitFor(() => {
+      expect(
+        appServer.requests.filter(
+          (request) => request.method === 'account/rateLimitResetCredit/consume',
+        ),
+      ).toHaveLength(1);
+      expect(
+        appServer.requests.filter(
+          (request) =>
+            request.method === 'turn/start' &&
+            JSON.stringify(request.params).includes('Продолжи незавершённую работу'),
+        ),
+      ).toHaveLength(1);
+    });
+    expect(repository.hasBlockedRateLimitContinuations()).toBe(false);
+  });
+
+  it('reconstructs a missed quota completion before releasing capacity', async () => {
+    const { app, appServer, repository, projectPath } = await fixture(1);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const firstThreadId = await createThread(app, project.id, session.headers);
+    const secondThreadId = await createThread(app, project.id, session.headers);
+    const blockedLimits = {
+      accountId: 'private-account-id',
+      ordinaryUsageAllowed: false,
+      rateLimitResetCredits: { availableCount: 1, credits: null },
+      rateLimits: {
+        limitId: 'codex',
+        rateLimitReachedType: 'rate_limit_reached',
+        primary: { usedPercent: 100 },
+      },
+      rateLimitsByLimitId: null,
+    };
+    appServer.rateLimitsResponse = blockedLimits;
+    appServer.afterResetRateLimitsResponse = {
+      ...blockedLimits,
+      ordinaryUsageAllowed: true,
+      rateLimitResetCredits: { availableCount: 0, credits: [] },
+      rateLimits: { limitId: 'codex', rateLimitReachedType: null, primary: { usedPercent: 0 } },
+    };
+    const accountBinding = (
+      await app.inject({
+        method: 'GET',
+        url: '/api/system/capabilities',
+        headers: { cookie: session.cookie },
+      })
+    ).json<{ rateLimitReset: { accountBinding: string } }>().rateLimitReset.accountBinding;
+    expect(
+      (
+        await app.inject({
+          method: 'PUT',
+          url: '/api/system/rate-limit-reset',
+          headers: session.headers,
+          payload: { enabled: true, expectedVersion: 0, accountBinding },
+        })
+      ).statusCode,
+    ).toBe(200);
+    const started = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${firstThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Long task interrupted by quota',
+        idempotencyKey: '00000000-0000-4000-8000-000000000074',
+      },
+    });
+    const turnId = started.json<{ data: { turnId: string } }>().data.turnId;
+    appServer.setThreadStatus(firstThreadId, 'idle');
+    appServer.setThreadTurns(firstThreadId, [
+      {
+        id: turnId,
+        status: 'failed',
+        error: { codexErrorInfo: 'usageLimitExceeded' },
+        items: [],
+      },
+    ]);
+
+    await app.inject({
+      method: 'POST',
+      url: `/api/threads/${secondThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Follower',
+        idempotencyKey: '00000000-0000-4000-8000-000000000075',
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(
+        appServer.requests.filter(
+          (request) => request.method === 'account/rateLimitResetCredit/consume',
+        ),
+      ).toHaveLength(1);
+      expect(
+        repository
+          .listQueuedTurns(firstThreadId)
+          .some((record) => record.source === 'rate-limit-continuation' && !record.blocked),
+      ).toBe(true);
+    });
+    expect(repository.hasBlockedRateLimitContinuations()).toBe(false);
+  });
+
+  it('reconstructs a quota completion missed across an API restart', async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-web-quota-restart-'));
+    const appServer = new FakeAppServer();
+    const first = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      { temp, appServer },
+    );
+    const firstSession = await login(first.app);
+    const project = await createProject(first.app, first.projectPath, firstSession.headers);
+    const firstThreadId = await createThread(first.app, project.id, firstSession.headers);
+    const secondThreadId = await createThread(first.app, project.id, firstSession.headers);
+    const blockedLimits = {
+      accountId: 'private-account-id',
+      ordinaryUsageAllowed: false,
+      rateLimitResetCredits: { availableCount: 1, credits: null },
+      rateLimits: {
+        limitId: 'codex',
+        rateLimitReachedType: 'rate_limit_reached',
+        primary: { usedPercent: 100 },
+      },
+      rateLimitsByLimitId: null,
+    };
+    appServer.rateLimitsResponse = blockedLimits;
+    appServer.afterResetRateLimitsResponse = {
+      ...blockedLimits,
+      ordinaryUsageAllowed: true,
+      rateLimitResetCredits: { availableCount: 0, credits: [] },
+      rateLimits: { limitId: 'codex', rateLimitReachedType: null, primary: { usedPercent: 0 } },
+    };
+    const accountBinding = (
+      await first.app.inject({
+        method: 'GET',
+        url: '/api/system/capabilities',
+        headers: { cookie: firstSession.cookie },
+      })
+    ).json<{ rateLimitReset: { accountBinding: string } }>().rateLimitReset.accountBinding;
+    await first.app.inject({
+      method: 'PUT',
+      url: '/api/system/rate-limit-reset',
+      headers: firstSession.headers,
+      payload: { enabled: true, expectedVersion: 0, accountBinding },
+    });
+    const started = await first.app.inject({
+      method: 'POST',
+      url: `/api/threads/${firstThreadId}/turns`,
+      headers: firstSession.headers,
+      payload: {
+        text: 'Survive an API restart',
+        idempotencyKey: '00000000-0000-4000-8000-000000000078',
+      },
+    });
+    const turnId = started.json<{ data: { turnId: string } }>().data.turnId;
+    appServer.setThreadStatus(firstThreadId, 'idle');
+    appServer.setThreadTurns(firstThreadId, [
+      {
+        id: turnId,
+        status: 'failed',
+        error: { codexErrorInfo: 'rateLimitExceeded' },
+        items: [],
+      },
+    ]);
+    await first.app.close();
+    openApps.splice(openApps.indexOf(first.app), 1);
+
+    const second = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      { temp, appServer },
+    );
+    const secondSession = await login(second.app);
+    await second.app.inject({
+      method: 'POST',
+      url: `/api/threads/${secondThreadId}/turns`,
+      headers: secondSession.headers,
+      payload: {
+        text: 'Follower after restart',
+        idempotencyKey: '00000000-0000-4000-8000-000000000079',
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(
+        appServer.requests.filter(
+          (request) => request.method === 'account/rateLimitResetCredit/consume',
+        ),
+      ).toHaveLength(1);
+      expect(
+        second.repository
+          .listQueuedTurns(firstThreadId)
+          .some((record) => record.source === 'rate-limit-continuation' && !record.blocked) ||
+          appServer.requests.some(
+            (request) =>
+              request.method === 'turn/start' &&
+              JSON.stringify(request.params).includes('Продолжи незавершённую работу'),
+          ),
+      ).toBe(true);
+    });
+    const consumeIndex = appServer.requests.findIndex(
+      (request) => request.method === 'account/rateLimitResetCredit/consume',
+    );
+    const followerIndex = appServer.requests.findIndex(
+      (request) =>
+        request.method === 'turn/start' &&
+        (request.params as { clientUserMessageId?: string }).clientUserMessageId ===
+          '00000000-0000-4000-8000-000000000079',
+    );
+    expect(consumeIndex).toBeGreaterThanOrEqual(0);
+    if (followerIndex >= 0) expect(followerIndex).toBeGreaterThan(consumeIndex);
+  });
+
+  it('reblocks a recovered continuation when another account becomes active before dispatch', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const fingerprint = createHash('sha256').update('private-account-id').digest('hex');
+    repository.setAutoRateLimitResetEnabled(fingerprint, true, 0);
+    repository.recordTurnExecutionIntent(
+      'cross-account-turn',
+      threadId,
+      {
+        text: 'Account A task',
+        attachmentIds: [],
+        idempotencyKey: '00000000-0000-4000-8000-000000000076',
+      },
+      fingerprint,
+    );
+    expect(
+      repository.enqueueRateLimitContinuation({
+        threadId,
+        originTurnId: 'cross-account-turn',
+        text: 'Continue only on account A.',
+      })?.created,
+    ).toBe(true);
+    repository.completeRateLimitRecovery(fingerprint, { availableCount: 0, outcome: 'reset' });
+    appServer.rateLimitsResponse = {
+      accountId: 'different-private-account-id',
+      ordinaryUsageAllowed: true,
+      rateLimitResetCredits: { availableCount: 0, credits: [] },
+      rateLimits: { limitId: 'codex', rateLimitReachedType: null, primary: { usedPercent: 0 } },
+      rateLimitsByLimitId: null,
+    };
+
+    await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Trigger dispatch',
+        idempotencyKey: '00000000-0000-4000-8000-000000000077',
+      },
+    });
+
+    await vi.waitFor(() => {
+      const continuation = repository
+        .listQueuedTurns(threadId)
+        .find((record) => record.source === 'rate-limit-continuation');
+      expect(continuation).toMatchObject({ blocked: true, accountFingerprint: fingerprint });
+    });
+    expect(
+      appServer.requests.some(
+        (request) =>
+          request.method === 'turn/start' &&
+          JSON.stringify(request.params).includes('Continue only on account A.'),
+      ),
+    ).toBe(false);
+    const activeTurnId = repository.getThread(threadId)?.activeTurnId;
+    expect(activeTurnId).toEqual(expect.any(String));
+    if (!activeTurnId) throw new Error('Expected the account-B trigger turn to be active');
+    appServer.setThreadStatus(threadId, 'idle');
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: activeTurnId, status: 'completed', items: [] } },
+    });
+
+    const blockedLimits = {
+      accountId: 'private-account-id',
+      ordinaryUsageAllowed: false,
+      rateLimitResetCredits: {
+        availableCount: 1,
+        credits: [
+          {
+            id: 'private-credit-id',
+            resetType: 'codexRateLimits',
+            status: 'available',
+            grantedAt: 1_700_000_000,
+            expiresAt: null,
+          },
+        ],
+      },
+      rateLimits: {
+        limitId: 'codex',
+        rateLimitReachedType: 'rate_limit_reached',
+        primary: { usedPercent: 100 },
+      },
+      rateLimitsByLimitId: null,
+    };
+    appServer.rateLimitsResponse = blockedLimits;
+    appServer.afterResetRateLimitsResponse = {
+      ...blockedLimits,
+      ordinaryUsageAllowed: true,
+      rateLimitResetCredits: { availableCount: 0, credits: [] },
+      rateLimits: { limitId: 'codex', rateLimitReachedType: null, primary: { usedPercent: 0 } },
+    };
+    await vi.waitFor(async () => {
+      const loginStarted = await app.inject({
+        method: 'POST',
+        url: '/api/system/codex-account/login',
+        headers: session.headers,
+        payload: { type: 'chatgptDeviceCode' },
+      });
+      expect(loginStarted.statusCode).toBe(202);
+    });
+    appServer.emit({
+      method: 'account/login/completed',
+      params: { loginId: 'login-1', success: true },
+    });
+
+    await vi.waitFor(() => {
+      expect(
+        appServer.requests.filter(
+          (request) =>
+            request.method === 'turn/start' &&
+            JSON.stringify(request.params).includes('Continue only on account A.'),
+        ),
+      ).toHaveLength(1);
+    });
   });
 
   it('reports only safe aggregated usage for a selected repository thread', async () => {
@@ -5116,7 +5824,7 @@ describe('Codex routes', () => {
     });
   });
 
-  it('clears stale turn and subagent activity when the app-server disconnects', async () => {
+  it('interrupts stale subagents but preserves root capacity until disconnect recovery', async () => {
     const { app, appServer, repository, projectPath } = await fixture();
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
@@ -5160,7 +5868,7 @@ describe('Codex routes', () => {
     const health = await app.inject({ method: 'GET', url: '/api/health' });
     expect(health.statusCode).toBe(503);
     expect(health.json()).toMatchObject({
-      upgradeDrain: { activeTurns: 0, activeSubagents: 0, activeExecutionUnits: 0 },
+      upgradeDrain: { activeTurns: 1, activeSubagents: 0, activeExecutionUnits: 1 },
     });
     const disconnectEvents = repository.listEvents(threadId, 0);
     expect(disconnectEvents).toEqual(
@@ -7023,6 +7731,7 @@ describe('Codex routes', () => {
     });
     await first.app.close();
     openApps.splice(openApps.indexOf(first.app), 1);
+    appServer.setThreadStatus(firstThreadId, 'idle');
 
     const second = await fixture(
       1,
@@ -7535,24 +8244,22 @@ describe('Codex routes', () => {
   });
 
   it('reconciles a missed root terminal before the no-broker capacity fallback rejects', async () => {
-    const { app, appServer, projectPath } = await fixture(1);
+    const { app, appServer, repository, projectPath } = await fixture(1);
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const firstThreadId = await createThread(app, project.id, session.headers);
     const secondThreadId = await createThread(app, project.id, session.headers);
-    expect(
-      (
-        await app.inject({
-          method: 'POST',
-          url: `/api/threads/${firstThreadId}/turns`,
-          headers: session.headers,
-          payload: {
-            text: 'first',
-            idempotencyKey: '00000000-0000-4000-8000-000000000290',
-          },
-        })
-      ).statusCode,
-    ).toBe(202);
+    const firstStarted = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${firstThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'first',
+        idempotencyKey: '00000000-0000-4000-8000-000000000290',
+      },
+    });
+    expect(firstStarted.statusCode).toBe(202);
+    const firstTurnId = firstStarted.json<{ data: { turnId: string } }>().data.turnId;
 
     appServer.setThreadStatus(firstThreadId, 'idle');
     const reconciled = await app.inject({
@@ -7573,6 +8280,11 @@ describe('Codex routes', () => {
           (request.params as { threadId?: string }).threadId === firstThreadId,
       ),
     ).toBe(true);
+    expect(
+      repository.database
+        .prepare('SELECT COUNT(*) AS count FROM turn_execution_intents WHERE turn_id=?')
+        .get(firstTurnId),
+    ).toEqual({ count: 0 });
   });
 
   it('counts and reconciles an unknown-id native active root before no-broker admission', async () => {

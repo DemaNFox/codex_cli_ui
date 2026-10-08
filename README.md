@@ -26,6 +26,11 @@ scopes: an estimate for the selected chat and dated totals for all token activit
 Account totals distinguish today, the trailing 7 and 30 days and all available time; unavailable per-chat
 breakdowns stay visibly unavailable instead of being inferred. `/skills` opens the same status surface at the
 loaded skills and instruction-source inventory.
+The Status drawer also contains a default-off setting for the current ChatGPT account that can spend one
+available earned Codex reset after a task is conclusively stopped by the resettable account limit. The server
+verifies the native failure and fresh account state, spends with a durable idempotency key, verifies recovery,
+then continues affected work through the normal queue. It does not purchase credits or act on percentages,
+workspace spend limits, unsupported authentication or an uncertain account state.
 The same Status drawer can replace the runner's Codex account through the official device-code flow when no
 task or subagent is running. The short-lived code is shown only to the authenticated owner; access and refresh
 tokens never pass through the Web application.
@@ -135,6 +140,11 @@ it is reconciled against Codex and is never retried blindly. An answer emitted b
 is shown as received while work continues; only a successful terminal turn is marked as the final answer.
 If the root finishes while descendants keep running, the header says so explicitly. Active execution state is
 also reconciled automatically, and a successful completion notification waits for the whole task tree to stop.
+If automatic reset is enabled and Codex terminates a root task at the eligible account limit, the visible task
+waits behind one account-wide recovery fence. Concurrent chats share the same reset attempt; after Codex
+confirms ordinary usage is available again, each stopped task receives at most one explicit, attachment-free
+continuation with its original runtime settings. Missing credits, an unsupported account, a lost or malformed
+response, an account change, or a still-blocked post-check stays visible and does not repeatedly spend resets.
 
 A new host needs only:
 

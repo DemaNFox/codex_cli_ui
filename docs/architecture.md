@@ -60,6 +60,15 @@ Browser
   output and total tokens. It does not expose billing-route groups or invent a historical reasoning-token split
   that the thread estimate does not provide. Account-wide and selected-thread failures degrade independently to
   `null` plus a static warning.
+- The Status drawer offers a separate, account-bound and default-off automatic reset policy for earned Codex
+  rate-limit resets. A native terminal limit error is only a wake-up signal: the backend closes account-wide
+  task admission, performs a fresh detailed `account/rateLimits/read`, verifies the same ChatGPT account,
+  `ordinaryUsageAllowed === false`, the resettable `rate_limit_reached` state and an available Codex reset,
+  then persists one idempotency key before requesting `account/rateLimitResetCredit/consume`. It never spends a
+  reset for API-key/Bedrock auth, workspace spend or credit limits, percentages, reset timestamps or sparse
+  notifications. `reset` and `alreadyRedeemed` still require a same-account post-read with ordinary usage
+  explicitly allowed before dispatch resumes; unavailable, malformed or ambiguous state remains fail closed.
+  The browser receives only availability, count and bounded lifecycle status, never account or credit IDs.
 - The authenticated owner can replace the runner's Codex account through the official app-server device-code
   flow. The API exposes the short-lived verification URL and one-time code only in process memory, never reads
   `CODEX_HOME`, and never receives an access or refresh token. Starting the flow atomically closes task
@@ -248,6 +257,16 @@ switching, service draining, resource-policy changes and degraded-capacity condi
 separate fail-closed states. Guidance sent to an already running turn continues to use the explicit steer path;
 the durable queue is only for new root turns.
 
+When the account-bound automatic reset policy is enabled, every accepted root start also retains the immutable
+execution settings needed for one attachment-free continuation. If that native turn terminally fails with a
+Codex usage/rate-limit error, the backend durably records the account-wide quota fence and a continuation keyed
+by the source turn before any queued follower can be dispatched. Concurrent failures share one reset attempt;
+duplicate notifications and restarts cannot create another continuation or redemption key. After verified
+recovery, continuations re-enter the existing dispatcher and remain subject to its archive, active-turn,
+ambiguous-start and host-capacity gates. A lost `turn/start` result is still never retried blindly. Disabling
+the policy prevents new attempts but cannot cancel a redemption already submitted upstream; that attempt is
+reconciled with its original key.
+
 The authenticated subagent projection exposes an addressable interrupt action for each active descendant. The
 server verifies that the selected child belongs to the requested root, discovers its live turn through an
 authoritative `thread/read`, and sends `turn/interrupt` only for that exact child turn. An ambiguous interrupt
@@ -302,6 +321,8 @@ Codex enter `needsReview`.
 - `POST/GET /api/threads/:id/attachments`, `GET/DELETE /api/threads/:id/attachments/:attachmentId`; uploads use multipart field `file`
 - `GET /api/system/capabilities`, with an optional registered `threadId`, for safe
   version/auth/instruction/skill, rate-limit, account-usage and selected-thread usage status
+- `PUT /api/system/rate-limit-reset` for the authenticated, CSRF-protected, versioned automatic-reset policy;
+  reset consumption itself is never exposed as a browser command
 - `POST /api/audio/transcriptions` for bounded ephemeral speech-to-text; uploads use multipart field `file`
 - `POST /api/threads/:id/push-subscriptions/status`, plus `PUT` and `DELETE` on
   `/api/threads/:id/push-subscriptions`, for a CSRF-protected per-device chat subscription

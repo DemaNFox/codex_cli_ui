@@ -1,6 +1,7 @@
 import {
   accountRateLimitSchema,
   accountUsageSchema,
+  autoRateLimitResetSnapshotSchema,
   applyCodexUpdateRequestSchema,
   attachmentSchema,
   capabilitySchema,
@@ -27,11 +28,13 @@ import {
   threadUsageSchema,
   threadListQuerySchema,
   updateRuntimePreferencesRequestSchema,
+  updateAutoRateLimitResetRequestSchema,
   updateResourceLimitsRequestSchema,
   applyResourceLimitsRequestSchema,
   userInputQuestionSchema,
   type PermissionPreset,
   type Attachment,
+  type AutoRateLimitResetSnapshot,
   type CodexAccount,
   type CodexAccountLogin,
   type CodexUpdateSnapshot,
@@ -47,7 +50,7 @@ import {
 } from '@codex-web/contracts';
 import cookie from '@fastify/cookie';
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { constants as fsConstants, lstatSync, type BigIntStats } from 'node:fs';
 import { open, realpath, stat, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
@@ -81,6 +84,7 @@ import {
   TurnQueueStorageLimitError,
   type AttachmentRecord,
   type QueuedTurnRecord,
+  type StoredAutoRateLimitReset,
   type SqliteRepository,
 } from './database.js';
 import {
@@ -316,12 +320,30 @@ const upstreamRateLimitWindowSchema = z.object({
   resetsAt: z.number().int().nonnegative().nullable().optional(),
 });
 
+const rateLimitReachedTypeSchema = z.enum([
+  'rate_limit_reached',
+  'workspace_owner_credits_depleted',
+  'workspace_member_credits_depleted',
+  'workspace_owner_usage_limit_reached',
+  'workspace_member_usage_limit_reached',
+]);
+
+const rateLimitResetCreditSchema = z.object({
+  id: z.string().min(1).max(512),
+  resetType: z.enum(['codexRateLimits', 'unknown']),
+  status: z.enum(['available', 'redeeming', 'redeemed', 'unknown']),
+  grantedAt: z.number().int().nonnegative(),
+  expiresAt: z.number().int().nonnegative().nullable().optional(),
+});
+
 const upstreamRateLimitSchema = z.object({
   limitId: z.string().min(1).max(120).nullable().optional(),
   limitName: z.string().min(1).max(200).nullable().optional(),
   planType: z.string().min(1).max(80).nullable().optional(),
   primary: upstreamRateLimitWindowSchema.nullable().optional(),
   secondary: upstreamRateLimitWindowSchema.nullable().optional(),
+  rateLimitReachedType: rateLimitReachedTypeSchema.nullable().optional(),
+  spendControlReached: z.boolean().nullable().optional(),
 });
 
 const rateLimitsResponseSchema = z.object({
@@ -330,6 +352,19 @@ const rateLimitsResponseSchema = z.object({
     .record(z.string(), upstreamRateLimitSchema.passthrough())
     .nullable()
     .optional(),
+  ordinaryUsageAllowed: z.boolean().nullable().optional(),
+  accountId: z.string().min(1).max(512).nullable().optional(),
+  rateLimitResetCredits: z
+    .object({
+      availableCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+      credits: z.array(rateLimitResetCreditSchema).max(1_000).nullable().optional(),
+    })
+    .nullable()
+    .optional(),
+});
+
+const consumeRateLimitResetCreditResponseSchema = z.object({
+  outcome: z.enum(['reset', 'nothingToReset', 'noCredit', 'alreadyRedeemed']),
 });
 
 const nullableUsageIntegerSchema = z.number().int().nonnegative().nullable();
@@ -446,6 +481,76 @@ function inputRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function accountIdFingerprint(accountId: string): string {
+  return createHash('sha256').update(accountId).digest('hex');
+}
+
+function publicAccountBinding(sessionSecret: string, accountId: string): string {
+  return createHmac('sha256', sessionSecret).update(`rate-limit-reset:${accountId}`).digest('hex');
+}
+
+function isChatgptAccount(value: unknown): boolean {
+  return inputRecord(value)?.type === 'chatgpt';
+}
+
+function limitErrorCode(
+  message: AppServerInbound,
+): 'usageLimitExceeded' | 'rateLimitExceeded' | null {
+  if (!('method' in message) || message.method !== 'turn/completed') return null;
+  const params = inputRecord(message.params);
+  const turn = inputRecord(params?.turn);
+  const error = inputRecord(turn?.error);
+  const code = error?.codexErrorInfo;
+  return code === 'usageLimitExceeded' || code === 'rateLimitExceeded' ? code : null;
+}
+
+function rateLimitReached(input: z.infer<typeof rateLimitsResponseSchema>): boolean {
+  if (input.rateLimits.rateLimitReachedType === 'rate_limit_reached') return true;
+  return Object.values(input.rateLimitsByLimitId ?? {}).some(
+    (snapshot) => snapshot.rateLimitReachedType === 'rate_limit_reached',
+  );
+}
+
+function eligibleResetCreditId(
+  input: z.infer<typeof rateLimitsResponseSchema>,
+): string | null | undefined {
+  const credits = input.rateLimitResetCredits?.credits;
+  if (credits === null || credits === undefined) return null;
+  const now = Math.floor(Date.now() / 1_000);
+  const eligible = credits
+    .filter(
+      (credit) =>
+        credit.resetType === 'codexRateLimits' &&
+        credit.status === 'available' &&
+        (credit.expiresAt == null || credit.expiresAt > now),
+    )
+    .sort(
+      (left, right) =>
+        (left.expiresAt ?? Number.MAX_SAFE_INTEGER) - (right.expiresAt ?? Number.MAX_SAFE_INTEGER),
+    );
+  return eligible[0]?.id;
+}
+
+function publicAutoRateLimitReset(
+  stored: StoredAutoRateLimitReset,
+  supported: boolean,
+  accountBinding: string | null,
+): AutoRateLimitResetSnapshot {
+  return autoRateLimitResetSnapshotSchema.parse({
+    supported,
+    accountBinding: supported ? accountBinding : null,
+    enabled: supported && stored.enabled,
+    availableCount: supported ? stored.availableCount : null,
+    state: supported ? stored.state : 'idle',
+    version: supported ? stored.version : 0,
+    updatedAt: supported ? stored.updatedAt : new Date(0).toISOString(),
+    lastOutcome: supported ? stored.lastOutcome : null,
+    lastOutcomeAt: supported ? stored.lastOutcomeAt : null,
+    resumedTaskCount: supported ? stored.resumedTaskCount : 0,
+    message: supported ? stored.message : null,
+  });
 }
 
 function publicCodexAccount(value: unknown): CodexAccount | null {
@@ -714,6 +819,20 @@ function activeTurnIdFromHistory(turns: unknown): string | null {
   return null;
 }
 
+function quotaErrorFromHistory(
+  turns: unknown,
+  turnId: string,
+): 'usageLimitExceeded' | 'rateLimitExceeded' | null {
+  if (!Array.isArray(turns)) return null;
+  for (const value of turns) {
+    const turn = inputRecord(value);
+    if (turn?.id !== turnId) continue;
+    const code = inputRecord(turn.error)?.codexErrorInfo;
+    return code === 'usageLimitExceeded' || code === 'rateLimitExceeded' ? code : null;
+  }
+  return null;
+}
+
 function queuedClientMessageEvidence(
   turns: unknown,
   clientUserMessageId: string,
@@ -894,6 +1013,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const titleGenerationAttempts = new Set<string>();
   const manuallyNamedThreads = new Set<string>();
   const activeTurns = new Set<string>();
+  const unreconciledInterruptedTurns = new Set<string>();
   const treeBusyThreads = new Set<string>();
   const deferredCompletionPushes = new Map<string, string>();
   const pendingTurnStartThreads = new Map<string, number>();
@@ -994,7 +1114,12 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return persisted;
   };
   repository.markPendingIdempotencyUnknown();
-  repository.resetActiveThreadRuntime();
+  for (const interrupted of repository.resetActiveThreadRuntime()) {
+    if (interrupted.turnId !== null) {
+      setActiveTurn(interrupted.threadId, interrupted.turnId);
+      unreconciledInterruptedTurns.add(`${interrupted.threadId}:${interrupted.turnId}`);
+    }
+  }
   repository.resetActiveSubagentRuntime();
   let pendingTurnStarts = 0;
   const beginPendingTurnStart = (threadId: string): void => {
@@ -1024,10 +1149,298 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   let queuedTurnDispatch: Promise<void> | null = null;
   let queuedTurnDispatchRequested = false;
   let requestQueuedTurnDispatch: () => void = () => {};
+  let rateLimitRecoveryInterlocked = repository.hasBlockedRateLimitContinuations();
+  let rateLimitRecovery: Promise<void> | null = null;
+  let rateLimitRecoveryRequested = false;
+  let rateLimitRecoveryRetry: NodeJS.Timeout | null = null;
+  let requestRateLimitRecovery: () => void = () => {};
   const unknownQueuedTurnReconcileDueAt = new Map<number, number>();
   const maxUnknownReconciliationsPerPass = 8;
   const visibleUnknownReconcileDelayMs = 5_000;
   const dismissedUnknownReconcileDelayMs = 60 * 60 * 1_000;
+
+  const readRateLimitContext = async (): Promise<{
+    account: z.infer<typeof accountResponseSchema>;
+    limits: z.infer<typeof rateLimitsResponseSchema>;
+  }> => {
+    const [accountRaw, limitsRaw] = await Promise.all([
+      appServer.request('account/read', { refreshToken: false }),
+      appServer.request('account/rateLimits/read', { excludeResetCreditDetails: false }),
+    ]);
+    return {
+      account: accountResponseSchema.parse(accountRaw),
+      limits: rateLimitsResponseSchema.parse(limitsRaw),
+    };
+  };
+
+  const currentChatgptAccountFingerprint = async (): Promise<string | null> => {
+    const context = await readRateLimitContext();
+    if (!isChatgptAccount(context.account.account) || context.limits.accountId == null) return null;
+    return accountIdFingerprint(context.limits.accountId);
+  };
+
+  const executionResetAccountFingerprint = async (): Promise<string | null> => {
+    if (!repository.hasEnabledAutoRateLimitReset()) return null;
+    try {
+      const fingerprint = await currentChatgptAccountFingerprint();
+      return fingerprint !== null && repository.getAutoRateLimitReset(fingerprint).enabled
+        ? fingerprint
+        : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const scheduleRateLimitRecoveryRetry = (): void => {
+    if (serverClosing || rateLimitRecoveryRetry) return;
+    rateLimitRecoveryRetry = setTimeout(() => {
+      rateLimitRecoveryRetry = null;
+      requestRateLimitRecovery();
+    }, 2_000);
+    rateLimitRecoveryRetry.unref();
+  };
+
+  const runRateLimitRecovery = async (): Promise<void> => {
+    if (!repository.hasBlockedRateLimitContinuations()) {
+      rateLimitRecoveryInterlocked = false;
+      return;
+    }
+    let context: Awaited<ReturnType<typeof readRateLimitContext>>;
+    try {
+      context = await readRateLimitContext();
+    } catch {
+      rateLimitRecoveryInterlocked = true;
+      scheduleRateLimitRecoveryRetry();
+      return;
+    }
+    if (!isChatgptAccount(context.account.account) || context.limits.accountId == null) {
+      repository.discardBlockedRateLimitContinuations(null);
+      rateLimitRecoveryInterlocked = false;
+      requestQueuedTurnDispatch();
+      return;
+    }
+    const fingerprint = accountIdFingerprint(context.limits.accountId);
+    const availableCount = context.limits.rateLimitResetCredits?.availableCount ?? null;
+    const stored = repository.updateAutoRateLimitResetState(fingerprint, { availableCount });
+    const existingAttempt = repository.getRateLimitResetAttempt(fingerprint);
+    const mustReconcileIssuedAttempt =
+      existingAttempt?.state === 'redeeming' || existingAttempt?.state === 'recovering';
+    if (!stored.enabled && !mustReconcileIssuedAttempt) {
+      repository.discardBlockedRateLimitContinuations(null);
+      repository.discardBlockedRateLimitContinuations(fingerprint);
+      rateLimitRecoveryInterlocked = false;
+      requestQueuedTurnDispatch();
+      return;
+    }
+    if (!repository.hasBlockedRateLimitContinuations(fingerprint)) {
+      rateLimitRecoveryInterlocked = false;
+      requestQueuedTurnDispatch();
+      return;
+    }
+    rateLimitRecoveryInterlocked = true;
+    if (context.limits.ordinaryUsageAllowed === true) {
+      repository.completeRateLimitRecovery(fingerprint, {
+        availableCount,
+        outcome:
+          existingAttempt?.outcome === 'reset' || existingAttempt?.outcome === 'alreadyRedeemed'
+            ? existingAttempt.outcome
+            : null,
+      });
+      rateLimitRecoveryInterlocked = false;
+      requestQueuedTurnDispatch();
+      return;
+    }
+    if (context.limits.ordinaryUsageAllowed !== false) {
+      repository.updateAutoRateLimitResetState(fingerprint, {
+        state: 'waiting',
+        message: 'Лимит достигнут; подходящий накопленный сброс пока недоступен.',
+      });
+      return;
+    }
+    if (existingAttempt?.state === 'terminal') return;
+    let attempt = existingAttempt;
+    if (!attempt) {
+      if (!rateLimitReached(context.limits) || availableCount === null || availableCount < 1) {
+        repository.updateAutoRateLimitResetState(fingerprint, {
+          state: 'waiting',
+          message: 'Лимит достигнут; подходящий накопленный сброс пока недоступен.',
+        });
+        return;
+      }
+      const creditId = eligibleResetCreditId(context.limits);
+      if (creditId === undefined) {
+        repository.updateAutoRateLimitResetState(fingerprint, {
+          state: 'waiting',
+          message: 'Доступный сброс не поддерживает лимиты Codex.',
+        });
+        return;
+      }
+      attempt = repository.beginRateLimitResetAttempt(fingerprint, creditId);
+    }
+    repository.setRateLimitResetAttemptState(
+      fingerprint,
+      attempt.idempotencyKey,
+      'redeeming',
+      null,
+      true,
+    );
+    repository.updateAutoRateLimitResetState(fingerprint, {
+      state: 'redeeming',
+      message: 'Используется накопленный сброс лимита…',
+    });
+    try {
+      const revalidated = rateLimitsResponseSchema.parse(
+        await appServer.request('account/rateLimits/read', { excludeResetCreditDetails: false }),
+      );
+      if (revalidated.accountId !== context.limits.accountId) {
+        repository.setRateLimitResetAttemptState(fingerprint, attempt.idempotencyKey, 'recovering');
+        repository.updateAutoRateLimitResetState(fingerprint, {
+          state: 'recovering',
+          message: 'Аккаунт изменился; восстановление продолжится после возврата к нему.',
+        });
+        rateLimitRecoveryInterlocked = false;
+        requestQueuedTurnDispatch();
+        return;
+      }
+      if (revalidated.ordinaryUsageAllowed === true) {
+        const released = repository.completeRateLimitRecovery(fingerprint, {
+          availableCount: revalidated.rateLimitResetCredits?.availableCount ?? null,
+          outcome:
+            attempt.outcome === 'reset' || attempt.outcome === 'alreadyRedeemed'
+              ? attempt.outcome
+              : null,
+        });
+        repository.audit('rate_limit_reset.verification', 'succeeded', {
+          resumedTaskCount: released,
+        });
+        rateLimitRecoveryInterlocked = false;
+        requestQueuedTurnDispatch();
+        return;
+      }
+      if (revalidated.ordinaryUsageAllowed !== false || !rateLimitReached(revalidated)) {
+        repository.setRateLimitResetAttemptState(fingerprint, attempt.idempotencyKey, 'recovering');
+        repository.updateAutoRateLimitResetState(fingerprint, {
+          state: 'recovering',
+          message: 'Состояние лимита изменилось; восстановление будет перепроверено.',
+        });
+        scheduleRateLimitRecoveryRetry();
+        return;
+      }
+    } catch {
+      repository.setRateLimitResetAttemptState(fingerprint, attempt.idempotencyKey, 'recovering');
+      repository.updateAutoRateLimitResetState(fingerprint, {
+        state: 'recovering',
+        message: 'Проверяется аккаунт перед использованием накопленного сброса…',
+      });
+      scheduleRateLimitRecoveryRetry();
+      return;
+    }
+    let outcome: z.infer<typeof consumeRateLimitResetCreditResponseSchema>['outcome'];
+    try {
+      const consumed = consumeRateLimitResetCreditResponseSchema.parse(
+        await appServer.request('account/rateLimitResetCredit/consume', {
+          idempotencyKey: attempt.idempotencyKey,
+          ...(attempt.creditId === null ? {} : { creditId: attempt.creditId }),
+        }),
+      );
+      outcome = consumed.outcome;
+    } catch (error) {
+      if (error instanceof AppServerRequestError && error.failureKind !== 'rejected') {
+        repository.setRateLimitResetAttemptState(fingerprint, attempt.idempotencyKey, 'recovering');
+        repository.updateAutoRateLimitResetState(fingerprint, {
+          state: 'recovering',
+          message: 'Проверяется результат сброса лимита…',
+        });
+        scheduleRateLimitRecoveryRetry();
+        return;
+      }
+      repository.setRateLimitResetAttemptState(
+        fingerprint,
+        attempt.idempotencyKey,
+        'terminal',
+        'failed',
+      );
+      repository.updateAutoRateLimitResetState(fingerprint, {
+        state: 'failed',
+        lastOutcome: 'failed',
+        recordOutcome: true,
+        message: 'Не удалось использовать накопленный сброс лимита.',
+      });
+      repository.audit('rate_limit_reset.consume', 'failed');
+      return;
+    }
+    if (outcome === 'nothingToReset' || outcome === 'noCredit') {
+      repository.setRateLimitResetAttemptState(
+        fingerprint,
+        attempt.idempotencyKey,
+        'terminal',
+        outcome,
+      );
+      repository.updateAutoRateLimitResetState(fingerprint, {
+        state: 'waiting',
+        availableCount: outcome === 'noCredit' ? 0 : availableCount,
+        lastOutcome: outcome,
+        recordOutcome: true,
+        message:
+          outcome === 'noCredit'
+            ? 'Накопленных сбросов больше нет.'
+            : 'Сейчас нет окна лимита, которое можно сбросить.',
+      });
+      repository.audit('rate_limit_reset.consume', outcome);
+      return;
+    }
+    repository.setRateLimitResetAttemptState(
+      fingerprint,
+      attempt.idempotencyKey,
+      'recovering',
+      outcome,
+    );
+    repository.updateAutoRateLimitResetState(fingerprint, {
+      state: 'recovering',
+      lastOutcome: outcome,
+      recordOutcome: true,
+      message: 'Сброс применён; проверяется восстановление лимита…',
+    });
+    repository.audit('rate_limit_reset.consume', outcome);
+    try {
+      const verified = rateLimitsResponseSchema.parse(
+        await appServer.request('account/rateLimits/read', { excludeResetCreditDetails: false }),
+      );
+      if (
+        verified.accountId === context.limits.accountId &&
+        verified.ordinaryUsageAllowed === true
+      ) {
+        const released = repository.completeRateLimitRecovery(fingerprint, {
+          availableCount: verified.rateLimitResetCredits?.availableCount ?? null,
+          outcome,
+        });
+        repository.audit('rate_limit_reset.verification', 'succeeded', {
+          resumedTaskCount: released,
+        });
+        rateLimitRecoveryInterlocked = false;
+        requestQueuedTurnDispatch();
+        return;
+      }
+    } catch {
+      // Keep the same persisted attempt and verify it again after app-server recovery.
+    }
+    scheduleRateLimitRecoveryRetry();
+  };
+
+  requestRateLimitRecovery = () => {
+    if (serverClosing) return;
+    if (rateLimitRecovery) {
+      rateLimitRecoveryRequested = true;
+      return;
+    }
+    rateLimitRecovery = runRateLimitRecovery().finally(() => {
+      rateLimitRecovery = null;
+      if (rateLimitRecoveryRequested) {
+        rateLimitRecoveryRequested = false;
+        queueMicrotask(requestRateLimitRecovery);
+      }
+    });
+  };
   let lastQueuedEligibilityReconcileAt = 0;
   const queuedEligibilityReconcileGraceMs = 1_000;
   let accountLogin: CodexAccountLogin = codexAccountLoginSchema.parse({
@@ -1077,6 +1490,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       expiresAt: null,
       message,
     });
+    if (state === 'succeeded' && repository.hasBlockedRateLimitContinuations())
+      queueMicrotask(requestRateLimitRecovery);
     return true;
   };
   const resetAccountLogin = (expectedLoginId?: string): boolean => {
@@ -1593,20 +2008,46 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   };
 
   const runStaleExecutionCapacityReconciliation = async (): Promise<void> => {
+    const hadUnreconciledInterruptedTurns = unreconciledInterruptedTurns.size > 0;
     const affectedRoots = new Set<string>();
     const reconciledSubagents = new Set<string>();
     for (const snapshot of activeTurnEntries()) {
       if (serverClosing) return;
       const existing = repository.getThread(snapshot.threadId);
-      if (!existing || activeTurnIdForThread(snapshot.threadId) !== snapshot.turnId) continue;
+      if (!existing || activeTurnIdForThread(snapshot.threadId) !== snapshot.turnId) {
+        unreconciledInterruptedTurns.delete(`${snapshot.threadId}:${snapshot.turnId}`);
+        continue;
+      }
       try {
-        const reconciled = await readThreadFromAppServer(existing, false, snapshot.turnId);
+        const reconciled = await readThreadFromAppServer(existing, true, snapshot.turnId);
         if (serverClosing) return;
         if (
           reconciled.thread.status === 'active' ||
           activeTurnIdForThread(snapshot.threadId) !== snapshot.turnId
-        )
+        ) {
+          unreconciledInterruptedTurns.delete(`${snapshot.threadId}:${snapshot.turnId}`);
           continue;
+        }
+        const quotaError = quotaErrorFromHistory(reconciled.turns, snapshot.turnId);
+        const continuation = quotaError
+          ? repository.enqueueRateLimitContinuation({
+              threadId: snapshot.threadId,
+              originTurnId: snapshot.turnId,
+              text: 'Лимит Codex восстановлен. Продолжи незавершённую работу с того места, где остановился.',
+            })
+          : undefined;
+        if (continuation) {
+          rateLimitRecoveryInterlocked = true;
+          if (continuation.created)
+            repository.audit('rate_limit_reset.detected', 'queued', {
+              threadId: snapshot.threadId,
+              turnId: snapshot.turnId,
+              errorCode: quotaError,
+              reconciled: true,
+            });
+          requestRateLimitRecovery();
+        } else repository.deleteTurnExecutionIntent(snapshot.turnId, snapshot.threadId);
+        unreconciledInterruptedTurns.delete(`${snapshot.threadId}:${snapshot.turnId}`);
         clearActiveTurns(snapshot.threadId);
         affectedRoots.add(snapshot.threadId);
         repository.audit('turn.capacity_reconcile', 'succeeded', {
@@ -1741,6 +2182,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         }),
       );
     }
+    if (hadUnreconciledInterruptedTurns && unreconciledInterruptedTurns.size === 0)
+      requestQueuedTurnDispatch();
   };
 
   const reconcileStaleExecutionCapacity = (): Promise<void> => {
@@ -1996,6 +2439,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       );
       return;
     }
+    if (message.id === undefined && message.method === 'account/rateLimits/updated') {
+      if (repository.hasBlockedRateLimitContinuations()) requestRateLimitRecovery();
+      return;
+    }
     if (message.id !== undefined) {
       if (message.method === 'item/tool/requestUserInput') {
         const request = normalizeUserInputRequest(message.params);
@@ -2150,8 +2597,27 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       const currentTurnId =
         repository.getThread(normalized.threadId)?.activeTurnId ??
         activeTurnIdForThread(normalized.threadId);
-      activeTurns.delete(`${normalized.threadId}:${normalized.turnId}`);
       runtimeTurnEvent = currentTurnId === null || currentTurnId === normalized.turnId;
+      const quotaError = limitErrorCode(message);
+      const continuation =
+        quotaError && runtimeTurnEvent
+          ? repository.enqueueRateLimitContinuation({
+              threadId: normalized.threadId,
+              originTurnId: normalized.turnId,
+              text: 'Лимит Codex восстановлен. Продолжи незавершённую работу с того места, где остановился.',
+            })
+          : undefined;
+      if (continuation) {
+        rateLimitRecoveryInterlocked = true;
+        if (continuation.created)
+          repository.audit('rate_limit_reset.detected', 'queued', {
+            threadId: normalized.threadId,
+            turnId: normalized.turnId,
+            errorCode: quotaError,
+          });
+        requestRateLimitRecovery();
+      } else repository.deleteTurnExecutionIntent(normalized.turnId, normalized.threadId);
+      activeTurns.delete(`${normalized.threadId}:${normalized.turnId}`);
       const treeBusy = repository.countActiveSubagentsForRoot(normalized.threadId) > 0;
       if (runtimeTurnEvent) clearNativeActive(normalized.threadId);
       if (runtimeTurnEvent && treeBusy) treeBusyThreads.add(normalized.threadId);
@@ -2280,7 +2746,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     treeBusyThreads.clear();
     deferredCompletionPushes.clear();
     uncertainTurnStartThreads.clear();
-    for (const threadId of repository.resetActiveThreadRuntime()) affectedRoots.add(threadId);
+    for (const interrupted of repository.resetActiveThreadRuntime()) {
+      affectedRoots.add(interrupted.threadId);
+      if (interrupted.turnId !== null) {
+        setActiveTurn(interrupted.threadId, interrupted.turnId);
+        unreconciledInterruptedTurns.add(`${interrupted.threadId}:${interrupted.turnId}`);
+      }
+    }
     repository.resetActiveSubagentRuntime();
     for (const approval of repository.listUnfinishedApprovals()) {
       if (repository.cancelUnfinishedApproval(approval.id))
@@ -2323,6 +2795,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     });
     void applyPendingResourcesWhenIdle();
     requestQueuedTurnDispatch();
+    if (repository.hasBlockedRateLimitContinuations()) requestRateLimitRecovery();
   };
   const unsubscribe = appServer.subscribe(onAppServerMessage);
   const unsubscribeLifecycle = appServer.subscribeLifecycle(onAppServerLifecycle);
@@ -2371,10 +2844,12 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
 
   app.addHook('onReady', async () => {
     await appServer.start();
+    if (unreconciledInterruptedTurns.size > 0) await reconcileStaleExecutionCapacity();
     pushDispatcher?.start();
     if (dependencies.resourceBroker) void reconcileStartupResources();
     void requestAttachmentFileDeletionDrain();
     requestQueuedTurnDispatch();
+    if (repository.hasBlockedRateLimitContinuations()) requestRateLimitRecovery();
     scheduleExecutionReconciliation();
   });
   app.addHook('onClose', async () => {
@@ -2383,12 +2858,14 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (codexUpdateStartupRetry) clearTimeout(codexUpdateStartupRetry);
     if (attachmentFileDeletionRetry) clearTimeout(attachmentFileDeletionRetry);
     if (queuedTurnRetry) clearTimeout(queuedTurnRetry);
+    if (rateLimitRecoveryRetry) clearTimeout(rateLimitRecoveryRetry);
     if (executionReconcileTimer) clearTimeout(executionReconcileTimer);
     clearAccountLoginTimer();
     unsubscribe();
     unsubscribeLifecycle();
     await attachmentFileDeletionDrain?.catch(() => undefined);
     await queuedTurnDispatch?.catch(() => undefined);
+    await rateLimitRecovery?.catch(() => undefined);
     await pushDispatcher?.close();
     await appServer.stop();
     repository.close();
@@ -2535,6 +3012,57 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const preferences = repository.setRuntimePreferences(input);
     repository.audit('runtime_preferences.update', 'succeeded');
     return { data: preferences };
+  });
+
+  app.put('/api/system/rate-limit-reset', async (request) => {
+    csrfGuard(auth, request);
+    const input = updateAutoRateLimitResetRequestSchema.parse(request.body);
+    let context: Awaited<ReturnType<typeof readRateLimitContext>>;
+    try {
+      context = await readRateLimitContext();
+    } catch {
+      throw new HttpError(503, 'RATE_LIMIT_RESET_STATUS_UNAVAILABLE');
+    }
+    if (!isChatgptAccount(context.account.account) || context.limits.accountId == null)
+      throw new HttpError(409, 'RATE_LIMIT_RESET_UNSUPPORTED');
+    if (
+      input.accountBinding !== publicAccountBinding(config.sessionSecret, context.limits.accountId)
+    )
+      throw new HttpError(409, 'RATE_LIMIT_RESET_ACCOUNT_CHANGED');
+    const fingerprint = accountIdFingerprint(context.limits.accountId);
+    repository.updateAutoRateLimitResetState(fingerprint, {
+      availableCount: context.limits.rateLimitResetCredits?.availableCount ?? null,
+    });
+    const updated = repository.setAutoRateLimitResetEnabled(
+      fingerprint,
+      input.enabled,
+      input.expectedVersion,
+    );
+    if (!updated) throw new HttpError(409, 'RATE_LIMIT_RESET_VERSION_CONFLICT');
+    repository.audit('rate_limit_reset.preference', 'succeeded', {
+      enabled: updated.enabled,
+      version: updated.version,
+    });
+    if (updated.enabled) requestRateLimitRecovery();
+    else {
+      const attempt = repository.getRateLimitResetAttempt(fingerprint);
+      if (attempt?.state === 'redeeming' || attempt?.state === 'recovering') {
+        rateLimitRecoveryInterlocked = true;
+        requestRateLimitRecovery();
+      } else {
+        repository.discardBlockedRateLimitContinuations(null);
+        repository.discardBlockedRateLimitContinuations(fingerprint);
+        rateLimitRecoveryInterlocked = false;
+        requestQueuedTurnDispatch();
+      }
+    }
+    return {
+      data: publicAutoRateLimitReset(
+        updated,
+        true,
+        publicAccountBinding(config.sessionSecret, context.limits.accountId),
+      ),
+    };
   });
 
   app.get('/api/system/codex-update', async (request) => {
@@ -3442,7 +3970,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       clearNativeActive(record.threadId);
       repository.updateThreadRuntime(record.threadId, { status: 'active', activeTurnId: turnId });
     }
-    if (!repository.completeQueuedTurn(record.id, turnId)) return false;
+    if (!repository.completeQueuedTurn(record.id, turnId, record.accountFingerprint)) return false;
     unknownQueuedTurnReconcileDueAt.delete(record.id);
     publishQueueChanged(record.threadId);
     const userEvent = repository.appendEvent({
@@ -3470,12 +3998,26 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     requestHashValue: string,
   ): { data: z.infer<typeof startTurnResultSchema> } => {
     const claimToken = `queued:${threadId}:${input.idempotencyKey}`;
+    const thread = repository.getThread(threadId);
+    const project = thread && repository.getProject(thread.projectId);
+    const queuedInput = project
+      ? {
+          ...input,
+          permissionPreset: input.permissionPreset ?? project.defaultPermissionPreset,
+          ...(input.model === undefined && project.defaultModel !== null
+            ? { model: project.defaultModel }
+            : {}),
+          ...(input.reasoningEffort === undefined && project.defaultReasoningEffort !== null
+            ? { reasoningEffort: project.defaultReasoningEffort }
+            : {}),
+        }
+      : input;
     try {
       const queued = repository.enqueueTurn({
         threadId,
         idempotencyKey: input.idempotencyKey,
         requestHash: requestHashValue,
-        request: input,
+        request: queuedInput,
         claimToken,
       }).record;
       repository.audit('turn.queue', 'succeeded', { threadId, queuedTurnId: queued.id });
@@ -3497,7 +4039,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
 
   const queuedThreadIsEligible = (record: QueuedTurnRecord): boolean => {
     const thread = repository.getThread(record.threadId);
-    if (!thread || thread.archived) return false;
+    if (!thread || thread.archived || record.blocked) return false;
     return (
       !repository.hasUnknownQueuedTurn(record.threadId) &&
       activeTurnIdForThread(record.threadId) === null &&
@@ -3521,6 +4063,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (
       serverClosing ||
       codexUpdateInterlocked ||
+      rateLimitRecoveryInterlocked ||
+      unreconciledInterruptedTurns.size > 0 ||
       upgradeDrainRequested() ||
       accountLoginInterlocked ||
       (dependencies.resourceBroker !== undefined &&
@@ -3562,6 +4106,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       }
     }
 
+    if (rateLimitRecoveryInterlocked) {
+      endPendingTurnStart(record.threadId);
+      return 'wait';
+    }
     const claimed = repository.claimQueuedTurn(record.id);
     if (!claimed) {
       endPendingTurnStart(record.threadId);
@@ -3606,6 +4154,29 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       const appInput = attachmentUserInput(claimed.request.text, attachments, (attachment) =>
         attachmentStore.localPath(project.id, thread.id, attachment.storageName),
       );
+      let resetAccountFingerprint = claimed.accountFingerprint;
+      if (claimed.accountFingerprint !== null) {
+        let currentFingerprint: string | null;
+        try {
+          currentFingerprint = await currentChatgptAccountFingerprint();
+        } catch {
+          repository.reblockRateLimitContinuation(claimed.id);
+          rateLimitRecoveryInterlocked = true;
+          scheduleRateLimitRecoveryRetry();
+          return 'wait';
+        }
+        if (currentFingerprint !== claimed.accountFingerprint) {
+          repository.reblockRateLimitContinuation(claimed.id);
+          requestRateLimitRecovery();
+          return 'wait';
+        }
+      } else resetAccountFingerprint = await executionResetAccountFingerprint();
+      if (rateLimitRecoveryInterlocked || unreconciledInterruptedTurns.size > 0) {
+        repository.requeueTurn(claimed.id);
+        return 'wait';
+      }
+      if (!repository.setQueuedTurnAccountFingerprint(claimed.id, resetAccountFingerprint))
+        return 'wait';
       turnStartIssued = true;
       const result = turnResponseSchema.parse(
         await appServer.request('turn/start', {
@@ -3623,7 +4194,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           ),
         }),
       );
-      if (!repository.completeQueuedTurn(claimed.id, result.turn.id))
+      if (!repository.completeQueuedTurn(claimed.id, result.turn.id, resetAccountFingerprint))
         throw new HttpError(409, 'IDEMPOTENCY_OUTCOME_UNKNOWN');
       publishQueueChanged(thread.id);
       setActiveTurn(thread.id, result.turn.id);
@@ -3764,12 +4335,14 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       }
       if (
         serverClosing ||
-        (repository.listQueuedTurns().length === 0 &&
+        (repository.listQueuedTurns().every((record) => record.blocked) &&
           repository.listUnknownQueuedTurns().length === 0)
       )
         return;
       if (queuedTurnRetry) clearTimeout(queuedTurnRetry);
-      const retryDelayMs = repository.listQueuedTurns().length > 0 ? 1_000 : 5_000;
+      const retryDelayMs = repository.listQueuedTurns().some((record) => !record.blocked)
+        ? 1_000
+        : 5_000;
       queuedTurnRetry = setTimeout(() => {
         queuedTurnRetry = null;
         requestQueuedTurnDispatch();
@@ -3946,6 +4519,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       throw new HttpError(409, 'ATTACHMENT_ALREADY_SENT');
     }
     if (
+      rateLimitRecoveryInterlocked ||
+      unreconciledInterruptedTurns.size > 0 ||
       repository.listQueuedTurns().length > 0 ||
       activeTurnIdForThread(id) !== null ||
       nativeActiveThreads.has(id)
@@ -4081,6 +4656,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       const appInput = attachmentUserInput(input.text, attachments, (attachment) =>
         attachmentStore.localPath(project.id, id, attachment.storageName),
       );
+      const resetAccountFingerprint = await executionResetAccountFingerprint();
+      if (rateLimitRecoveryInterlocked || unreconciledInterruptedTurns.size > 0) {
+        repository.releaseAttachmentClaims(id, attachmentClaim);
+        const response = enqueueReservedTurn(id, input, hash);
+        requestQueuedTurnDispatch();
+        return reply.code(202).send(response);
+      }
       turnStartIssued = true;
       result = turnResponseSchema.parse(
         await appServer.request('turn/start', {
@@ -4094,6 +4676,21 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           approvalsReviewer: 'user',
           sandboxPolicy: sandboxPolicy(preset, turnCwd),
         }),
+      );
+      repository.recordTurnExecutionIntent(
+        result.turn.id,
+        id,
+        {
+          ...input,
+          permissionPreset: preset,
+          ...(input.model === undefined && project.defaultModel !== null
+            ? { model: project.defaultModel }
+            : {}),
+          ...(input.reasoningEffort === undefined && project.defaultReasoningEffort !== null
+            ? { reasoningEffort: project.defaultReasoningEffort }
+            : {}),
+        },
+        resetAccountFingerprint,
       );
       uncertainTurnStartThreads.delete(id);
       setActiveTurn(id, result.turn.id);
@@ -4427,6 +5024,12 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (codexUpdateInterlocked || upgradeDrainRequested())
       throw new HttpError(409, 'CODEX_UPDATE_PENDING');
     if (accountLoginInterlocked) throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
+    if (rateLimitRecoveryInterlocked)
+      throw new HttpError(
+        409,
+        'CODEX_ACCOUNT_LOGIN_BUSY',
+        'Account login is blocked while a rate-limit reset is being recovered',
+      );
     if (resourceWorkActive() || pendingThreadStarts > 0)
       throw new HttpError(
         409,
@@ -4582,6 +5185,11 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
     const warnings: string[] = [];
     let rateLimits: z.infer<typeof accountRateLimitSchema>[] | null = null;
+    let rateLimitReset = publicAutoRateLimitReset(
+      repository.getAutoRateLimitReset('unsupported'),
+      false,
+      null,
+    );
     let usage: z.infer<typeof accountUsageSchema> | null = null;
     let threadUsage: z.infer<typeof threadUsageSchema> | null = null;
     const [rateLimitsResult, usageResult, threadUsageResult] = await Promise.allSettled([
@@ -4603,6 +5211,17 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           buckets.length > 0
             ? buckets.map(([limitId, snapshot]) => publicRateLimit(snapshot, limitId))
             : [publicRateLimit(parsed.rateLimits)];
+        if (isChatgptAccount(account.account) && parsed.accountId != null) {
+          const fingerprint = accountIdFingerprint(parsed.accountId);
+          const stored = repository.updateAutoRateLimitResetState(fingerprint, {
+            availableCount: parsed.rateLimitResetCredits?.availableCount ?? null,
+          });
+          rateLimitReset = publicAutoRateLimitReset(
+            stored,
+            true,
+            publicAccountBinding(config.sessionSecret, parsed.accountId),
+          );
+        }
       } catch {
         warnings.push('Codex rate limits are unavailable.');
       }
@@ -4655,6 +5274,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         })),
       ),
       rateLimits,
+      rateLimitReset,
       usage,
       threadUsage,
       transcription: {

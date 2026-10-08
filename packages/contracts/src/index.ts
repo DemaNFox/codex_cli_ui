@@ -486,6 +486,32 @@ export const codexAccountLoginSchema = z.object({
 });
 export type CodexAccountLogin = z.infer<typeof codexAccountLoginSchema>;
 
+export const autoRateLimitResetSnapshotSchema = z.object({
+  supported: z.boolean(),
+  accountBinding: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .nullable(),
+  enabled: z.boolean(),
+  availableCount: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER).nullable(),
+  state: z.enum(['idle', 'waiting', 'redeeming', 'recovering', 'failed']),
+  version: z.number().int().nonnegative(),
+  updatedAt: z.string().datetime(),
+  lastOutcome: z
+    .enum(['reset', 'alreadyRedeemed', 'nothingToReset', 'noCredit', 'failed'])
+    .nullable(),
+  lastOutcomeAt: z.string().datetime().nullable(),
+  resumedTaskCount: z.number().int().nonnegative(),
+  message: z.string().min(1).max(240).nullable(),
+});
+export type AutoRateLimitResetSnapshot = z.infer<typeof autoRateLimitResetSnapshotSchema>;
+
+export const updateAutoRateLimitResetRequestSchema = z.object({
+  enabled: z.boolean(),
+  expectedVersion: z.number().int().nonnegative(),
+  accountBinding: z.string().regex(/^[a-f0-9]{64}$/),
+});
+
 export const capabilitySchema = z.object({
   codexVersion: z.string(),
   authenticated: z.boolean(),
@@ -494,6 +520,7 @@ export const capabilitySchema = z.object({
   projectRoots: z.array(z.string()),
   skills: z.array(z.object({ name: z.string(), path: z.string(), enabled: z.boolean() })),
   rateLimits: z.array(accountRateLimitSchema).nullable(),
+  rateLimitReset: autoRateLimitResetSnapshotSchema,
   usage: accountUsageSchema.nullable(),
   threadUsage: threadUsageSchema.nullable().optional(),
   transcription: z

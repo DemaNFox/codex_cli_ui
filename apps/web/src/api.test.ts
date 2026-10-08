@@ -255,6 +255,43 @@ describe('api response envelopes', () => {
     );
   });
 
+  it('sends the versioned account-wide automatic rate-limit reset preference', async () => {
+    const snapshot = {
+      supported: true,
+      enabled: true,
+      availableCount: 2,
+      state: 'idle' as const,
+      version: 5,
+      updatedAt: '2026-10-08T10:00:00.000Z',
+      lastOutcome: null,
+      lastOutcomeAt: null,
+      resumedTaskCount: 0,
+      message: null,
+    };
+    const fetchMock = vi.fn<typeof fetch>(() => Promise.resolve(response({ data: snapshot })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(
+      api.updateAutoRateLimitReset('csrf', {
+        enabled: true,
+        expectedVersion: 4,
+        accountBinding: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      }),
+    ).resolves.toEqual(snapshot);
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/system/rate-limit-reset',
+      expect.objectContaining({
+        method: 'PUT',
+        body: JSON.stringify({
+          enabled: true,
+          expectedVersion: 4,
+          accountBinding: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+        }),
+      }),
+    );
+    expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf');
+  });
+
   it('sends attachment ids when steering an active turn', async () => {
     const fetchMock = vi.fn<typeof fetch>(() =>
       Promise.resolve(response({ data: { turnId: 'turn-active' } })),

@@ -2457,6 +2457,84 @@ button:disabled {
   display: grid;
   gap: 0.55rem;
 }
+.auto-rate-limit-reset {
+  display: grid;
+  gap: 0.65rem;
+  min-width: 0;
+  margin-top: 1.2rem;
+  padding: 0.8rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 0.7rem;
+  background: #0d1114;
+}
+.auto-rate-limit-reset-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.65rem;
+}
+.diagnostics .auto-rate-limit-reset h3 {
+  margin: 0;
+}
+.auto-rate-limit-reset-heading small,
+.auto-rate-limit-reset-note,
+.auto-rate-limit-reset-warning,
+.auto-rate-limit-reset-availability,
+.auto-rate-limit-reset-notice {
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: 0.7rem;
+  line-height: 1.45;
+}
+.auto-rate-limit-reset-heading small,
+.auto-rate-limit-reset-note,
+.auto-rate-limit-reset-availability {
+  color: var(--muted);
+}
+.auto-rate-limit-reset-state {
+  flex: 0 0 auto;
+  max-width: 48%;
+  color: #dff79c;
+  font-size: 0.67rem;
+  line-height: 1.35;
+  text-align: right;
+}
+.auto-rate-limit-reset-state.waiting,
+.auto-rate-limit-reset-state.redeeming,
+.auto-rate-limit-reset-state.recovering {
+  color: #ffe3a5;
+}
+.auto-rate-limit-reset-state.failed {
+  color: #ffc0be;
+}
+.auto-rate-limit-reset-control {
+  display: flex;
+  min-height: 2.75rem;
+  align-items: flex-start;
+  gap: 0.65rem;
+  padding: 0.65rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 0.6rem;
+  background: #0b0e10;
+  font-size: 0.75rem;
+  line-height: 1.4;
+}
+.auto-rate-limit-reset-control input {
+  flex: 0 0 auto;
+  margin-top: 0.15rem;
+}
+.auto-rate-limit-reset-warning {
+  color: #ffe3a5;
+}
+.auto-rate-limit-reset-notice {
+  color: #dce2e6;
+}
+.auto-rate-limit-reset-notice.success {
+  color: #dff79c;
+}
+.auto-rate-limit-reset-notice.error {
+  color: #ffc0be;
+}
 .rate-limit {
   display: grid;
   gap: 0.25rem;
@@ -2718,6 +2796,13 @@ button:disabled {
 @media (max-width: 500px) {
   .login-card {
     padding: 1.4rem;
+  }
+  .auto-rate-limit-reset-heading {
+    display: grid;
+  }
+  .auto-rate-limit-reset-state {
+    max-width: none;
+    text-align: left;
   }
   .chat-toolbar {
     align-items: center;

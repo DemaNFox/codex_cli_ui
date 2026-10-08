@@ -20,6 +20,7 @@ import {
   steerTurnRequestSchema,
   subagentSchema,
   updateRuntimePreferencesRequestSchema,
+  updateAutoRateLimitResetRequestSchema,
   startTurnRequestSchema,
   turnNavigationEntrySchema,
 } from './index.js';
@@ -368,6 +369,21 @@ describe('contracts', () => {
           accountId: 'must-not-survive',
         },
       ],
+      rateLimitReset: {
+        supported: true,
+        accountBinding: 'a'.repeat(64),
+        enabled: true,
+        availableCount: 2,
+        state: 'waiting',
+        version: 3,
+        updatedAt: '2026-10-08T00:00:00.000Z',
+        lastOutcome: 'noCredit',
+        lastOutcomeAt: '2026-10-07T00:00:00.000Z',
+        resumedTaskCount: 4,
+        message: 'Ожидание восстановления лимита.',
+        accountId: 'must-not-survive',
+        creditId: 'must-not-survive',
+      },
       usage: {
         summary: {
           lifetimeTokens: 10_000,
@@ -403,6 +419,8 @@ describe('contracts', () => {
       warnings: [],
     });
     expect(parsed.rateLimits?.[0]).not.toHaveProperty('accountId');
+    expect(parsed.rateLimitReset).not.toHaveProperty('accountId');
+    expect(parsed.rateLimitReset).not.toHaveProperty('creditId');
     expect(parsed.account).toEqual({
       type: 'chatgpt',
       email: 'owner@example.test',
@@ -442,6 +460,23 @@ describe('contracts', () => {
       capabilitySchema.safeParse({
         ...parsed,
         rateLimits: [{ ...parsed.rateLimits?.[0], primary: { usedPercent: 101 } }],
+      }).success,
+    ).toBe(false);
+  });
+
+  it('requires a versioned boolean update for automatic rate-limit resets', () => {
+    expect(
+      updateAutoRateLimitResetRequestSchema.parse({
+        enabled: true,
+        expectedVersion: 2,
+        accountBinding: 'a'.repeat(64),
+      }),
+    ).toEqual({ enabled: true, expectedVersion: 2, accountBinding: 'a'.repeat(64) });
+    expect(
+      updateAutoRateLimitResetRequestSchema.safeParse({
+        enabled: true,
+        expectedVersion: -1,
+        accountBinding: 'a'.repeat(64),
       }).success,
     ).toBe(false);
   });
