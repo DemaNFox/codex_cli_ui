@@ -71,16 +71,26 @@ describe('contracts', () => {
     ).toMatchObject({ status: 'needsReview', position: null });
   });
 
-  it('discriminates resolved and unresolved queued turn reconciliation', () => {
+  it('discriminates resolved, cancellable and unresolved queued turn reconciliation', () => {
     expect(reconcileQueuedTurnResultSchema.parse({ status: 'resolved', turnId: 'turn-1' })).toEqual(
       { status: 'resolved', turnId: 'turn-1' },
     );
+    expect(reconcileQueuedTurnResultSchema.parse({ status: 'dismissed' })).toEqual({
+      status: 'dismissed',
+    });
     expect(
       reconcileQueuedTurnResultSchema.parse({
         status: 'stillNeedsReview',
         reason: 'notFound',
       }),
-    ).toEqual({ status: 'stillNeedsReview', reason: 'notFound' });
+    ).toEqual({ status: 'stillNeedsReview', reason: 'notFound', canDismissLocal: false });
+    expect(
+      reconcileQueuedTurnResultSchema.parse({
+        status: 'stillNeedsReview',
+        reason: 'notFound',
+        canDismissLocal: true,
+      }),
+    ).toEqual({ status: 'stillNeedsReview', reason: 'notFound', canDismissLocal: true });
     expect(
       reconcileQueuedTurnResultSchema.safeParse({
         status: 'stillNeedsReview',

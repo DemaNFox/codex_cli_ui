@@ -282,11 +282,20 @@ export const queuedTurnSchema = z.discriminatedUnion('status', [
 ]);
 export type QueuedTurn = z.infer<typeof queuedTurnSchema>;
 
+export const reconcileQueuedTurnRequestSchema = z
+  .object({
+    action: z.enum(['check', 'dismissLocal']).default('check'),
+  })
+  .default({ action: 'check' });
+export type ReconcileQueuedTurnRequest = z.infer<typeof reconcileQueuedTurnRequestSchema>;
+
 export const reconcileQueuedTurnResultSchema = z.discriminatedUnion('status', [
   z.object({ status: z.literal('resolved'), turnId: z.string().min(1) }),
+  z.object({ status: z.literal('dismissed') }),
   z.object({
     status: z.literal('stillNeedsReview'),
-    reason: z.enum(['notFound', 'readFailed']),
+    reason: z.enum(['notFound', 'readFailed', 'startMayStillArrive']),
+    canDismissLocal: z.boolean().default(false),
   }),
 ]);
 export type ReconcileQueuedTurnResult = z.infer<typeof reconcileQueuedTurnResultSchema>;

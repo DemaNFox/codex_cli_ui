@@ -741,6 +741,26 @@ button:disabled {
   margin: 0;
   color: var(--muted);
 }
+.thread-load-state {
+  display: grid;
+  justify-items: center;
+  gap: 0.75rem;
+  width: min(32rem, 100%);
+  margin: clamp(2rem, 10vh, 6rem) auto 0;
+  padding: 1.25rem;
+  border: 1px solid var(--border-soft);
+  border-radius: 0.9rem;
+  color: var(--muted);
+  background: var(--panel);
+  text-align: center;
+}
+.thread-load-state.error {
+  border-color: rgba(255, 113, 111, 0.35);
+}
+.thread-load-state p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
 .transcript-shell {
   min-width: 0;
   width: 100%;
@@ -1716,6 +1736,13 @@ button:disabled {
   color: #c7cfd6;
   background: #171b1f;
   font-size: 0.7rem;
+}
+.runtime-application-note {
+  width: min(100%, var(--chat-reading-width));
+  margin: 0 auto 0.45rem;
+  color: #d8c58f;
+  font-size: 0.72rem;
+  line-height: 1.4;
 }
 .composer {
   position: relative;

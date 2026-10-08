@@ -209,9 +209,22 @@ describe('api response envelopes', () => {
     });
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/threads/thread-1/queued-turns/9/reconcile',
-      expect.objectContaining({ method: 'POST' }),
+      expect.objectContaining({ method: 'POST', body: JSON.stringify({ action: 'check' }) }),
     );
     expect(new Headers(fetchMock.mock.calls[0]?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf');
+
+    await expect(api.dismissAmbiguousQueuedTurn('csrf', thread.id, 9)).resolves.toEqual({
+      status: 'resolved',
+      turnId: 'turn-found',
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      '/api/threads/thread-1/queued-turns/9/reconcile',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ action: 'dismissLocal' }),
+      }),
+    );
   });
 
   it('sends versioned resource save and apply requests', async () => {

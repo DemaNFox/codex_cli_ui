@@ -45,7 +45,11 @@ semantic; if Codex supplied only the beginning of the request, the server replac
 short contextual title through the same authenticated app-server account.
 The last model, reasoning, access and approval selections are account settings stored on the server. Messages
 and execution stages show their date and time, while steer and stop actions show an explicit accepted or failed
-state instead of relying on a disappearing input value.
+state instead of relying on a disappearing input value. A model change applies to the next new root task and
+the new subagents it creates; it cannot replace the model of a root turn that is already running, and the
+composer states that boundary while such a turn is active.
+Short Codex runtime outages keep the persisted project/chat navigation and already rendered transcript in
+place. A selected chat shows an in-place retry state instead of falling back to the new-chat welcome screen.
 Each chat has an optional per-device notification subscription. After an explicit bell-button action, the
 browser asks for notification permission and can report a terminal Codex result even while the page is
 closed. Notification text is deliberately generic and never contains transcript, command, attachment or
@@ -119,9 +123,13 @@ with its runtime settings and attachments, shown in the chat with its position, 
 that chat has no active root turn and a safe slot becomes available. Active subagents use execution slots but
 do not block a new root task in the same chat when another slot is free. A selected active subagent can be
 stopped from the Agents menu without interrupting the root turn or unrelated agents. A task that is still waiting can be cancelled from its
-queue card; cancellation never interrupts work that has already started, and an ambiguous start that requires
-review remains non-cancellable. Its card can request an immediate authoritative check or open a blank new chat
-without resending the uncertain task. Resource reconfiguration, draining and degraded-capacity
+queue card; cancellation never interrupts work that has already started. An ambiguous start that requires
+review is never presented as cancelled: after a fresh authoritative read finds no matching client message, the
+operator may hide only the local queue card. The durable unknown record, idempotency fence and attachments are
+retained, new work in that chat stays blocked, and the UI warns that a late native task may still appear. This
+allows the chat to be archived without claiming that Codex work was stopped. The card can also request another
+authoritative check or open a blank new chat without resending the uncertain task.
+Resource reconfiguration, draining and degraded-capacity
 states still fail closed instead of silently adding work. A rare interrupted start is shown as requiring review;
 it is reconciled against Codex and is never retried blindly. An answer emitted before the whole turn finishes
 is shown as received while work continues; only a successful terminal turn is marked as the final answer.

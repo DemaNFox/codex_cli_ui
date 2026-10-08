@@ -816,7 +816,13 @@ describe('App', () => {
       if (url === '/api/threads/thread-1')
         return jsonResponse({ data: thread, events: [], queuedTurns: [queuedTurn] });
       if (url === '/api/threads/thread-1/queued-turns/14/reconcile' && init?.method === 'POST') {
-        return jsonResponse({ data: { status: 'stillNeedsReview', reason: 'notFound' } });
+        return jsonResponse({
+          data: {
+            status: 'stillNeedsReview',
+            reason: 'startMayStillArrive',
+            canDismissLocal: false,
+          },
+        });
       }
       if (url === '/api/threads/thread-1/queued-turns') return jsonResponse({ data: [queuedTurn] });
       return undefined;
@@ -829,11 +835,144 @@ describe('App', () => {
 
     expect(
       await screen.findByText(
-        'Codex пока не подтвердил запуск этой задачи. Она не отправлена повторно и остаётся на проверке.',
+        'Прежний runtime ещё может подтвердить запуск. Задача не отправлена повторно и пока не может быть отменена.',
       ),
     ).not.toBeNull();
     expect(within(queue).getByText(queuedTurn.textPreview)).not.toBeNull();
     expect(within(queue).getByRole('button', { name: 'Проверить сейчас' })).not.toBeNull();
+  });
+
+  it('offers a local dismissal without claiming that the possible native task was stopped', async () => {
+    const queuedTurn = {
+      id: 16,
+      threadId: thread.id,
+      status: 'needsReview' as const,
+      position: null,
+      errorCode: 'IDEMPOTENCY_OUTCOME_UNKNOWN',
+      textPreview: 'Спорная задача старого runtime',
+      attachmentCount: 0,
+      createdAt: '2026-10-04T10:14:00.000Z',
+    };
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ data: thread, events: [], queuedTurns: [queuedTurn] });
+      if (url === '/api/threads/thread-1/queued-turns') return jsonResponse({ data: [queuedTurn] });
+      if (url === '/api/threads/thread-1/queued-turns/16/reconcile' && init?.method === 'POST') {
+        const action = JSON.parse(typeof init.body === 'string' ? init.body : '') as {
+          action: string;
+        };
+        return jsonResponse({
+          data:
+            action.action === 'dismissLocal'
+              ? { status: 'dismissed' }
+              : { status: 'stillNeedsReview', reason: 'notFound', canDismissLocal: true },
+        });
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const queue = await screen.findByRole('region', { name: 'Задачи в очереди' });
+    await user.click(within(queue).getByRole('button', { name: 'Проверить сейчас' }));
+    expect(
+      await within(queue).findByRole('button', { name: 'Скрыть локальную запись' }),
+    ).not.toBeNull();
+    await user.click(within(queue).getByRole('button', { name: 'Скрыть локальную запись' }));
+
+    expect(
+      await screen.findByText(
+        'Запись скрыта локально. Чат можно архивировать, но возможная задача Codex не была остановлена.',
+      ),
+    ).not.toBeNull();
+    await waitFor(() =>
+      expect(screen.queryByRole('region', { name: 'Задачи в очереди' })).toBeNull(),
+    );
+    expect(
+      fetchMock.mock.calls.some(
+        ([input, init]) =>
+          requestUrl(input) === '/api/threads/thread-1/queued-turns/16/reconcile' &&
+          init?.body === JSON.stringify({ action: 'dismissLocal' }),
+      ),
+    ).toBe(true);
+  });
+
+  it('keeps project navigation available when runtime metadata is temporarily unavailable', async () => {
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/preferences/runtime')
+        return jsonResponse({
+          data: {
+            model: 'gpt-5.6-sol',
+            reasoningEffort: 'high',
+            permissionPreset: 'workspace-write',
+            approvalPolicy: 'on-request',
+            updatedAt: '2026-09-27T10:00:00.000Z',
+          },
+        });
+      if (url === '/api/models' || url === '/api/system/capabilities')
+        return jsonResponse({ error: { code: 'APP_SERVER_UNAVAILABLE', message: 'offline' } }, 503);
+      if (url === '/api/threads/thread-1/turns' && init?.method === 'POST')
+        return jsonResponse({ data: { status: 'started', turnId: 'turn-degraded-model' } });
+      return undefined;
+    });
+    const user = userEvent.setup();
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole('button', { name: 'Открыть чат проекта Frontend task' }),
+    ).not.toBeNull();
+    expect(screen.getByRole('heading', { name: 'Frontend task' })).not.toBeNull();
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Модель' }).value).toBe(
+      'gpt-5.6-sol',
+    );
+    expect(
+      screen.getByRole<HTMLSelectElement>('combobox', { name: 'Уровень reasoning' }).value,
+    ).toBe('high');
+
+    await user.type(await screen.findByLabelText('Сообщение Codex'), 'Используй выбранную модель');
+    await user.click(screen.getByRole('button', { name: 'Отправить сообщение' }));
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/threads/thread-1/turns',
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    );
+    const startCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        requestUrl(input) === '/api/threads/thread-1/turns' && init?.method === 'POST',
+    );
+    const startBody = startCall?.[1]?.body;
+    expect(JSON.parse(typeof startBody === 'string' ? startBody : '')).toMatchObject({
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'high',
+    });
+  });
+
+  it('preserves the selected chat shell on a transient history failure and retries in place', async () => {
+    let detailReads = 0;
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') {
+        detailReads += 1;
+        if (detailReads === 1)
+          return jsonResponse(
+            { error: { code: 'APP_SERVER_UNAVAILABLE', message: 'temporary outage' } },
+            503,
+          );
+        return jsonResponse({ data: thread, events: [] });
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText('Чат временно недоступен')).not.toBeNull();
+    expect(screen.queryByText('Что будем делать?')).toBeNull();
+    expect(screen.getByRole('heading', { name: 'Frontend task' })).not.toBeNull();
+    await user.click(screen.getByRole('button', { name: 'Повторить загрузку' }));
+
+    await waitFor(() => expect(detailReads).toBe(2));
+    expect(screen.queryByText('Чат временно недоступен')).toBeNull();
   });
 
   it('opens a fresh blank chat without resending or stopping the ambiguous task', async () => {
@@ -2488,7 +2627,37 @@ describe('App', () => {
         expect.objectContaining({ method: 'POST' }),
       ),
     );
+    const startCall = fetchMock.mock.calls.find(
+      ([input, init]) =>
+        requestUrl(input) === '/api/threads/thread-1/turns' && init?.method === 'POST',
+    );
+    const startBody = startCall?.[1]?.body;
+    expect(JSON.parse(typeof startBody === 'string' ? startBody : '')).toMatchObject({
+      model: 'gpt-test',
+      reasoningEffort: 'medium',
+    });
     expect(screen.queryByText(/потеряла идентификатор/)).toBeNull();
+  });
+
+  it('explains that changing the selector cannot switch an already active root turn', async () => {
+    const activeThread = {
+      ...thread,
+      status: 'active' as const,
+      activeTurnId: 'turn-active-model',
+    };
+    installAuthenticatedApi((url) => {
+      if (url.includes('/api/threads?')) return jsonResponse([activeThread]);
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: activeThread, events: [] });
+      return undefined;
+    });
+
+    render(<App />);
+
+    expect(await screen.findByText(/Активная задача продолжает работать на модели/)).not.toBeNull();
+    expect(screen.getByText(/применится к следующей новой задаче/)).not.toBeNull();
+    expect(screen.getByRole<HTMLSelectElement>('combobox', { name: 'Модель' }).value).toBe(
+      'gpt-test',
+    );
   });
 
   it('reconciles an ambiguous active chat before sending instead of failing locally', async () => {
@@ -2587,7 +2756,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    expect(await screen.findByText('Готов')).not.toBeNull();
+    expect(await screen.findByText(/Готов|Подключаемся…/)).not.toBeNull();
     expect(screen.queryByText(/Codex работает/)).toBeNull();
     expect(screen.queryByRole('button', { name: 'Остановить' })).toBeNull();
 
@@ -2820,7 +2989,7 @@ describe('App', () => {
       return undefined;
     });
     render(<App />);
-    expect(await screen.findByText('Готов')).not.toBeNull();
+    expect(await screen.findByText(/Готов|Подключаемся…/)).not.toBeNull();
     await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
     const runningChild = {
       ...subagents[0]!,
@@ -2886,7 +3055,7 @@ describe('App', () => {
         createdAt: '2026-09-29T00:00:02.000Z',
       }),
     );
-    expect(await screen.findByText('Готов')).not.toBeNull();
+    expect(await screen.findByText(/Готов|Подключаемся…/)).not.toBeNull();
   });
 
   it('applies native root status changes without requiring a REST refresh', async () => {
@@ -2897,7 +3066,7 @@ describe('App', () => {
       return undefined;
     });
     render(<App />);
-    expect(await screen.findByText('Готов')).not.toBeNull();
+    expect(await screen.findByText(/Готов|Подключаемся…/)).not.toBeNull();
     await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
 
     act(() =>
@@ -2924,7 +3093,7 @@ describe('App', () => {
         createdAt: '2026-09-29T00:01:01.000Z',
       }),
     );
-    expect(await screen.findByText('Готов')).not.toBeNull();
+    expect(await screen.findByText(/Готов|Подключаемся…/)).not.toBeNull();
   });
 
   it('keeps execution history compact and removes redundant lifecycle noise', async () => {

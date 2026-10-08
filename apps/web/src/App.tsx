@@ -3177,6 +3177,9 @@ function Workspace({
   const [reconcilingQueuedTurnKeys, setReconcilingQueuedTurnKeys] = useState<Set<string>>(
     () => new Set(),
   );
+  const [cancellableAmbiguousTurnKeys, setCancellableAmbiguousTurnKeys] = useState<Set<string>>(
+    () => new Set(),
+  );
   const [queuedAttachments, setQueuedAttachments] = useState<QueuedAttachment[]>([]);
   const [previewImage, setPreviewImage] = useState<PreviewImage | null>(null);
   const [threadAttachmentBytes, setThreadAttachmentBytes] = useState(0);
@@ -3184,6 +3187,11 @@ function Workspace({
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [dragActive, setDragActive] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [threadLoadState, setThreadLoadState] = useState<'idle' | 'loading' | 'ready' | 'error'>(
+    'idle',
+  );
+  const [threadLoadError, setThreadLoadError] = useState<string | null>(null);
+  const [threadReloadToken, setThreadReloadToken] = useState(0);
   const [busy, setBusy] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
   const [interruptingSubagentIds, setInterruptingSubagentIds] = useState<Set<string>>(
@@ -3203,6 +3211,7 @@ function Workspace({
   const accountSwitchButtonRef = useRef<HTMLButtonElement>(null);
   const refreshedCodexUpdateRef = useRef<string | null>(null);
   const capabilityRequestRef = useRef(0);
+  const automaticThreadRetryRef = useRef<string | null>(null);
   const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
   const attachmentThreadRef = useRef<string | null>(null);
   const csrfTokenRef = useRef(session.csrfToken);
@@ -3955,13 +3964,28 @@ function Workspace({
   useEffect(() => {
     const navigationEpoch = navigationEpochRef.current;
     let cancelled = false;
-    void Promise.all([api.projects(), api.models(), api.capabilities(), api.runtimePreferences()])
-      .then(([projectList, modelList, systemCapability, preferences]) => {
+    const preferencesRequest = api.runtimePreferences();
+    void Promise.all([api.projects(), preferencesRequest])
+      .then(([projectList, preferences]) => {
         if (cancelled || navigationEpoch !== navigationEpochRef.current) return;
         setProjects(projectList);
-        setModels(modelList);
-        setCapability(systemCapability);
         setProjectId((current) => current ?? projectList[0]?.id ?? null);
+        setModel(preferences.model ?? '');
+        setEffort(preferences.reasoningEffort ?? '');
+        setPermission(preferences.permissionPreset);
+        setApprovalPolicy(preferences.approvalPolicy);
+        void refreshRecentThreads(projectList, navigationEpoch).catch((cause: unknown) =>
+          setError(errorMessage(cause)),
+        );
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled && navigationEpoch === navigationEpochRef.current)
+          setError(errorMessage(cause));
+      });
+    void Promise.all([api.models(), preferencesRequest])
+      .then(([modelList, preferences]) => {
+        if (cancelled || navigationEpoch !== navigationEpochRef.current) return;
+        setModels(modelList);
         const defaultModel = modelList.find((item) => item.isDefault) ?? modelList[0] ?? null;
         const preferredModel =
           modelList.find((item) => item.id === preferences.model) ?? defaultModel;
@@ -3972,15 +3996,24 @@ function Workspace({
           : (preferredModel?.defaultReasoningEffort ?? '');
         setModel(preferredModel?.id ?? '');
         setEffort(preferredEffort);
-        setPermission(preferences.permissionPreset);
-        setApprovalPolicy(preferences.approvalPolicy);
-        void refreshRecentThreads(projectList, navigationEpoch).catch((cause: unknown) =>
-          setError(errorMessage(cause)),
-        );
       })
       .catch((cause: unknown) => {
         if (!cancelled && navigationEpoch === navigationEpochRef.current)
-          setError(errorMessage(cause));
+          setError(
+            `Каталог моделей временно недоступен. Сохранённый выбор будет использован без изменений. ${errorMessage(cause)}`,
+          );
+      });
+    void api
+      .capabilities()
+      .then((systemCapability) => {
+        if (!cancelled && navigationEpoch === navigationEpochRef.current)
+          setCapability(systemCapability);
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled && navigationEpoch === navigationEpochRef.current)
+          setError(
+            `Статус Codex временно недоступен, но сохранённые проекты и чаты доступны. ${errorMessage(cause)}`,
+          );
       });
     void api
       .resourceLimits()
@@ -4113,11 +4146,17 @@ function Workspace({
     setAttachmentNotice(null);
     setThreadAttachmentBytes(0);
     setQueuedTurns([]);
+    setCancellableAmbiguousTurnKeys(new Set());
     setSubagents([]);
     setServerTurnNavigation(null);
     runtimeSnapshotCursorRef.current = 0;
     setEventStreamStart(null);
-    if (!threadId) return;
+    setThreadLoadError(null);
+    if (!threadId) {
+      setThreadLoadState('idle');
+      return;
+    }
+    setThreadLoadState('loading');
     const requestedThreadId = threadId;
     let cancelled = false;
     void Promise.all([api.thread(requestedThreadId), api.attachments(requestedThreadId)])
@@ -4147,10 +4186,14 @@ function Workspace({
         setThreadAttachmentBytes(
           attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
         );
+        automaticThreadRetryRef.current = null;
+        setThreadLoadState('ready');
+        setThreadLoadError(null);
       })
       .catch((cause: unknown) => {
         if (!cancelled) {
-          setError(errorMessage(cause));
+          setThreadLoadState('error');
+          setThreadLoadError(errorMessage(cause));
           setEventStreamStart({ threadId: requestedThreadId, cursor: 0 });
         }
       });
@@ -4165,7 +4208,19 @@ function Workspace({
     return () => {
       cancelled = true;
     };
-  }, [closeImagePreview, mergeEvents, threadId]);
+  }, [closeImagePreview, mergeEvents, threadId, threadReloadToken]);
+
+  useEffect(() => {
+    if (
+      !threadId ||
+      threadLoadState !== 'error' ||
+      streamState !== 'open' ||
+      automaticThreadRetryRef.current === threadId
+    )
+      return;
+    automaticThreadRetryRef.current = threadId;
+    setThreadReloadToken((current) => current + 1);
+  }, [streamState, threadId, threadLoadState]);
 
   async function refreshThreads(selectId?: string | null) {
     if (!projectId) return;
@@ -4566,7 +4621,9 @@ function Workspace({
             ? { attachmentIds: attachments.map((attachment) => attachment.id) }
             : {}),
         });
-        setActionNotice('Уточнение принято активной задачей.');
+        setActionNotice(
+          'Уточнение принято активной задачей. Выбранная модель применится к следующей новой задаче.',
+        );
       } else {
         const result = await api.startTurn(session.csrfToken, threadId, {
           text,
@@ -4730,18 +4787,34 @@ function Workspace({
       );
       if (attachmentThreadRef.current !== targetThreadId) return;
       if (result.status === 'stillNeedsReview') {
+        setCancellableAmbiguousTurnKeys((current) => {
+          const next = new Set(current);
+          if (result.canDismissLocal) next.add(reconciliationKey);
+          else next.delete(reconciliationKey);
+          return next;
+        });
         setActionNotice(
           result.reason === 'readFailed'
             ? 'Не удалось получить актуальное состояние Codex. Задача не отправлена повторно и остаётся на проверке.'
-            : 'Codex пока не подтвердил запуск этой задачи. Она не отправлена повторно и остаётся на проверке.',
+            : result.canDismissLocal
+              ? 'Codex не нашёл запуск задачи. Запись можно скрыть локально, но это не остановит возможную позднюю задачу Codex.'
+              : 'Прежний runtime ещё может подтвердить запуск. Задача не отправлена повторно и пока не может быть отменена.',
         );
         return;
       }
 
       setQueuedTurns((current) => current.filter((item) => item.id !== queuedTurn.id));
+      setCancellableAmbiguousTurnKeys((current) => {
+        const next = new Set(current);
+        next.delete(reconciliationKey);
+        return next;
+      });
       setActionNotice(
-        'Запуск задачи найден в Codex. Чат обновлён; повторная отправка не выполнялась.',
+        result.status === 'dismissed'
+          ? 'Запись скрыта локально. Чат можно архивировать, но возможная задача Codex не была остановлена.'
+          : 'Запуск задачи найден в Codex. Чат обновлён; повторная отправка не выполнялась.',
       );
+      if (result.status === 'dismissed') return;
       try {
         const [history, nextQueuedTurns] = await Promise.all([
           api.thread(targetThreadId),
@@ -4769,6 +4842,66 @@ function Workspace({
         setActionNotice(null);
         setError(queuedTurnReconcileErrorMessage(cause));
       }
+    } finally {
+      queuedTurnReconciliationsRef.current.delete(reconciliationKey);
+      setReconcilingQueuedTurnKeys((current) => {
+        const next = new Set(current);
+        next.delete(reconciliationKey);
+        return next;
+      });
+    }
+  }
+
+  async function dismissAmbiguousQueuedTurn(queuedTurn: QueuedTurn) {
+    const targetThreadId = threadId;
+    if (!targetThreadId || queuedTurn.status !== 'needsReview') return;
+    const reconciliationKey = queuedTurnKey(targetThreadId, queuedTurn.id);
+    if (
+      !cancellableAmbiguousTurnKeys.has(reconciliationKey) ||
+      queuedTurnReconciliationsRef.current.has(reconciliationKey)
+    )
+      return;
+    queuedTurnReconciliationsRef.current.add(reconciliationKey);
+    setReconcilingQueuedTurnKeys((current) => new Set(current).add(reconciliationKey));
+    setError(null);
+    setActionNotice(null);
+    try {
+      const result = await api.dismissAmbiguousQueuedTurn(
+        session.csrfToken,
+        targetThreadId,
+        queuedTurn.id,
+      );
+      if (attachmentThreadRef.current !== targetThreadId) return;
+      if (result.status === 'dismissed') {
+        setQueuedTurns((current) => current.filter((item) => item.id !== queuedTurn.id));
+        setCancellableAmbiguousTurnKeys((current) => {
+          const next = new Set(current);
+          next.delete(reconciliationKey);
+          return next;
+        });
+        setActionNotice(
+          'Запись скрыта локально. Чат можно архивировать, но возможная задача Codex не была остановлена.',
+        );
+        return;
+      }
+      if (result.status === 'resolved') {
+        setQueuedTurns((current) => current.filter((item) => item.id !== queuedTurn.id));
+        setActionNotice('Запуск задачи найден в Codex и сохранён в чате. Отмена не выполнялась.');
+        return;
+      }
+      setCancellableAmbiguousTurnKeys((current) => {
+        const next = new Set(current);
+        if (result.canDismissLocal) next.add(reconciliationKey);
+        else next.delete(reconciliationKey);
+        return next;
+      });
+      setActionNotice(
+        result.reason === 'readFailed'
+          ? 'Не удалось повторно проверить Codex. Спорная задача сохранена.'
+          : 'Отмена пока небезопасна: прежний runtime ещё может подтвердить запуск.',
+      );
+    } catch (cause) {
+      if (attachmentThreadRef.current === targetThreadId) setError(errorMessage(cause));
     } finally {
       queuedTurnReconciliationsRef.current.delete(reconciliationKey);
       setReconcilingQueuedTurnKeys((current) => {
@@ -5024,7 +5157,9 @@ function Workspace({
                   : `Codex работает${activeTurnDuration ? ` уже ${activeTurnDuration}` : ''}`
                 : streamState === 'offline'
                   ? 'Нет подключения'
-                  : 'Готов'}
+                  : streamState === 'connecting'
+                    ? 'Подключаемся…'
+                    : 'Готов'}
             </span>
           </div>
           <div className="toolbar-actions">
@@ -5104,12 +5239,33 @@ function Workspace({
           onKeyDown={markConversationKeyboardScrollIntent}
         >
           <div className="conversation-content" ref={conversationContentRef}>
-            <Transcript
-              events={events}
-              serverTurnNavigation={serverTurnNavigation}
-              onNavigateTurn={navigateToTurn}
-              onPreviewImage={openImagePreview}
-            />
+            {threadId && threadLoadState === 'loading' && events.length === 0 ? (
+              <section className="thread-load-state" aria-live="polite" aria-busy="true">
+                <span className="spinner" aria-hidden="true" />
+                <strong>Загружаем чат…</strong>
+              </section>
+            ) : null}
+            {threadId && threadLoadState === 'error' ? (
+              <section className="thread-load-state error" role="alert">
+                <strong>Чат временно недоступен</strong>
+                <p>{threadLoadError ?? 'Соединение с сервером прервано.'}</p>
+                <button
+                  type="button"
+                  className="secondary"
+                  onClick={() => setThreadReloadToken((current) => current + 1)}
+                >
+                  Повторить загрузку
+                </button>
+              </section>
+            ) : null}
+            {!threadId || threadLoadState === 'ready' || events.length > 0 ? (
+              <Transcript
+                events={events}
+                serverTurnNavigation={serverTurnNavigation}
+                onNavigateTurn={navigateToTurn}
+                onPreviewImage={openImagePreview}
+              />
+            ) : null}
             {queuedTurns.length > 0 && (
               <section className="queued-turns" aria-label="Задачи в очереди" aria-live="polite">
                 {queuedTurns.map((queuedTurn) => {
@@ -5119,6 +5275,9 @@ function Workspace({
                   const reconciling =
                     threadId !== null &&
                     reconcilingQueuedTurnKeys.has(queuedTurnKey(threadId, queuedTurn.id));
+                  const cancellableAmbiguous =
+                    threadId !== null &&
+                    cancellableAmbiguousTurnKeys.has(queuedTurnKey(threadId, queuedTurn.id));
                   return (
                     <article
                       className={`queued-turn-card ${queuedTurn.status === 'needsReview' ? 'needs-review' : ''}`}
@@ -5159,6 +5318,16 @@ function Workspace({
                             >
                               {reconciling ? 'Проверяем…' : 'Проверить сейчас'}
                             </button>
+                            {cancellableAmbiguous && (
+                              <button
+                                type="button"
+                                className="queued-turn-cancel"
+                                disabled={reconciling || busy}
+                                onClick={() => void dismissAmbiguousQueuedTurn(queuedTurn)}
+                              >
+                                {reconciling ? 'Скрываем…' : 'Скрыть локальную запись'}
+                              </button>
+                            )}
                             <button
                               type="button"
                               className="queued-turn-new-chat"
@@ -5276,6 +5445,9 @@ function Workspace({
                   });
                 }}
               >
+                {model && !models.some((item) => item.id === model) ? (
+                  <option value={model}>{model}</option>
+                ) : null}
                 {models.map((item) => (
                   <option value={item.id} key={item.id}>
                     {item.displayName}
@@ -5293,6 +5465,12 @@ function Workspace({
                 }
               >
                 <option value="">По умолчанию</option>
+                {effort &&
+                !modelOption?.supportedReasoningEfforts.some(
+                  (item) => item.reasoningEffort === effort,
+                ) ? (
+                  <option value={effort}>{effort}</option>
+                ) : null}
                 {modelOption?.supportedReasoningEfforts.map((item) => (
                   <option value={item.reasoningEffort} key={item.reasoningEffort}>
                     {item.reasoningEffort}
@@ -5333,6 +5511,12 @@ function Workspace({
               </select>
             </label>
           </div>
+          {activeRootTurn && (
+            <p className="runtime-application-note">
+              Активная задача продолжает работать на модели, с которой была запущена. Выбор
+              применится к следующей новой задаче и её новым субагентам по умолчанию.
+            </p>
+          )}
           <div
             className={`composer ${dragActive ? 'drag-active' : ''}`}
             onDragEnter={(event: DragEvent<HTMLDivElement>) => {

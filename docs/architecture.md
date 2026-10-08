@@ -39,10 +39,17 @@ Browser
   broadcast as `interruptRequested`; the turn remains active until Codex emits its terminal notification.
 - The single administrator's last model, reasoning effort, permission preset and approval policy are stored as
   one atomic server-side preference tuple. They follow the account between devices and are not reset when the
-  operator switches projects.
+  operator switches projects. The selected model is sent on every new root `turn/start`, including a queued
+  request when it is eventually dispatched. Active-turn guidance uses `turn/steer`, whose protocol has no
+  model override, so changing the selector cannot replace an already running root turn or its existing
+  descendants; the UI identifies the selection as applying to the next new task and its new subagents.
 - Codex rollout files remain the source of truth for Codex conversation history. SQLite stores the local project registry, thread-to-project mapping, UI metadata, sessions, audit records and a bounded reconnect journal. The journal keeps the newest configured event window plus a separately bounded window of user prompts so command/subagent noise cannot evict every transcript anchor. A bounded per-thread turn-navigation index is rebuilt from authoritative Codex history once per app-server generation and updated with every accepted local prompt; it restores navigation after reload without making the activity journal unbounded.
 - A project is a display name plus a canonical existing directory under an allowlisted root. Codex has no separate project entity; thread `cwd` binds execution to a project.
 - Models and reasoning efforts come from `model/list`; the UI never hard-codes account availability.
+- Persisted project and chat navigation remains readable when `thread/list` cannot reach Codex. Likewise, a
+  selected chat whose first native history hydration is temporarily unavailable returns its persisted safe
+  journal and metadata. The browser loads navigation independently from the model/capability catalog and keeps
+  a selected failed chat in an explicit loading/retry state rather than rendering the blank-chat welcome view.
 - `instructionSources` from thread start/resume and `skills/list` are visible in the status drawer so the operator can verify that `AGENTS.md` and required skills loaded.
 - The backend reads account identity, rate limits and aggregate usage through bounded app-server methods. The
   public projection exposes only the authenticated account type, email and plan label; it omits account IDs,
@@ -246,13 +253,14 @@ server verifies that the selected child belongs to the requested root, discovers
 authoritative `thread/read`, and sends `turn/interrupt` only for that exact child turn. An ambiguous interrupt
 does not optimistically mark the child terminal; normal lifecycle reconciliation remains authoritative.
 
-An authenticated operator may cancel a request only while its durable row is still `queued`. The cancellation
+An authenticated operator may normally cancel a request only while its durable row is still `queued`. The cancellation
 removes the row and its exclusively claimed attachment records in one SQLite transaction, immediately releasing
 the thread quota. The same transaction creates no-foreign-key file-deletion tombstones, so bounded idempotent
 cleanup under the thread attachment lock survives a crash, retries after startup with fair exponential backoff,
 and removes a tombstone only after the file is absent. Cleanup processes at most 16 due records per pass; failed
 records yield to newer work and emit only finitely many audit milestones. A concurrent dispatcher claim wins over cancellation, so `dispatching`
-and `unknown` rows cannot be cancelled and active native work is never interrupted by this operation.
+and `unknown` rows cannot be cancelled through the ordinary cancellation route and active native work is never
+interrupted by this operation.
 Successful cancellation publishes a queue-change event so every device refreshes the remaining positions.
 Ambiguous `needsReview` work stays fail closed until authoritative reconciliation.
 
@@ -260,14 +268,18 @@ If the API process loses the result of `turn/start`, the row is retained as visi
 never started again automatically. Recovery reads the authoritative Codex thread and matches the persisted
 client message id: an existing native turn completes the queue record and attachment binding without another
 side effect. Absence from a read is not proof that an earlier request cannot still be applied, so the ambiguous
-outcome remains visible and fail closed; it cannot be retried, cancelled or archived through the normal UI
-until Codex supplies positive evidence that resolves it. The operator can request the same exact authoritative
-check immediately; a positive client-message match adopts the native turn atomically, while an absent match or
-failed read leaves the record unchanged and never calls `turn/start`. The card also offers a blank new chat in
-the same project so unrelated work can continue without resending or stopping the uncertain task. New root
-turns and queued followers for the affected thread remain held back so a late native turn cannot overtake a
-newer request; unrelated threads continue to use the available execution slots. Definite pre-send failures and
-explicit upstream rejections return the request to the queue; only transport outcomes that can have reached
+outcome remains visible and fail closed; it cannot be retried or represented as cancelled. The operator can
+request the same exact authoritative check immediately. A positive client-message match always adopts the
+native turn atomically. After a fresh successful thread read finds no matching client message, a separate local
+dismissal hides the queue card and permits archive without claiming that native work stopped. The durable
+`unknown` row, its attachment claims and unknown idempotency tombstone are retained, background reconciliation
+continues through a bounded hourly sweep, and the UI warns that a late native task may still appear. The
+dismissed ambiguity fence also continues to block successful-completion notifications. The dismissal never calls `turn/start` or
+`turn/interrupt`; failed reads cannot expose it. The card also offers a blank new chat in the same project so
+unrelated work can continue without resending or stopping the uncertain task. New root turns and queued
+followers for the affected thread remain held back by the durable ambiguity fence so a late native turn cannot
+overtake a newer request; unrelated threads continue to use the available execution slots. Definite pre-send
+failures and explicit upstream rejections return the request to the queue; only transport outcomes that can have reached
 Codex enter `needsReview`.
 
 ## Initial API

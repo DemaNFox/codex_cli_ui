@@ -94,6 +94,7 @@ interface QueuedTurnRow {
   claim_token: string;
   status: QueuedTurnRecord['status'];
   error_code: string | null;
+  dismissed_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -197,6 +198,7 @@ export interface QueuedTurnRecord {
   claimToken: string;
   status: 'queued' | 'dispatching' | 'unknown' | 'failed';
   errorCode: string | null;
+  dismissedAt: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -213,6 +215,7 @@ function queuedTurnFromRow(row: QueuedTurnRow): QueuedTurnRecord {
     claimToken: row.claim_token,
     status: row.status,
     errorCode: row.error_code,
+    dismissedAt: row.dismissed_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -501,6 +504,7 @@ export class SqliteRepository {
         claim_token TEXT NOT NULL UNIQUE,
         status TEXT NOT NULL CHECK(status IN ('queued','dispatching','unknown','failed')),
         error_code TEXT,
+        dismissed_at TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         UNIQUE(thread_id,idempotency_key)
@@ -562,6 +566,7 @@ export class SqliteRepository {
     this.migrateIdempotencyState();
     this.migrateThreadActiveTurn();
     this.migrateAttachmentFileDeletionDueTime();
+    this.migrateQueuedTurnDismissal();
     this.recoverInterruptedQueuedTurns();
     this.enforcePushStorageBounds();
   }
@@ -577,6 +582,14 @@ export class SqliteRepository {
     this.database.exec(
       'CREATE INDEX IF NOT EXISTS projects_archived_idx ON projects(archived,name COLLATE NOCASE,id)',
     );
+  }
+
+  private migrateQueuedTurnDismissal(): void {
+    const columns = this.database.prepare('PRAGMA table_info(queued_turns)').all() as unknown as {
+      name: string;
+    }[];
+    if (!columns.some((column) => column.name === 'dismissed_at'))
+      this.database.exec('ALTER TABLE queued_turns ADD COLUMN dismissed_at TEXT');
   }
 
   private recoverInterruptedQueuedTurns(): void {
@@ -1787,7 +1800,7 @@ export class SqliteRepository {
     return (
       this.database
         .prepare(
-          "SELECT * FROM queued_turns WHERE thread_id=? AND status IN ('queued','unknown') ORDER BY id",
+          "SELECT * FROM queued_turns WHERE thread_id=? AND status IN ('queued','unknown') AND dismissed_at IS NULL ORDER BY id",
         )
         .all(threadId) as unknown as QueuedTurnRow[]
     ).map(queuedTurnFromRow);
@@ -1809,11 +1822,22 @@ export class SqliteRepository {
     );
   }
 
+  dismissUnknownQueuedTurn(threadId: string, id: number): boolean {
+    const now = new Date().toISOString();
+    return (
+      this.database
+        .prepare(
+          "UPDATE queued_turns SET dismissed_at=?,updated_at=? WHERE id=? AND thread_id=? AND status='unknown' AND dismissed_at IS NULL",
+        )
+        .run(now, now, id, threadId).changes === 1
+    );
+  }
+
   hasOutstandingQueuedTurns(threadId: string): boolean {
     return (
       this.database
         .prepare(
-          "SELECT 1 FROM queued_turns WHERE thread_id=? AND status IN ('queued','dispatching','unknown','failed') LIMIT 1",
+          "SELECT 1 FROM queued_turns WHERE thread_id=? AND (status IN ('queued','dispatching','failed') OR (status='unknown' AND dismissed_at IS NULL)) LIMIT 1",
         )
         .get(threadId) !== undefined
     );

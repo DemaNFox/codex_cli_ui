@@ -18,6 +18,7 @@ import {
   resourceLimitSnapshotSchema,
   pushSubscriptionSchema,
   pushSubscriptionStatusRequestSchema,
+  reconcileQueuedTurnRequestSchema,
   reconcileQueuedTurnResultSchema,
   startThreadRequestSchema,
   startTurnRequestSchema,
@@ -967,6 +968,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       nativeActiveThreads.has(threadId) ||
       repository.countActiveSubagentsForRoot(threadId) > 0 ||
       repository.hasOutstandingQueuedTurns(threadId) ||
+      repository.hasUnknownQueuedTurn(threadId) ||
       (pendingTurnStartThreads.get(threadId) ?? 0) > 0 ||
       uncertainTurnStartThreads.has(threadId)
     )
@@ -1022,6 +1024,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   let queuedTurnDispatch: Promise<void> | null = null;
   let queuedTurnDispatchRequested = false;
   let requestQueuedTurnDispatch: () => void = () => {};
+  const unknownQueuedTurnReconcileDueAt = new Map<number, number>();
+  const maxUnknownReconciliationsPerPass = 8;
+  const visibleUnknownReconcileDelayMs = 5_000;
+  const dismissedUnknownReconcileDelayMs = 60 * 60 * 1_000;
   let lastQueuedEligibilityReconcileAt = 0;
   const queuedEligibilityReconcileGraceMs = 1_000;
   let accountLogin: CodexAccountLogin = codexAccountLoginSchema.parse({
@@ -2833,47 +2839,56 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       .passthrough();
     let cursor = query.cursor ?? null;
     const seenCursors = new Set<string>();
-    for (let page = 0; page < 100; page += 1) {
-      const cwd = await canonicalProjectPath(pathPolicy, project);
-      const remote = pageSchema.parse(
-        await appServer.request('thread/list', {
-          cwd,
-          archived: query.archived,
-          cursor,
-          limit: 100,
-          sourceKinds: ['cli', 'vscode', 'appServer', 'exec'],
-        }),
-      );
-      for (const rpcThread of remote.data) {
-        if (rpcThread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
-        const existing = repository.getThread(rpcThread.id);
-        const archiveStateWasKnown = archiveStateAtRequestStart.has(rpcThread.id);
-        const archiveStateChanged =
-          existing !== undefined &&
-          (!archiveStateWasKnown ||
-            existing.archived !== archiveStateAtRequestStart.get(rpcThread.id));
-        repository.upsertThread(
-          mapThread(
-            rpcThread,
-            project.id,
-            archiveStateChanged ? existing.archived : query.archived,
-            existing?.instructionSources ?? [],
-            undefined,
-            existing,
-            activeTurnIdForThread(rpcThread.id),
-            repository.countActiveSubagentsForRoot(rpcThread.id) > 0,
-          ),
+    try {
+      for (let page = 0; page < 100; page += 1) {
+        const cwd = await canonicalProjectPath(pathPolicy, project);
+        const remote = pageSchema.parse(
+          await appServer.request('thread/list', {
+            cwd,
+            archived: query.archived,
+            cursor,
+            limit: 100,
+            sourceKinds: ['cli', 'vscode', 'appServer', 'exec'],
+          }),
         );
+        for (const rpcThread of remote.data) {
+          if (rpcThread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
+          const existing = repository.getThread(rpcThread.id);
+          const archiveStateWasKnown = archiveStateAtRequestStart.has(rpcThread.id);
+          const archiveStateChanged =
+            existing !== undefined &&
+            (!archiveStateWasKnown ||
+              existing.archived !== archiveStateAtRequestStart.get(rpcThread.id));
+          repository.upsertThread(
+            mapThread(
+              rpcThread,
+              project.id,
+              archiveStateChanged ? existing.archived : query.archived,
+              existing?.instructionSources ?? [],
+              undefined,
+              existing,
+              activeTurnIdForThread(rpcThread.id),
+              repository.countActiveSubagentsForRoot(rpcThread.id) > 0,
+            ),
+          );
+        }
+        const nextCursor = remote.nextCursor ?? null;
+        if (nextCursor === null) {
+          cursor = null;
+          break;
+        }
+        if (seenCursors.has(nextCursor)) throw new HttpError(502, 'APP_SERVER_CURSOR_LOOP');
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
+        if (page === 99) throw new HttpError(502, 'APP_SERVER_PAGINATION_LIMIT');
       }
-      const nextCursor = remote.nextCursor ?? null;
-      if (nextCursor === null) {
-        cursor = null;
-        break;
-      }
-      if (seenCursors.has(nextCursor)) throw new HttpError(502, 'APP_SERVER_CURSOR_LOOP');
-      seenCursors.add(nextCursor);
-      cursor = nextCursor;
-      if (page === 99) throw new HttpError(502, 'APP_SERVER_PAGINATION_LIMIT');
+    } catch (error) {
+      if (!(error instanceof AppServerRequestError) || error.failureKind !== 'notSent') throw error;
+      cursor = null;
+      repository.audit('thread.list', 'degraded', {
+        projectId: project.id,
+        reason: 'app_server_unavailable',
+      });
     }
     return {
       data: repository.listThreads(project.id, query.archived),
@@ -2947,7 +2962,16 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (!existing) throw new HttpError(404, 'THREAD_NOT_FOUND');
     let thread = existing;
     if (!repository.isThreadHistoryHydrated(id)) {
-      thread = await hydrateThreadHistory(existing);
+      try {
+        thread = await hydrateThreadHistory(existing);
+      } catch (error) {
+        if (!(error instanceof AppServerRequestError) || error.failureKind !== 'notSent')
+          throw error;
+        repository.audit('thread.history', 'degraded', {
+          threadId: id,
+          reason: 'app_server_unavailable',
+        });
+      }
     } else {
       try {
         if (turnNavigationGenerations.get(id) !== appServer.generation)
@@ -3419,6 +3443,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       repository.updateThreadRuntime(record.threadId, { status: 'active', activeTurnId: turnId });
     }
     if (!repository.completeQueuedTurn(record.id, turnId)) return false;
+    unknownQueuedTurnReconcileDueAt.delete(record.id);
     publishQueueChanged(record.threadId);
     const userEvent = repository.appendEvent({
       threadId: record.threadId,
@@ -3646,12 +3671,24 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   };
 
   const reconcileUnknownQueuedTurns = async (): Promise<void> => {
+    let attempted = 0;
     for (const record of repository.listUnknownQueuedTurns()) {
       if (serverClosing || !appServer.ready) return;
+      const now = Date.now();
+      if ((unknownQueuedTurnReconcileDueAt.get(record.id) ?? 0) > now) continue;
+      if (attempted >= maxUnknownReconciliationsPerPass) return;
+      attempted += 1;
       await attachmentStore.withThreadLock(record.threadId, async () => {
         const current = repository.getQueuedTurn(record.id);
         if (!current || current.threadId !== record.threadId || current.status !== 'unknown')
           return;
+        unknownQueuedTurnReconcileDueAt.set(
+          current.id,
+          now +
+            (current.dismissedAt === null
+              ? visibleUnknownReconcileDelayMs
+              : dismissedUnknownReconcileDelayMs),
+        );
         const thread = repository.getThread(record.threadId);
         if (!thread) return;
         try {
@@ -3668,6 +3705,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           if (evidence.turnId === null) return;
           if (!adoptUnknownQueuedTurn(current, evidence.turnId, evidence.matchingTurnIsInProgress))
             return;
+          unknownQueuedTurnReconcileDueAt.delete(current.id);
           repository.audit('turn.queue.reconcile', 'succeeded', {
             threadId: record.threadId,
             queuedTurnId: record.id,
@@ -3750,6 +3788,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   app.post('/api/threads/:id/queued-turns/:queuedTurnId/reconcile', async (request) => {
     csrfGuard(auth, request);
     const params = queuedTurnParamsSchema.parse(request.params);
+    const input = reconcileQueuedTurnRequestSchema.parse(request.body);
     const thread = repository.getThread(params.id);
     if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
     const project = repository.getProject(thread.projectId);
@@ -3760,24 +3799,43 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         throw new HttpError(404, 'QUEUED_TURN_NOT_FOUND');
       if (record.status !== 'unknown') throw new HttpError(409, 'QUEUED_TURN_NOT_REVIEWABLE');
       try {
+        const cwd = await canonicalProjectPath(pathPolicy, project);
         const read = threadResponseSchema.parse(
           await appServer.request('thread/read', {
             threadId: params.id,
             includeTurns: true,
           }),
         );
+        if (read.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
         const evidence = queuedClientMessageEvidence(
           inputRecord(read.thread)?.turns,
           record.idempotencyKey,
         );
         if (evidence.turnId === null) {
+          const canDismissLocal = record.dismissedAt === null;
+          if (input.action === 'dismissLocal' && canDismissLocal) {
+            if (!repository.dismissUnknownQueuedTurn(params.id, params.queuedTurnId))
+              throw new HttpError(409, 'QUEUED_TURN_NOT_REVIEWABLE');
+            unknownQueuedTurnReconcileDueAt.set(
+              record.id,
+              Date.now() + dismissedUnknownReconcileDelayMs,
+            );
+            repository.audit('turn.queue.resolve.manual', 'dismissed', {
+              threadId: params.id,
+              queuedTurnId: params.queuedTurnId,
+            });
+            publishQueueChanged(params.id);
+            return reconcileQueuedTurnResultSchema.parse({ status: 'dismissed' });
+          }
           repository.audit('turn.queue.reconcile.manual', 'not_found', {
             threadId: params.id,
             queuedTurnId: params.queuedTurnId,
+            canDismissLocal,
           });
           return reconcileQueuedTurnResultSchema.parse({
             status: 'stillNeedsReview',
-            reason: 'notFound',
+            reason: canDismissLocal ? 'notFound' : 'startMayStillArrive',
+            canDismissLocal,
           });
         }
         if (!adoptUnknownQueuedTurn(record, evidence.turnId, evidence.matchingTurnIsInProgress))
@@ -3800,10 +3858,11 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         return reconcileQueuedTurnResultSchema.parse({
           status: 'stillNeedsReview',
           reason: 'readFailed',
+          canDismissLocal: false,
         });
       }
     });
-    if (result.status === 'resolved') {
+    if (result.status === 'resolved' || result.status === 'dismissed') {
       flushDeferredCompletionPush(params.id);
       requestQueuedTurnDispatch();
     }
