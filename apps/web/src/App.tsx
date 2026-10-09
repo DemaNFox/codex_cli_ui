@@ -3150,14 +3150,19 @@ function SettingsDialog({
 function Diagnostics({
   capability,
   thread,
+  refreshing,
+  refreshError,
   onClose,
 }: {
   capability: Capability | null;
   thread: Thread | null;
+  refreshing: boolean;
+  refreshError: string | null;
   onClose: () => void;
 }) {
   const performance = capability?.threadPerformance;
   const matchingPerformance = thread && performance?.threadId === thread.id ? performance : null;
+  const performanceRefreshing = refreshing && thread !== null;
   return (
     <aside id="codex-diagnostics" className="diagnostics" aria-label="Статус Codex">
       <header>
@@ -3311,9 +3316,19 @@ function Diagnostics({
                   </dd>
                 </dl>
               </>
+            ) : performanceRefreshing ? (
+              <p className="empty-hint compact" role="status">
+                Обновляем замер завершённых задач…
+              </p>
+            ) : refreshError ? (
+              <p className="empty-hint compact" role="alert">
+                Не удалось обновить замер этого чата. Повторите попытку позже.
+              </p>
             ) : (
               <p className="empty-hint compact">
-                Замер последнего завершённого ответа пока недоступен.
+                {thread?.status === 'active'
+                  ? 'Текущая задача ещё выполняется. Замер появится после её успешного завершения.'
+                  : 'Замеров успешных задач после обновления пока нет.'}
               </p>
             )}
             <h4>Недавние ответы чата</h4>
@@ -3330,8 +3345,14 @@ function Diagnostics({
                 <dt>Размер выборки</dt>
                 <dd>{matchingPerformance.recent.sampleSize.toLocaleString('ru')}</dd>
               </dl>
+            ) : performanceRefreshing ? (
+              <p className="empty-hint compact">Обновляем выборку…</p>
+            ) : refreshError ? (
+              <p className="empty-hint compact">Выборка этого чата не загружена.</p>
             ) : (
-              <p className="empty-hint compact">Недостаточно завершённых ответов для медианы.</p>
+              <p className="empty-hint compact">
+                Для медианы нужны успешно завершённые задачи после обновления.
+              </p>
             )}
           </section>
           {capability.warnings.length > 0 && (
@@ -3545,6 +3566,7 @@ function Workspace({
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const [mobileRuntimeOpen, setMobileRuntimeOpen] = useState(false);
   const [statusRefreshing, setStatusRefreshing] = useState(false);
+  const [statusRefreshError, setStatusRefreshError] = useState<string | null>(null);
   const [pushNotificationState, setPushNotificationState] =
     useState<PushNotificationState>('unavailable');
   const [pushNotificationBusy, setPushNotificationBusy] = useState(false);
@@ -3623,6 +3645,9 @@ function Workspace({
   const { events, streamState, mergeEvents } = useThreadEvents(threadId, eventStreamCursor);
   const latestEvent = events.at(-1) ?? null;
   const latestEventId = latestEvent?.id ?? null;
+  const latestCompletedTurnEventId = [...events]
+    .reverse()
+    .find((event) => event.kind === 'turn' && event.phase === 'completed')?.id;
   const queueChangeEventId = [...events]
     .reverse()
     .find((event) => event.payload.queueChanged === true)?.id;
@@ -4038,9 +4063,14 @@ function Workspace({
     if (!showDiagnostics) return;
     let disposed = false;
     setStatusRefreshing(true);
+    setStatusRefreshError(null);
     void refreshCapabilityForThread(threadId)
       .catch((cause: unknown) => {
-        if (!disposed) setError(errorMessage(cause));
+        if (!disposed) {
+          const message = errorMessage(cause);
+          setStatusRefreshError(message);
+          setError(message);
+        }
       })
       .finally(() => {
         if (!disposed) setStatusRefreshing(false);
@@ -4050,7 +4080,7 @@ function Workspace({
       capabilityRequestRef.current += 1;
       setStatusRefreshing(false);
     };
-  }, [showDiagnostics, threadId]);
+  }, [latestCompletedTurnEventId, showDiagnostics, threadId]);
 
   function closeAccountLoginDialog() {
     setAccountLoginOpen(false);
@@ -6142,7 +6172,13 @@ function Workspace({
         </div>
       </section>
       {showDiagnostics && (
-        <Diagnostics capability={capability} thread={selectedThread} onClose={closeDiagnostics} />
+        <Diagnostics
+          capability={capability}
+          thread={selectedThread}
+          refreshing={statusRefreshing}
+          refreshError={statusRefreshError}
+          onClose={closeDiagnostics}
+        />
       )}
       {settingsOpen && !accountLoginOpen && (
         <SettingsDialog

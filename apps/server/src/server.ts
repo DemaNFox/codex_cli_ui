@@ -2534,16 +2534,37 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         } else if (message.method === 'turn/completed') {
           const key = performanceKey(threadId, turnId);
           const state = turnPerformance.get(key);
-          const completedAtMs = epochSecondsToMilliseconds(turn?.completedAt) ?? Date.now();
-          if (turn?.status === 'completed' && state && state.startedAtMono !== null) {
+          const terminalCompletedAtMs = epochSecondsToMilliseconds(turn?.completedAt);
+          const completedAtMs = terminalCompletedAtMs ?? Date.now();
+          const terminalStartedAtMs = epochSecondsToMilliseconds(turn?.startedAt);
+          const terminalDurationMs = safeNonnegativeInteger(turn?.durationMs);
+          const derivedTerminalDurationMs =
+            terminalStartedAtMs !== null &&
+            terminalCompletedAtMs !== null &&
+            terminalCompletedAtMs >= terminalStartedAtMs
+              ? terminalCompletedAtMs - terminalStartedAtMs
+              : null;
+          if (
+            turn?.status === 'completed' &&
+            ((state !== undefined && state.startedAtMono !== null) ||
+              (terminalDurationMs !== null && terminalDurationMs > 0) ||
+              (derivedTerminalDurationMs !== null && derivedTerminalDurationMs > 0))
+          ) {
             const totalDurationMs =
-              safeNonnegativeInteger(turn.durationMs) ??
-              Math.max(0, Math.round(observedAtMono - state.startedAtMono));
+              terminalDurationMs !== null && terminalDurationMs > 0
+                ? terminalDurationMs
+                : state !== undefined && state.startedAtMono !== null
+                  ? Math.max(0, Math.round(observedAtMono - state.startedAtMono))
+                  : derivedTerminalDurationMs!;
             const timeToFirstOutputMs =
-              state.firstDeltaAtMono !== null && state.firstDeltaAtMono >= state.startedAtMono
+              state !== undefined &&
+              state.startedAtMono !== null &&
+              state.firstDeltaAtMono !== null &&
+              state.firstDeltaAtMono >= state.startedAtMono
                 ? Math.round(state.firstDeltaAtMono - state.startedAtMono)
                 : null;
             const generationDurationMs =
+              state !== undefined &&
               state.firstDeltaAtMono !== null &&
               state.lastDeltaAtMono !== null &&
               state.lastDeltaAtMono > state.firstDeltaAtMono
@@ -2553,7 +2574,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
               completedAt: Number.isNaN(new Date(completedAtMs).getTime())
                 ? new Date().toISOString()
                 : new Date(completedAtMs).toISOString(),
-              outputTokens: state.outputTokens,
+              outputTokens: state?.outputTokens ?? null,
               timeToFirstOutputMs,
               generationDurationMs:
                 generationDurationMs !== null && generationDurationMs > 0
@@ -4302,6 +4323,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       if (!repository.setQueuedTurnAccountFingerprint(claimed.id, resetAccountFingerprint))
         return 'wait';
       turnStartIssued = true;
+      const turnStartIssuedAtMono = performance.now();
       const result = turnResponseSchema.parse(
         await appServer.request('turn/start', {
           threadId: thread.id,
@@ -4321,6 +4343,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       if (!repository.completeQueuedTurn(claimed.id, result.turn.id, resetAccountFingerprint))
         throw new HttpError(409, 'IDEMPOTENCY_OUTCOME_UNKNOWN');
       publishQueueChanged(thread.id);
+      performanceState(thread.id, result.turn.id).startedAtMono ??= turnStartIssuedAtMono;
       setActiveTurn(thread.id, result.turn.id);
       repository.updateThreadRuntime(thread.id, { status: 'active', activeTurnId: result.turn.id });
       const userEvent = repository.appendEvent({
@@ -4788,6 +4811,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         return reply.code(202).send(response);
       }
       turnStartIssued = true;
+      const turnStartIssuedAtMono = performance.now();
       result = turnResponseSchema.parse(
         await appServer.request('turn/start', {
           threadId: id,
@@ -4801,6 +4825,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           sandboxPolicy: sandboxPolicy(preset, turnCwd),
         }),
       );
+      performanceState(id, result.turn.id).startedAtMono ??= turnStartIssuedAtMono;
       repository.recordTurnExecutionIntent(
         result.turn.id,
         id,

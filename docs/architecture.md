@@ -68,9 +68,12 @@ Browser
   output-stream duration, total turn duration and reported-output-token throughput. The first-output timestamp
   is the first public text fragment observed by the server, and throughput is an operational estimate over the
   first-to-last-fragment interval rather than an exact decoder benchmark. Streamed text is never stored for this
-  measurement. Missing, interrupted or zero-duration evidence remains unavailable, and Status labels estimated
-  output-stream throughput separately from effective whole-task throughput because tools and waiting can
-  dominate an agentic turn.
+  measurement. A successful terminal event with an authoritative duration still creates a partial sample when
+  the process missed `turn/started`; unavailable first-fragment or stream-duration fields remain `null`, while a
+  later matching token-usage notification may complete the effective-throughput value. Interrupted, failed or
+  zero-duration evidence remains unavailable. Status labels estimated output-stream throughput separately from
+  effective whole-task throughput because tools and waiting can dominate an agentic turn, shows a loading state
+  for the selected-thread read and refreshes an open projection after a terminal turn event.
 - The Settings dialog offers a separate, account-bound and default-off automatic reset policy for earned Codex
   rate-limit resets. A native terminal limit error is only a wake-up signal: the backend closes account-wide
   task admission, performs a fresh detailed `account/rateLimits/read`, verifies the same ChatGPT account,

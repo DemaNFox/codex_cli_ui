@@ -3881,6 +3881,155 @@ describe('Codex routes', () => {
     expect(tableDefinition.sql).not.toContain('delta');
   });
 
+  it('persists terminal performance when turn started was missed and accepts late token usage', async () => {
+    const { app, appServer, projectPath, repository } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: {
+        threadId,
+        turn: {
+          id: 'turn-performance-missed-start',
+          status: 'completed',
+          startedAt: 1_800_000_020,
+          completedAt: 1_800_000_022,
+          durationMs: 2_000,
+          items: [],
+        },
+      },
+    });
+    appServer.emit({
+      method: 'thread/tokenUsage/updated',
+      params: {
+        threadId,
+        turnId: 'turn-performance-missed-start',
+        tokenUsage: { last: { outputTokens: 80 }, total: { outputTokens: 80 } },
+      },
+    });
+
+    expect(repository.listTurnPerformance(threadId)).toEqual([
+      {
+        turnId: 'turn-performance-missed-start',
+        completedAt: '2027-01-15T08:00:22.000Z',
+        outputTokens: 80,
+        timeToFirstOutputMs: null,
+        generationDurationMs: null,
+        totalDurationMs: 2_000,
+        generationTokensPerSecond: null,
+        effectiveTokensPerSecond: 40,
+      },
+    ]);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/system/capabilities?threadId=${encodeURIComponent(threadId)}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      threadPerformance: {
+        threadId,
+        last: {
+          turnId: 'turn-performance-missed-start',
+          outputTokens: 80,
+          timeToFirstOutputMs: null,
+          generationDurationMs: null,
+          totalDurationMs: 2_000,
+          generationTokensPerSecond: null,
+          effectiveTokensPerSecond: 40,
+        },
+        recent: {
+          sampleSize: 0,
+          medianGenerationTokensPerSecond: null,
+          medianTimeToFirstOutputMs: null,
+        },
+      },
+    });
+  });
+
+  it('does not persist a missed-start terminal sample with zero duration', async () => {
+    const { app, appServer, projectPath, repository } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+
+    appServer.emit({
+      method: 'turn/completed',
+      params: {
+        threadId,
+        turn: {
+          id: 'turn-performance-zero-duration',
+          status: 'completed',
+          startedAt: 1_800_000_022,
+          completedAt: 1_800_000_022,
+          durationMs: 0,
+          items: [],
+        },
+      },
+    });
+
+    expect(repository.listTurnPerformance(threadId)).toEqual([]);
+  });
+
+  it('seeds performance from an accepted turn start when its notification is absent', async () => {
+    const { app, appServer, projectPath, repository } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const monotonic = vi.spyOn(performance, 'now');
+    try {
+      monotonic.mockReturnValue(1_000);
+      const started = await app.inject({
+        method: 'POST',
+        url: `/api/threads/${threadId}/turns`,
+        headers: session.headers,
+        payload: {
+          text: 'measure an accepted turn',
+          idempotencyKey: '22100000-0000-4000-8000-000000000099',
+        },
+      });
+      expect(started.statusCode).toBe(202);
+      expect(started.json()).toMatchObject({ data: { status: 'started', turnId: 'turn-1' } });
+
+      monotonic.mockReturnValue(1_500);
+      appServer.emit({
+        method: 'item/agentMessage/delta',
+        params: { threadId, turnId: 'turn-1', itemId: 'message-1', delta: 'not persisted' },
+      });
+      monotonic.mockReturnValue(2_000);
+      appServer.emit({
+        method: 'item/agentMessage/delta',
+        params: { threadId, turnId: 'turn-1', itemId: 'message-1', delta: 'still private' },
+      });
+      monotonic.mockReturnValue(2_500);
+      appServer.emit({
+        method: 'turn/completed',
+        params: {
+          threadId,
+          turn: { id: 'turn-1', status: 'completed', completedAt: 1_800_000_030, items: [] },
+        },
+      });
+    } finally {
+      monotonic.mockRestore();
+    }
+
+    expect(repository.listTurnPerformance(threadId)).toEqual([
+      {
+        turnId: 'turn-1',
+        completedAt: '2027-01-15T08:00:30.000Z',
+        outputTokens: null,
+        timeToFirstOutputMs: 500,
+        generationDurationMs: 500,
+        totalDurationMs: 1_500,
+        generationTokensPerSecond: null,
+        effectiveTokensPerSecond: null,
+      },
+    ]);
+  });
+
   it('bounds persisted turn performance to the latest twenty completed samples', async () => {
     const { app, projectPath, repository } = await fixture();
     const session = await login(app);

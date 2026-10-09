@@ -5217,6 +5217,127 @@ describe('App', () => {
     expect(within(status).getByText('2 222', { exact: true })).not.toBeNull();
   });
 
+  it('shows a refresh state instead of claiming that performance is unavailable', async () => {
+    let resolveScopedCapability!: (response: Response) => void;
+    const scopedCapability = new Promise<Response>((resolve) => {
+      resolveScopedCapability = resolve;
+    });
+    installAuthenticatedApi((url) => {
+      if (url === '/api/system/capabilities')
+        return jsonResponse({ ...capabilities, threadPerformance: null });
+      if (url === '/api/system/capabilities?threadId=thread-1') return scopedCapability;
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByRole('button', { name: 'Открыть недавний чат Frontend task' });
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+
+    const status = await screen.findByRole('complementary', { name: 'Статус Codex' });
+    expect(within(status).getByText('Обновляем замер завершённых задач…')).not.toBeNull();
+    expect(
+      within(status).queryByText('Замеров успешных задач после обновления пока нет.'),
+    ).toBeNull();
+
+    await act(async () => {
+      resolveScopedCapability(
+        jsonResponse({
+          ...capabilities,
+          threadPerformance: {
+            threadId: thread.id,
+            last: null,
+            recent: {
+              sampleSize: 0,
+              medianGenerationTokensPerSecond: null,
+              medianTimeToFirstOutputMs: null,
+            },
+          },
+        }),
+      );
+      await Promise.resolve();
+    });
+    expect(
+      await within(status).findByText('Замеров успешных задач после обновления пока нет.'),
+    ).not.toBeNull();
+  });
+
+  it('reports a failed scoped performance refresh instead of claiming there are no samples', async () => {
+    installAuthenticatedApi((url) => {
+      if (url === '/api/system/capabilities')
+        return jsonResponse({ ...capabilities, threadPerformance: null });
+      if (url === '/api/system/capabilities?threadId=thread-1')
+        return jsonResponse({ error: 'temporarily unavailable' }, 503);
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByRole('button', { name: 'Открыть недавний чат Frontend task' });
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+
+    const status = await screen.findByRole('complementary', { name: 'Статус Codex' });
+    expect(
+      await within(status).findByText(
+        'Не удалось обновить замер этого чата. Повторите попытку позже.',
+      ),
+    ).not.toBeNull();
+    expect(
+      within(status).queryByText('Замеров успешных задач после обновления пока нет.'),
+    ).toBeNull();
+    expect(within(status).getByText('Выборка этого чата не загружена.')).not.toBeNull();
+  });
+
+  it('refreshes performance when the selected turn completes while Status is open', async () => {
+    let scopedReads = 0;
+    const emptyPerformance = {
+      threadId: thread.id,
+      last: null,
+      recent: {
+        sampleSize: 0,
+        medianGenerationTokensPerSecond: null,
+        medianTimeToFirstOutputMs: null,
+      },
+    };
+    installAuthenticatedApi((url) => {
+      if (url === '/api/system/capabilities')
+        return jsonResponse({ ...capabilities, threadPerformance: null });
+      if (url === '/api/system/capabilities?threadId=thread-1') {
+        scopedReads += 1;
+        return jsonResponse({
+          ...capabilities,
+          threadPerformance: scopedReads === 1 ? emptyPerformance : capabilities.threadPerformance,
+        });
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByRole('button', { name: 'Открыть недавний чат Frontend task' });
+    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    const status = await screen.findByRole('complementary', { name: 'Статус Codex' });
+    expect(
+      await within(status).findByText('Замеров успешных задач после обновления пока нет.'),
+    ).not.toBeNull();
+
+    const source = FakeEventSource.instances.at(-1);
+    act(() => {
+      source?.emit({
+        id: 73,
+        threadId: thread.id,
+        turnId: 'turn-performance-new',
+        kind: 'turn',
+        phase: 'completed',
+        payload: { status: 'completed' },
+        createdAt: '2026-10-09T10:30:00.000Z',
+      });
+    });
+
+    await within(status).findByText('60 ток/с');
+    expect(scopedReads).toBeGreaterThanOrEqual(2);
+  });
+
   it('starts a prepared Codex update and refreshes its version after completion', async () => {
     let updateReads = 0;
     let capabilityReads = 0;
