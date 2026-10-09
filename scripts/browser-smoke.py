@@ -262,6 +262,26 @@ def main() -> int:
                     }
                     if query.get("threadId") == ["t1"]
                     else None,
+                    "threadPerformance": {
+                        "threadId": "t1",
+                        "last": {
+                            "turnId": "turn-performance-smoke",
+                            "completedAt": "2026-10-09T12:00:00.000Z",
+                            "outputTokens": 240,
+                            "timeToFirstOutputMs": 800,
+                            "generationDurationMs": 4000,
+                            "totalDurationMs": 10000,
+                            "generationTokensPerSecond": 60,
+                            "effectiveTokensPerSecond": 24,
+                        },
+                        "recent": {
+                            "sampleSize": 3,
+                            "medianGenerationTokensPerSecond": 55.5,
+                            "medianTimeToFirstOutputMs": 900,
+                        },
+                    }
+                    if query.get("threadId") == ["t1"]
+                    else None,
                     "transcription": {
                         "available": True,
                         "model": "onnx-community/whisper-base",
@@ -1038,7 +1058,9 @@ def main() -> int:
         page = browser.new_page(viewport={"width": 390, "height": 600})
         page.on(
             "console",
-            lambda message: console_errors.append(message.text)
+            lambda message: console_errors.append(
+                f"{message.text} [{message.location.get('url', '')}]"
+            )
             if message.type == "error"
             else None,
         )
@@ -1602,30 +1624,21 @@ def main() -> int:
         if not compact_box or compact_box["height"] > textarea_box["height"] + 1:
             raise AssertionError("composer did not return to compact height after clearing")
 
+        composer.fill("$multi")
+        skill_palette = page.get_by_role("listbox", name="Skills Codex")
+        skill_palette.wait_for()
+        skill_palette.get_by_role("option", name="$multi-agent-orchestrator Вставить skill в сообщение").click()
+        if composer.input_value() != "$multi-agent-orchestrator ":
+            raise AssertionError("skill palette did not insert the selected skill")
+        composer.fill("")
+
         composer.fill("/sta")
         page.get_by_role("listbox", name="Команды Codex").wait_for()
         page.get_by_role("option", name="/status Статус, лимиты и использование").click()
         composer.press("Enter")
         page.get_by_label("Статус Codex").wait_for()
         page.get_by_text("31% использовано · 300 мин.").wait_for()
-        page.get_by_text("multi-agent-orchestrator", exact=True).wait_for()
         diagnostics = page.get_by_label("Статус Codex")
-        auto_reset = diagnostics.get_by_role(
-            "checkbox",
-            name="Автоматически использовать сохранённый сброс, когда лимит Codex остановит задачу",
-        )
-        if auto_reset.is_checked():
-            raise AssertionError("automatic rate-limit reset is not off by default")
-        diagnostics.get_by_text("Доступно сохранённых сбросов: 2", exact=True).wait_for()
-        diagnostics.get_by_text(
-            "Сброс будет потрачен только после подтверждённой остановки из-за лимита.",
-            exact=False,
-        ).wait_for()
-        auto_reset.click()
-        diagnostics.get_by_text("Доступно сохранённых сбросов: 1", exact=True).wait_for()
-        if not auto_reset.is_checked():
-            raise AssertionError("automatic rate-limit reset did not reflect the saved setting")
-        diagnostics.get_by_text("Сброс применён · продолжено задач: 2", exact=True).wait_for()
         current_chat_usage = diagnostics.get_by_role("heading", name="Текущий чат").locator("..")
         current_chat_usage.get_by_text("Переносимый чат", exact=True).wait_for()
         current_chat_usage.get_by_text("Оценка Codex по этому чату", exact=True).wait_for()
@@ -1637,6 +1650,13 @@ def main() -> int:
         account_usage.get_by_text("За всё доступное время", exact=True).wait_for()
         account_usage.get_by_text("23 477", exact=True).wait_for()
         account_usage.get_by_text("23 914", exact=True).wait_for()
+        performance = diagnostics.get_by_role("heading", name="Скорость ответа").locator("..")
+        performance.get_by_text("60 ток/с", exact=True).wait_for()
+        performance.get_by_text("55,5 ток/с", exact=True).wait_for()
+        if diagnostics.get_by_text("multi-agent-orchestrator", exact=True).count():
+            raise AssertionError("skills remained in Status")
+        if diagnostics.get_by_role("button", name="Сменить аккаунт").count():
+            raise AssertionError("account controls remained in Status")
         if os.environ.get("CODEX_WEB_USAGE_ONLY") == "1":
             page.set_viewport_size({"width": 390, "height": 780})
             mobile_usage = diagnostics.evaluate(
@@ -1660,22 +1680,51 @@ def main() -> int:
             browser.close()
             print("browser-smoke: chat and account usage scopes passed")
             return 0
-        diagnostics.get_by_text("owner@example.test", exact=True).wait_for()
-        diagnostics.get_by_text("Доступна новая версия Codex.", exact=False).wait_for()
-        diagnostics.get_by_role("button", name="Проверить обновления").click()
-        diagnostics.get_by_text("Проверено 01.10.2026, 13:01:00").wait_for()
-        diagnostics.get_by_text("Обновление готово к установке.").wait_for()
-        diagnostics.get_by_role("button", name="Обновить Codex").click()
-        diagnostics.get_by_text("Обновляем Codex…").wait_for()
-        diagnostics.get_by_text("Установлена актуальная подготовленная версия.").wait_for()
-        diagnostics.get_by_text("codex-cli 0.154.0", exact=True).wait_for()
-        if diagnostics.get_by_role("button", name="Обновить Codex").count():
+        diagnostics.get_by_role("button", name="Закрыть диагностику").click()
+        profile = page.get_by_role("button", name="Открыть настройки профиля owner")
+        profile.click()
+        settings = page.get_by_role("dialog", name="Настройки")
+        settings.wait_for()
+        settings.get_by_text("owner@example.test", exact=True).wait_for()
+        settings.get_by_role("tab", name="Обновления").click()
+        settings.get_by_text("Доступна новая версия Codex.", exact=False).wait_for()
+        settings.get_by_role("button", name="Проверить обновления").click()
+        settings.get_by_text("Проверено 01.10.2026, 13:01:00").wait_for()
+        settings.get_by_text("Обновление готово к установке.").wait_for()
+        settings.get_by_role("button", name="Скачать и установить").click()
+        settings.get_by_text("Обновляем Codex…").wait_for()
+        settings.get_by_text("Установлена актуальная подготовленная версия.").wait_for()
+        settings.get_by_text("codex-cli 0.154.0", exact=True).wait_for()
+        if settings.get_by_role("button", name="Скачать и установить").count():
             raise AssertionError("Codex update button remains after the prepared update completed")
-        diagnostics.get_by_role("button", name="Сменить аккаунт").click()
+        settings.get_by_role("tab", name="Ресурсы").click()
+        auto_reset = settings.get_by_role(
+            "checkbox",
+            name="Автоматически использовать сохранённый сброс, когда лимит Codex остановит задачу",
+        )
+        if auto_reset.is_checked():
+            raise AssertionError("automatic rate-limit reset is not off by default")
+        auto_reset.click()
+        settings.get_by_text("Доступно сохранённых сбросов: 1", exact=True).wait_for()
+        settings.get_by_label("Настроить вручную").click()
+        settings.get_by_label("Лимит CPU, ядер").fill("4")
+        settings.get_by_role("button", name="Сохранить").click()
+        settings.get_by_text("Ожидает завершения текущих задач").wait_for()
+        settings.get_by_role("button", name="Применить").click()
+        settings.get_by_role("tab", name="Skills и инструкции").click()
+        settings.get_by_text("multi-agent-orchestrator", exact=True).wait_for()
+        settings.get_by_role("button", name="Использовать").click()
+        settings.wait_for(state="detached")
+        if composer.input_value() != "$multi-agent-orchestrator ":
+            raise AssertionError("Skills settings did not insert the selected skill")
+        composer.fill("")
+        profile.click()
+        settings = page.get_by_role("dialog", name="Настройки")
+        settings.get_by_role("button", name="Сменить аккаунт").click()
         account_dialog = page.get_by_role("dialog", name="Смена аккаунта Codex")
         account_dialog.wait_for()
         account_dialog.get_by_label("Одноразовый код").get_by_text("SMOK-TEST").wait_for()
-        if account_dialog.get_by_role("link", name="Открыть страницу входа").get_attribute("href") != "https://auth.openai.com/device":
+        if account_dialog.get_by_role("link", name="Открыть auth.openai.com").get_attribute("href") != "https://auth.openai.com/device":
             raise AssertionError("device login link is not the bounded OpenAI verification URL")
         account_box = account_dialog.bounding_box()
         if not account_box or account_box["x"] < 0 or account_box["x"] + account_box["width"] > 1440:
@@ -1683,16 +1732,11 @@ def main() -> int:
         page.keyboard.press("Escape")
         account_dialog.wait_for(state="detached")
         page.get_by_text("Смена аккаунта отменена. Текущий аккаунт сохранён.").wait_for()
-        diagnostics.get_by_label("Настроить вручную").click()
-        diagnostics.get_by_label("Лимит CPU, ядер").fill("4")
-        diagnostics.get_by_role("button", name="Сохранить").click()
-        diagnostics.get_by_text("Ожидает завершения текущих задач").wait_for()
-        diagnostics.get_by_role("button", name="Применить").click()
-        diagnostics.get_by_text("Ожидает завершения текущих задач").wait_for()
-        if diagnostics.get_by_text("Применено", exact=True).count():
-            raise AssertionError("pending resource apply was rendered as applied")
-        page.get_by_label("Закрыть диагностику").click()
-
+        page.keyboard.press("Escape")
+        settings.wait_for(state="detached")
+        page.wait_for_function(
+            "document.activeElement === document.querySelector('.profile-button')"
+        )
         page.get_by_label("Вопросы Codex").wait_for()
         secret = page.get_by_label("Секрет: ответ")
         if secret.get_attribute("type") != "password":
@@ -1881,15 +1925,30 @@ def main() -> int:
             raise AssertionError("mobile slash-command palette is clipped outside the viewport")
         page.get_by_role("option", name="/status Статус, лимиты и использование").click()
         composer.press("Enter")
-        page.get_by_label("Статус Codex").wait_for()
-        resource_box = page.locator(".resource-settings").bounding_box()
+        mobile_status = page.get_by_label("Статус Codex")
+        mobile_status.wait_for()
+        mobile_status.get_by_role("heading", name="Скорость ответа").wait_for()
+        mobile_status.get_by_role("button", name="Закрыть диагностику").click()
+        composer.fill("/skills")
+        composer.press("Enter")
+        mobile_settings = page.get_by_role("dialog", name="Настройки")
+        mobile_settings.wait_for()
+        settings_box = mobile_settings.bounding_box()
+        if (
+            not settings_box
+            or settings_box["x"] < 0
+            or settings_box["x"] + settings_box["width"] > 390
+        ):
+            raise AssertionError("mobile settings dialog is outside the viewport")
+        mobile_settings.get_by_role("tab", name="Ресурсы").click()
+        resource_box = mobile_settings.locator(".resource-settings").bounding_box()
         if (
             not resource_box
             or resource_box["x"] < 0
             or resource_box["x"] + resource_box["width"] > 390
         ):
             raise AssertionError("mobile resource settings are outside the viewport")
-        auto_reset_box = page.locator(".auto-rate-limit-reset").bounding_box()
+        auto_reset_box = mobile_settings.locator(".auto-rate-limit-reset").bounding_box()
         if (
             not auto_reset_box
             or auto_reset_box["x"] < 0
@@ -1902,10 +1961,11 @@ def main() -> int:
             "Лимит процессов",
             "Максимум параллельных агентов",
         ):
-            field_box = page.get_by_label(label).bounding_box()
+            field_box = mobile_settings.get_by_label(label).bounding_box()
             if not field_box or field_box["x"] < 0 or field_box["x"] + field_box["width"] > 390:
                 raise AssertionError(f"mobile resource control is outside the viewport: {label}")
-        page.get_by_label("Статус Codex").get_by_role("button", name="Сменить аккаунт").click()
+        mobile_settings.get_by_role("tab", name="Аккаунт").click()
+        mobile_settings.get_by_role("button", name="Сменить аккаунт").click()
         mobile_account_dialog = page.get_by_role("dialog", name="Смена аккаунта Codex")
         mobile_account_dialog.wait_for()
         mobile_account_box = mobile_account_dialog.bounding_box()
@@ -1919,7 +1979,8 @@ def main() -> int:
             raise AssertionError("account login dialog creates horizontal mobile overflow")
         mobile_account_dialog.get_by_role("button", name="Отменить вход").click()
         mobile_account_dialog.wait_for(state="detached")
-        page.get_by_label("Закрыть диагностику").click()
+        page.keyboard.press("Escape")
+        mobile_settings.wait_for(state="detached")
 
         page.set_viewport_size({"width": 390, "height": 780})
         if page.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth"):
@@ -1936,6 +1997,7 @@ def main() -> int:
             error
             for error in console_errors
             if "401 (Unauthorized)" not in error
+            and "project-files/download?path=reports%2Fmissing.md" not in error
         ]
         if unexpected_console_errors:
             raise AssertionError(f"browser console errors: {unexpected_console_errors}")

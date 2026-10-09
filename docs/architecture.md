@@ -50,7 +50,9 @@ Browser
   selected chat whose first native history hydration is temporarily unavailable returns its persisted safe
   journal and metadata. The browser loads navigation independently from the model/capability catalog and keeps
   a selected failed chat in an explicit loading/retry state rather than rendering the blank-chat welcome view.
-- `instructionSources` from thread start/resume and `skills/list` are visible in the status drawer so the operator can verify that `AGENTS.md` and required skills loaded.
+- `instructionSources` from thread start/resume and `skills/list` are visible in the Skills tab of the
+  account/settings dialog so the operator can verify that `AGENTS.md` and required skills loaded. The browser
+  may insert an enabled `$skill-name` reference into the composer, but never auto-sends that prompt.
 - The backend reads account identity, rate limits and aggregate usage through bounded app-server methods. The
   public projection exposes only the authenticated account type, email and plan label; it omits account IDs,
   credits, authentication material and unknown upstream fields. Account usage preserves the bounded daily
@@ -60,7 +62,16 @@ Browser
   output and total tokens. It does not expose billing-route groups or invent a historical reasoning-token split
   that the thread estimate does not provide. Account-wide and selected-thread failures degrade independently to
   `null` plus a static warning.
-- The Status drawer offers a separate, account-bound and default-off automatic reset policy for earned Codex
+- For a selected registered thread, the server also maintains a bounded, content-free performance projection.
+  `turn/started`, the first and last public agent-message delta timestamps, the matching
+  `thread/tokenUsage/updated` last-turn counts and the terminal event produce time-to-first-output,
+  output-stream duration, total turn duration and reported-output-token throughput. The first-output timestamp
+  is the first public text fragment observed by the server, and throughput is an operational estimate over the
+  first-to-last-fragment interval rather than an exact decoder benchmark. Streamed text is never stored for this
+  measurement. Missing, interrupted or zero-duration evidence remains unavailable, and Status labels estimated
+  output-stream throughput separately from effective whole-task throughput because tools and waiting can
+  dominate an agentic turn.
+- The Settings dialog offers a separate, account-bound and default-off automatic reset policy for earned Codex
   rate-limit resets. A native terminal limit error is only a wake-up signal: the backend closes account-wide
   task admission, performs a fresh detailed `account/rateLimits/read`, verifies the same ChatGPT account,
   `ordinaryUsageAllowed === false`, the resettable `rate_limit_reached` state and an available Codex reset,
@@ -77,7 +88,9 @@ Browser
   cancellation stays fail-closed until Codex reports a terminal login result or the API process is restarted.
   Completion refreshes the bounded account projection without deleting Web sessions, SQLite chat history or
   Codex rollout files.
-- The browser handles `/status` and `/skills` locally instead of sending them as model turns. Other text, including unknown slash-prefixed text, remains an ordinary Codex prompt.
+- The browser handles `/status` and `/skills` locally instead of sending them as model turns. `/status` opens
+  the focused limits/usage/performance surface; `/skills` opens the settings dialog at Skills. Other text,
+  including unknown slash-prefixed text and inserted `$skill-name` references, remains an ordinary Codex prompt.
 - Completed agent messages are rendered as sanitized GitHub-flavored Markdown. Raw HTML is disabled, links
   receive safe navigation attributes and wide tables scroll inside their own mobile-safe container; model
   output is never executed as JavaScript.
@@ -320,7 +333,7 @@ Codex enter `needsReview`.
 - `GET /api/threads/:id/subagents` for the durable root-chat subagent projection
 - `POST/GET /api/threads/:id/attachments`, `GET/DELETE /api/threads/:id/attachments/:attachmentId`; uploads use multipart field `file`
 - `GET /api/system/capabilities`, with an optional registered `threadId`, for safe
-  version/auth/instruction/skill, rate-limit, account-usage and selected-thread usage status
+  version/auth/instruction/skill, rate-limit, account-usage, selected-thread usage and bounded performance status
 - `PUT /api/system/rate-limit-reset` for the authenticated, CSRF-protected, versioned automatic-reset policy;
   reset consumption itself is never exposed as a browser command
 - `POST /api/audio/transcriptions` for bounded ephemeral speech-to-text; uploads use multipart field `file`
@@ -368,7 +381,7 @@ time when the protocol item did not expose a trustworthy occurrence timestamp.
 At `820px` and below, the navigation is an off-canvas drawer with focus containment, Escape close and focus
 return. Runtime model, reasoning, permission and approval controls remain available behind a compact toggle;
 their collapsed state reserves the constrained viewport for the independently scrolling transcript and the
-composer. The account/logout row remains reachable inside the drawer.
+composer. The clickable profile/settings control and separate logout action remain reachable inside the drawer.
 
 ## Browser notifications
 
@@ -410,17 +423,17 @@ runner process failure can still terminate an in-flight Codex turn because the p
 bound to that connection. Preserving computation across such a crash would require a durable broker outside
 the API lifecycle.
 
-## Status-drawer Codex updates
+## Settings-dialog Codex updates
 
-The drawer separately shows the installed CLI and the latest official upstream CLI version. It checks the
-fixed registry source when Status opens, supports an explicit “check now” action and reports registry failure
+The Updates tab separately shows the installed CLI and the latest official upstream CLI version. It checks the
+fixed registry source when Settings opens, supports an explicit “check now” action and reports registry failure
 without hiding the existing prepared-release state. After a completed activation, capabilities and the model
 catalog are both refreshed; a still-supported selected model is preserved.
 
 An operator may place a complete reviewed application package in the immutable release store and stage its
 release identifier through the root-only host helper. When no full package is staged, the installed release may
 instead expose one reviewed runtime-only target whose version, architecture archives and protocol hashes are
-fixed in root-owned package files. The authenticated Status drawer can request only activation of whichever
+fixed in root-owned package files. The authenticated Updates tab can request only activation of whichever
 fixed candidate the broker reports. The API keeps an admission interlock while the request is uncertain or the
 worker is applying, and rejects activation unless root turns, pending starts, subagents, account login, resource
 changes and voice transcription are idle.

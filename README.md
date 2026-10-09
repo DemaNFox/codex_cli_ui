@@ -21,17 +21,23 @@ is never exposed publicly.
 The workspace uses one navigation sidebar: projects expand to their chats, each project has its own new-chat
 action and archived chats remain recoverable from the project menu. Entire idle projects can also be archived
 to remove them and their chats from the working sidebar, then restored without deleting history. The composer stays pinned while a long
-transcript scrolls independently. `/status` opens safe Codex account limits plus two explicitly labelled usage
-scopes: an estimate for the selected chat and dated totals for all token activity on the signed-in account.
-Account totals distinguish today, the trailing 7 and 30 days and all available time; unavailable per-chat
-breakdowns stay visibly unavailable instead of being inferred. `/skills` opens the same status surface at the
-loaded skills and instruction-source inventory.
-The Status drawer also contains a default-off setting for the current ChatGPT account that can spend one
+transcript scrolls independently. `/status` opens a focused operational view with Codex account limits, two
+explicitly labelled usage scopes and bounded response-performance measurements for the selected chat. Account
+totals distinguish today, the trailing 7 and 30 days and all available time; unavailable per-chat breakdowns
+or performance samples stay visibly unavailable instead of being inferred. The last successful turn separates
+time until the first server-observed text fragment, estimated output-stream throughput and whole-task duration,
+while recent values are reported only from completed measurable samples. The stream value is an operational
+estimate from Codex-reported output tokens, not a benchmark or guaranteed model decoding rate.
+The clickable sidebar profile opens a tabbed account/settings dialog for account identity and switching, Codex
+updates, resource controls, automatic rate-limit reset and the loaded instruction/skill inventory. `/skills`
+opens that dialog directly on Skills; typing `$` offers enabled skill names for insertion into the prompt
+without sending it automatically.
+The settings dialog contains a default-off setting for the current ChatGPT account that can spend one
 available earned Codex reset after a task is conclusively stopped by the resettable account limit. The server
 verifies the native failure and fresh account state, spends with a durable idempotency key, verifies recovery,
 then continues affected work through the normal queue. It does not purchase credits or act on percentages,
 workspace spend limits, unsupported authentication or an uncertain account state.
-The same Status drawer can replace the runner's Codex account through the official device-code flow when no
+The same settings dialog can replace the runner's Codex account through the official device-code flow when no
 task or subagent is running. The short-lived code is shown only to the authenticated owner; access and refresh
 tokens never pass through the Web application.
 It also shows the installed and prepared Codex versions. An update can be started there only after an operator
@@ -121,8 +127,8 @@ root profile with a normal `--upgrade`.
 
 The installed service starts in automatic resource mode. It uses the live host/ancestor-cgroup capacity,
 keeps one CPU core and at least 15% RAM (minimum 1 GiB) outside the Codex workload, and derives a safe
-concurrency ceiling. The administrator can inspect or lower CPU, RAM, task and agent limits in the Status
-drawer. Changes wait for all root turns and subagents to finish; they never terminate active work.
+concurrency ceiling. The administrator can inspect or lower CPU, RAM, task and agent limits in Settings.
+Changes wait for all root turns and subagents to finish; they never terminate active work.
 Temporary saturation is not shown as a rejected task. A new root task is stored in the local durable queue
 with its runtime settings and attachments, shown in the chat with its position, and started automatically when
 that chat has no active root turn and a safe slot becomes available. Active subagents use execution slots but
@@ -202,13 +208,13 @@ The command verifies the checksummed package with the currently installed verifi
 `web-current`. Use `rollback-web-ubuntu.sh` to reverse only that static switch. Backend, protocol, migration,
 systemd or resource-control changes still require the normal drained full upgrade.
 
-The Status drawer can install the single repository-reviewed compatible Codex runtime target without a server
-terminal command. The browser sends only an empty request; the root worker verifies fixed official npm URLs,
+The Updates tab in Settings can install the single repository-reviewed compatible Codex runtime target without
+a server terminal command. The browser sends only an empty request; the root worker verifies fixed official npm URLs,
 committed archive digests and an exact generated-protocol match before switching the immutable runtime, and
 rolls back protected configuration if health fails. An arbitrary newer CLI or a protocol-changing release still
 requires a reviewed full application package.
 
-To expose a previously installed and reviewed full release in the Status drawer, stage its release identifier
+To expose a previously installed and reviewed full release in the Updates tab of Settings, stage its release identifier
 on the server:
 
 ```bash

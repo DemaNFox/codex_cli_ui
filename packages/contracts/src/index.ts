@@ -469,6 +469,27 @@ export const threadUsageSchema = z.object({
   totalTokens: z.number().int().nonnegative().nullable(),
 });
 
+export const turnPerformanceSampleSchema = z.object({
+  turnId: z.string().min(1).max(200),
+  completedAt: z.string().datetime(),
+  outputTokens: z.number().int().nonnegative().nullable(),
+  timeToFirstOutputMs: z.number().int().nonnegative().nullable(),
+  generationDurationMs: z.number().int().nonnegative().nullable(),
+  totalDurationMs: z.number().int().nonnegative(),
+  generationTokensPerSecond: z.number().finite().nonnegative().max(1_000_000).nullable(),
+  effectiveTokensPerSecond: z.number().finite().nonnegative().max(1_000_000).nullable(),
+});
+
+export const threadPerformanceSchema = z.object({
+  threadId: z.string().min(1).max(200),
+  last: turnPerformanceSampleSchema.nullable(),
+  recent: z.object({
+    sampleSize: z.number().int().nonnegative().max(20),
+    medianGenerationTokensPerSecond: z.number().finite().nonnegative().max(1_000_000).nullable(),
+    medianTimeToFirstOutputMs: z.number().int().nonnegative().nullable(),
+  }),
+});
+
 export const codexAccountSchema = z.object({
   type: z.enum(['chatgpt', 'apiKey', 'amazonBedrock', 'unknown']),
   email: z.string().email().max(320).nullable(),
@@ -523,6 +544,7 @@ export const capabilitySchema = z.object({
   rateLimitReset: autoRateLimitResetSnapshotSchema,
   usage: accountUsageSchema.nullable(),
   threadUsage: threadUsageSchema.nullable().optional(),
+  threadPerformance: threadPerformanceSchema.nullable().optional(),
   transcription: z
     .object({
       available: z.boolean(),

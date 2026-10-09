@@ -520,6 +520,26 @@ button:disabled {
 .account-row .ghost {
   margin-left: auto;
 }
+.profile-button {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 0.55rem;
+  padding: 0.25rem;
+  overflow: hidden;
+  border: 0;
+  border-radius: 0.55rem;
+  background: transparent;
+  text-align: left;
+}
+.profile-button:hover,
+.profile-button:focus-visible {
+  background: #242a2f;
+}
+.profile-button > span:last-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .avatar {
   display: grid;
   place-items: center;
@@ -2093,6 +2113,73 @@ button:disabled {
   background: var(--panel);
   box-shadow: 0 1.2rem 3rem rgba(0, 0, 0, 0.5);
 }
+.settings-dialog {
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  width: min(52rem, 100%);
+  min-width: 0;
+  max-height: calc(100dvh - 2rem);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 0.9rem;
+  background: var(--panel);
+  box-shadow: 0 1.2rem 3rem rgba(0, 0, 0, 0.5);
+}
+.settings-dialog > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  padding: 1rem 1rem 0.75rem;
+}
+.settings-dialog h2,
+.settings-dialog header p {
+  margin: 0;
+}
+.settings-tabs {
+  display: flex;
+  gap: 0.3rem;
+  padding: 0 1rem 0.75rem;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--border-soft);
+}
+.settings-tabs button {
+  flex: 0 0 auto;
+  padding: 0.55rem 0.7rem;
+  border-color: transparent;
+  background: transparent;
+}
+.settings-tabs button[aria-selected='true'] {
+  border-color: #56616a;
+  color: var(--accent);
+  background: #20262b;
+}
+.settings-content {
+  min-width: 0;
+  padding: 1rem;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+.settings-content > section > h3:first-child,
+.settings-section h3 {
+  margin-top: 0;
+}
+.settings-section + .settings-section {
+  margin-top: 1.2rem;
+}
+.settings-skill-list li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.settings-skill-list li > span {
+  min-width: 0;
+}
+.settings-skill-list button {
+  flex: 0 0 auto;
+  font-family: inherit;
+}
 .account-login-dialog h2 {
   margin: 0 0 0.8rem;
   font-size: 1rem;
@@ -2426,6 +2513,11 @@ button:disabled {
 .usage-scope {
   margin-top: 1.2rem;
 }
+.performance-scope h4 {
+  margin: 0.8rem 0 0.45rem;
+  color: #dce2e6;
+  font-size: 0.72rem;
+}
 .diagnostics .usage-scope h3 {
   margin-top: 0;
 }
@@ -2452,6 +2544,18 @@ button:disabled {
 }
 .usage-grid {
   grid-template-columns: minmax(0, 1fr) auto;
+}
+.warning-list {
+  display: grid;
+  gap: 0.45rem;
+  margin: 0;
+  padding-left: 1.1rem;
+  color: #f2c28b;
+  font-size: 0.72rem;
+  line-height: 1.45;
+}
+.warning-list li {
+  overflow-wrap: anywhere;
 }
 .rate-limit-list {
   display: grid;
@@ -2880,6 +2984,22 @@ button:disabled {
   .account-login-dialog {
     width: 100%;
     max-width: 100%;
+  }
+  .settings-dialog {
+    width: 100%;
+    max-width: 100%;
+    max-height: calc(100dvh - 1.5rem);
+  }
+  .settings-tabs {
+    padding-right: 0.75rem;
+    padding-left: 0.75rem;
+  }
+  .settings-content {
+    padding: 0.75rem;
+  }
+  .settings-skill-list li {
+    align-items: stretch;
+    flex-direction: column;
   }
   .account-login-actions > *,
   .account-login-footer > button {

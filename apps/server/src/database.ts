@@ -112,6 +112,16 @@ interface TurnExecutionIntentRow {
   created_at: string;
 }
 
+interface TurnPerformanceRow {
+  thread_id: string;
+  turn_id: string;
+  completed_at: string;
+  time_to_first_output_ms: number | null;
+  generation_duration_ms: number | null;
+  total_duration_ms: number;
+  output_tokens: number | null;
+}
+
 interface SubagentRow {
   id: string;
   root_thread_id: string;
@@ -241,6 +251,17 @@ export interface RateLimitResetAttempt {
   attempts: number;
   createdAt: string;
   updatedAt: string;
+}
+
+export interface StoredTurnPerformanceSample {
+  turnId: string;
+  completedAt: string;
+  outputTokens: number | null;
+  timeToFirstOutputMs: number | null;
+  generationDurationMs: number | null;
+  totalDurationMs: number;
+  generationTokensPerSecond: number | null;
+  effectiveTokensPerSecond: number | null;
 }
 
 export const MAX_QUEUED_TURNS = 128;
@@ -566,6 +587,19 @@ export class SqliteRepository {
         account_fingerprint TEXT,
         created_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS turn_performance (
+        thread_id TEXT NOT NULL REFERENCES threads(id) ON DELETE CASCADE,
+        turn_id TEXT NOT NULL,
+        completed_at TEXT NOT NULL,
+        time_to_first_output_ms INTEGER CHECK(time_to_first_output_ms IS NULL OR time_to_first_output_ms >= 0),
+        generation_duration_ms INTEGER CHECK(generation_duration_ms IS NULL OR generation_duration_ms > 0),
+        total_duration_ms INTEGER NOT NULL CHECK(total_duration_ms >= 0),
+        output_tokens INTEGER CHECK(output_tokens IS NULL OR output_tokens >= 0),
+        PRIMARY KEY(thread_id, turn_id)
+      );
+      CREATE INDEX IF NOT EXISTS turn_performance_recent_idx
+        ON turn_performance(thread_id, completed_at DESC, turn_id DESC);
 
       CREATE TABLE IF NOT EXISTS auto_rate_limit_reset_preferences (
         account_fingerprint TEXT PRIMARY KEY,
@@ -1926,6 +1960,94 @@ export class SqliteRepository {
       )
       .run();
     return interrupted;
+  }
+
+  saveTurnPerformance(
+    threadId: string,
+    turnId: string,
+    sample: Omit<
+      StoredTurnPerformanceSample,
+      'turnId' | 'generationTokensPerSecond' | 'effectiveTokensPerSecond'
+    >,
+  ): void {
+    this.database
+      .prepare(
+        `INSERT INTO turn_performance(
+           thread_id,turn_id,completed_at,time_to_first_output_ms,generation_duration_ms,
+           total_duration_ms,output_tokens
+         ) VALUES(?,?,?,?,?,?,?)
+         ON CONFLICT(thread_id,turn_id) DO UPDATE SET
+           completed_at=COALESCE(turn_performance.completed_at,excluded.completed_at),
+           total_duration_ms=COALESCE(turn_performance.total_duration_ms,excluded.total_duration_ms),
+           time_to_first_output_ms=COALESCE(turn_performance.time_to_first_output_ms,excluded.time_to_first_output_ms),
+           generation_duration_ms=COALESCE(turn_performance.generation_duration_ms,excluded.generation_duration_ms),
+           output_tokens=COALESCE(excluded.output_tokens,turn_performance.output_tokens)`,
+      )
+      .run(
+        threadId,
+        turnId,
+        sample.completedAt,
+        sample.timeToFirstOutputMs,
+        sample.generationDurationMs,
+        sample.totalDurationMs,
+        sample.outputTokens,
+      );
+    this.enforceTurnPerformanceBounds(threadId);
+  }
+
+  updateTurnPerformanceOutputTokens(
+    threadId: string,
+    turnId: string,
+    outputTokens: number,
+  ): boolean {
+    if (!Number.isSafeInteger(outputTokens) || outputTokens < 0) return false;
+    const result = this.database
+      .prepare('UPDATE turn_performance SET output_tokens=? WHERE thread_id=? AND turn_id=?')
+      .run(outputTokens, threadId, turnId);
+    return result.changes === 1;
+  }
+
+  listTurnPerformance(threadId: string, limit = 20): StoredTurnPerformanceSample[] {
+    const safeLimit = Math.max(0, Math.min(20, Math.trunc(limit)));
+    if (safeLimit === 0) return [];
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM turn_performance
+         WHERE thread_id=? ORDER BY completed_at DESC,turn_id DESC LIMIT ?`,
+      )
+      .all(threadId, safeLimit) as unknown as TurnPerformanceRow[];
+    return rows.map((row) => this.turnPerformanceSampleFromRow(row));
+  }
+
+  private turnPerformanceSampleFromRow(row: TurnPerformanceRow): StoredTurnPerformanceSample {
+    const perSecond = (durationMs: number | null): number | null => {
+      if (row.output_tokens === null || durationMs === null || durationMs <= 0) return null;
+      const value = (row.output_tokens * 1_000) / durationMs;
+      return Number.isFinite(value) && value <= 1_000_000 ? value : null;
+    };
+    return {
+      turnId: row.turn_id,
+      completedAt: row.completed_at,
+      outputTokens: row.output_tokens,
+      timeToFirstOutputMs: row.time_to_first_output_ms,
+      generationDurationMs: row.generation_duration_ms,
+      totalDurationMs: row.total_duration_ms,
+      generationTokensPerSecond: perSecond(row.generation_duration_ms),
+      effectiveTokensPerSecond: perSecond(row.total_duration_ms),
+    };
+  }
+
+  private enforceTurnPerformanceBounds(threadId: string): void {
+    this.database
+      .prepare(
+        `DELETE FROM turn_performance
+         WHERE thread_id=? AND turn_id NOT IN (
+           SELECT turn_id FROM turn_performance
+           WHERE thread_id=?
+           ORDER BY completed_at DESC,turn_id DESC LIMIT 20
+         )`,
+      )
+      .run(threadId, threadId);
   }
 
   createAttachment(input: Omit<AttachmentRecord, 'turnId' | 'createdAt'>): AttachmentRecord {
