@@ -54,6 +54,7 @@ import { createHash, createHmac, randomUUID } from 'node:crypto';
 import { constants as fsConstants, lstatSync, type BigIntStats } from 'node:fs';
 import { open, realpath, stat, type FileHandle } from 'node:fs/promises';
 import path from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { Readable } from 'node:stream';
 import { z } from 'zod';
 
@@ -481,6 +482,23 @@ function inputRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : null;
+}
+
+function safeNonnegativeInteger(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
+
+function epochSecondsToMilliseconds(value: unknown): number | null {
+  const seconds = safeNonnegativeInteger(value);
+  if (seconds === null || seconds > Math.floor(Number.MAX_SAFE_INTEGER / 1_000)) return null;
+  return seconds * 1_000;
+}
+
+function median(values: readonly number[]): number | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((left, right) => left - right);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2;
 }
 
 function accountIdFingerprint(accountId: string): string {
@@ -1013,6 +1031,35 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const titleGenerationAttempts = new Set<string>();
   const manuallyNamedThreads = new Set<string>();
   const activeTurns = new Set<string>();
+  const turnPerformance = new Map<
+    string,
+    {
+      startedAtMono: number | null;
+      firstDeltaAtMono: number | null;
+      lastDeltaAtMono: number | null;
+      outputTokens: number | null;
+    }
+  >();
+  const performanceKey = (threadId: string, turnId: string): string => `${threadId}:${turnId}`;
+  const performanceState = (threadId: string, turnId: string) => {
+    const key = performanceKey(threadId, turnId);
+    let state = turnPerformance.get(key);
+    if (!state) {
+      state = {
+        startedAtMono: null,
+        firstDeltaAtMono: null,
+        lastDeltaAtMono: null,
+        outputTokens: null,
+      };
+      turnPerformance.set(key, state);
+      while (turnPerformance.size > 256) {
+        const oldest = turnPerformance.keys().next().value;
+        if (oldest === undefined) break;
+        turnPerformance.delete(oldest);
+      }
+    }
+    return state;
+  };
   const unreconciledInterruptedTurns = new Set<string>();
   const treeBusyThreads = new Set<string>();
   const deferredCompletionPushes = new Map<string, string>();
@@ -2443,6 +2490,82 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       if (repository.hasBlockedRateLimitContinuations()) requestRateLimitRecovery();
       return;
     }
+    if (message.id === undefined) {
+      const params = inputRecord(message.params);
+      const threadId =
+        typeof params?.threadId === 'string' &&
+        params.threadId.length > 0 &&
+        params.threadId.length <= 200
+          ? params.threadId
+          : null;
+      const turn = inputRecord(params?.turn);
+      const turnId =
+        typeof params?.turnId === 'string' &&
+        params.turnId.length > 0 &&
+        params.turnId.length <= 200
+          ? params.turnId
+          : typeof turn?.id === 'string' && turn.id.length > 0 && turn.id.length <= 200
+            ? turn.id
+            : null;
+      if (threadId !== null && turnId !== null && repository.getThread(threadId)) {
+        const observedAtMono = performance.now();
+        if (message.method === 'turn/started') {
+          const state = performanceState(threadId, turnId);
+          state.startedAtMono ??= observedAtMono;
+        } else if (message.method === 'item/agentMessage/delta') {
+          const state = performanceState(threadId, turnId);
+          state.firstDeltaAtMono ??= observedAtMono;
+          state.lastDeltaAtMono = observedAtMono;
+        } else if (message.method === 'thread/tokenUsage/updated') {
+          const tokenUsage = inputRecord(params?.tokenUsage);
+          const last = inputRecord(tokenUsage?.last);
+          const outputTokens = safeNonnegativeInteger(last?.outputTokens);
+          if (outputTokens !== null) {
+            const key = performanceKey(threadId, turnId);
+            const state = turnPerformance.get(key);
+            const updatedStored = repository.updateTurnPerformanceOutputTokens(
+              threadId,
+              turnId,
+              outputTokens,
+            );
+            if (state) state.outputTokens = outputTokens;
+            else if (!updatedStored) performanceState(threadId, turnId).outputTokens = outputTokens;
+          }
+        } else if (message.method === 'turn/completed') {
+          const key = performanceKey(threadId, turnId);
+          const state = turnPerformance.get(key);
+          const completedAtMs = epochSecondsToMilliseconds(turn?.completedAt) ?? Date.now();
+          if (turn?.status === 'completed' && state && state.startedAtMono !== null) {
+            const totalDurationMs =
+              safeNonnegativeInteger(turn.durationMs) ??
+              Math.max(0, Math.round(observedAtMono - state.startedAtMono));
+            const timeToFirstOutputMs =
+              state.firstDeltaAtMono !== null && state.firstDeltaAtMono >= state.startedAtMono
+                ? Math.round(state.firstDeltaAtMono - state.startedAtMono)
+                : null;
+            const generationDurationMs =
+              state.firstDeltaAtMono !== null &&
+              state.lastDeltaAtMono !== null &&
+              state.lastDeltaAtMono > state.firstDeltaAtMono
+                ? Math.round(state.lastDeltaAtMono - state.firstDeltaAtMono)
+                : null;
+            repository.saveTurnPerformance(threadId, turnId, {
+              completedAt: Number.isNaN(new Date(completedAtMs).getTime())
+                ? new Date().toISOString()
+                : new Date(completedAtMs).toISOString(),
+              outputTokens: state.outputTokens,
+              timeToFirstOutputMs,
+              generationDurationMs:
+                generationDurationMs !== null && generationDurationMs > 0
+                  ? generationDurationMs
+                  : null,
+              totalDurationMs,
+            });
+          }
+          turnPerformance.delete(key);
+        }
+      }
+    }
     if (message.id !== undefined) {
       if (message.method === 'item/tool/requestUserInput') {
         const request = normalizeUserInputRequest(message.params);
@@ -2742,6 +2865,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     for (const subagent of activeSubagents) affectedRoots.add(subagent.rootThreadId);
 
     activeTurns.clear();
+    turnPerformance.clear();
     nativeActiveThreads.clear();
     treeBusyThreads.clear();
     deferredCompletionPushes.clear();
@@ -5192,6 +5316,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     );
     let usage: z.infer<typeof accountUsageSchema> | null = null;
     let threadUsage: z.infer<typeof threadUsageSchema> | null = null;
+    let threadPerformance: z.infer<typeof capabilitySchema>['threadPerformance'] = null;
     const [rateLimitsResult, usageResult, threadUsageResult] = await Promise.allSettled([
       appServer.request('account/rateLimits/read', null),
       appServer.request('account/usage/read', null),
@@ -5250,6 +5375,31 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     } else if (query.threadId !== undefined) {
       warnings.push('Codex thread usage is unavailable.');
     }
+    if (query.threadId !== undefined) {
+      const samples = repository.listTurnPerformance(query.threadId, 20);
+      const measurableSamples = samples.filter(
+        (sample) => sample.generationTokensPerSecond !== null,
+      );
+      const generationSamples = measurableSamples.map(
+        (sample) => sample.generationTokensPerSecond!,
+      );
+      const medianGenerationTokensPerSecond = median(generationSamples);
+      const medianTimeToFirstOutputMs = median(
+        measurableSamples.flatMap((sample) =>
+          sample.timeToFirstOutputMs === null ? [] : [sample.timeToFirstOutputMs],
+        ),
+      );
+      threadPerformance = {
+        threadId: query.threadId,
+        last: samples[0] ?? null,
+        recent: {
+          sampleSize: generationSamples.length,
+          medianGenerationTokensPerSecond,
+          medianTimeToFirstOutputMs:
+            medianTimeToFirstOutputMs === null ? null : Math.round(medianTimeToFirstOutputMs),
+        },
+      };
+    }
     if (skills.data.some((entry) => entry.errors.length > 0))
       warnings.push('One or more project skill scans reported errors.');
     const names = new Set(skills.data.flatMap((entry) => entry.skills.map((skill) => skill.name)));
@@ -5277,6 +5427,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       rateLimitReset,
       usage,
       threadUsage,
+      threadPerformance,
       transcription: {
         available: dependencies.transcriptionClient !== undefined,
         model: config.transcriptionModel,

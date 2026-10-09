@@ -406,6 +406,25 @@ describe('contracts', () => {
         estimatedUsageCreditsMicros: 123_000,
         model: 'must-not-survive',
       },
+      threadPerformance: {
+        threadId: 'thread-1',
+        last: {
+          turnId: 'turn-1',
+          completedAt: '2026-10-09T12:00:00.000Z',
+          outputTokens: 120,
+          timeToFirstOutputMs: 400,
+          generationDurationMs: 2_000,
+          totalDurationMs: 5_000,
+          generationTokensPerSecond: 60,
+          effectiveTokensPerSecond: 24,
+          responseText: 'must-not-survive',
+        },
+        recent: {
+          sampleSize: 4,
+          medianGenerationTokensPerSecond: 55.5,
+          medianTimeToFirstOutputMs: 450,
+        },
+      },
       transcription: {
         available: true,
         model: 'onnx-community/whisper-base',
@@ -438,6 +457,7 @@ describe('contracts', () => {
     });
     expect(parsed.threadUsage).not.toHaveProperty('estimatedUsageCreditsMicros');
     expect(parsed.threadUsage).not.toHaveProperty('model');
+    expect(parsed.threadPerformance?.last).not.toHaveProperty('responseText');
     expect(parsed.transcription).toEqual({
       available: true,
       model: 'onnx-community/whisper-base',
@@ -454,6 +474,15 @@ describe('contracts', () => {
       capabilitySchema.safeParse({
         ...parsed,
         threadUsage: { ...parsed.threadUsage, inputTokens: -1 },
+      }).success,
+    ).toBe(false);
+    expect(
+      capabilitySchema.safeParse({
+        ...parsed,
+        threadPerformance: {
+          ...parsed.threadPerformance,
+          last: { ...parsed.threadPerformance?.last, generationTokensPerSecond: -1 },
+        },
       }).success,
     ).toBe(false);
     expect(

@@ -102,6 +102,24 @@ const capabilities = {
     },
     dailyUsageBuckets: null,
   },
+  threadPerformance: {
+    threadId: thread.id,
+    last: {
+      turnId: 'turn-performance-1',
+      completedAt: '2026-10-09T10:00:00.000Z',
+      outputTokens: 240,
+      timeToFirstOutputMs: 850,
+      generationDurationMs: 4_000,
+      totalDurationMs: 10_000,
+      generationTokensPerSecond: 60,
+      effectiveTokensPerSecond: 24,
+    },
+    recent: {
+      sampleSize: 3,
+      medianGenerationTokensPerSecond: 55.5,
+      medianTimeToFirstOutputMs: 900,
+    },
+  },
   warnings: [],
 };
 
@@ -318,6 +336,15 @@ function installAuthenticatedApi(
   });
   vi.stubGlobal('fetch', fetchMock);
   return fetchMock;
+}
+
+async function openSettings(
+  user: ReturnType<typeof userEvent.setup>,
+  tab: 'Аккаунт' | 'Обновления' | 'Ресурсы' | 'Skills и инструкции' = 'Аккаунт',
+) {
+  await user.click(await screen.findByRole('button', { name: /Открыть настройки профиля/ }));
+  if (tab !== 'Аккаунт') await user.click(screen.getByRole('tab', { name: tab }));
+  return screen.getByRole('dialog', { name: 'Настройки' });
 }
 
 beforeEach(() => {
@@ -2560,7 +2587,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await openSettings(user, 'Ресурсы');
     expect(await screen.findByText('Ресурсы задач Codex')).not.toBeNull();
     await user.click(screen.getByLabelText('Настроить вручную'));
     const cpu = screen.getByLabelText('Лимит CPU, ядер');
@@ -4773,8 +4800,11 @@ describe('App', () => {
     await waitFor(() => expect(screen.queryByLabelText('Запрос дополнительных прав')).toBeNull());
   });
 
-  it('opens status and skills through slash commands without sending a model turn', async () => {
-    installAuthenticatedApi();
+  it('opens focused status and the Skills settings tab through slash commands', async () => {
+    installAuthenticatedApi((url) => {
+      if (!url.startsWith('/api/system/capabilities')) return undefined;
+      return jsonResponse({ ...capabilities, warnings: ['Codex работает с ограничениями.'] });
+    });
     const user = userEvent.setup();
     render(<App />);
 
@@ -4789,11 +4819,62 @@ describe('App', () => {
     expect(await screen.findByRole('complementary', { name: 'Статус Codex' })).not.toBeNull();
     expect(screen.getByText('27% использовано · 300 мин.')).not.toBeNull();
     expect(screen.getByText((content) => content.replace(/\s/g, '') === '123456')).not.toBeNull();
-    expect(await screen.findByText('/srv/projects/ai-chat-bot/AGENTS.md')).not.toBeNull();
-    expect(screen.getByText('multi-agent-orchestrator')).not.toBeNull();
-    expect(screen.getAllByText('1.2.3').length).toBeGreaterThan(0);
-    expect(screen.getByText('Подготовленное обновление отсутствует.')).not.toBeNull();
-    expect(screen.queryByRole('button', { name: 'Обновить Codex' })).toBeNull();
+    expect(screen.getByRole('heading', { name: 'Скорость ответа' })).not.toBeNull();
+    expect(screen.getByText('60 ток/с')).not.toBeNull();
+    expect(screen.getByText('55,5 ток/с')).not.toBeNull();
+    expect(screen.getByText('Codex работает с ограничениями.')).not.toBeNull();
+    expect(screen.queryByText('/srv/projects/ai-chat-bot/AGENTS.md')).toBeNull();
+    expect(screen.queryByText('multi-agent-orchestrator')).toBeNull();
+    expect(screen.queryByText('Обновление Codex')).toBeNull();
+    expect(screen.queryByText('Ресурсы задач Codex')).toBeNull();
+
+    const profile = screen.getByRole('button', { name: /Открыть настройки профиля/ });
+    await user.click(profile);
+    expect(screen.queryByRole('complementary', { name: 'Статус Codex' })).toBeNull();
+    const accountTab = screen.getByRole('tab', { name: 'Аккаунт' });
+    expect(document.activeElement).toBe(accountTab);
+    await user.keyboard('{ArrowRight}');
+    const updatesTab = screen.getByRole('tab', { name: 'Обновления' });
+    expect(updatesTab.getAttribute('aria-selected')).toBe('true');
+    expect(document.activeElement).toBe(updatesTab);
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Настройки' })).toBeNull();
+    expect(document.activeElement).toBe(profile);
+
+    await user.type(composer, '/skills');
+    await user.keyboard('{Enter}');
+    const settings = await screen.findByRole('dialog', { name: 'Настройки' });
+    expect(
+      within(settings)
+        .getByRole('tab', { name: 'Skills и инструкции' })
+        .getAttribute('aria-selected'),
+    ).toBe('true');
+    expect(within(settings).getByText('/srv/projects/ai-chat-bot/AGENTS.md')).not.toBeNull();
+    expect(within(settings).getByText('multi-agent-orchestrator')).not.toBeNull();
+    await user.keyboard('{Escape}');
+    expect(document.activeElement).toBe(composer);
+  });
+
+  it('inserts enabled skills from the dollar palette and settings without sending', async () => {
+    const fetchMock = installAuthenticatedApi();
+    const user = userEvent.setup();
+    render(<App />);
+    const composer = await screen.findByLabelText<HTMLTextAreaElement>('Сообщение Codex');
+
+    fireEvent.change(composer, { target: { value: '$multi' } });
+    const palette = screen.getByRole('listbox', { name: 'Skills Codex' });
+    await user.click(within(palette).getByRole('option', { name: /multi-agent-orchestrator/ }));
+    expect(composer.value).toBe('$multi-agent-orchestrator ');
+    expect(
+      fetchMock.mock.calls.some(([input]) => requestUrl(input) === '/api/threads/thread-1/turns'),
+    ).toBe(false);
+
+    await user.clear(composer);
+    const settings = await openSettings(user, 'Skills и инструкции');
+    await user.click(within(settings).getByRole('button', { name: 'Использовать' }));
+    expect(screen.queryByRole('dialog', { name: 'Настройки' })).toBeNull();
+    expect(composer.value).toBe('$multi-agent-orchestrator ');
+    expect(document.activeElement).toBe(composer);
   });
 
   it('saves the account-wide automatic rate-limit reset without optimistic UI state', async () => {
@@ -4810,8 +4891,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
-    const diagnostics = await screen.findByRole('complementary', { name: 'Статус Codex' });
+    const diagnostics = await openSettings(user, 'Ресурсы');
     const checkbox = within(diagnostics).getByRole('checkbox', {
       name: 'Автоматически использовать сохранённый сброс, когда лимит Codex остановит задачу',
     });
@@ -4880,7 +4960,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await openSettings(user, 'Ресурсы');
     const checkbox = screen.getByRole('checkbox', {
       name: 'Автоматически использовать сохранённый сброс, когда лимит Codex остановит задачу',
     });
@@ -4893,7 +4973,7 @@ describe('App', () => {
 
   it('disables automatic reset when the account does not support it', async () => {
     installAuthenticatedApi((url) => {
-      if (url !== '/api/system/capabilities?threadId=thread-1') return undefined;
+      if (!url.startsWith('/api/system/capabilities')) return undefined;
       return jsonResponse({
         ...capabilities,
         rateLimitReset: {
@@ -4906,7 +4986,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await openSettings(user, 'Ресурсы');
     expect(
       screen.getByRole<HTMLInputElement>('checkbox', {
         name: 'Автоматически использовать сохранённый сброс, когда лимит Codex остановит задачу',
@@ -5206,8 +5286,8 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
-    expect((await screen.findAllByText('1.2.4')).length).toBeGreaterThan(0);
+    await openSettings(user, 'Обновления');
+    expect((await screen.findAllByText('codex-cli 1.2.4')).length).toBeGreaterThan(0);
     const scopedCapabilityReadsBeforeApply = fetchMock.mock.calls.filter(
       ([input]) => requestUrl(input) === '/api/system/capabilities?threadId=thread-1',
     ).length;
@@ -5266,7 +5346,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await openSettings(user, 'Обновления');
     const applyButton = await screen.findByRole('button', { name: 'Скачать и установить' });
     await user.click(applyButton);
 
@@ -5277,6 +5357,33 @@ describe('App', () => {
     );
     expect(applyCall?.[1]?.body).toBe('{}');
     expect(new Headers(applyCall?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf-token');
+  });
+
+  it('shows the server-provided reason when the last Codex update failed', async () => {
+    installAuthenticatedApi((url) => {
+      if (url !== '/api/system/codex-update') return undefined;
+      return jsonResponse({
+        data: {
+          state: 'failed',
+          currentVersion: 'codex-cli 1.2.3',
+          availableVersion: 'codex-cli 1.2.4',
+          candidateReleaseId: 'release-124',
+          lastResult: {
+            status: 'failed',
+            message: 'Проверка совместимости пакета не пройдена.',
+            completedAt: '2026-10-01T16:00:00.000Z',
+          },
+        },
+      });
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    await openSettings(user, 'Обновления');
+
+    expect((await screen.findByRole('alert')).textContent).toContain(
+      'Проверка совместимости пакета не пройдена.',
+    );
   });
 
   it('checks the latest Codex version automatically and supports a manual refresh', async () => {
@@ -5301,7 +5408,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await openSettings(user, 'Обновления');
     expect(await screen.findByText('codex-cli 1.2.4')).not.toBeNull();
     expect(screen.getByText(/Доступна новая версия Codex/)).not.toBeNull();
     expect(screen.getByText(/Проверено/)).not.toBeNull();
@@ -5334,7 +5441,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await openSettings(user);
     expect(await screen.findByText('old@example.com')).not.toBeNull();
     await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
 
@@ -5382,7 +5489,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await openSettings(user);
     await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
     expect(await screen.findByText('Ожидаем подтверждение входа…')).not.toBeNull();
     await waitFor(() => expect(statusReads).toBeGreaterThan(0), { timeout: 1_500 });
@@ -5430,7 +5537,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await openSettings(user);
     const scopedCapabilityReadsBeforeLogin = fetchMock.mock.calls.filter(
       ([input]) => requestUrl(input) === '/api/system/capabilities?threadId=thread-1',
     ).length;
@@ -5438,6 +5545,7 @@ describe('App', () => {
 
     expect(await screen.findByText(/Аккаунт Codex успешно сменён/)).not.toBeNull();
     expect(statusReads).toBeGreaterThan(0);
+    await user.click(screen.getByRole('button', { name: 'Закрыть' }));
     expect(await screen.findByText('new@example.com')).not.toBeNull();
     expect(
       fetchMock.mock.calls.filter(
@@ -5476,7 +5584,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await openSettings(user);
     await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
     expect(await screen.findByRole('button', { name: 'Отменить вход' })).not.toBeNull();
     await user.keyboard('{Escape}');
@@ -5533,11 +5641,12 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await openSettings(user);
     await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
     await user.click(await screen.findByRole('button', { name: 'Отменить вход' }));
 
     expect(await screen.findByText(/Аккаунт Codex успешно сменён/)).not.toBeNull();
+    await user.click(screen.getByRole('button', { name: 'Закрыть' }));
     expect(await screen.findByText('race-winner@example.com')).not.toBeNull();
     expect(screen.queryByText(/Текущий аккаунт сохранён/)).toBeNull();
   });
@@ -5554,7 +5663,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await openSettings(user);
     await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
 
     expect((await screen.findByRole('alert')).textContent).toContain(
@@ -5584,7 +5693,7 @@ describe('App', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await user.click(await screen.findByRole('button', { name: 'Статус' }));
+    await openSettings(user);
     await user.click(screen.getByRole('button', { name: 'Сменить аккаунт' }));
 
     expect(await screen.findByLabelText('Одноразовый код')).not.toBeNull();

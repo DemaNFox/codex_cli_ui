@@ -3702,6 +3702,207 @@ describe('Codex routes', () => {
     ).toEqual([null, { threadId }]);
   });
 
+  it('persists bounded successful turn performance without response delta content', async () => {
+    const { app, appServer, projectPath, repository } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const monotonic = vi.spyOn(performance, 'now');
+    try {
+      monotonic.mockReturnValue(1_000);
+      appServer.emit({
+        method: 'turn/started',
+        params: { threadId, turn: { id: 'turn-performance-1', status: 'inProgress' } },
+      });
+      monotonic.mockReturnValue(1_400);
+      appServer.emit({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId,
+          turnId: 'turn-performance-1',
+          tokenUsage: {
+            last: {
+              inputTokens: 10,
+              cachedInputTokens: 0,
+              outputTokens: 120,
+              reasoningOutputTokens: 0,
+              totalTokens: 130,
+            },
+            total: {
+              inputTokens: 10,
+              cachedInputTokens: 0,
+              outputTokens: 120,
+              reasoningOutputTokens: 0,
+              totalTokens: 130,
+            },
+          },
+        },
+      });
+      monotonic.mockReturnValue(1_600);
+      appServer.emit({
+        method: 'item/agentMessage/delta',
+        params: {
+          threadId,
+          turnId: 'turn-performance-1',
+          itemId: 'message-1',
+          delta: 'private-response-fragment-must-not-persist',
+        },
+      });
+      monotonic.mockReturnValue(2_600);
+      appServer.emit({
+        method: 'item/agentMessage/delta',
+        params: {
+          threadId,
+          turnId: 'turn-performance-1',
+          itemId: 'message-1',
+          delta: 'another-private-fragment',
+        },
+      });
+      monotonic.mockReturnValue(4_000);
+      appServer.emit({
+        method: 'turn/completed',
+        params: {
+          threadId,
+          turn: {
+            id: 'turn-performance-1',
+            status: 'completed',
+            completedAt: 1_800_000_000,
+            items: [],
+          },
+        },
+      });
+
+      monotonic.mockReturnValue(5_000);
+      appServer.emit({
+        method: 'turn/started',
+        params: { threadId, turn: { id: 'turn-performance-2', status: 'inProgress' } },
+      });
+      monotonic.mockReturnValue(5_200);
+      appServer.emit({
+        method: 'item/agentMessage/delta',
+        params: {
+          threadId,
+          turnId: 'turn-performance-2',
+          itemId: 'message-2',
+          delta: 'not persisted',
+        },
+      });
+      monotonic.mockReturnValue(5_700);
+      appServer.emit({
+        method: 'item/agentMessage/delta',
+        params: {
+          threadId,
+          turnId: 'turn-performance-2',
+          itemId: 'message-2',
+          delta: 'still not persisted',
+        },
+      });
+      monotonic.mockReturnValue(6_500);
+      appServer.emit({
+        method: 'turn/completed',
+        params: {
+          threadId,
+          turn: {
+            id: 'turn-performance-2',
+            status: 'completed',
+            completedAt: 1_800_000_010,
+            durationMs: 1_200,
+            items: [],
+          },
+        },
+      });
+      appServer.emit({
+        method: 'thread/tokenUsage/updated',
+        params: {
+          threadId,
+          turnId: 'turn-performance-2',
+          tokenUsage: { last: { outputTokens: 200 }, total: { outputTokens: 320 } },
+        },
+      });
+
+      monotonic.mockReturnValue(7_000);
+      appServer.emit({
+        method: 'turn/started',
+        params: { threadId, turn: { id: 'turn-failed', status: 'inProgress' } },
+      });
+      monotonic.mockReturnValue(7_300);
+      appServer.emit({
+        method: 'item/agentMessage/delta',
+        params: {
+          threadId,
+          turnId: 'turn-failed',
+          itemId: 'message-failed',
+          delta: 'failed response must not become a sample',
+        },
+      });
+      monotonic.mockReturnValue(7_500);
+      appServer.emit({
+        method: 'turn/completed',
+        params: {
+          threadId,
+          turn: { id: 'turn-failed', status: 'failed', items: [], error: { message: 'failed' } },
+        },
+      });
+    } finally {
+      monotonic.mockRestore();
+    }
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/system/capabilities?threadId=${encodeURIComponent(threadId)}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      threadPerformance: {
+        threadId,
+        last: {
+          turnId: 'turn-performance-2',
+          completedAt: '2027-01-15T08:00:10.000Z',
+          outputTokens: 200,
+          timeToFirstOutputMs: 200,
+          generationDurationMs: 500,
+          totalDurationMs: 1_200,
+          generationTokensPerSecond: 400,
+          effectiveTokensPerSecond: 166.66666666666666,
+        },
+        recent: {
+          sampleSize: 2,
+          medianGenerationTokensPerSecond: 260,
+          medianTimeToFirstOutputMs: 400,
+        },
+      },
+    });
+    expect(response.body).not.toContain('private-response-fragment-must-not-persist');
+    expect(response.body).not.toContain('turn-failed');
+    const tableDefinition = repository.database
+      .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='turn_performance'")
+      .get() as { sql: string };
+    expect(tableDefinition.sql).not.toContain('delta');
+  });
+
+  it('bounds persisted turn performance to the latest twenty completed samples', async () => {
+    const { app, projectPath, repository } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+
+    for (let index = 0; index < 22; index += 1) {
+      repository.saveTurnPerformance(threadId, `turn-${String(index).padStart(2, '0')}`, {
+        completedAt: new Date(1_800_000_000_000 + index * 1_000).toISOString(),
+        outputTokens: index,
+        timeToFirstOutputMs: 100,
+        generationDurationMs: 500,
+        totalDurationMs: 1_000,
+      });
+    }
+
+    const samples = repository.listTurnPerformance(threadId, 20);
+    expect(samples).toHaveLength(20);
+    expect(samples[0]?.turnId).toBe('turn-21');
+    expect(samples.at(-1)?.turnId).toBe('turn-02');
+  });
+
   it('degrades malformed or failed thread usage independently from account usage', async () => {
     const { app, appServer, projectPath } = await fixture();
     const session = await login(app);

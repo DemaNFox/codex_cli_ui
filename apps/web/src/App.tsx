@@ -48,6 +48,7 @@ import { useThreadEvents } from './useThreadEvents.js';
 import { VoiceInputButton } from './VoiceInputButton.js';
 
 type LoadState = 'loading' | 'ready' | 'signed-out';
+type SettingsTab = 'account' | 'updates' | 'resources' | 'skills';
 type PushNotificationState =
   | 'unavailable'
   | 'insecure'
@@ -197,6 +198,18 @@ function formatResetTime(value: number | null): string {
 
 function formatMetric(value: number | null): string {
   return value === null ? 'нет данных' : value.toLocaleString('ru');
+}
+
+function formatMilliseconds(value: number | null): string {
+  if (value === null) return 'нет данных';
+  if (value < 1_000) return `${value.toLocaleString('ru')} мс`;
+  return `${(value / 1_000).toLocaleString('ru', { maximumFractionDigits: 2 })} сек.`;
+}
+
+function formatTokensPerSecond(value: number | null): string {
+  return value === null
+    ? 'нет данных'
+    : `${value.toLocaleString('ru', { maximumFractionDigits: 1 })} ток/с`;
 }
 
 function localCalendarKey(date: Date): string {
@@ -1252,6 +1265,8 @@ function NavigationSidebar({
   onArchiveProject,
   onRestoreProject,
   onLogout,
+  onOpenSettings,
+  settingsButtonRef,
   username,
   disabled,
   mobileOpen,
@@ -1283,6 +1298,8 @@ function NavigationSidebar({
   onArchiveProject: (id: string) => void;
   onRestoreProject: (id: string) => void;
   onLogout: () => void;
+  onOpenSettings: () => void;
+  settingsButtonRef: RefObject<HTMLButtonElement | null>;
   username: string;
   disabled: boolean;
   mobileOpen: boolean;
@@ -1507,8 +1524,19 @@ function NavigationSidebar({
         </nav>
       </div>
       <div className="account-row">
-        <span className="avatar">{username.slice(0, 1).toUpperCase()}</span>
-        <span>{username}</span>
+        <button
+          ref={settingsButtonRef}
+          className="profile-button"
+          type="button"
+          onClick={onOpenSettings}
+          aria-haspopup="dialog"
+          aria-label={`Открыть настройки профиля ${username}`}
+        >
+          <span className="avatar" aria-hidden="true">
+            {username.slice(0, 1).toUpperCase()}
+          </span>
+          <span>{username}</span>
+        </button>
         <button className="ghost" onClick={onLogout}>
           Выйти
         </button>
@@ -2756,7 +2784,111 @@ function SubagentMenu({
   );
 }
 
-function Diagnostics({
+function CodexUpdateSettings({
+  snapshot,
+  discovery,
+  busy,
+  discoveryBusy,
+  error,
+  discoveryError,
+  onApply,
+  onCheck,
+}: {
+  snapshot: CodexUpdateSnapshot | null;
+  discovery: CodexVersionDiscovery | null;
+  busy: boolean;
+  discoveryBusy: boolean;
+  error: string | null;
+  discoveryError: string | null;
+  onApply: () => void;
+  onCheck: () => void;
+}) {
+  const canApply =
+    snapshot?.state === 'ready' ||
+    (snapshot?.state === 'unavailable' && discovery?.state === 'available');
+  return (
+    <section className="codex-update" aria-labelledby="codex-update-title">
+      <h3 id="codex-update-title">Обновление Codex</h3>
+      <dl className="status-grid codex-update-versions">
+        <dt>Установлена</dt>
+        <dd>{snapshot?.currentVersion ?? discovery?.currentVersion ?? 'нет данных'}</dd>
+        <dt>Последняя</dt>
+        <dd>{discovery?.latestVersion ?? 'не удалось определить'}</dd>
+        {snapshot?.availableVersion && (
+          <>
+            <dt>Подготовлена</dt>
+            <dd>{snapshot.availableVersion}</dd>
+          </>
+        )}
+      </dl>
+      {discovery ? (
+        <>
+          <p className={`codex-update-state ${discovery.state}`} role="status">
+            {discovery.state === 'available' && 'Доступна новая версия Codex.'}
+            {discovery.state === 'current' && 'Установлена последняя версия Codex.'}
+            {discovery.state === 'failed' && 'Не удалось проверить доступную версию Codex.'}
+          </p>
+          <small className="codex-update-checked-at">
+            Проверено {formatEventDateTime(discovery.checkedAt)}
+          </small>
+        </>
+      ) : (
+        <p className="empty-hint compact">Проверяем доступную версию…</p>
+      )}
+      <button
+        className="secondary codex-update-button"
+        type="button"
+        disabled={discoveryBusy}
+        onClick={onCheck}
+      >
+        {discoveryBusy ? 'Проверяем…' : 'Проверить обновления'}
+      </button>
+      {discoveryError && (
+        <p className="notice error" role="alert">
+          {discoveryError}
+        </p>
+      )}
+      {snapshot && (
+        <p className="codex-update-state" role="status">
+          {snapshot.state === 'ready' && 'Обновление готово к установке.'}
+          {snapshot.state === 'applying' && 'Обновляем Codex…'}
+          {snapshot.state === 'current' && 'Установлена актуальная подготовленная версия.'}
+          {snapshot.state === 'unavailable' && 'Подготовленное обновление отсутствует.'}
+          {snapshot.state === 'failed' && 'Обновление не установлено.'}
+          {snapshot.state === 'rollback_failed' &&
+            'Обновление не установлено, автоматический откат не завершён.'}
+        </p>
+      )}
+      {snapshot?.lastResult && snapshot.lastResult.status !== 'succeeded' && (
+        <p className="notice error" role="alert">
+          {snapshot.lastResult.message}
+        </p>
+      )}
+      {canApply && (
+        <button
+          className="primary codex-update-button"
+          type="button"
+          disabled={busy}
+          onClick={onApply}
+        >
+          {busy ? 'Запускаем…' : 'Скачать и установить'}
+        </button>
+      )}
+      <p className="codex-update-note">
+        Обновление запускается только когда Codex свободен и ненадолго перезапускает его. Чаты и
+        файлы сохраняются.
+      </p>
+      {error && (
+        <p className="notice error" role="alert">
+          {error}
+        </p>
+      )}
+    </section>
+  );
+}
+
+function SettingsDialog({
+  activeTab,
   capability,
   codexUpdate,
   codexUpdateBusy,
@@ -2770,16 +2902,19 @@ function Diagnostics({
   autoRateLimitResetBusy,
   autoRateLimitResetError,
   thread,
+  accountSwitchButtonRef,
+  onTabChange,
+  onClose,
+  onStartAccountLogin,
+  onApplyCodexUpdate,
+  onCheckCodexUpdate,
   onRefreshResources,
   onSaveResources,
   onApplyResources,
   onSaveAutoRateLimitReset,
-  onStartAccountLogin,
-  onApplyCodexUpdate,
-  onCheckCodexUpdate,
-  accountSwitchButtonRef,
-  onClose,
+  onUseSkill,
 }: {
+  activeTab: SettingsTab;
   capability: Capability | null;
   codexUpdate: CodexUpdateSnapshot | null;
   codexUpdateBusy: boolean;
@@ -2793,20 +2928,236 @@ function Diagnostics({
   autoRateLimitResetBusy: boolean;
   autoRateLimitResetError: string | null;
   thread: Thread | null;
+  accountSwitchButtonRef: RefObject<HTMLButtonElement | null>;
+  onTabChange: (tab: SettingsTab) => void;
+  onClose: () => void;
+  onStartAccountLogin: () => void;
+  onApplyCodexUpdate: () => void;
+  onCheckCodexUpdate: () => void;
   onRefreshResources: () => void;
   onSaveResources: (desired: ResourceLimitPolicy) => Promise<void>;
   onApplyResources: () => Promise<void>;
   onSaveAutoRateLimitReset: (enabled: boolean) => Promise<void>;
-  onStartAccountLogin: () => void;
-  onApplyCodexUpdate: () => void;
-  onCheckCodexUpdate: () => void;
-  accountSwitchButtonRef: RefObject<HTMLButtonElement | null>;
+  onUseSkill: (name: string) => void;
+}) {
+  const dialogRef = useRef<HTMLElement>(null);
+  useEffect(() => {
+    dialogRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const controls = [
+        ...(dialogRef.current?.querySelectorAll<HTMLElement>(
+          'button:not(:disabled):not([tabindex="-1"]), a[href]:not([tabindex="-1"]), input:not(:disabled):not([tabindex="-1"]), select:not(:disabled):not([tabindex="-1"]), [tabindex]:not([tabindex="-1"])',
+        ) ?? []),
+      ].filter((element) => element.offsetParent !== null);
+      const first = controls[0];
+      const last = controls.at(-1);
+      if (!first || !last) return;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener('keydown', onKeyDown);
+    return () => document.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+  const tabs: Array<{ id: SettingsTab; label: string }> = [
+    { id: 'account', label: 'Аккаунт' },
+    { id: 'updates', label: 'Обновления' },
+    { id: 'resources', label: 'Ресурсы' },
+    { id: 'skills', label: 'Skills и инструкции' },
+  ];
+  return createPortal(
+    <div className="dialog-backdrop settings-backdrop">
+      <section
+        ref={dialogRef}
+        className="settings-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="settings-title"
+      >
+        <header>
+          <div>
+            <p className="eyebrow">CODEX SETTINGS</p>
+            <h2 id="settings-title">Настройки</h2>
+          </div>
+          <button
+            className="icon-button"
+            type="button"
+            onClick={onClose}
+            aria-label="Закрыть настройки"
+          >
+            ×
+          </button>
+        </header>
+        <div className="settings-tabs" role="tablist" aria-label="Разделы настроек">
+          {tabs.map((tab) => (
+            <button
+              key={tab.id}
+              id={`settings-tab-${tab.id}`}
+              type="button"
+              role="tab"
+              aria-selected={activeTab === tab.id}
+              aria-controls="settings-panel"
+              tabIndex={activeTab === tab.id ? 0 : -1}
+              onClick={() => onTabChange(tab.id)}
+              onKeyDown={(event) => {
+                if (
+                  event.key !== 'ArrowLeft' &&
+                  event.key !== 'ArrowRight' &&
+                  event.key !== 'Home' &&
+                  event.key !== 'End'
+                )
+                  return;
+                event.preventDefault();
+                const currentIndex = tabs.findIndex((candidate) => candidate.id === tab.id);
+                const next =
+                  event.key === 'Home'
+                    ? tabs[0]!
+                    : event.key === 'End'
+                      ? tabs.at(-1)!
+                      : tabs[
+                          (currentIndex + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) %
+                            tabs.length
+                        ]!;
+                dialogRef.current
+                  ?.querySelector<HTMLElement>(`[role="tab"][id="settings-tab-${next.id}"]`)
+                  ?.focus();
+                onTabChange(next.id);
+              }}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+        <div
+          className="settings-content"
+          id="settings-panel"
+          role="tabpanel"
+          aria-labelledby={`settings-tab-${activeTab}`}
+        >
+          {activeTab === 'account' && (
+            <section>
+              <h3>Аккаунт Codex</h3>
+              <dl className="status-grid">
+                <dt>Аккаунт</dt>
+                <dd>{capability?.account?.email ?? 'не указан'}</dd>
+                <dt>План</dt>
+                <dd>{capability?.account?.planType ?? 'нет данных'}</dd>
+                <dt>Авторизация</dt>
+                <dd>{capability?.authenticated ? 'активна' : 'нет'}</dd>
+                <dt>Codex</dt>
+                <dd>{capability?.codexVersion ?? 'нет данных'}</dd>
+                <dt>App Server</dt>
+                <dd>{capability?.appServerReady ? 'готов' : 'недоступен'}</dd>
+              </dl>
+              <button
+                ref={accountSwitchButtonRef}
+                className="secondary account-switch-button"
+                type="button"
+                onClick={onStartAccountLogin}
+              >
+                Сменить аккаунт
+              </button>
+            </section>
+          )}
+          {activeTab === 'updates' && (
+            <CodexUpdateSettings
+              snapshot={codexUpdate}
+              discovery={codexUpdateDiscovery}
+              busy={codexUpdateBusy}
+              discoveryBusy={codexUpdateDiscoveryBusy}
+              error={codexUpdateError}
+              discoveryError={codexUpdateDiscoveryError}
+              onApply={onApplyCodexUpdate}
+              onCheck={onCheckCodexUpdate}
+            />
+          )}
+          {activeTab === 'resources' && (
+            <>
+              <ResourceSettings
+                snapshot={resourceLimits}
+                busy={resourceBusy}
+                error={resourceError}
+                onRefresh={onRefreshResources}
+                onSave={onSaveResources}
+                onApply={onApplyResources}
+              />
+              {capability && (
+                <AutoRateLimitResetSettings
+                  snapshot={capability.rateLimitReset}
+                  busy={autoRateLimitResetBusy}
+                  error={autoRateLimitResetError}
+                  onSave={onSaveAutoRateLimitReset}
+                />
+              )}
+            </>
+          )}
+          {activeTab === 'skills' && (
+            <>
+              <section className="settings-section">
+                <h3>Инструкции текущего чата</h3>
+                <ul className="path-list">
+                  {thread?.instructionSources.map((path) => (
+                    <li key={path}>{path}</li>
+                  ))}
+                  {!thread?.instructionSources.length && <li>Нет данных для текущего чата</li>}
+                </ul>
+              </section>
+              <section className="settings-section">
+                <h3>Skills</h3>
+                <p className="usage-scope-note">
+                  Вставьте skill в поле сообщения — отправка останется за вами.
+                </p>
+                <ul className="skill-list settings-skill-list">
+                  {capability?.skills.map((skill) => (
+                    <li key={`${skill.name}:${skill.path}`}>
+                      <span>
+                        <strong>{skill.name}</strong>
+                        <small>
+                          {skill.enabled ? 'включён' : 'выключен'} · {skill.path}
+                        </small>
+                      </span>
+                      <button
+                        type="button"
+                        className="secondary"
+                        disabled={!skill.enabled}
+                        onClick={() => onUseSkill(skill.name)}
+                      >
+                        Использовать
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            </>
+          )}
+        </div>
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
+function Diagnostics({
+  capability,
+  thread,
+  onClose,
+}: {
+  capability: Capability | null;
+  thread: Thread | null;
   onClose: () => void;
 }) {
-  const canApplyCodexUpdate =
-    codexUpdate?.state === 'ready' ||
-    (codexUpdate?.state === 'unavailable' && codexUpdateDiscovery?.state === 'available');
-
+  const performance = capability?.threadPerformance;
+  const matchingPerformance = thread && performance?.threadId === thread.id ? performance : null;
   return (
     <aside id="codex-diagnostics" className="diagnostics" aria-label="Статус Codex">
       <header>
@@ -2827,133 +3178,6 @@ function Diagnostics({
         <p>Загрузка…</p>
       ) : (
         <>
-          <dl className="status-grid">
-            <dt>Codex</dt>
-            <dd>{capability.codexVersion}</dd>
-            <dt>Авторизация</dt>
-            <dd>{capability.authenticated ? 'активна' : 'нет'}</dd>
-            <dt>App Server</dt>
-            <dd>{capability.appServerReady ? 'готов' : 'недоступен'}</dd>
-            <dt>Аккаунт</dt>
-            <dd>{capability.account?.email ?? 'не указан'}</dd>
-            <dt>План</dt>
-            <dd>{capability.account?.planType ?? 'нет данных'}</dd>
-          </dl>
-          <button
-            ref={accountSwitchButtonRef}
-            className="secondary account-switch-button"
-            type="button"
-            onClick={onStartAccountLogin}
-          >
-            Сменить аккаунт
-          </button>
-          <section className="codex-update" aria-labelledby="codex-update-title">
-            <h3 id="codex-update-title">Обновление Codex</h3>
-            {codexUpdateDiscovery ? (
-              <>
-                <dl className="status-grid codex-update-versions">
-                  <dt>Установлена</dt>
-                  <dd>{codexUpdateDiscovery.currentVersion}</dd>
-                  <dt>Последняя</dt>
-                  <dd>{codexUpdateDiscovery.latestVersion ?? 'не удалось определить'}</dd>
-                </dl>
-                <p className={`codex-update-state ${codexUpdateDiscovery.state}`} role="status">
-                  {codexUpdateDiscovery.state === 'available' &&
-                    'Доступна новая версия Codex. Её можно безопасно скачать и установить.'}
-                  {codexUpdateDiscovery.state === 'current' &&
-                    'Установлена последняя версия Codex.'}
-                  {codexUpdateDiscovery.state === 'failed' &&
-                    'Не удалось проверить доступную версию Codex.'}
-                </p>
-                <small className="codex-update-checked-at">
-                  Проверено {formatEventDateTime(codexUpdateDiscovery.checkedAt)}
-                </small>
-              </>
-            ) : (
-              <p className="empty-hint compact">Проверяем доступную версию…</p>
-            )}
-            <button
-              className="secondary codex-update-button"
-              type="button"
-              disabled={codexUpdateDiscoveryBusy}
-              onClick={onCheckCodexUpdate}
-            >
-              {codexUpdateDiscoveryBusy ? 'Проверяем…' : 'Проверить обновления'}
-            </button>
-            {codexUpdateDiscoveryError && (
-              <p className="notice error" role="alert">
-                {codexUpdateDiscoveryError}
-              </p>
-            )}
-            <div className="codex-update-prepared">
-              <h4>Подготовленное обновление</h4>
-              {codexUpdate ? (
-                <>
-                  <dl className="status-grid codex-update-versions">
-                    <dt>Текущая версия</dt>
-                    <dd>{codexUpdate.currentVersion}</dd>
-                    {codexUpdate.availableVersion && (
-                      <>
-                        <dt>Подготовлена</dt>
-                        <dd>{codexUpdate.availableVersion}</dd>
-                      </>
-                    )}
-                  </dl>
-                  <p className="codex-update-state" role="status">
-                    {codexUpdate.state === 'ready' && 'Обновление готово к установке.'}
-                    {codexUpdate.state === 'applying' && 'Обновляем Codex…'}
-                    {codexUpdate.state === 'current' &&
-                      'Установлена актуальная подготовленная версия.'}
-                    {codexUpdate.state === 'unavailable' &&
-                      'Подготовленное обновление отсутствует.'}
-                    {codexUpdate.state === 'failed' && 'Обновление не установлено.'}
-                    {codexUpdate.state === 'rollback_failed' &&
-                      'Обновление не установлено, автоматический откат не завершён.'}
-                  </p>
-                  {codexUpdate.lastResult && codexUpdate.lastResult.status !== 'succeeded' && (
-                    <p className="notice error" role="alert">
-                      {codexUpdate.lastResult.message}
-                    </p>
-                  )}
-                  {canApplyCodexUpdate && (
-                    <button
-                      className="primary codex-update-button"
-                      type="button"
-                      disabled={codexUpdateBusy}
-                      onClick={onApplyCodexUpdate}
-                    >
-                      {codexUpdateBusy ? 'Запускаем…' : 'Скачать и установить'}
-                    </button>
-                  )}
-                </>
-              ) : (
-                <p className="empty-hint compact">Проверяем подготовленные обновления…</p>
-              )}
-            </div>
-            <p className="codex-update-note">
-              Обновление запускается только когда Codex свободен и ненадолго перезапускает его. Чаты
-              и файлы сохраняются.
-            </p>
-            {codexUpdateError && (
-              <p className="notice error" role="alert">
-                {codexUpdateError}
-              </p>
-            )}
-          </section>
-          <ResourceSettings
-            snapshot={resourceLimits}
-            busy={resourceBusy}
-            error={resourceError}
-            onRefresh={onRefreshResources}
-            onSave={onSaveResources}
-            onApply={onApplyResources}
-          />
-          <AutoRateLimitResetSettings
-            snapshot={capability.rateLimitReset}
-            busy={autoRateLimitResetBusy}
-            error={autoRateLimitResetError}
-            onSave={onSaveAutoRateLimitReset}
-          />
           <h3>Лимиты аккаунта</h3>
           {capability.rateLimits?.length ? (
             <div className="rate-limit-list">
@@ -3060,29 +3284,66 @@ function Diagnostics({
               </dd>
             </dl>
           </section>
-          <h3>Instruction sources</h3>
-          <ul className="path-list">
-            {thread?.instructionSources.map((path) => (
-              <li key={path}>{path}</li>
-            ))}
-            {!thread?.instructionSources.length && <li>Нет данных для текущего чата</li>}
-          </ul>
-          <h3>Skills</h3>
-          <ul className="skill-list">
-            {capability.skills.map((skill) => (
-              <li key={`${skill.name}:${skill.path}`}>
-                <span>{skill.name}</span>
-                <small>
-                  {skill.enabled ? 'включён' : 'выключен'} · {skill.path}
-                </small>
-              </li>
-            ))}
-          </ul>
-          {capability.warnings.map((warning) => (
-            <div className="notice warning" key={warning}>
-              {warning}
-            </div>
-          ))}
+          <section className="usage-scope performance-scope" aria-labelledby="performance-title">
+            <h3 id="performance-title">Скорость ответа</h3>
+            <p className="usage-scope-note">
+              Оценка потока рассчитана по выходным токенам Codex между первым и последним текстовыми
+              фрагментами, полученными сервером. Это не паспортная скорость модели. Полное время
+              задачи включает reasoning и инструменты.
+            </p>
+            {matchingPerformance?.last ? (
+              <>
+                <h4>Последний ответ</h4>
+                <dl className="status-grid usage-grid">
+                  <dt>Оценка потока</dt>
+                  <dd>
+                    {formatTokensPerSecond(matchingPerformance.last.generationTokensPerSecond)}
+                  </dd>
+                  <dt>До первого текстового фрагмента</dt>
+                  <dd>{formatMilliseconds(matchingPerformance.last.timeToFirstOutputMs)}</dd>
+                  <dt>Генерация</dt>
+                  <dd>{formatMilliseconds(matchingPerformance.last.generationDurationMs)}</dd>
+                  <dt>Вся задача</dt>
+                  <dd>{formatMilliseconds(matchingPerformance.last.totalDurationMs)}</dd>
+                  <dt>Эффективная скорость</dt>
+                  <dd>
+                    {formatTokensPerSecond(matchingPerformance.last.effectiveTokensPerSecond)}
+                  </dd>
+                </dl>
+              </>
+            ) : (
+              <p className="empty-hint compact">
+                Замер последнего завершённого ответа пока недоступен.
+              </p>
+            )}
+            <h4>Недавние ответы чата</h4>
+            {matchingPerformance && matchingPerformance.recent.sampleSize > 0 ? (
+              <dl className="status-grid usage-grid">
+                <dt>Медиана оценки потока</dt>
+                <dd>
+                  {formatTokensPerSecond(
+                    matchingPerformance.recent.medianGenerationTokensPerSecond,
+                  )}
+                </dd>
+                <dt>Медиана до первого фрагмента</dt>
+                <dd>{formatMilliseconds(matchingPerformance.recent.medianTimeToFirstOutputMs)}</dd>
+                <dt>Размер выборки</dt>
+                <dd>{matchingPerformance.recent.sampleSize.toLocaleString('ru')}</dd>
+              </dl>
+            ) : (
+              <p className="empty-hint compact">Недостаточно завершённых ответов для медианы.</p>
+            )}
+          </section>
+          {capability.warnings.length > 0 && (
+            <section className="usage-scope" aria-labelledby="status-warnings-title">
+              <h3 id="status-warnings-title">Предупреждения</h3>
+              <ul className="warning-list">
+                {capability.warnings.map((warning) => (
+                  <li key={warning}>{warning}</li>
+                ))}
+              </ul>
+            </section>
+          )}
         </>
       )}
     </aside>
@@ -3274,6 +3535,8 @@ function Workspace({
   const [threadId, setThreadId] = useState<string | null>(null);
   const [archiveView, setArchiveView] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<SettingsTab>('account');
   const [accountLoginOpen, setAccountLoginOpen] = useState(false);
   const [accountLogin, setAccountLogin] = useState<CodexAccountLogin | null>(null);
   const [accountLoginBusy, setAccountLoginBusy] = useState(false);
@@ -3328,6 +3591,8 @@ function Workspace({
   const positionedThreadRef = useRef<string | null>(null);
   const mobileNavigationToggleRef = useRef<HTMLButtonElement>(null);
   const statusToggleRef = useRef<HTMLButtonElement>(null);
+  const settingsButtonRef = useRef<HTMLButtonElement>(null);
+  const settingsReturnFocusRef = useRef<HTMLElement | null>(null);
   const accountSwitchButtonRef = useRef<HTMLButtonElement>(null);
   const refreshedCodexUpdateRef = useRef<string | null>(null);
   const capabilityRequestRef = useRef(0);
@@ -3750,6 +4015,13 @@ function Workspace({
     setShowDiagnostics(false);
     window.setTimeout(() => statusToggleRef.current?.focus());
   }
+
+  const closeSettings = useCallback(() => {
+    setSettingsOpen(false);
+    const returnFocus = settingsReturnFocusRef.current ?? settingsButtonRef.current;
+    settingsReturnFocusRef.current = null;
+    window.setTimeout(() => returnFocus?.focus());
+  }, []);
 
   async function refreshCapabilityForThread(requestedThreadId: string | null): Promise<void> {
     const requestId = ++capabilityRequestRef.current;
@@ -4657,8 +4929,13 @@ function Workspace({
 
   async function send() {
     const text = composer.trim();
-    if (text === '/status' || text === '/skills') {
-      await openStatus();
+    if (text === '/status') {
+      openStatus();
+      setComposer('');
+      return;
+    }
+    if (text === '/skills') {
+      await openSettings('skills');
       setComposer('');
       return;
     }
@@ -5041,39 +5318,49 @@ function Workspace({
     );
   }
 
-  async function openStatus() {
+  function openStatus() {
+    setSettingsOpen(false);
     setShowDiagnostics(true);
+    setError(null);
+  }
+
+  async function openSettings(tab: SettingsTab = 'account') {
+    settingsReturnFocusRef.current =
+      document.activeElement instanceof HTMLElement
+        ? document.activeElement
+        : settingsButtonRef.current;
+    setShowDiagnostics(false);
+    setSettingsTab(tab);
+    setSettingsOpen(true);
     setCodexUpdateDiscoveryBusy(true);
     setError(null);
-    try {
-      const [resourceResult, codexUpdateResult, discoveryResult] = await Promise.allSettled([
+    const [resourceResult, codexUpdateResult, discoveryResult, capabilityResult] =
+      await Promise.allSettled([
         api.resourceLimits(),
         api.codexUpdate(),
         api.codexUpdateDiscovery(),
+        api.capabilities(threadId),
       ]);
-      if (resourceResult.status === 'fulfilled') {
-        setResourceLimits(resourceResult.value);
-        setResourceError(null);
-      } else {
-        setResourceError(errorMessage(resourceResult.reason));
-      }
-      if (codexUpdateResult.status === 'fulfilled') {
-        setCodexUpdate(codexUpdateResult.value);
-        setCodexUpdateError(null);
-      } else {
-        setCodexUpdateError(errorMessage(codexUpdateResult.reason));
-      }
-      if (discoveryResult.status === 'fulfilled') {
-        setCodexUpdateDiscovery(discoveryResult.value);
-        setCodexUpdateDiscoveryError(null);
-      } else {
-        setCodexUpdateDiscoveryError(errorMessage(discoveryResult.reason));
-      }
-    } catch (cause) {
-      setError(errorMessage(cause));
-    } finally {
-      setCodexUpdateDiscoveryBusy(false);
+    if (resourceResult.status === 'fulfilled') {
+      setResourceLimits(resourceResult.value);
+      setResourceError(null);
+    } else {
+      setResourceError(errorMessage(resourceResult.reason));
     }
+    if (codexUpdateResult.status === 'fulfilled') {
+      setCodexUpdate(codexUpdateResult.value);
+      setCodexUpdateError(null);
+    } else {
+      setCodexUpdateError(errorMessage(codexUpdateResult.reason));
+    }
+    if (discoveryResult.status === 'fulfilled') {
+      setCodexUpdateDiscovery(discoveryResult.value);
+      setCodexUpdateDiscoveryError(null);
+    } else {
+      setCodexUpdateDiscoveryError(errorMessage(discoveryResult.reason));
+    }
+    if (capabilityResult.status === 'fulfilled') setCapability(capabilityResult.value);
+    setCodexUpdateDiscoveryBusy(false);
   }
 
   async function applyCodexUpdate() {
@@ -5266,6 +5553,8 @@ function Workspace({
         mobileOpen={mobileNavigationOpen}
         onMobileClose={closeMobileNavigation}
         onLogout={() => void api.logout(session.csrfToken).finally(onSignedOut)}
+        settingsButtonRef={settingsButtonRef}
+        onOpenSettings={() => void openSettings('account')}
       />
       {mobileNavigationOpen && (
         <button
@@ -5551,6 +5840,31 @@ function Workspace({
               )}
             </div>
           )}
+          {/^[$][\w-]*$/.test(composer) && (
+            <div className="slash-palette skill-palette" role="listbox" aria-label="Skills Codex">
+              {(capability?.skills ?? [])
+                .filter(
+                  (skill) =>
+                    skill.enabled &&
+                    skill.name.toLowerCase().startsWith(composer.slice(1).toLowerCase()),
+                )
+                .map((skill) => (
+                  <button
+                    type="button"
+                    role="option"
+                    aria-selected={composer === `$${skill.name}`}
+                    key={skill.name}
+                    onClick={() => {
+                      setComposer(`$${skill.name} `);
+                      window.requestAnimationFrame(() => composerInputRef.current?.focus());
+                    }}
+                  >
+                    <strong>${skill.name}</strong>
+                    <span>Вставить skill в сообщение</span>
+                  </button>
+                ))}
+            </div>
+          )}
           <button
             className="mobile-runtime-toggle"
             type="button"
@@ -5828,7 +6142,11 @@ function Workspace({
         </div>
       </section>
       {showDiagnostics && (
-        <Diagnostics
+        <Diagnostics capability={capability} thread={selectedThread} onClose={closeDiagnostics} />
+      )}
+      {settingsOpen && !accountLoginOpen && (
+        <SettingsDialog
+          activeTab={settingsTab}
           capability={capability}
           codexUpdate={codexUpdate}
           codexUpdateBusy={codexUpdateBusy}
@@ -5842,15 +6160,21 @@ function Workspace({
           autoRateLimitResetBusy={autoRateLimitResetBusy}
           autoRateLimitResetError={autoRateLimitResetError}
           thread={selectedThread}
+          accountSwitchButtonRef={accountSwitchButtonRef}
+          onTabChange={setSettingsTab}
+          onClose={closeSettings}
+          onStartAccountLogin={() => void startAccountLogin()}
+          onApplyCodexUpdate={() => void applyCodexUpdate()}
+          onCheckCodexUpdate={() => void checkCodexUpdate()}
           onRefreshResources={() => void refreshResourceLimits()}
           onSaveResources={saveResourceLimits}
           onApplyResources={applyResourceLimits}
           onSaveAutoRateLimitReset={saveAutoRateLimitReset}
-          onStartAccountLogin={() => void startAccountLogin()}
-          onApplyCodexUpdate={() => void applyCodexUpdate()}
-          onCheckCodexUpdate={() => void checkCodexUpdate()}
-          accountSwitchButtonRef={accountSwitchButtonRef}
-          onClose={closeDiagnostics}
+          onUseSkill={(name) => {
+            setComposer(`$${name} `);
+            closeSettings();
+            window.setTimeout(() => composerInputRef.current?.focus());
+          }}
         />
       )}
       {accountLoginOpen && (
