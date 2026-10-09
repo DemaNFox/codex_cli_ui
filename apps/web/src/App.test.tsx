@@ -4945,7 +4945,7 @@ describe('App', () => {
 
   it('keeps zero-credit automation available and exposes a safe failure state', async () => {
     installAuthenticatedApi((url) => {
-      if (url !== '/api/system/capabilities?threadId=thread-1') return undefined;
+      if (!url.startsWith('/api/system/capabilities')) return undefined;
       return jsonResponse({
         ...capabilities,
         rateLimitReset: {
