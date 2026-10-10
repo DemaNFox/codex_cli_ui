@@ -340,11 +340,20 @@ const rateLimitResetCreditSchema = z.object({
 const upstreamRateLimitSchema = z.object({
   limitId: z.string().min(1).max(120).nullable().optional(),
   limitName: z.string().min(1).max(200).nullable().optional(),
+  normalModelSlug: z.string().min(1).max(200).nullable().optional(),
   planType: z.string().min(1).max(80).nullable().optional(),
   primary: upstreamRateLimitWindowSchema.nullable().optional(),
   secondary: upstreamRateLimitWindowSchema.nullable().optional(),
   rateLimitReachedType: rateLimitReachedTypeSchema.nullable().optional(),
   spendControlReached: z.boolean().nullable().optional(),
+  credits: z
+    .object({
+      hasCredits: z.boolean(),
+      unlimited: z.boolean(),
+      balance: z.string().nullable().optional(),
+    })
+    .nullable()
+    .optional(),
 });
 
 const rateLimitsResponseSchema = z.object({
@@ -529,6 +538,27 @@ function rateLimitReached(input: z.infer<typeof rateLimitsResponseSchema>): bool
   return Object.values(input.rateLimitsByLimitId ?? {}).some(
     (snapshot) => snapshot.rateLimitReachedType === 'rate_limit_reached',
   );
+}
+
+function paidCreditFallbackState(
+  input: z.infer<typeof rateLimitsResponseSchema>,
+  model: string | null | undefined,
+): 'safe' | 'required' | 'unknown' {
+  if (input.ordinaryUsageAllowed !== true) return 'safe';
+  const canonical = Object.values(input.rateLimitsByLimitId ?? {});
+  const available = canonical.length > 0 ? canonical : [input.rateLimits];
+  const modelMatches =
+    model == null ? [] : available.filter((snapshot) => snapshot.normalModelSlug === model);
+  const unscoped = available.filter((snapshot) => snapshot.normalModelSlug == null);
+  const snapshots = modelMatches.length > 0 ? [...modelMatches, ...unscoped] : available;
+  let unknown = false;
+  for (const snapshot of snapshots) {
+    if (![snapshot.primary, snapshot.secondary].some((window) => window?.usedPercent === 100))
+      continue;
+    if (snapshot.credits?.hasCredits === true) return 'required';
+    if (snapshot.credits?.hasCredits !== false) unknown = true;
+  }
+  return unknown ? 'unknown' : 'safe';
 }
 
 function eligibleResetCreditId(
@@ -1197,6 +1227,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   let queuedTurnDispatchRequested = false;
   let requestQueuedTurnDispatch: () => void = () => {};
   let rateLimitRecoveryInterlocked = repository.hasBlockedRateLimitContinuations();
+  let paidCreditFallbackInterlocked = false;
   let rateLimitRecovery: Promise<void> | null = null;
   let rateLimitRecoveryRequested = false;
   let rateLimitRecoveryRetry: NodeJS.Timeout | null = null;
@@ -1218,6 +1249,61 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       account: accountResponseSchema.parse(accountRaw),
       limits: rateLimitsResponseSchema.parse(limitsRaw),
     };
+  };
+
+  const enforceIncludedUsageOnly = async (model: string | null | undefined): Promise<void> => {
+    let account: z.infer<typeof accountResponseSchema>;
+    try {
+      account = accountResponseSchema.parse(
+        await appServer.request('account/read', { refreshToken: false }),
+      );
+    } catch {
+      paidCreditFallbackInterlocked = true;
+      throw new HttpError(
+        503,
+        'CREDIT_USAGE_POLICY_UNAVAILABLE',
+        'Не удалось проверить источник использования Codex. Новая задача не запущена, чтобы не расходовать платные кредиты.',
+      );
+    }
+    if (!isChatgptAccount(account.account)) {
+      paidCreditFallbackInterlocked = false;
+      return;
+    }
+    let limits: z.infer<typeof rateLimitsResponseSchema>;
+    try {
+      limits = rateLimitsResponseSchema.parse(
+        await appServer.request('account/rateLimits/read', { excludeResetCreditDetails: true }),
+      );
+    } catch {
+      paidCreditFallbackInterlocked = true;
+      throw new HttpError(
+        503,
+        'CREDIT_USAGE_POLICY_UNAVAILABLE',
+        'Не удалось проверить включённый лимит Codex. Новая задача не запущена, чтобы не расходовать платные кредиты.',
+      );
+    }
+    if (limits.ordinaryUsageAllowed == null) {
+      paidCreditFallbackInterlocked = true;
+      throw new HttpError(
+        503,
+        'CREDIT_USAGE_POLICY_UNAVAILABLE',
+        'Codex не подтвердил доступность включённого лимита. Новая задача не запущена, чтобы не расходовать платные кредиты.',
+      );
+    }
+    const state = paidCreditFallbackState(limits, model);
+    paidCreditFallbackInterlocked = state !== 'safe';
+    if (state === 'unknown')
+      throw new HttpError(
+        503,
+        'CREDIT_USAGE_POLICY_UNAVAILABLE',
+        'Codex не подтвердил отсутствие платного продолжения. Новая задача не запущена, чтобы не расходовать кредиты.',
+      );
+    if (state === 'required')
+      throw new HttpError(
+        429,
+        'PAID_CREDIT_USAGE_BLOCKED',
+        'Включённый лимит Codex исчерпан. Новая задача не запущена: использование платных кредитов на сервере запрещено.',
+      );
   };
 
   const currentChatgptAccountFingerprint = async (): Promise<string | null> => {
@@ -2487,6 +2573,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       return;
     }
     if (message.id === undefined && message.method === 'account/rateLimits/updated') {
+      paidCreditFallbackInterlocked = false;
+      requestQueuedTurnDispatch();
       if (repository.hasBlockedRateLimitContinuations()) requestRateLimitRecovery();
       return;
     }
@@ -4320,6 +4408,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         repository.requeueTurn(claimed.id);
         return 'wait';
       }
+      await enforceIncludedUsageOnly(claimed.request.model ?? project.defaultModel);
       if (!repository.setQueuedTurnAccountFingerprint(claimed.id, resetAccountFingerprint))
         return 'wait';
       turnStartIssued = true;
@@ -4488,7 +4577,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         return;
       if (queuedTurnRetry) clearTimeout(queuedTurnRetry);
       const retryDelayMs = repository.listQueuedTurns().some((record) => !record.blocked)
-        ? 1_000
+        ? paidCreditFallbackInterlocked
+          ? 15_000
+          : 1_000
         : 5_000;
       queuedTurnRetry = setTimeout(() => {
         queuedTurnRetry = null;
@@ -4810,6 +4901,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         requestQueuedTurnDispatch();
         return reply.code(202).send(response);
       }
+      await enforceIncludedUsageOnly(input.model ?? project.defaultModel);
       turnStartIssued = true;
       const turnStartIssuedAtMono = performance.now();
       result = turnResponseSchema.parse(
@@ -4902,6 +4994,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     });
     const project = attachments.length === 0 ? undefined : repository.getProject(thread.projectId);
     if (attachments.length > 0 && !project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+    await enforceIncludedUsageOnly(
+      repository.getTurnExecutionModel(input.expectedTurnId, id) ?? null,
+    );
     const attachmentClaim = `pending:steer:${randomUUID()}`;
     if (!repository.claimAttachments(id, input.attachmentIds, attachmentClaim))
       throw new HttpError(409, 'ATTACHMENT_NOT_AVAILABLE');

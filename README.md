@@ -37,6 +37,11 @@ available earned Codex reset after a task is conclusively stopped by the resetta
 verifies the native failure and fresh account state, spends with a durable idempotency key, verifies recovery,
 then continues affected work through the normal queue. It does not purchase credits or act on percentages,
 workspace spend limits, unsupported authentication or an uncertain account state.
+Independently of that reset policy, the server refuses every new root start and active-turn steer when a fresh
+ChatGPT usage read shows an applicable included Codex window at 100% with paid credits available. Queued root work remains
+cancellable and is rechecked after a rate-limit update; an unavailable usage read also fails closed. This
+prevents new work from deliberately entering paid-credit fallback, but an already running turn can cross the
+boundary before Codex reports the updated window, including after a steer accepted below the boundary.
 The same settings dialog can replace the runner's Codex account through the official device-code flow when no
 task or subagent is running. The short-lived code is shown only to the authenticated owner; access and refresh
 tokens never pass through the Web application.

@@ -2165,6 +2165,19 @@ export class SqliteRepository {
       .run(turnId, threadId, JSON.stringify(request), accountFingerprint, new Date().toISOString());
   }
 
+  getTurnExecutionModel(turnId: string, threadId: string): string | null {
+    const row = this.database
+      .prepare('SELECT request_json FROM turn_execution_intents WHERE turn_id=? AND thread_id=?')
+      .get(turnId, threadId) as Pick<TurnExecutionIntentRow, 'request_json'> | undefined;
+    if (!row) return null;
+    try {
+      const request = JSON.parse(row.request_json) as Partial<StartTurnRequest>;
+      return typeof request.model === 'string' && request.model.length > 0 ? request.model : null;
+    } catch {
+      return null;
+    }
+  }
+
   deleteTurnExecutionIntent(turnId: string, threadId: string): boolean {
     return (
       this.database

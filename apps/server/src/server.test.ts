@@ -75,6 +75,7 @@ class FakeAppServer implements AppServerClient {
   private readonly unloadedThreadIds = new Set<string>();
   failNextRequestWith: Error | null = null;
   failTurnStartWith: Error | null = null;
+  failSteerWith: Error | null = null;
   failNextResponseWith: Error | null = null;
   failAccountStatusReads = false;
   failThreadUsageReads = false;
@@ -106,7 +107,7 @@ class FakeAppServer implements AppServerClient {
         planType: 'plus',
         primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1_800_000_000 },
         secondary: null,
-        credits: { balance: 'secret' },
+        credits: { balance: 'secret', hasCredits: true, unlimited: false },
       },
     },
   };
@@ -413,7 +414,14 @@ class FakeAppServer implements AppServerClient {
       this.setThreadStatus(String(values.threadId), 'active');
       return { turn: { id: `turn-${++this.turnCounter}` } };
     }
-    if (method === 'turn/steer') return { turnId: values.expectedTurnId };
+    if (method === 'turn/steer') {
+      if (this.failSteerWith) {
+        const error = this.failSteerWith;
+        this.failSteerWith = null;
+        throw error;
+      }
+      return { turnId: values.expectedTurnId };
+    }
     if (method === 'model/list')
       return {
         data: [
@@ -2154,7 +2162,7 @@ describe('Codex routes', () => {
     });
 
     const unavailableAttachment = await uploadAttachment('unavailable.txt');
-    appServer.failNextRequestWith = new Error('APP_SERVER_UNAVAILABLE');
+    appServer.failSteerWith = new Error('APP_SERVER_UNAVAILABLE');
     const unavailable = await app.inject({
       method: 'POST',
       url: `/api/threads/${threadId}/steer`,
@@ -2170,7 +2178,7 @@ describe('Codex routes', () => {
 
     const rejectedAttachment = await uploadAttachment('rejected.txt');
     appServer.setThreadStatus(threadId, 'idle');
-    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_FAILED');
+    appServer.failSteerWith = new Error('APP_SERVER_REQUEST_FAILED');
     const rejected = await app.inject({
       method: 'POST',
       url: `/api/threads/${threadId}/steer`,
@@ -2190,7 +2198,7 @@ describe('Codex routes', () => {
       method: 'turn/started',
       params: { threadId, turn: { id: 'turn-active', status: 'inProgress', items: [] } },
     });
-    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_TIMEOUT');
+    appServer.failSteerWith = new Error('APP_SERVER_REQUEST_TIMEOUT');
     const ambiguous = await app.inject({
       method: 'POST',
       url: `/api/threads/${threadId}/steer`,
@@ -3059,6 +3067,348 @@ describe('Codex routes', () => {
     expect(staleAccount.json<{ error: { code: string } }>().error.code).toBe(
       'RATE_LIMIT_RESET_ACCOUNT_CHANGED',
     );
+  });
+
+  it('blocks a new root turn before Codex can fall back to paid credits', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.rateLimitsResponse = {
+      accountId: 'private-account-id',
+      ordinaryUsageAllowed: true,
+      rateLimitResetCredits: { availableCount: 1, credits: null },
+      rateLimits: {
+        limitId: 'codex',
+        primary: { usedPercent: 100 },
+        credits: { balance: '42', hasCredits: true, unlimited: false },
+      },
+      rateLimitsByLimitId: null,
+    };
+    const payload = {
+      text: 'Do not spend credits',
+      idempotencyKey: '09000000-0000-4000-8000-000000000001',
+    };
+
+    const blocked = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload,
+    });
+    expect(blocked.statusCode).toBe(429);
+    expect(blocked.json()).toEqual({
+      error: {
+        code: 'PAID_CREDIT_USAGE_BLOCKED',
+        message:
+          'Включённый лимит Codex исчерпан. Новая задача не запущена: использование платных кредитов на сервере запрещено.',
+      },
+    });
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(0);
+    expect(
+      appServer.requests.filter(
+        (request) => request.method === 'account/rateLimitResetCredit/consume',
+      ),
+    ).toHaveLength(0);
+
+    appServer.rateLimitsResponse = {
+      ...(appServer.rateLimitsResponse as Record<string, unknown>),
+      rateLimits: {
+        limitId: 'codex',
+        primary: { usedPercent: 99 },
+        credits: { balance: '42', hasCredits: true, unlimited: false },
+      },
+    };
+    const retried = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload,
+    });
+    expect(retried.statusCode).toBe(202);
+    expect(retried.json()).toMatchObject({ data: { status: 'started' } });
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(1);
+  });
+
+  it('holds an already queued root turn until included usage becomes available again', async () => {
+    const { app, appServer, projectPath } = await fixture(1);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const firstThreadId = await createThread(app, project.id, session.headers);
+    const queuedThreadId = await createThread(app, project.id, session.headers);
+    const start = (threadId: string, text: string, idempotencyKey: string) =>
+      app.inject({
+        method: 'POST',
+        url: `/api/threads/${threadId}/turns`,
+        headers: session.headers,
+        payload: { text, idempotencyKey },
+      });
+    expect(
+      (
+        await start(firstThreadId, 'occupy the slot', '09000000-0000-4000-8000-000000000002')
+      ).json(),
+    ).toMatchObject({ data: { status: 'started' } });
+    appServer.rateLimitsResponse = {
+      accountId: 'private-account-id',
+      ordinaryUsageAllowed: true,
+      rateLimitResetCredits: { availableCount: 1, credits: null },
+      rateLimits: {
+        limitId: 'codex',
+        primary: { usedPercent: 100 },
+        credits: { balance: '42', hasCredits: true, unlimited: false },
+      },
+      rateLimitsByLimitId: null,
+    };
+    expect(
+      (
+        await start(queuedThreadId, 'wait without credits', '09000000-0000-4000-8000-000000000003')
+      ).json(),
+    ).toMatchObject({ data: { status: 'queued' } });
+    appServer.setThreadStatus(firstThreadId, 'idle');
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: firstThreadId, turn: { id: 'turn-1' } },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(1);
+
+    appServer.rateLimitsResponse = {
+      ...(appServer.rateLimitsResponse as Record<string, unknown>),
+      rateLimits: {
+        limitId: 'codex',
+        primary: { usedPercent: 0 },
+        credits: { balance: '42', hasCredits: true, unlimited: false },
+      },
+    };
+    appServer.emit({ method: 'account/rateLimits/updated', params: { rateLimits: {} } });
+    await vi.waitFor(() => {
+      expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(
+        2,
+      );
+    });
+  });
+
+  it('uses authoritative model-scoped buckets instead of stale legacy or unrelated limits', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.rateLimitsResponse = {
+      accountId: 'private-account-id',
+      ordinaryUsageAllowed: true,
+      rateLimitResetCredits: { availableCount: 0, credits: [] },
+      rateLimits: {
+        limitId: 'legacy',
+        primary: { usedPercent: 100 },
+        credits: { balance: '42', hasCredits: true, unlimited: false },
+      },
+      rateLimitsByLimitId: {
+        sol: {
+          limitId: 'sol',
+          normalModelSlug: 'gpt-6.1-sol',
+          primary: { usedPercent: 0 },
+          credits: { balance: '42', hasCredits: true, unlimited: false },
+        },
+        astra: {
+          limitId: 'astra',
+          normalModelSlug: 'gpt-6-astra',
+          primary: { usedPercent: 100 },
+          credits: { balance: '42', hasCredits: true, unlimited: false },
+        },
+      },
+    };
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Use the included Sol bucket',
+        model: 'gpt-6.1-sol',
+        idempotencyKey: '09000000-0000-4000-8000-000000000005',
+      },
+    });
+    expect(response.statusCode).toBe(202);
+    expect(response.json()).toMatchObject({ data: { status: 'started' } });
+  });
+
+  it('blocks a steer that would extend an active turn through paid credits', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-credit-guard', status: 'inProgress', items: [] } },
+    });
+    appServer.rateLimitsResponse = {
+      accountId: 'private-account-id',
+      ordinaryUsageAllowed: true,
+      rateLimitResetCredits: { availableCount: 0, credits: [] },
+      rateLimits: {
+        limitId: 'codex',
+        primary: { usedPercent: 100 },
+        credits: { balance: '42', hasCredits: true, unlimited: false },
+      },
+      rateLimitsByLimitId: null,
+    };
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/steer`,
+      headers: session.headers,
+      payload: { expectedTurnId: 'turn-credit-guard', text: 'Do more paid work' },
+    });
+    expect(response.statusCode).toBe(429);
+    expect(response.json()).toMatchObject({ error: { code: 'PAID_CREDIT_USAGE_BLOCKED' } });
+    expect(appServer.requests.filter((request) => request.method === 'turn/steer')).toHaveLength(0);
+  });
+
+  it('checks the active turn model rather than the thread model before steer', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.rateLimitsResponse = {
+      accountId: 'private-account-id',
+      ordinaryUsageAllowed: true,
+      rateLimitResetCredits: { availableCount: 0, credits: [] },
+      rateLimits: { limitId: 'generic', primary: { usedPercent: 0 }, credits: null },
+      rateLimitsByLimitId: {
+        sol: {
+          limitId: 'sol',
+          normalModelSlug: 'gpt-6.1-sol',
+          primary: { usedPercent: 0 },
+          credits: { balance: '42', hasCredits: true, unlimited: false },
+        },
+        astra: {
+          limitId: 'astra',
+          normalModelSlug: 'gpt-6-astra',
+          primary: { usedPercent: 0 },
+          credits: { balance: '42', hasCredits: true, unlimited: false },
+        },
+      },
+    };
+    const started = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Run on Astra',
+        model: 'gpt-6-astra',
+        idempotencyKey: '09000000-0000-4000-8000-000000000006',
+      },
+    });
+    const turnId = started.json<{ data: { turnId: string } }>().data.turnId;
+    appServer.rateLimitsResponse = {
+      ...(appServer.rateLimitsResponse as Record<string, unknown>),
+      rateLimitsByLimitId: {
+        sol: {
+          limitId: 'sol',
+          normalModelSlug: 'gpt-6.1-sol',
+          primary: { usedPercent: 0 },
+          credits: { balance: '42', hasCredits: true, unlimited: false },
+        },
+        astra: {
+          limitId: 'astra',
+          normalModelSlug: 'gpt-6-astra',
+          primary: { usedPercent: 100 },
+          credits: { balance: '42', hasCredits: true, unlimited: false },
+        },
+      },
+    };
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/steer`,
+      headers: session.headers,
+      payload: { expectedTurnId: turnId, text: 'Continue Astra work' },
+    });
+    expect(response.statusCode).toBe(429);
+    expect(response.json()).toMatchObject({ error: { code: 'PAID_CREDIT_USAGE_BLOCKED' } });
+    expect(appServer.requests.filter((request) => request.method === 'turn/steer')).toHaveLength(0);
+  });
+
+  it('fails closed across all buckets when the selected model cannot be mapped', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.rateLimitsResponse = {
+      accountId: 'private-account-id',
+      ordinaryUsageAllowed: true,
+      rateLimitResetCredits: { availableCount: 0, credits: [] },
+      rateLimits: { limitId: 'legacy', primary: { usedPercent: 0 }, credits: null },
+      rateLimitsByLimitId: {
+        generic: { limitId: 'generic', primary: { usedPercent: 0 }, credits: null },
+        scoped: {
+          limitId: 'scoped',
+          normalModelSlug: 'gpt-6-astra',
+          primary: { usedPercent: 100 },
+          credits: { balance: '42', hasCredits: true, unlimited: false },
+        },
+      },
+    };
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Unknown alias must not bypass the guard',
+        model: 'gpt-unknown-alias',
+        idempotencyKey: '09000000-0000-4000-8000-000000000007',
+      },
+    });
+    expect(response.statusCode).toBe(429);
+    expect(response.json()).toMatchObject({ error: { code: 'PAID_CREDIT_USAGE_BLOCKED' } });
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(0);
+  });
+
+  it('fails closed without consuming the idempotency key when credit safety cannot be read', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const payload = {
+      text: 'Wait for a safe usage read',
+      idempotencyKey: '09000000-0000-4000-8000-000000000004',
+    };
+    appServer.rateLimitsResponse = {
+      accountId: 'private-account-id',
+      ordinaryUsageAllowed: null,
+      rateLimitResetCredits: { availableCount: 0, credits: [] },
+      rateLimits: { limitId: 'codex', primary: { usedPercent: 100 }, credits: null },
+      rateLimitsByLimitId: null,
+    };
+
+    const unavailable = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload,
+    });
+    expect(unavailable.statusCode).toBe(503);
+    expect(unavailable.json()).toMatchObject({
+      error: { code: 'CREDIT_USAGE_POLICY_UNAVAILABLE' },
+    });
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(0);
+
+    appServer.rateLimitsResponse = {
+      accountId: 'private-account-id',
+      ordinaryUsageAllowed: true,
+      rateLimitResetCredits: { availableCount: 0, credits: [] },
+      rateLimits: { limitId: 'codex', primary: { usedPercent: 25 }, credits: null },
+      rateLimitsByLimitId: null,
+    };
+    const retried = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload,
+    });
+    expect(retried.statusCode).toBe(202);
+    expect(retried.json()).toMatchObject({ data: { status: 'started' } });
   });
 
   it('persists an account-bound quota continuation across restart and discards it while opt-in is off', async () => {
@@ -6653,7 +7003,7 @@ describe('Codex routes', () => {
       params: { threadId, turn: { id: 'turn-old', status: 'inProgress', items: [] } },
     });
     appServer.setThreadStatus(threadId, 'idle');
-    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_FAILED');
+    appServer.failSteerWith = new Error('APP_SERVER_REQUEST_FAILED');
     const gate = appServer.blockThreadReads();
 
     const steer = app.inject({
@@ -6840,7 +7190,7 @@ describe('Codex routes', () => {
       params: { threadId, turn: { id: 'turn-ambiguous', status: 'inProgress', items: [] } },
     });
     appServer.setThreadStatus(threadId, 'active');
-    appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_TIMEOUT');
+    appServer.failSteerWith = new Error('APP_SERVER_REQUEST_TIMEOUT');
 
     const response = await app.inject({
       method: 'POST',
