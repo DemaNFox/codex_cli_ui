@@ -83,6 +83,15 @@ Browser
   notifications. `reset` and `alreadyRedeemed` still require a same-account post-read with ordinary usage
   explicitly allowed before dispatch resumes; unavailable, malformed or ambiguous state remains fail closed.
   The browser receives only availability, count and bounded lifecycle status, never account or credit IDs.
+- Paid-credit fallback is denied by a separate, server-enforced admission rule. Immediately before every new
+  root `turn/start` and active-turn steer, the server reads the authenticated account and a fresh detailed
+  rate-limit snapshot. A ChatGPT account whose applicable included Codex window is at 100% with
+  `credits.hasCredits` is not
+  allowed to issue the native request; an unavailable or malformed read also fails closed. Existing durable
+  queued roots remain queued and cancellable, poll with a bounded backoff, and wake immediately on
+  `account/rateLimits/updated`. The rule does not consume an earned reset from percentage evidence and cannot
+  guarantee that an already running native turn, including one extended below the boundary by steer, will stop
+  before crossing into credit-backed usage.
 - The authenticated owner can replace the runner's Codex account through the official app-server device-code
   flow. The API exposes the short-lived verification URL and one-time code only in process memory, never reads
   `CODEX_HOME`, and never receives an access or refresh token. Starting the flow atomically closes task
