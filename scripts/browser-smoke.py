@@ -752,6 +752,7 @@ def main() -> int:
                         {
                             "historyState": "degraded",
                             "historyWarning": "HISTORY_LOADING_DEFERRED",
+                            "historyTruncated": True,
                         }
                         if continuation_only
                         else {"historyState": "complete"}
@@ -1311,6 +1312,10 @@ def main() -> int:
             page.get_by_text("Проверить активную задачу", exact=True).wait_for()
             page.get_by_text(
                 "Показаны последние сохранённые сообщения. Полная история загружается в фоне.",
+                exact=True,
+            ).wait_for()
+            page.get_by_text(
+                "Показаны последние сообщения; более ранняя история не загружена в окно",
                 exact=True,
             ).wait_for()
             page.get_by_text(

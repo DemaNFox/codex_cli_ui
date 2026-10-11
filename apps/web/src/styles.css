@@ -500,6 +500,9 @@ button:disabled {
 .thread-history-warning {
   margin: 0 0 1rem;
 }
+.thread-history-truncated {
+  margin: 0 0 1rem;
+}
 .thread-history-warning .ghost {
   flex: 0 0 auto;
 }
@@ -2075,6 +2078,11 @@ button:disabled {
   background: rgba(245, 196, 90, 0.08);
   border: 1px solid rgba(245, 196, 90, 0.2);
   margin-top: 0.5rem;
+}
+.notice.info {
+  color: #b8c9d8;
+  background: rgba(113, 147, 175, 0.08);
+  border: 1px solid rgba(113, 147, 175, 0.2);
 }
 .global-error {
   display: flex;

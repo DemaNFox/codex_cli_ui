@@ -3725,6 +3725,7 @@ function Workspace({
   const [threadLoadError, setThreadLoadError] = useState<string | null>(null);
   const [threadHistoryWarning, setThreadHistoryWarning] = useState<string | null>(null);
   const [threadHistoryWarningCode, setThreadHistoryWarningCode] = useState<string | null>(null);
+  const [threadHistoryTruncated, setThreadHistoryTruncated] = useState(false);
   const [threadReloadToken, setThreadReloadToken] = useState(0);
   const [busy, setBusy] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
@@ -4717,6 +4718,7 @@ function Workspace({
     setThreadLoadError(null);
     setThreadHistoryWarning(null);
     setThreadHistoryWarningCode(null);
+    setThreadHistoryTruncated(false);
     if (!threadId) {
       setThreadLoadState('idle');
       return;
@@ -4762,6 +4764,7 @@ function Workspace({
         setThreadHistoryWarningCode(
           history.historyState === 'degraded' ? (history.historyWarning ?? 'DEGRADED') : null,
         );
+        setThreadHistoryTruncated(history.historyTruncated === true);
         if (deferredHistory && deferredHistoryRetryAttemptedRef.current !== requestedThreadId) {
           deferredHistoryRetryAttemptedRef.current = requestedThreadId;
           window.clearTimeout(deferredHistoryRetryTimerRef.current);
@@ -5951,6 +5954,11 @@ function Workspace({
           onKeyDown={markConversationKeyboardScrollIntent}
         >
           <div className="conversation-content" ref={conversationContentRef}>
+            {threadId && threadHistoryTruncated ? (
+              <section className="thread-history-truncated notice info" role="status">
+                Показаны последние сообщения; более ранняя история не загружена в окно
+              </section>
+            ) : null}
             {threadId && threadHistoryWarning ? (
               <section className="thread-history-warning notice warning" role="status">
                 <span>{threadHistoryWarning}</span>

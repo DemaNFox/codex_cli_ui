@@ -1046,6 +1046,36 @@ describe('App', () => {
     await user.click(screen.getByRole('button', { name: 'Обновить' }));
   });
 
+  it('labels a bounded history tail without treating it as a load error', async () => {
+    const event = {
+      id: 1,
+      threadId: thread.id,
+      turnId: 'turn-1',
+      kind: 'user-message' as const,
+      phase: 'completed' as const,
+      payload: { text: 'Последняя сохранённая задача' },
+      createdAt: '2026-10-11T09:00:00.000Z',
+    };
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({
+          data: thread,
+          events: [event],
+          historyState: 'complete',
+          historyTruncated: true,
+        });
+      return undefined;
+    });
+    render(<App />);
+
+    expect(await screen.findByText('Последняя сохранённая задача')).not.toBeNull();
+    const notice = screen.getByText(
+      'Показаны последние сообщения; более ранняя история не загружена в окно',
+    );
+    expect(notice.closest('[role="status"]')).not.toBeNull();
+    expect(screen.queryByText('Чат временно недоступен')).toBeNull();
+  });
+
   it('retries deferred lazy history once after the event stream opens', async () => {
     let detailReads = 0;
     installAuthenticatedApi((url) => {
