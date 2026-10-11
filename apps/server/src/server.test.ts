@@ -40,7 +40,7 @@ import type { BrokerResourceSnapshot, ResourceBroker } from './resource-broker.j
 import type { PushNotificationPayload, PushSender } from './push-notifications.js';
 import type { PushSubscriptionInput } from '@codex-web/contracts';
 import { buildServer, projectFileReadStream } from './server.js';
-import { createSseDelivery } from './sse.js';
+import { createSseDelivery, SSE_LIVE_QUEUE_LIMIT } from './sse.js';
 import type { ThreadTitleGenerator } from './thread-title-generator.js';
 
 /* eslint-disable @typescript-eslint/require-await -- fake protocol methods intentionally implement async production interfaces. */
@@ -9732,6 +9732,55 @@ describe('Codex routes', () => {
     expect(repository.isThreadHistoryHydrated(threadId)).toBe(false);
     await reader.cancel();
     blockedRead.release();
+  });
+
+  it('publishes only the latest bounded tail when hydrating a large native history', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = appServer.addExternalThread(projectPath);
+    await app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
+    appServer.setThreadTurns(
+      threadId,
+      Array.from({ length: 80 }, (_, index) => ({
+        id: `historical-turn-${index}`,
+        status: 'completed',
+        items: [
+          {
+            type: 'userMessage',
+            content: [{ type: 'text', text: `historical-message-${index}` }],
+          },
+        ],
+      })),
+    );
+
+    const address = await app.listen({ host: '127.0.0.1', port: 0 });
+    const stream = await fetch(`${address}/api/threads/${threadId}/events?after=0`, {
+      headers: { cookie: session.cookie },
+    });
+    expect(stream.status).toBe(200);
+    await vi.waitFor(() => expect(repository.isThreadHistoryHydrated(threadId)).toBe(true));
+    const persisted = repository.listEvents(threadId, 0);
+    expect(persisted).toHaveLength(160);
+    const expectedPublishedIds = persisted
+      .slice(-Math.min(120, SSE_LIVE_QUEUE_LIMIT))
+      .map((event) => event.id);
+    const finalId = expectedPublishedIds.at(-1)!;
+    const reader = stream.body!.getReader();
+    const decoder = new TextDecoder();
+    let output = '';
+    while (!output.includes(`id: ${finalId}\n`)) {
+      const chunk = await reader.read();
+      expect(chunk.done).toBe(false);
+      output += decoder.decode(chunk.value, { stream: true });
+    }
+    await reader.cancel();
+    const publishedIds = [...output.matchAll(/^id: (\d+)$/gmu)].map((match) => Number(match[1]));
+    expect(publishedIds).toEqual(expectedPublishedIds);
   });
 
   it('caches an initial history integrity failure with its explicit warning', async () => {

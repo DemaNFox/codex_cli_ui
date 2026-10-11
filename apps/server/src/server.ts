@@ -118,7 +118,7 @@ import {
   type BrokerResourceSnapshot,
   type ResourceBroker,
 } from './resource-broker.js';
-import { createSseDelivery } from './sse.js';
+import { createSseDelivery, SSE_LIVE_QUEUE_LIMIT } from './sse.js';
 import { normalizeSubagentNotification } from './subagents.js';
 import {
   titleStillNeedsSemanticReplacement,
@@ -167,6 +167,7 @@ const eventCursorSchema = z
   .union([z.number(), z.string().regex(/^\d+$/).transform(Number)])
   .pipe(z.number().int().min(0).max(Number.MAX_SAFE_INTEGER));
 const THREAD_DETAIL_EVENT_LIMIT = 120;
+const HISTORY_PUBLICATION_LIMIT = Math.min(THREAD_DETAIL_EVENT_LIMIT, SSE_LIVE_QUEUE_LIMIT);
 const HISTORY_HYDRATION_RETRY_MS = 30_000;
 const TRANSCRIPTION_RATE_LIMIT = 10;
 const TRANSCRIPTION_RATE_WINDOW_MS = 10 * 60 * 1_000;
@@ -2372,11 +2373,11 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       const navigationMutationVersion = turnNavigationMutationVersions.get(existing.id) ?? 0;
       const result = await readThreadFromAppServer(existing, true);
       const safeTurns = redactAttachmentStorage(result.turns, attachmentStore.root);
-      for (const event of repository.reconcileThreadHistoryEvents(
+      const reconciledEvents = repository.reconcileThreadHistoryEvents(
         existing.id,
         normalizeThreadHistory(existing.id, safeTurns, config.maxEventBytes),
-      ))
-        publish(event);
+      );
+      for (const event of reconciledEvents.slice(-HISTORY_PUBLICATION_LIMIT)) publish(event);
       if ((turnNavigationMutationVersions.get(existing.id) ?? 0) === navigationMutationVersion) {
         repository.replaceTurnNavigation(
           existing.id,
@@ -2435,13 +2436,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       const mutationVersion = turnNavigationMutationVersions.get(existing.id) ?? 0;
       const read = await readThreadFromAppServer(existing, true);
       const safeTurns = redactAttachmentStorage(read.turns, attachmentStore.root);
-      for (const event of repository.reconcileThreadHistoryEvents(
+      const reconciledEvents = repository.reconcileThreadHistoryEvents(
         existing.id,
         recoverableCompletedHistory(
           normalizeThreadHistory(existing.id, safeTurns, config.maxEventBytes),
         ),
-      ))
-        publish(event);
+      );
+      for (const event of reconciledEvents.slice(-HISTORY_PUBLICATION_LIMIT)) publish(event);
       if ((turnNavigationMutationVersions.get(existing.id) ?? 0) !== mutationVersion)
         return read.thread;
       repository.replaceTurnNavigation(
