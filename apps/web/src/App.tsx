@@ -42,6 +42,7 @@ import type {
   Session,
   Subagent,
   Thread,
+  ThreadContinuationDraft,
   TurnNavigationEntry,
 } from './api.js';
 import { useThreadEvents } from './useThreadEvents.js';
@@ -1729,6 +1730,127 @@ function RenameThreadDialog({
           </button>
         </div>
       </form>
+    </div>,
+    document.body,
+  );
+}
+
+function ContinueThreadDialog({
+  draft,
+  loading,
+  creating,
+  error,
+  onConfirm,
+  onClose,
+}: {
+  draft: ThreadContinuationDraft | null;
+  loading: boolean;
+  creating: boolean;
+  error: string | null;
+  onConfirm: () => void;
+  onClose: () => void;
+}) {
+  const dialogRef = useRef<HTMLElement>(null);
+  const closeRef = useRef<HTMLButtonElement>(null);
+  const insufficient = draft?.completeness === 'insufficient' || !draft?.text.trim();
+
+  useEffect(() => closeRef.current?.focus(), []);
+
+  return createPortal(
+    <div
+      className="dialog-backdrop"
+      onMouseDown={(event) => event.target === event.currentTarget && !creating && onClose()}
+    >
+      <section
+        ref={dialogRef}
+        className="continue-thread-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="continue-thread-title"
+        aria-busy={loading || creating}
+        tabIndex={-1}
+        onKeyDown={(event) => {
+          if (event.key === 'Escape' && !creating) onClose();
+          if (event.key !== 'Tab') return;
+          const controls = dialogRef.current?.querySelectorAll<HTMLElement>(
+            'button:not(:disabled), textarea:not(:disabled), [href], [tabindex]:not([tabindex="-1"])',
+          );
+          if (!controls?.length) return;
+          const first = controls[0];
+          const last = controls[controls.length - 1];
+          if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last?.focus();
+          } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first?.focus();
+          }
+        }}
+      >
+        <header>
+          <div>
+            <h2 id="continue-thread-title">Продолжить в новом чате</h2>
+            <p>Создадим чистый чат и перенесём только краткий контекст. Старый чат не изменится.</p>
+          </div>
+          <button
+            ref={closeRef}
+            className="icon-button"
+            type="button"
+            disabled={creating}
+            onClick={onClose}
+            aria-label="Закрыть перенос в новый чат"
+          >
+            ×
+          </button>
+        </header>
+        {loading && (
+          <p className="empty-hint" role="status">
+            Подготавливаем краткий контекст…
+          </p>
+        )}
+        {error && (
+          <div className="notice error" role="alert">
+            {error}
+          </div>
+        )}
+        {!loading && draft && (
+          <>
+            {draft.completeness === 'local-fallback' && (
+              <div className="notice warning" role="status">
+                Контекст собран из сохранённой истории: свежая сверка с Codex сейчас недоступна.
+              </div>
+            )}
+            {draft.warnings.map((warning) => (
+              <div className="notice warning" role="status" key={warning}>
+                {warning}
+              </div>
+            ))}
+            {insufficient ? (
+              <p className="empty-hint">
+                В этом чате пока недостаточно доступной истории для безопасного переноса.
+              </p>
+            ) : (
+              <label className="continuation-preview">
+                Контекст для нового чата
+                <textarea readOnly value={draft.text} aria-label="Контекст для нового чата" />
+              </label>
+            )}
+          </>
+        )}
+        <footer>
+          <button className="secondary" type="button" disabled={creating} onClick={onClose}>
+            Отмена
+          </button>
+          <button
+            className="primary"
+            type="button"
+            disabled={loading || creating || insufficient}
+            onClick={onConfirm}
+          >
+            {creating ? 'Создаём…' : 'Создать новый чат'}
+          </button>
+        </footer>
+      </section>
     </div>,
     document.body,
   );
@@ -3563,6 +3685,11 @@ function Workspace({
   const [accountLoginBusy, setAccountLoginBusy] = useState(false);
   const [accountLoginError, setAccountLoginError] = useState<string | null>(null);
   const [accountLoginCopyNotice, setAccountLoginCopyNotice] = useState<string | null>(null);
+  const [continuationOpen, setContinuationOpen] = useState(false);
+  const [continuationDraft, setContinuationDraft] = useState<ThreadContinuationDraft | null>(null);
+  const [continuationLoading, setContinuationLoading] = useState(false);
+  const [continuationCreating, setContinuationCreating] = useState(false);
+  const [continuationError, setContinuationError] = useState<string | null>(null);
   const [mobileNavigationOpen, setMobileNavigationOpen] = useState(false);
   const [mobileRuntimeOpen, setMobileRuntimeOpen] = useState(false);
   const [statusRefreshing, setStatusRefreshing] = useState(false);
@@ -3596,6 +3723,8 @@ function Workspace({
     'idle',
   );
   const [threadLoadError, setThreadLoadError] = useState<string | null>(null);
+  const [threadHistoryWarning, setThreadHistoryWarning] = useState<string | null>(null);
+  const [threadHistoryWarningCode, setThreadHistoryWarningCode] = useState<string | null>(null);
   const [threadReloadToken, setThreadReloadToken] = useState(0);
   const [busy, setBusy] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
@@ -3613,12 +3742,17 @@ function Workspace({
   const positionedThreadRef = useRef<string | null>(null);
   const mobileNavigationToggleRef = useRef<HTMLButtonElement>(null);
   const statusToggleRef = useRef<HTMLButtonElement>(null);
+  const continuationButtonRef = useRef<HTMLButtonElement>(null);
+  const continuationCreateInFlightRef = useRef(false);
   const settingsButtonRef = useRef<HTMLButtonElement>(null);
   const settingsReturnFocusRef = useRef<HTMLElement | null>(null);
   const accountSwitchButtonRef = useRef<HTMLButtonElement>(null);
   const refreshedCodexUpdateRef = useRef<string | null>(null);
   const capabilityRequestRef = useRef(0);
   const automaticThreadRetryRef = useRef<string | null>(null);
+  const deferredHistoryRetryAttemptedRef = useRef<string | null>(null);
+  const deferredHistoryRetryCompletedRef = useRef<string | null>(null);
+  const deferredHistoryRetryTimerRef = useRef(0);
   const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
   const attachmentThreadRef = useRef<string | null>(null);
   const csrfTokenRef = useRef(session.csrfToken);
@@ -4544,6 +4678,13 @@ function Workspace({
   }, [archiveView, projectId, threadId]);
 
   useEffect(() => {
+    deferredHistoryRetryAttemptedRef.current = null;
+    deferredHistoryRetryCompletedRef.current = null;
+    window.clearTimeout(deferredHistoryRetryTimerRef.current);
+    return () => window.clearTimeout(deferredHistoryRetryTimerRef.current);
+  }, [threadId]);
+
+  useEffect(() => {
     const previousThreadId = attachmentThreadRef.current;
     attachmentThreadRef.current = threadId;
     closeImagePreview();
@@ -4574,6 +4715,8 @@ function Workspace({
     runtimeSnapshotCursorRef.current = 0;
     setEventStreamStart(null);
     setThreadLoadError(null);
+    setThreadHistoryWarning(null);
+    setThreadHistoryWarningCode(null);
     if (!threadId) {
       setThreadLoadState('idle');
       return;
@@ -4581,8 +4724,9 @@ function Workspace({
     setThreadLoadState('loading');
     const requestedThreadId = threadId;
     let cancelled = false;
-    void Promise.all([api.thread(requestedThreadId), api.attachments(requestedThreadId)])
-      .then(([history, attachments]) => {
+    void api
+      .thread(requestedThreadId)
+      .then((history) => {
         if (cancelled) return;
         const historyCursor = history.eventCursor ?? history.events.at(-1)?.id ?? 0;
         runtimeSnapshotCursorRef.current = historyCursor;
@@ -4605,9 +4749,29 @@ function Workspace({
         );
         const historySubagents = history.subagents;
         if (historySubagents) setSubagents((current) => mergeSubagents(current, historySubagents));
-        setThreadAttachmentBytes(
-          attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
+        const deferredHistory =
+          history.historyState === 'degraded' &&
+          history.historyWarning === 'HISTORY_LOADING_DEFERRED';
+        setThreadHistoryWarning(
+          history.historyState === 'degraded'
+            ? deferredHistory
+              ? 'Показаны последние сохранённые сообщения. Полная история загружается в фоне.'
+              : 'Показана сохранённая история. Свежая сверка с Codex временно недоступна.'
+            : null,
         );
+        setThreadHistoryWarningCode(
+          history.historyState === 'degraded' ? (history.historyWarning ?? 'DEGRADED') : null,
+        );
+        if (deferredHistory && deferredHistoryRetryAttemptedRef.current !== requestedThreadId) {
+          deferredHistoryRetryAttemptedRef.current = requestedThreadId;
+          window.clearTimeout(deferredHistoryRetryTimerRef.current);
+          deferredHistoryRetryTimerRef.current = window.setTimeout(() => {
+            if (attachmentThreadRef.current === requestedThreadId) {
+              deferredHistoryRetryCompletedRef.current = requestedThreadId;
+              setThreadReloadToken((current) => current + 1);
+            }
+          }, 1_500);
+        }
         automaticThreadRetryRef.current = null;
         setThreadLoadState('ready');
         setThreadLoadError(null);
@@ -4618,6 +4782,20 @@ function Workspace({
           setThreadLoadError(errorMessage(cause));
           setEventStreamStart({ threadId: requestedThreadId, cursor: 0 });
         }
+      });
+    void api
+      .attachments(requestedThreadId)
+      .then((attachments) => {
+        if (cancelled) return;
+        setThreadAttachmentBytes(
+          attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0),
+        );
+      })
+      .catch((cause: unknown) => {
+        if (!cancelled)
+          setAttachmentNotice(
+            `История чата загружена, но список вложений временно недоступен. ${errorMessage(cause)}`,
+          );
       });
     void api
       .subagents(requestedThreadId)
@@ -4643,6 +4821,20 @@ function Workspace({
     automaticThreadRetryRef.current = threadId;
     setThreadReloadToken((current) => current + 1);
   }, [streamState, threadId, threadLoadState]);
+
+  useEffect(() => {
+    if (
+      !threadId ||
+      streamState !== 'open' ||
+      threadHistoryWarningCode !== 'HISTORY_LOADING_DEFERRED' ||
+      deferredHistoryRetryAttemptedRef.current !== threadId ||
+      deferredHistoryRetryCompletedRef.current === threadId
+    )
+      return;
+    window.clearTimeout(deferredHistoryRetryTimerRef.current);
+    deferredHistoryRetryCompletedRef.current = threadId;
+    setThreadReloadToken((current) => current + 1);
+  }, [streamState, threadHistoryWarningCode, threadId]);
 
   async function refreshThreads(selectId?: string | null) {
     if (!projectId) return;
@@ -4777,6 +4969,57 @@ function Workspace({
     } finally {
       setBusy(false);
     }
+  }
+
+  function closeContinuationDialog() {
+    if (continuationCreating) return;
+    setContinuationOpen(false);
+    setContinuationDraft(null);
+    setContinuationError(null);
+    window.setTimeout(() => continuationButtonRef.current?.focus());
+  }
+
+  async function openContinuationDialog() {
+    if (!threadId || continuationLoading || continuationCreating) return;
+    setContinuationOpen(true);
+    setContinuationDraft(null);
+    setContinuationError(null);
+    setContinuationLoading(true);
+    try {
+      setContinuationDraft(await api.continuationDraft(threadId));
+    } catch (cause) {
+      setContinuationError(`Не удалось подготовить перенос. ${errorMessage(cause)}`);
+    } finally {
+      setContinuationLoading(false);
+    }
+  }
+
+  async function confirmContinuation() {
+    const draft = continuationDraft;
+    if (
+      continuationCreateInFlightRef.current ||
+      !draft ||
+      draft.completeness === 'insufficient' ||
+      !draft.text.trim()
+    )
+      return;
+    continuationCreateInFlightRef.current = true;
+    setContinuationCreating(true);
+    setContinuationError(null);
+    const created = await newThread(
+      draft.projectId,
+      'Открыт новый чат с кратким контекстом. Старый чат и его задачи не изменены.',
+    );
+    if (created) {
+      setComposer(draft.text);
+      setContinuationOpen(false);
+      setContinuationDraft(null);
+      window.setTimeout(() => composerInputRef.current?.focus());
+    } else {
+      setContinuationError('Не удалось создать новый чат. Исходный чат не изменён.');
+    }
+    continuationCreateInFlightRef.current = false;
+    setContinuationCreating(false);
   }
 
   async function archiveThread(id: string) {
@@ -5623,6 +5866,15 @@ function Workspace({
             </span>
           </div>
           <div className="toolbar-actions">
+            <button
+              ref={continuationButtonRef}
+              className="ghost continue-thread-button"
+              type="button"
+              onClick={() => void openContinuationDialog()}
+              disabled={!threadId || archiveView || continuationLoading || continuationCreating}
+            >
+              {continuationLoading ? 'Готовим перенос…' : 'Продолжить в новом чате'}
+            </button>
             <SubagentMenu
               subagents={subagents}
               interruptingIds={interruptingSubagentIds}
@@ -5699,6 +5951,18 @@ function Workspace({
           onKeyDown={markConversationKeyboardScrollIntent}
         >
           <div className="conversation-content" ref={conversationContentRef}>
+            {threadId && threadHistoryWarning ? (
+              <section className="thread-history-warning notice warning" role="status">
+                <span>{threadHistoryWarning}</span>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => setThreadReloadToken((current) => current + 1)}
+                >
+                  Обновить
+                </button>
+              </section>
+            ) : null}
             {threadId && threadLoadState === 'loading' && events.length === 0 ? (
               <section className="thread-load-state" aria-live="polite" aria-busy="true">
                 <span className="spinner" aria-hidden="true" />
@@ -6222,6 +6486,16 @@ function Workspace({
           onCopy={() => void copyAccountLoginCode()}
           onCancel={() => void cancelAccountLogin()}
           onClose={closeAccountLoginDialog}
+        />
+      )}
+      {continuationOpen && (
+        <ContinueThreadDialog
+          draft={continuationDraft}
+          loading={continuationLoading}
+          creating={continuationCreating}
+          error={continuationError}
+          onConfirm={() => void confirmContinuation()}
+          onClose={closeContinuationDialog}
         />
       )}
       {previewImage && (

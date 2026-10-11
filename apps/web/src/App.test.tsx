@@ -1015,6 +1015,192 @@ describe('App', () => {
     expect(screen.queryByText('Чат временно недоступен')).toBeNull();
   });
 
+  it('keeps a degraded saved transcript usable and offers an in-place refresh', async () => {
+    const event = {
+      id: 1,
+      threadId: thread.id,
+      turnId: 'turn-1',
+      kind: 'user-message' as const,
+      phase: 'completed' as const,
+      payload: { text: 'Сохранённая задача' },
+      createdAt: '2026-10-11T09:00:00.000Z',
+    };
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({
+          data: thread,
+          events: [event],
+          historyState: 'degraded',
+          historyWarning: 'APP_SERVER_UNAVAILABLE',
+        });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText('Сохранённая задача')).not.toBeNull();
+    expect(
+      screen.getByText('Показана сохранённая история. Свежая сверка с Codex временно недоступна.'),
+    ).not.toBeNull();
+    expect(screen.getByLabelText<HTMLTextAreaElement>('Сообщение Codex').disabled).toBe(false);
+    await user.click(screen.getByRole('button', { name: 'Обновить' }));
+  });
+
+  it('retries deferred lazy history once after the event stream opens', async () => {
+    let detailReads = 0;
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') {
+        detailReads += 1;
+        return jsonResponse({
+          data: thread,
+          events: [],
+          historyState: detailReads === 1 ? 'degraded' : 'complete',
+          ...(detailReads === 1 ? { historyWarning: 'HISTORY_LOADING_DEFERRED' } : {}),
+        });
+      }
+      return undefined;
+    });
+    render(<App />);
+
+    expect(
+      await screen.findByText(
+        'Показаны последние сохранённые сообщения. Полная история загружается в фоне.',
+      ),
+    ).not.toBeNull();
+    const stream = FakeEventSource.instances.find((instance) =>
+      instance.url.includes('/api/threads/thread-1/events'),
+    );
+    expect(stream).toBeDefined();
+    await act(() => stream?.dispatchEvent(new Event('open')));
+
+    await waitFor(() => expect(detailReads).toBe(2));
+    expect(
+      screen.queryByText(
+        'Показаны последние сохранённые сообщения. Полная история загружается в фоне.',
+      ),
+    ).toBeNull();
+  });
+
+  it('does not hide chat history when the attachment list is unavailable', async () => {
+    const event = {
+      id: 1,
+      threadId: thread.id,
+      turnId: 'turn-1',
+      kind: 'user-message' as const,
+      phase: 'completed' as const,
+      payload: { text: 'История остаётся видимой' },
+      createdAt: '2026-10-11T09:00:00.000Z',
+    };
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return jsonResponse({ data: thread, events: [event] });
+      if (url === '/api/threads/thread-1/attachments')
+        return jsonResponse({ error: { message: 'attachments offline' } }, 503);
+      return undefined;
+    });
+    render(<App />);
+
+    expect(await screen.findByText('История остаётся видимой')).not.toBeNull();
+    expect(
+      await screen.findByText(/История чата загружена, но список вложений временно недоступен/),
+    ).not.toBeNull();
+    expect(screen.queryByText('Чат временно недоступен')).toBeNull();
+  });
+
+  it('creates a fresh chat with a reviewed continuation draft without sending it', async () => {
+    const draft = {
+      sourceThreadId: thread.id,
+      projectId: project.id,
+      generatedAt: '2026-10-11T10:00:00.000Z',
+      completeness: 'local-fallback' as const,
+      text: 'Краткий контекст\n\nНезавершённая задача',
+      omittedCompletedTurns: 2,
+      sourceWork: { rootActive: true, activeSubagents: 1, queued: 1, needsReview: 0 },
+      warnings: ['Исходный чат продолжает работу.'],
+    };
+    const freshThread = {
+      ...thread,
+      id: 'thread-fresh',
+      name: null,
+      preview: '',
+      createdAt: '2026-10-11T10:01:00.000Z',
+      updatedAt: '2026-10-11T10:01:00.000Z',
+    };
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ error: { message: 'history unavailable' } }, 503);
+      if (url === '/api/threads/thread-1/continuation-draft') return jsonResponse({ data: draft });
+      if (url === '/api/threads' && init?.method === 'POST')
+        return jsonResponse({ data: freshThread }, 201);
+      if (url === '/api/threads/thread-fresh')
+        return jsonResponse({ data: freshThread, events: [] });
+      if (url === '/api/threads/thread-fresh/subagents') return jsonResponse({ data: [] });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText('Чат временно недоступен')).not.toBeNull();
+    await user.click(screen.getByRole('button', { name: 'Продолжить в новом чате' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Продолжить в новом чате' });
+    expect(within(dialog).getByText('Исходный чат продолжает работу.')).not.toBeNull();
+    expect(
+      within(dialog).getByLabelText<HTMLTextAreaElement>('Контекст для нового чата').value,
+    ).toBe(draft.text);
+    await user.dblClick(within(dialog).getByRole('button', { name: 'Создать новый чат' }));
+
+    expect(await screen.findByRole('heading', { name: 'Новый чат' })).not.toBeNull();
+    expect(screen.getByLabelText<HTMLTextAreaElement>('Сообщение Codex').value).toBe(draft.text);
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input, init]) => /\/turns$/.test(requestUrl(input)) && init?.method === 'POST',
+      ),
+    ).toHaveLength(0);
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input, init]) => requestUrl(input) === '/api/threads' && init?.method === 'POST',
+      ),
+    ).toHaveLength(1);
+  });
+
+  it('prevents creating a continuation when the available history is insufficient', async () => {
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1/continuation-draft')
+        return jsonResponse({
+          data: {
+            sourceThreadId: thread.id,
+            projectId: project.id,
+            generatedAt: '2026-10-11T10:00:00.000Z',
+            completeness: 'insufficient',
+            text: '',
+            omittedCompletedTurns: 0,
+            sourceWork: { rootActive: false, activeSubagents: 0, queued: 0, needsReview: 0 },
+            warnings: [],
+          },
+        });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const continueButton = await screen.findByRole<HTMLButtonElement>('button', {
+      name: 'Продолжить в новом чате',
+    });
+    await waitFor(() => expect(continueButton.disabled).toBe(false));
+    await user.click(continueButton);
+    const dialog = await screen.findByRole('dialog', { name: 'Продолжить в новом чате' });
+    expect(within(dialog).getByText(/недостаточно доступной истории/)).not.toBeNull();
+    expect(
+      within(dialog).getByRole<HTMLButtonElement>('button', { name: 'Создать новый чат' }).disabled,
+    ).toBe(true);
+    await user.keyboard('{Escape}');
+    await waitFor(() =>
+      expect(screen.queryByRole('dialog', { name: 'Продолжить в новом чате' })).toBeNull(),
+    );
+    expect(document.activeElement).toBe(
+      screen.getByRole('button', { name: 'Продолжить в новом чате' }),
+    );
+  });
+
   it('opens a fresh blank chat without resending or stopping the ambiguous task', async () => {
     const queuedTurn = {
       id: 15,
