@@ -3162,6 +3162,41 @@ export class SqliteRepository {
     return { events, highWater, historyTruncated, oldestEventId };
   }
 
+  listEventsBefore(
+    threadId: string,
+    beforeId: number,
+    limit: number,
+  ): {
+    events: SafeEvent[];
+    oldestEventId: number | null;
+    hasMore: boolean;
+  } {
+    const boundedLimit = Math.max(1, Math.min(200, limit));
+    const rows = this.database
+      .prepare(
+        `SELECT * FROM (
+          SELECT * FROM events WHERE thread_id=? AND id<? ORDER BY id DESC LIMIT ?
+        ) ORDER BY id`,
+      )
+      .all(threadId, beforeId, boundedLimit) as unknown as EventRow[];
+    const events = rows.map((row) => ({
+      id: row.id,
+      threadId: row.thread_id,
+      turnId: row.turn_id,
+      kind: row.kind,
+      phase: row.phase,
+      payload: jsonRecord(row.payload_json),
+      createdAt: row.created_at,
+    }));
+    const oldestEventId = events.at(0)?.id ?? null;
+    const hasMore =
+      oldestEventId !== null &&
+      this.database
+        .prepare('SELECT 1 FROM events WHERE thread_id=? AND id<? LIMIT 1')
+        .get(threadId, oldestEventId) !== undefined;
+    return { events, oldestEventId, hasMore };
+  }
+
   listEvents(threadId: string, afterId: number, limit?: number): SafeEvent[] {
     const throughId = this.eventHighWater(threadId);
     if (limit !== undefined) return this.listEventPage(threadId, afterId, throughId, limit);

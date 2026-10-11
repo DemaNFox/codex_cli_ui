@@ -167,6 +167,25 @@ const threadNameUpdatedSchema = z.object({
 const eventCursorSchema = z
   .union([z.number(), z.string().regex(/^\d+$/).transform(Number)])
   .pipe(z.number().int().min(0).max(Number.MAX_SAFE_INTEGER));
+const positiveEventCursorSchema = z
+  .union([
+    z.number(),
+    z
+      .string()
+      .regex(/^[1-9]\d*$/)
+      .transform(Number),
+  ])
+  .pipe(z.number().int().positive().max(Number.MAX_SAFE_INTEGER));
+const threadHistoryPageQuerySchema = z
+  .object({
+    before: positiveEventCursorSchema,
+    limit: z
+      .union([z.number(), z.string().regex(/^\d+$/).transform(Number)])
+      .pipe(z.number().int().min(20).max(200))
+      .optional()
+      .default(120),
+  })
+  .strict();
 const THREAD_DETAIL_EVENT_LIMIT = 120;
 const HISTORY_PUBLICATION_LIMIT = Math.min(THREAD_DETAIL_EVENT_LIMIT, SSE_LIVE_QUEUE_LIMIT);
 const PENDING_INTERACTION_LIMIT = 120;
@@ -3922,6 +3941,14 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       queuedTurns: repository.listVisibleQueuedTurns(id),
     });
     return { data: threadContinuationDraftSchema.parse(draft) };
+  });
+
+  app.get('/api/threads/:id/history', (request) => {
+    auth.authenticate(request);
+    const id = parseId(request);
+    if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    const query = threadHistoryPageQuerySchema.parse(request.query);
+    return repository.listEventsBefore(id, query.before, query.limit);
   });
 
   app.get('/api/threads/:id/subagents', (request) => {
