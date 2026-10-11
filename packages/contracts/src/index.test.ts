@@ -22,10 +22,34 @@ import {
   updateRuntimePreferencesRequestSchema,
   updateAutoRateLimitResetRequestSchema,
   startTurnRequestSchema,
+  threadContinuationDraftSchema,
   turnNavigationEntrySchema,
 } from './index.js';
 
 describe('contracts', () => {
+  it('bounds safe continuation drafts and their source-work projection', () => {
+    const draft = {
+      sourceThreadId: 'thread-1',
+      projectId: '09000000-0000-4000-8000-000000000001',
+      generatedAt: '2026-10-11T10:00:00.000Z',
+      completeness: 'local-fallback' as const,
+      text: 'Продолжение задачи',
+      omittedCompletedTurns: 2,
+      sourceWork: { rootActive: true, activeSubagents: 1, queued: 2, needsReview: 1 },
+      warnings: ['Старый чат продолжает работать отдельно.'],
+    };
+    expect(threadContinuationDraftSchema.parse(draft)).toEqual(draft);
+    expect(
+      threadContinuationDraftSchema.safeParse({ ...draft, text: 'x'.repeat(24_001) }).success,
+    ).toBe(false);
+    expect(
+      threadContinuationDraftSchema.safeParse({
+        ...draft,
+        sourceWork: { ...draft.sourceWork, queued: -1 },
+      }).success,
+    ).toBe(false);
+  });
+
   it('discriminates started and queued turn admission results', () => {
     expect(startTurnResultSchema.parse({ status: 'started', turnId: 'turn-1' })).toEqual({
       status: 'started',
