@@ -4738,7 +4738,10 @@ function Workspace({
         setRecentThreads((current) =>
           current.map((item) => (item.id === requestedThreadId ? history.data : item)),
         );
-        mergeEvents(history.events, requestedThreadId);
+        mergeEvents(
+          [...history.events, ...(history.pendingInteractionEvents ?? [])],
+          requestedThreadId,
+        );
         setEventStreamStart({ threadId: requestedThreadId, cursor: historyCursor });
         setServerTurnNavigation(history.turnNavigation ?? null);
         setQueuedTurns(
@@ -5253,7 +5256,10 @@ function Workspace({
         setRecentThreads((current) =>
           current.map((item) => (item.id === threadId ? reconciledThread : item)),
         );
-        mergeEvents(refreshed.events, threadId);
+        mergeEvents(
+          [...refreshed.events, ...(refreshed.pendingInteractionEvents ?? [])],
+          threadId,
+        );
         setServerTurnNavigation(refreshed.turnNavigation ?? null);
         setSubagents(reconciledSubagents);
         targetActiveTurnId = reconciledThread.activeTurnId;
@@ -5500,7 +5506,10 @@ function Workspace({
         setRecentThreads((current) =>
           current.map((item) => (item.id === targetThreadId ? history.data : item)),
         );
-        mergeEvents(history.events, targetThreadId);
+        mergeEvents(
+          [...history.events, ...(history.pendingInteractionEvents ?? [])],
+          targetThreadId,
+        );
         setServerTurnNavigation(history.turnNavigation ?? null);
         setQueuedTurns(nextQueuedTurns);
       } catch {

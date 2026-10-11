@@ -5,6 +5,7 @@ import type { SafeEvent } from './api.js';
 export type StreamState = 'connecting' | 'open' | 'offline';
 
 export const THREAD_EVENT_RETENTION_LIMIT = 120;
+export const PINNED_INTERACTION_RETENTION_LIMIT = 32;
 
 const safeEventKinds = [
   'thread',
@@ -25,6 +26,11 @@ const safeEventKinds = [
 ] as const satisfies readonly SafeEvent['kind'][];
 
 const safeEventKindSet = new Set<string>(safeEventKinds);
+const interactionKinds = new Set<SafeEvent['kind']>([
+  'approval',
+  'user-input',
+  'permission-approval',
+]);
 
 function isSafeEvent(value: unknown): value is SafeEvent {
   if (!value || typeof value !== 'object') return false;
@@ -39,6 +45,50 @@ function isSafeEvent(value: unknown): value is SafeEvent {
     !!event.payload &&
     typeof event.payload === 'object'
   );
+}
+
+function interactionEventKey(event: SafeEvent): string | null {
+  if (!interactionKinds.has(event.kind)) return null;
+  if (event.kind === 'approval') {
+    const nested = event.payload.approval;
+    const approval =
+      nested && typeof nested === 'object'
+        ? (nested as Record<string, unknown>)
+        : event.payload;
+    return typeof approval.id === 'string' && approval.id
+      ? `${event.kind}:${approval.id}`
+      : null;
+  }
+  const nested = event.payload.request;
+  const request =
+    nested && typeof nested === 'object' ? (nested as Record<string, unknown>) : event.payload;
+  return typeof request.id === 'string' && request.id ? `${event.kind}:${request.id}` : null;
+}
+
+function isPendingInteractionStart(event: SafeEvent): boolean {
+  if (event.kind === 'approval') return event.phase !== 'completed' && event.phase !== 'failed';
+  if (event.kind !== 'user-input' && event.kind !== 'permission-approval') return false;
+  const nested = event.payload.request;
+  const request =
+    nested && typeof nested === 'object' ? (nested as Record<string, unknown>) : event.payload;
+  return request.status === 'pending';
+}
+
+function retainRecentEvents(events: SafeEvent[]): SafeEvent[] {
+  const pendingInteractions = new Map<string, SafeEvent>();
+  for (const event of events) {
+    const key = interactionEventKey(event);
+    if (!key) continue;
+    if (isPendingInteractionStart(event)) pendingInteractions.set(key, event);
+    else pendingInteractions.delete(key);
+  }
+
+  const tail = events.slice(-THREAD_EVENT_RETENTION_LIMIT);
+  const tailIds = new Set(tail.map((event) => event.id));
+  const pinned = [...pendingInteractions.values()]
+    .filter((event) => !tailIds.has(event.id))
+    .slice(-PINNED_INTERACTION_RETENTION_LIMIT);
+  return [...pinned, ...tail].sort((left, right) => left.id - right.id);
 }
 
 export function useThreadEvents(
@@ -64,9 +114,9 @@ export function useThreadEvents(
     setEvents((current) => {
       const byId = new Map(current.map((event) => [event.id, event]));
       for (const event of accepted) byId.set(event.id, event);
-      return [...byId.values()]
-        .sort((left, right) => left.id - right.id)
-        .slice(-THREAD_EVENT_RETENTION_LIMIT);
+      return retainRecentEvents(
+        [...byId.values()].sort((left, right) => left.id - right.id),
+      );
     });
   }, []);
 

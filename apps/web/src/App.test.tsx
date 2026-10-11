@@ -4844,6 +4844,59 @@ describe('App', () => {
     await waitFor(() => expect(screen.queryByText('Разрешить запуск тестов?')).toBeNull());
   });
 
+  it('keeps a server-reported pending interaction actionable beyond the retained event tail', async () => {
+    const approvalId = '22222222-2222-4222-8222-222222222222';
+    const pendingApproval = {
+      id: 1,
+      threadId: 'thread-1',
+      turnId: 'turn-approval',
+      kind: 'approval' as const,
+      phase: 'started' as const,
+      payload: {
+        id: approvalId,
+        summary: 'Разрешить долгую проверку?',
+        method: 'item/commandExecution/requestApproval',
+      },
+      createdAt: '2026-10-11T10:00:00.000Z',
+    };
+    const laterEvents = Array.from({ length: 130 }, (_, index) => ({
+      id: index + 2,
+      threadId: 'thread-1',
+      turnId: 'turn-long',
+      kind: 'usage' as const,
+      phase: 'state' as const,
+      payload: { totalTokens: index + 1 },
+      createdAt: '2026-10-11T10:01:00.000Z',
+    }));
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({
+          data: thread,
+          events: laterEvents,
+          eventCursor: 131,
+          pendingInteractionEvents: [pendingApproval],
+        });
+      return undefined;
+    });
+    render(<App />);
+
+    expect(await screen.findByText('Разрешить долгую проверку?')).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Разрешить' })).not.toBeNull();
+    await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
+    act(() => {
+      FakeEventSource.instances.at(-1)?.emit({
+        id: 132,
+        threadId: 'thread-1',
+        turnId: 'turn-approval',
+        kind: 'approval',
+        phase: 'completed',
+        payload: { id: approvalId },
+        createdAt: '2026-10-11T10:02:00.000Z',
+      });
+    });
+    await waitFor(() => expect(screen.queryByText('Разрешить долгую проверку?')).toBeNull());
+  });
+
   it('answers user-input questions by keyboard without echoing a secret', async () => {
     const fetchMock = installAuthenticatedApi();
     const user = userEvent.setup();

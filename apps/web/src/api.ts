@@ -109,6 +109,7 @@ export interface ThreadHistory {
   historyState?: 'complete' | 'degraded';
   historyWarning?: string;
   historyTruncated?: boolean;
+  pendingInteractionEvents?: SafeEvent[];
   queuedTurns?: QueuedTurn[];
   subagents?: Subagent[];
   turnNavigation?: TurnNavigationEntry[];
