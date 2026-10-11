@@ -3197,6 +3197,97 @@ export class SqliteRepository {
     return { events, oldestEventId, hasMore };
   }
 
+  hasRetainedTurnEvidence(threadId: string, turnId: string): boolean {
+    return (
+      this.database
+        .prepare(
+          `SELECT 1
+           WHERE EXISTS (
+             SELECT 1 FROM events WHERE thread_id=? AND turn_id=? LIMIT 1
+           ) OR EXISTS (
+             SELECT 1 FROM turn_navigation WHERE thread_id=? AND turn_id=? LIMIT 1
+           )`,
+        )
+        .get(threadId, turnId, threadId, turnId) !== undefined
+    );
+  }
+
+  listRetainedTurnTranscriptEvents(threadId: string, turnId: string, limit: number): SafeEvent[] {
+    const boundedLimit = Math.max(1, Math.min(200, limit));
+    const hasExplicitFinal =
+      this.database
+        .prepare(
+          `SELECT 1 FROM events
+           WHERE thread_id=? AND turn_id=? AND kind='agent-message' AND phase='completed'
+             AND json_extract(payload_json,'$.messagePhase')='final_answer'
+           LIMIT 1`,
+        )
+        .get(threadId, turnId) !== undefined;
+    const hasSuccessfulTerminal =
+      this.database
+        .prepare(
+          `SELECT 1 FROM events
+           WHERE thread_id=? AND turn_id=? AND kind='turn' AND phase='completed'
+             AND (
+               json_extract(payload_json,'$.status')='completed'
+               OR json_extract(payload_json,'$.turn.status')='completed'
+             )
+           LIMIT 1`,
+        )
+        .get(threadId, turnId) !== undefined;
+    const legacyAgentRow =
+      !hasExplicitFinal && hasSuccessfulTerminal
+        ? (this.database
+            .prepare(
+              `SELECT * FROM events
+               WHERE thread_id=? AND turn_id=? AND kind='agent-message' AND phase='completed'
+                 AND json_type(payload_json,'$.messagePhase') IS NULL
+               ORDER BY id DESC LIMIT 1`,
+            )
+            .get(threadId, turnId) as unknown as EventRow | undefined)
+        : undefined;
+    const boundaryLimit = Math.max(0, boundedLimit - (legacyAgentRow ? 1 : 0));
+    const rows =
+      boundaryLimit === 0
+        ? []
+        : (this.database
+            .prepare(
+              `SELECT * FROM (
+                 SELECT * FROM events
+                 WHERE thread_id=? AND turn_id=? AND (
+                   kind='user-message'
+                   OR (
+                     kind='agent-message' AND phase='completed'
+                     AND json_extract(payload_json,'$.messagePhase')='final_answer'
+                   )
+                   OR (kind='turn' AND phase IN ('completed','failed'))
+                   OR (kind='file-change' AND phase='completed')
+                   OR (
+                     kind='tool' AND phase='completed'
+                     AND json_extract(payload_json,'$.item.type')='fileChange'
+                     AND COALESCE(json_extract(payload_json,'$.item.status'),'completed')='completed'
+                   )
+                 )
+                 ORDER BY id DESC LIMIT ?
+               ) ORDER BY id`,
+            )
+            .all(threadId, turnId, boundaryLimit) as unknown as EventRow[]);
+    if (legacyAgentRow) rows.push(legacyAgentRow);
+    rows.sort((left, right) => left.id - right.id);
+    return rows.map((row) => ({
+      id: row.id,
+      threadId: row.thread_id,
+      turnId: row.turn_id,
+      kind: row.kind,
+      phase: row.phase,
+      payload:
+        row === legacyAgentRow
+          ? { ...jsonRecord(row.payload_json), messagePhase: 'final_answer' }
+          : jsonRecord(row.payload_json),
+      createdAt: row.created_at,
+    }));
+  }
+
   listEvents(threadId: string, afterId: number, limit?: number): SafeEvent[] {
     const throughId = this.eventHighWater(threadId);
     if (limit !== undefined) return this.listEventPage(threadId, afterId, throughId, limit);

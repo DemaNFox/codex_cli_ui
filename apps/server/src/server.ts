@@ -156,6 +156,10 @@ const subagentParamsSchema = z.object({
   id: z.string().min(1).max(200),
   subagentId: z.string().min(1).max(200),
 });
+const turnHistoryParamsSchema = z.object({
+  id: z.string().min(1).max(200),
+  turnId: z.string().min(1).max(200),
+});
 const threadStatusChangedSchema = z.object({
   threadId: z.string().min(1),
   status: z.object({ type: z.enum(['notLoaded', 'idle', 'active', 'systemError']) }).passthrough(),
@@ -187,6 +191,7 @@ const threadHistoryPageQuerySchema = z
   })
   .strict();
 const THREAD_DETAIL_EVENT_LIMIT = 120;
+const TURN_HISTORY_EVENT_LIMIT = 200;
 const HISTORY_PUBLICATION_LIMIT = Math.min(THREAD_DETAIL_EVENT_LIMIT, SSE_LIVE_QUEUE_LIMIT);
 const PENDING_INTERACTION_LIMIT = 120;
 const HISTORY_HYDRATION_RETRY_MS = 30_000;
@@ -3949,6 +3954,16 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
     const query = threadHistoryPageQuerySchema.parse(request.query);
     return repository.listEventsBefore(id, query.before, query.limit);
+  });
+
+  app.get('/api/threads/:id/turns/:turnId/history', (request) => {
+    auth.authenticate(request);
+    const { id, turnId } = turnHistoryParamsSchema.parse(request.params);
+    if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    if (!repository.hasRetainedTurnEvidence(id, turnId)) throw new HttpError(404, 'TURN_NOT_FOUND');
+    return {
+      events: repository.listRetainedTurnTranscriptEvents(id, turnId, TURN_HISTORY_EVENT_LIMIT),
+    };
   });
 
   app.get('/api/threads/:id/subagents', (request) => {

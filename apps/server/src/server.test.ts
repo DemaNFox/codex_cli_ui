@@ -6436,6 +6436,168 @@ describe('Codex routes', () => {
     }
   });
 
+  it('reloads retained transcript boundaries for a noisy turn outside the recent event tail', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'older-noisy-turn';
+    repository.appendTurnNavigation({ threadId, turnId, label: 'Older noisy task' });
+    const user = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'Build the retained result' },
+    });
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Interim progress', messagePhase: 'commentary' },
+    });
+    const finalAnswer = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'The retained result is ready', messagePhase: 'final_answer' },
+    });
+    const fileChange = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'file-change',
+      phase: 'completed',
+      payload: { status: 'completed', changes: [{ path: 'result.md', kind: 'add' }] },
+    });
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'file-change',
+      phase: 'delta',
+      payload: { diff: 'must not be returned' },
+    });
+    const terminal = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+    for (let index = 0; index < 140; index += 1) {
+      repository.appendEvent({
+        threadId,
+        turnId: `newer-turn-${index}`,
+        kind: 'warning',
+        phase: 'state',
+        payload: { index },
+      });
+    }
+
+    const recent = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(recent.statusCode).toBe(200);
+    expect(
+      recent.json<{ events: SafeEvent[] }>().events.some((event) => event.turnId === turnId),
+    ).toBe(false);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history`,
+      headers: { cookie: session.cookie },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json<{ events: SafeEvent[] }>().events).toEqual([
+      user,
+      finalAnswer,
+      fileChange,
+      terminal,
+    ]);
+    expect(response.body).not.toContain('Interim progress');
+    expect(response.body).not.toContain('must not be returned');
+  });
+
+  it('recovers only the last phase-less agent message for a legacy completed turn', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'legacy-completed-turn';
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Earlier legacy progress' },
+    });
+    const lastAgent = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Legacy final response' },
+    });
+    const terminal = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history`,
+      headers: { cookie: session.cookie },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json<{ events: SafeEvent[] }>().events).toEqual([
+      { ...lastAgent, payload: { ...lastAgent.payload, messagePhase: 'final_answer' } },
+      terminal,
+    ]);
+    expect(response.body).not.toContain('Earlier legacy progress');
+  });
+
+  it('fails closed for unknown or cross-thread turn history', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const firstThreadId = await createThread(app, project.id, session.headers);
+    const secondThreadId = await createThread(app, project.id, session.headers);
+    repository.appendTurnNavigation({
+      threadId: secondThreadId,
+      turnId: 'foreign-turn',
+      label: 'Foreign turn',
+    });
+    repository.appendTurnNavigation({
+      threadId: firstThreadId,
+      turnId: 'navigation-only-turn',
+      label: 'Navigation only turn',
+    });
+
+    for (const turnId of ['unknown-turn', 'foreign-turn']) {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/threads/${firstThreadId}/turns/${turnId}/history`,
+        headers: { cookie: session.cookie },
+      });
+      expect(response.statusCode).toBe(404);
+      expect(response.json()).toMatchObject({ error: { code: 'TURN_NOT_FOUND' } });
+    }
+
+    const navigationOnly = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${firstThreadId}/turns/navigation-only-turn/history`,
+      headers: { cookie: session.cookie },
+    });
+    expect(navigationOnly.statusCode).toBe(200);
+    expect(navigationOnly.json()).toEqual({ events: [] });
+  });
+
   it('returns every actionable pending interaction independently from the bounded event tail', async () => {
     const { app, repository, projectPath } = await fixture();
     const session = await login(app);
