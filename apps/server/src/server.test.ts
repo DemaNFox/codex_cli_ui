@@ -6617,7 +6617,10 @@ describe('Codex routes', () => {
           turnId,
           kind: 'file-change',
           phase: 'completed',
-          payload: { status: 'completed', changes: [{ path: `steering-${index}.txt`, kind: 'add' }] },
+          payload: {
+            status: 'completed',
+            changes: [{ path: `steering-${index}.txt`, kind: 'add' }],
+          },
         }),
       );
     }
@@ -7864,7 +7867,7 @@ describe('Codex routes', () => {
     });
   });
 
-  it('forces host-admin direct and queued turns to use danger-full-access', async () => {
+  it('preserves explicit host-admin presets across direct and queued cold resumes', async () => {
     const { app, appServer, projectPath } = await fixture(
       1,
       undefined,
@@ -7885,7 +7888,7 @@ describe('Codex routes', () => {
     const threadStarts = appServer.requests.filter((request) => request.method === 'thread/start');
     expect(threadStarts).toHaveLength(2);
     for (const request of threadStarts)
-      expect(request.params).toMatchObject({ sandbox: 'danger-full-access' });
+      expect(request.params).toMatchObject({ sandbox: 'workspace-write' });
 
     const active = await app.inject({
       method: 'POST',
@@ -7893,7 +7896,7 @@ describe('Codex routes', () => {
       headers: session.headers,
       payload: {
         text: 'host admin direct',
-        permissionPreset: 'read-only',
+        permissionPreset: 'full-access',
         idempotencyKey: '44000000-0000-4000-8000-000000000005',
       },
     });
@@ -7904,7 +7907,7 @@ describe('Codex routes', () => {
       headers: session.headers,
       payload: {
         text: 'host admin queued',
-        permissionPreset: 'workspace-write',
+        permissionPreset: 'full-access',
         approvalPolicy: 'never',
         model: 'gpt-6.1-sol',
         reasoningEffort: 'medium',
@@ -7964,12 +7967,15 @@ describe('Codex routes', () => {
     expect(resumes).toHaveLength(2);
     expect(resumes[1]?.params).toMatchObject({
       threadId: queuedThreadId,
-      sandbox: 'danger-full-access',
+      sandbox: 'read-only',
       approvalPolicy: 'untrusted',
       approvalsReviewer: 'user',
       model: 'gpt-6-sol',
       config: { model_reasoning_effort: 'high' },
     });
+    expect(
+      appServer.requests.filter((candidate) => candidate.method === 'turn/start').at(-1)?.params,
+    ).toMatchObject({ sandboxPolicy: { type: 'readOnly', networkAccess: true } });
   });
 
   it('drains only new turns and reports pending plus active work in health', async () => {
@@ -10109,11 +10115,15 @@ describe('Codex routes', () => {
       appServer.requests.find((item) => item.method === 'thread/resume')?.params,
     ).toMatchObject({
       sandbox: 'workspace-write',
-      approvalPolicy: 'on-request',
-      approvalsReviewer: 'user',
       model: null,
       config: { agents: { max_threads: 6 } },
     });
+    expect(
+      appServer.requests.find((item) => item.method === 'thread/resume')?.params,
+    ).not.toHaveProperty('approvalPolicy');
+    expect(
+      appServer.requests.find((item) => item.method === 'thread/resume')?.params,
+    ).not.toHaveProperty('approvalsReviewer');
   });
 
   it('explains when an empty pre-restart chat was never persisted by Codex', async () => {

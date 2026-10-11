@@ -1036,19 +1036,14 @@ function mapThread(
 }
 
 function sandboxMode(
-  runnerMode: ServerConfig['runnerMode'],
   preset: PermissionPreset,
 ): 'read-only' | 'workspace-write' | 'danger-full-access' {
-  if (runnerMode === 'host-admin' || preset === 'full-access') return 'danger-full-access';
+  if (preset === 'full-access') return 'danger-full-access';
   return preset;
 }
 
-function sandboxPolicy(
-  runnerMode: ServerConfig['runnerMode'],
-  preset: PermissionPreset,
-  projectPath: string,
-): Record<string, unknown> {
-  const mode = sandboxMode(runnerMode, preset);
+function sandboxPolicy(preset: PermissionPreset, projectPath: string): Record<string, unknown> {
+  const mode = sandboxMode(preset);
   if (mode === 'read-only') return { type: 'readOnly', networkAccess: true };
   if (mode === 'danger-full-access') return { type: 'dangerFullAccess' };
   return {
@@ -1063,7 +1058,6 @@ function sandboxPolicy(
 function resumeThreadParams(input: {
   threadId: string;
   cwd: string;
-  runnerMode: ServerConfig['runnerMode'];
   permissionPreset: PermissionPreset;
   approvalPolicy: ApprovalPolicy | undefined;
   model: string | null | undefined;
@@ -1082,9 +1076,10 @@ function resumeThreadParams(input: {
     threadId: input.threadId,
     cwd: input.cwd,
     excludeTurns: true,
-    sandbox: sandboxMode(input.runnerMode, input.permissionPreset),
-    approvalPolicy: input.approvalPolicy ?? 'on-request',
-    approvalsReviewer: 'user',
+    sandbox: sandboxMode(input.permissionPreset),
+    ...(input.approvalPolicy === undefined
+      ? {}
+      : { approvalPolicy: input.approvalPolicy, approvalsReviewer: 'user' }),
     model: input.model ?? null,
     ...(Object.keys(resumeConfig).length === 0 ? {} : { config: resumeConfig }),
   };
@@ -3881,7 +3876,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           model: input.model ?? project.defaultModel,
           approvalPolicy: input.approvalPolicy,
           approvalsReviewer: 'user',
-          sandbox: sandboxMode(config.runnerMode, preset),
+          sandbox: sandboxMode(preset),
           config:
             (reasoningEffort === null || reasoningEffort === undefined) &&
             configuredAgentLimit === null
@@ -4617,7 +4612,6 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
             resumeThreadParams({
               threadId: thread.id,
               cwd: resumeCwd,
-              runnerMode: config.runnerMode,
               permissionPreset: claimed.request.permissionPreset ?? project.defaultPermissionPreset,
               approvalPolicy: claimed.request.approvalPolicy,
               model: claimed.request.model ?? project.defaultModel,
@@ -4680,7 +4674,6 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           approvalPolicy: claimed.request.approvalPolicy,
           approvalsReviewer: 'user',
           sandboxPolicy: sandboxPolicy(
-            config.runnerMode,
             claimed.request.permissionPreset ?? project.defaultPermissionPreset,
             turnCwd,
           ),
@@ -5126,7 +5119,6 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
               resumeThreadParams({
                 threadId: id,
                 cwd: resumeCwd,
-                runnerMode: config.runnerMode,
                 permissionPreset: preset,
                 approvalPolicy: input.approvalPolicy,
                 model: input.model ?? project.defaultModel,
@@ -5176,7 +5168,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           effort: input.reasoningEffort ?? project.defaultReasoningEffort,
           approvalPolicy: input.approvalPolicy,
           approvalsReviewer: 'user',
-          sandboxPolicy: sandboxPolicy(config.runnerMode, preset, turnCwd),
+          sandboxPolicy: sandboxPolicy(preset, turnCwd),
         }),
       );
       performanceState(id, result.turn.id).startedAtMono ??= turnStartIssuedAtMono;
