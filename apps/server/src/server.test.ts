@@ -6527,6 +6527,143 @@ describe('Codex routes', () => {
     expect(response.body).not.toContain('must not be returned');
   });
 
+  it('reserves transcript boundaries before filling a turn history page with file changes', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'file-change-heavy-turn';
+    repository.appendTurnNavigation({ threadId, turnId, label: 'File-change-heavy task' });
+    const user = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'Keep this prompt even after many file changes' },
+    });
+    const fileChanges = Array.from({ length: 220 }, (_, index) =>
+      repository.appendEvent({
+        threadId,
+        turnId,
+        kind: 'file-change',
+        phase: 'completed',
+        payload: { status: 'completed', changes: [{ path: `file-${index}.txt`, kind: 'add' }] },
+      }),
+    );
+    const finalAnswer = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'All files are ready', messagePhase: 'final_answer' },
+    });
+    const terminal = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const events = response.json<{ events: SafeEvent[] }>().events;
+    expect(events).toHaveLength(200);
+    expect(events).toContainEqual(user);
+    expect(events).toContainEqual(finalAnswer);
+    expect(events).toContainEqual(terminal);
+    expect(events.filter((event) => event.kind === 'file-change').map((event) => event.id)).toEqual(
+      fileChanges.slice(-197).map((event) => event.id),
+    );
+    expect(new Set(events.map((event) => event.id))).toHaveProperty('size', 200);
+    expect(events.map((event) => event.id)).toEqual(
+      [...events.map((event) => event.id)].sort((left, right) => left - right),
+    );
+  });
+
+  it('keeps the original prompt, latest final answer and terminal after more than 200 steering messages', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'steering-heavy-turn';
+    repository.appendTurnNavigation({ threadId, turnId, label: 'Steering-heavy task' });
+    const originalPrompt = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'Original prompt must remain available' },
+    });
+    const fillers: SafeEvent[] = [];
+    for (let index = 0; index < 220; index += 1) {
+      fillers.push(
+        repository.appendEvent({
+          threadId,
+          turnId,
+          kind: 'user-message',
+          phase: 'completed',
+          payload: { text: `Steering message ${index}` },
+        }),
+      );
+      fillers.push(
+        repository.appendEvent({
+          threadId,
+          turnId,
+          kind: 'file-change',
+          phase: 'completed',
+          payload: { status: 'completed', changes: [{ path: `steering-${index}.txt`, kind: 'add' }] },
+        }),
+      );
+    }
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Superseded final answer', messagePhase: 'final_answer' },
+    });
+    const latestFinal = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Latest final answer', messagePhase: 'final_answer' },
+    });
+    const terminal = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const events = response.json<{ events: SafeEvent[] }>().events;
+    expect(events).toHaveLength(200);
+    expect(events).toContainEqual(originalPrompt);
+    expect(events).toContainEqual(latestFinal);
+    expect(events).toContainEqual(terminal);
+    expect(events.filter((event) => event.kind === 'agent-message')).toEqual([latestFinal]);
+    expect(events.filter((event) => fillers.some((filler) => filler.id === event.id))).toEqual(
+      fillers.slice(-197),
+    );
+    expect(events.map((event) => event.id)).toEqual(
+      [...events.map((event) => event.id)].sort((left, right) => left - right),
+    );
+  });
+
   it('recovers only the last phase-less agent message for a legacy completed turn', async () => {
     const { app, repository, projectPath } = await fixture();
     const session = await login(app);

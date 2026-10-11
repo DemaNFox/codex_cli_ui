@@ -3214,15 +3214,28 @@ export class SqliteRepository {
 
   listRetainedTurnTranscriptEvents(threadId: string, turnId: string, limit: number): SafeEvent[] {
     const boundedLimit = Math.max(1, Math.min(200, limit));
-    const hasExplicitFinal =
-      this.database
-        .prepare(
-          `SELECT 1 FROM events
-           WHERE thread_id=? AND turn_id=? AND kind='agent-message' AND phase='completed'
-             AND json_extract(payload_json,'$.messagePhase')='final_answer'
-           LIMIT 1`,
-        )
-        .get(threadId, turnId) !== undefined;
+    const originalUserRow = this.database
+      .prepare(
+        `SELECT * FROM events
+         WHERE thread_id=? AND turn_id=? AND kind='user-message'
+         ORDER BY id LIMIT 1`,
+      )
+      .get(threadId, turnId) as unknown as EventRow | undefined;
+    const explicitFinalRow = this.database
+      .prepare(
+        `SELECT * FROM events
+         WHERE thread_id=? AND turn_id=? AND kind='agent-message' AND phase='completed'
+           AND json_extract(payload_json,'$.messagePhase')='final_answer'
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(threadId, turnId) as unknown as EventRow | undefined;
+    const terminalRow = this.database
+      .prepare(
+        `SELECT * FROM events
+         WHERE thread_id=? AND turn_id=? AND kind='turn' AND phase IN ('completed','failed')
+         ORDER BY id DESC LIMIT 1`,
+      )
+      .get(threadId, turnId) as unknown as EventRow | undefined;
     const hasSuccessfulTerminal =
       this.database
         .prepare(
@@ -3236,7 +3249,7 @@ export class SqliteRepository {
         )
         .get(threadId, turnId) !== undefined;
     const legacyAgentRow =
-      !hasExplicitFinal && hasSuccessfulTerminal
+      !explicitFinalRow && hasSuccessfulTerminal
         ? (this.database
             .prepare(
               `SELECT * FROM events
@@ -3246,9 +3259,14 @@ export class SqliteRepository {
             )
             .get(threadId, turnId) as unknown as EventRow | undefined)
         : undefined;
-    const boundaryLimit = Math.max(0, boundedLimit - (legacyAgentRow ? 1 : 0));
-    const rows =
-      boundaryLimit === 0
+    const reservedRows = [originalUserRow, explicitFinalRow ?? legacyAgentRow, terminalRow]
+      .filter((row): row is EventRow => row !== undefined)
+      .filter((row, index, rows) => rows.findIndex((candidate) => candidate.id === row.id) === index)
+      .slice(0, boundedLimit);
+    const remainingLimit = Math.max(0, boundedLimit - reservedRows.length);
+    const reservedIds = reservedRows.map((row) => row.id);
+    const fillers =
+      remainingLimit === 0
         ? []
         : (this.database
             .prepare(
@@ -3256,11 +3274,6 @@ export class SqliteRepository {
                  SELECT * FROM events
                  WHERE thread_id=? AND turn_id=? AND (
                    kind='user-message'
-                   OR (
-                     kind='agent-message' AND phase='completed'
-                     AND json_extract(payload_json,'$.messagePhase')='final_answer'
-                   )
-                   OR (kind='turn' AND phase IN ('completed','failed'))
                    OR (kind='file-change' AND phase='completed')
                    OR (
                      kind='tool' AND phase='completed'
@@ -3268,11 +3281,12 @@ export class SqliteRepository {
                      AND COALESCE(json_extract(payload_json,'$.item.status'),'completed')='completed'
                    )
                  )
+                 ${reservedIds.length > 0 ? `AND id NOT IN (${reservedIds.map(() => '?').join(',')})` : ''}
                  ORDER BY id DESC LIMIT ?
                ) ORDER BY id`,
             )
-            .all(threadId, turnId, boundaryLimit) as unknown as EventRow[]);
-    if (legacyAgentRow) rows.push(legacyAgentRow);
+            .all(threadId, turnId, ...reservedIds, remainingLimit) as unknown as EventRow[]);
+    const rows = [...reservedRows, ...fillers];
     rows.sort((left, right) => left.id - right.id);
     return rows.map((row) => ({
       id: row.id,
