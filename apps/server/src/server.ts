@@ -84,6 +84,7 @@ import type { ServerConfig } from './config.js';
 import {
   PushStorageLimitError,
   TurnQueueStorageLimitError,
+  type ApprovalRecord,
   type AttachmentRecord,
   type QueuedTurnRecord,
   type StoredAutoRateLimitReset,
@@ -168,6 +169,7 @@ const eventCursorSchema = z
   .pipe(z.number().int().min(0).max(Number.MAX_SAFE_INTEGER));
 const THREAD_DETAIL_EVENT_LIMIT = 120;
 const HISTORY_PUBLICATION_LIMIT = Math.min(THREAD_DETAIL_EVENT_LIMIT, SSE_LIVE_QUEUE_LIMIT);
+const PENDING_INTERACTION_LIMIT = 120;
 const HISTORY_HYDRATION_RETRY_MS = 30_000;
 const TRANSCRIPTION_RATE_LIMIT = 10;
 const TRANSCRIPTION_RATE_WINDOW_MS = 10 * 60 * 1_000;
@@ -2023,6 +2025,97 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return event;
   };
 
+  const interactionEventRequestId = (event: SafeEvent): string | null => {
+    if (!['approval', 'user-input', 'permission-approval'].includes(event.kind)) return null;
+    const container = event.kind === 'approval' ? event.payload.approval : event.payload.request;
+    if (container === null || typeof container !== 'object') return null;
+    const id = (container as Record<string, unknown>).id;
+    return typeof id === 'string' ? id : null;
+  };
+
+  const reconstructPendingInteractionEvent = (approval: ApprovalRecord): SafeEvent => {
+    let kind: SafeEvent['kind'] = 'approval';
+    let payload: Record<string, unknown>;
+    if (approval.method === 'item/tool/requestUserInput') {
+      kind = 'user-input';
+      const details = storedUserInputDetailsSchema.safeParse(approval.details);
+      payload = sanitizeEventPayload(
+        {
+          request: {
+            id: approval.id,
+            method: approval.method,
+            status: 'pending',
+            ...(details.success ? details.data : {}),
+          },
+        },
+        config.maxEventBytes,
+      );
+    } else if (approval.method === 'item/permissions/requestApproval') {
+      kind = 'permission-approval';
+      const details = storedPermissionDetailsSchema.safeParse(approval.details);
+      payload = sanitizeEventPayload(
+        {
+          request: {
+            id: approval.id,
+            method: approval.method,
+            status: 'pending',
+            ...(details.success ? details.data : {}),
+          },
+        },
+        config.maxEventBytes,
+      );
+    } else {
+      const full = sanitizeEventPayload({ approval }, config.maxEventBytes);
+      payload =
+        full.truncated === true
+          ? {
+              approval: {
+                id: approval.id,
+                threadId: approval.threadId,
+                turnId: approval.turnId,
+                method: approval.method,
+                status: 'pending',
+                createdAt: approval.createdAt,
+                summary: 'Approval details truncated',
+              },
+            }
+          : full;
+    }
+    const key = kind === 'approval' ? 'approval' : 'request';
+    if (!(key in payload)) payload = { [key]: { id: approval.id, status: 'pending' } };
+    return {
+      id: 0,
+      threadId: approval.threadId,
+      turnId: approval.turnId,
+      kind,
+      phase: 'state',
+      payload,
+      createdAt: approval.createdAt,
+    };
+  };
+
+  const pendingInteractionSnapshot = (
+    threadId: string,
+  ): { events: SafeEvent[]; truncated: boolean } => {
+    const pending = repository
+      .listUnfinishedApprovals()
+      .filter((approval) => approval.threadId === threadId && approval.status === 'pending');
+    const retainedByApprovalId = new Map<string, SafeEvent>();
+    for (const event of repository.listEvents(threadId, 0)) {
+      if (event.phase !== 'state') continue;
+      const approvalId = interactionEventRequestId(event);
+      if (approvalId !== null) retainedByApprovalId.set(approvalId, event);
+    }
+    const selected = pending.slice(-PENDING_INTERACTION_LIMIT);
+    return {
+      events: selected.map(
+        (approval) =>
+          retainedByApprovalId.get(approval.id) ?? reconstructPendingInteractionEvent(approval),
+      ),
+      truncated: pending.length > selected.length,
+    };
+  };
+
   for (const approval of repository.listUnfinishedApprovals()) {
     if (repository.cancelUnfinishedApproval(approval.id))
       appendInteractionTerminal(approval, 'cancelled');
@@ -3796,12 +3889,15 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
     const data = repository.getThread(id) ?? thread;
     const recent = repository.listRecentEvents(id, THREAD_DETAIL_EVENT_LIMIT);
+    const pendingInteractions = pendingInteractionSnapshot(id);
     return {
       data,
       events: recent.events,
       eventCursor: recent.highWater,
       historyTruncated: recent.historyTruncated,
       oldestEventId: recent.oldestEventId,
+      pendingInteractionEvents: pendingInteractions.events,
+      pendingInteractionsTruncated: pendingInteractions.truncated,
       turnNavigation: repository.listTurnNavigation(id),
       subagents: repository.listSubagents(id),
       queuedTurns: repository.listVisibleQueuedTurns(id).map(publicQueuedTurn),

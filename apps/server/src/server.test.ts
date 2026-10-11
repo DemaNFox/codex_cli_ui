@@ -6342,6 +6342,84 @@ describe('Codex routes', () => {
     expect(headerReplay.match(/^id: /gm)).toHaveLength(50);
   }, 10_000);
 
+  it('returns every actionable pending interaction independently from the bounded event tail', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const createPending = (method: string, rpcRequestId: number) =>
+      repository.createApproval({
+        threadId,
+        turnId: `interaction-turn-${rpcRequestId}`,
+        rpcRequestId,
+        method,
+        summary: `Safe request ${rpcRequestId}`,
+        details: { apiKey: 'raw-secret-must-not-leak' },
+      });
+    const approval = createPending('item/commandExecution/requestApproval', 301);
+    const userInput = createPending('item/tool/requestUserInput', 302);
+    const permission = createPending('item/permissions/requestApproval', 303);
+    const reconstructed = createPending('item/fileChange/requestApproval', 304);
+    const startEvents = [
+      repository.appendEvent({
+        threadId,
+        turnId: approval.turnId,
+        kind: 'approval',
+        phase: 'state',
+        payload: { approval: { id: approval.id, status: 'pending', summary: 'Safe approval' } },
+      }),
+      repository.appendEvent({
+        threadId,
+        turnId: userInput.turnId,
+        kind: 'user-input',
+        phase: 'state',
+        payload: { request: { id: userInput.id, status: 'pending', questions: [] } },
+      }),
+      repository.appendEvent({
+        threadId,
+        turnId: permission.turnId,
+        kind: 'permission-approval',
+        phase: 'state',
+        payload: { request: { id: permission.id, status: 'pending', reason: 'Safe reason' } },
+      }),
+    ];
+    for (let index = 0; index < 130; index += 1) {
+      repository.appendEvent({
+        threadId,
+        turnId: null,
+        kind: 'warning',
+        phase: 'state',
+        payload: { index },
+      });
+    }
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json<{
+      events: SafeEvent[];
+      pendingInteractionEvents: SafeEvent[];
+      pendingInteractionsTruncated: boolean;
+    }>();
+    expect(body.events).toHaveLength(120);
+    expect(body.events.map((event) => event.id)).not.toEqual(
+      expect.arrayContaining(startEvents.map((event) => event.id)),
+    );
+    expect(body.pendingInteractionEvents).toHaveLength(4);
+    expect(body.pendingInteractionEvents.slice(0, 3)).toEqual(startEvents);
+    expect(body.pendingInteractionEvents[3]).toMatchObject({
+      id: 0,
+      kind: 'approval',
+      phase: 'state',
+      payload: { approval: { id: reconstructed.id, status: 'pending' } },
+    });
+    expect(body.pendingInteractionsTruncated).toBe(false);
+    expect(response.body).not.toContain('raw-secret-must-not-leak');
+  });
+
   it('returns unhealthy status when the pinned app-server is unavailable', async () => {
     const { app, appServer } = await fixture();
     appServer.ready = false;
