@@ -191,6 +191,9 @@ const threadHistoryPageQuerySchema = z
       .default(120),
   })
   .strict();
+const turnHistoryQuerySchema = z
+  .object({ navigationId: positiveEventCursorSchema.optional() })
+  .strict();
 const THREAD_DETAIL_EVENT_LIMIT = 120;
 const TURN_HISTORY_EVENT_LIMIT = 200;
 const HISTORY_PUBLICATION_LIMIT = Math.min(THREAD_DETAIL_EVENT_LIMIT, SSE_LIVE_QUEUE_LIMIT);
@@ -3998,10 +4001,34 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   app.get('/api/threads/:id/turns/:turnId/history', (request) => {
     auth.authenticate(request);
     const { id, turnId } = turnHistoryParamsSchema.parse(request.params);
+    const query = turnHistoryQuerySchema.parse(request.query);
     if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
     if (!repository.hasRetainedTurnEvidence(id, turnId)) throw new HttpError(404, 'TURN_NOT_FOUND');
+    let anchorEventId: number | null = null;
+    if (query.navigationId !== undefined) {
+      const navigation = repository.getTurnNavigationOccurrence(id, turnId, query.navigationId);
+      if (!navigation) throw new HttpError(404, 'TURN_NAVIGATION_NOT_FOUND');
+      const matchingUserMessages = repository
+        .listRetainedTurnUserMessages(id, turnId)
+        .filter(
+          (event) =>
+            typeof event.payload.text === 'string' &&
+            normalizeTurnNavigationLabel(event.payload.text, config.maxEventBytes) ===
+              navigation.entry.label,
+        );
+      anchorEventId = matchingUserMessages[navigation.occurrence]?.id ?? null;
+      if (anchorEventId === null) throw new HttpError(404, 'TURN_NAVIGATION_ANCHOR_NOT_FOUND');
+    }
+    const events = repository.listRetainedTurnTranscriptEvents(
+      id,
+      turnId,
+      TURN_HISTORY_EVENT_LIMIT,
+      anchorEventId ?? undefined,
+    );
     return {
-      events: repository.listRetainedTurnTranscriptEvents(id, turnId, TURN_HISTORY_EVENT_LIMIT),
+      events,
+      anchorEventId:
+        anchorEventId ?? events.find((event) => event.kind === 'user-message')?.id ?? null,
     };
   });
 

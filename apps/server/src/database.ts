@@ -3084,6 +3084,24 @@ export class SqliteRepository {
     ).map((row) => this.turnNavigationFromRow(row));
   }
 
+  getTurnNavigationOccurrence(
+    threadId: string,
+    turnId: string,
+    navigationId: number,
+  ): { entry: TurnNavigationEntry; occurrence: number } | undefined {
+    const row = this.database
+      .prepare('SELECT * FROM turn_navigation WHERE id=? AND thread_id=? AND turn_id=?')
+      .get(navigationId, threadId, turnId) as unknown as TurnNavigationRow | undefined;
+    if (!row) return undefined;
+    const count = this.database
+      .prepare(
+        `SELECT COUNT(*) AS count FROM turn_navigation
+         WHERE thread_id=? AND turn_id=? AND label=? AND id<=?`,
+      )
+      .get(threadId, turnId, row.label, row.id) as { count: number };
+    return { entry: this.turnNavigationFromRow(row), occurrence: count.count - 1 };
+  }
+
   replaceTurnNavigation(
     threadId: string,
     entries: readonly Omit<TurnNavigationEntry, 'id'>[],
@@ -3212,7 +3230,32 @@ export class SqliteRepository {
     );
   }
 
-  listRetainedTurnTranscriptEvents(threadId: string, turnId: string, limit: number): SafeEvent[] {
+  listRetainedTurnUserMessages(threadId: string, turnId: string): SafeEvent[] {
+    return (
+      this.database
+        .prepare(
+          `SELECT * FROM events
+           WHERE thread_id=? AND turn_id=? AND kind='user-message' AND phase='completed'
+           ORDER BY id`,
+        )
+        .all(threadId, turnId) as unknown as EventRow[]
+    ).map((row) => ({
+      id: row.id,
+      threadId: row.thread_id,
+      turnId: row.turn_id,
+      kind: row.kind,
+      phase: row.phase,
+      payload: jsonRecord(row.payload_json),
+      createdAt: row.created_at,
+    }));
+  }
+
+  listRetainedTurnTranscriptEvents(
+    threadId: string,
+    turnId: string,
+    limit: number,
+    pinnedUserEventId?: number,
+  ): SafeEvent[] {
     const boundedLimit = Math.max(1, Math.min(200, limit));
     const originalUserRow = this.database
       .prepare(
@@ -3236,6 +3279,15 @@ export class SqliteRepository {
          ORDER BY id DESC LIMIT 1`,
       )
       .get(threadId, turnId) as unknown as EventRow | undefined;
+    const pinnedUserRow =
+      pinnedUserEventId === undefined
+        ? undefined
+        : (this.database
+            .prepare(
+              `SELECT * FROM events
+               WHERE id=? AND thread_id=? AND turn_id=? AND kind='user-message'`,
+            )
+            .get(pinnedUserEventId, threadId, turnId) as unknown as EventRow | undefined);
     const hasSuccessfulTerminal =
       this.database
         .prepare(
@@ -3259,7 +3311,12 @@ export class SqliteRepository {
             )
             .get(threadId, turnId) as unknown as EventRow | undefined)
         : undefined;
-    const reservedRows = [originalUserRow, explicitFinalRow ?? legacyAgentRow, terminalRow]
+    const reservedRows = [
+      originalUserRow,
+      pinnedUserRow,
+      explicitFinalRow ?? legacyAgentRow,
+      terminalRow,
+    ]
       .filter((row): row is EventRow => row !== undefined)
       .filter((row, index, rows) => rows.findIndex((candidate) => candidate.id === row.id) === index)
       .slice(0, boundedLimit);

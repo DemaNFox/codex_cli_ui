@@ -4,6 +4,7 @@ import {
   type CodexUpdateSnapshot,
   type SafeEvent,
   type Thread,
+  type TurnNavigationEntry,
 } from '@codex-web/contracts';
 import { hash } from 'argon2';
 import { EventEmitter } from 'node:events';
@@ -6667,6 +6668,196 @@ describe('Codex routes', () => {
     );
   });
 
+  it('anchors identical steering rail entries to their exact retained user messages', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'identical-steering-turn';
+    const identicalText = 'Check the same thing again';
+    const firstUser = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: identicalText },
+    });
+    const firstNavigation = repository.appendTurnNavigation({
+      threadId,
+      turnId,
+      label: identicalText,
+    });
+    const secondUser = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: identicalText },
+    });
+    const secondNavigation = repository.appendTurnNavigation({
+      threadId,
+      turnId,
+      label: identicalText,
+    });
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+    for (let index = 0; index < 140; index += 1) {
+      repository.appendEvent({
+        threadId,
+        turnId: `newer-identical-${index}`,
+        kind: 'warning',
+        phase: 'state',
+        payload: { index },
+      });
+    }
+
+    const recent = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(recent.statusCode).toBe(200);
+    expect(
+      recent.json<{ events: SafeEvent[] }>().events.some((event) => event.turnId === turnId),
+    ).toBe(false);
+
+    for (const [navigationId, anchorEventId] of [
+      [firstNavigation.id, firstUser.id],
+      [secondNavigation.id, secondUser.id],
+    ]) {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/threads/${threadId}/turns/${turnId}/history?navigationId=${navigationId}`,
+        headers: { cookie: session.cookie },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json<{ anchorEventId: number }>().anchorEventId).toBe(anchorEventId);
+    }
+  });
+
+  it('does not let an outcome-unknown user state shift a completed navigation anchor', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'outcome-unknown-anchor-turn';
+    const text = 'Retry this identical steering message';
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'state',
+      payload: { text, outcomeUnknown: true },
+    });
+    const completedUser = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text },
+    });
+    const navigation = repository.appendTurnNavigation({ threadId, turnId, label: text });
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history?navigationId=${navigation.id}`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json<{ anchorEventId: number }>().anchorEventId).toBe(completedUser.id);
+  });
+
+  it('pins an older steering rail entry inside a capped turn history response', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'targeted-steering-heavy-turn';
+    const original = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'Original targeted task' },
+    });
+    repository.appendTurnNavigation({
+      threadId,
+      turnId,
+      label: 'Original targeted task',
+    });
+    const steerEvents: SafeEvent[] = [];
+    const steerNavigation: TurnNavigationEntry[] = [];
+    for (let index = 0; index < 220; index += 1) {
+      const text = `Targeted steering message ${index}`;
+      steerEvents.push(
+        repository.appendEvent({
+          threadId,
+          turnId,
+          kind: 'user-message',
+          phase: 'completed',
+          payload: { text },
+        }),
+      );
+      steerNavigation.push(repository.appendTurnNavigation({ threadId, turnId, label: text }));
+    }
+    const finalAnswer = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Targeted work complete', messagePhase: 'final_answer' },
+    });
+    const terminal = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+    const targetIndex = 5;
+
+    const unanchored = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history`,
+      headers: { cookie: session.cookie },
+    });
+    expect(unanchored.statusCode).toBe(200);
+    expect(
+      unanchored
+        .json<{ events: SafeEvent[] }>()
+        .events.some((event) => event.id === steerEvents[targetIndex]!.id),
+    ).toBe(false);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history?navigationId=${steerNavigation[targetIndex]!.id}`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json<{ events: SafeEvent[]; anchorEventId: number }>();
+    expect(body.anchorEventId).toBe(steerEvents[targetIndex]!.id);
+    expect(body.events).toHaveLength(200);
+    expect(body.events).toContainEqual(original);
+    expect(body.events).toContainEqual(steerEvents[targetIndex]);
+    expect(body.events).toContainEqual(finalAnswer);
+    expect(body.events).toContainEqual(terminal);
+    expect(body.events).not.toContainEqual(steerEvents[targetIndex + 1]);
+  });
+
   it('recovers only the last phase-less agent message for a legacy completed turn', async () => {
     const { app, repository, projectPath } = await fixture();
     const session = await login(app);
@@ -6714,7 +6905,7 @@ describe('Codex routes', () => {
     const project = await createProject(app, projectPath, session.headers);
     const firstThreadId = await createThread(app, project.id, session.headers);
     const secondThreadId = await createThread(app, project.id, session.headers);
-    repository.appendTurnNavigation({
+    const foreignNavigation = repository.appendTurnNavigation({
       threadId: secondThreadId,
       turnId: 'foreign-turn',
       label: 'Foreign turn',
@@ -6741,7 +6932,17 @@ describe('Codex routes', () => {
       headers: { cookie: session.cookie },
     });
     expect(navigationOnly.statusCode).toBe(200);
-    expect(navigationOnly.json()).toEqual({ events: [] });
+    expect(navigationOnly.json()).toEqual({ events: [], anchorEventId: null });
+
+    const crossThreadNavigation = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${firstThreadId}/turns/navigation-only-turn/history?navigationId=${foreignNavigation.id}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(crossThreadNavigation.statusCode).toBe(404);
+    expect(crossThreadNavigation.json()).toMatchObject({
+      error: { code: 'TURN_NAVIGATION_NOT_FOUND' },
+    });
   });
 
   it('returns every actionable pending interaction independently from the bounded event tail', async () => {
