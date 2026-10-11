@@ -41,6 +41,15 @@ def main() -> int:
     thread_detail_reads = 0
     outage_released = False
     project_archived = False
+    continuation_created = False
+    continuation_attachment_failures = 0
+    continuation_turn_starts: list[str] = []
+    continuation_source_mutations: list[str] = []
+    continuation_context = (
+        "Контекст предыдущего чата\n\n"
+        "Завершено: проверка сохранённой истории.\n"
+        "Продолжить: дождаться полной загрузки истории и сверить результат."
+    )
     auto_rate_limit_reset = {
         "supported": True,
         "accountBinding": "a" * 64,
@@ -95,10 +104,20 @@ def main() -> int:
         nonlocal outage_released
         nonlocal project_archived
         nonlocal auto_rate_limit_reset
+        nonlocal continuation_created
+        nonlocal continuation_attachment_failures
         request = route.request
         parsed = urlparse(request.url)
         path = parsed.path
         query = parse_qs(parsed.query)
+        continuation_only = os.environ.get("CODEX_WEB_CONTINUATION_ONLY") == "1"
+
+        if (
+            continuation_only
+            and path.startswith("/api/threads/t1")
+            and request.method not in {"GET", "HEAD"}
+        ):
+            continuation_source_mutations.append(f"{request.method} {path}")
 
         if path == "/api/auth/session":
             if not signed_in:
@@ -472,6 +491,47 @@ def main() -> int:
             payload(route, 200, {"data": resource_snapshot})
         elif path == "/api/system/resource-limits/apply" and request.method == "POST":
             payload(route, 202, {"data": resource_snapshot})
+        elif path == "/api/threads" and request.method == "POST":
+            if not continuation_only:
+                payload(route, 404, {"error": {"message": "Unexpected thread creation"}})
+                return
+            if request.headers.get("x-csrf-token") != "csrf-smoke":
+                raise AssertionError("continuation thread creation did not carry CSRF protection")
+            requested = request.post_data_json
+            expected = {
+                "projectId": "p1",
+                "model": "gpt-6-astra",
+                "reasoningEffort": "high",
+                "permissionPreset": "full-access",
+                "approvalPolicy": "on-request",
+            }
+            if requested != expected:
+                raise AssertionError(
+                    f"continuation did not preserve project/runtime settings: {requested}"
+                )
+            continuation_created = True
+            payload(
+                route,
+                201,
+                {
+                    "data": {
+                        "id": "t3",
+                        "projectId": "p1",
+                        "name": None,
+                        "preview": "",
+                        "archived": False,
+                        "status": "idle",
+                        "activeTurnId": None,
+                        "model": "gpt-6-astra",
+                        "reasoningEffort": "high",
+                        "permissionPreset": "full-access",
+                        "approvalPolicy": "on-request",
+                        "instructionSources": ["/srv/projects/demo/AGENTS.md"],
+                        "createdAt": "2026-10-11T12:01:00.000Z",
+                        "updatedAt": "2026-10-11T12:01:00.000Z",
+                    }
+                },
+            )
         elif path == "/api/threads" and request.method == "GET":
             wants_archived = query.get("archived", ["false"])[0] == "true"
             visible = wants_archived == archived
@@ -514,6 +574,30 @@ def main() -> int:
                             "updatedAt": "2026-09-27T12:01:00.000Z",
                         }
                     ] if visible and not wants_archived else [])
+                },
+            )
+        elif path == "/api/threads/t1/continuation-draft" and request.method == "GET":
+            payload(
+                route,
+                200,
+                {
+                    "data": {
+                        "sourceThreadId": "t1",
+                        "projectId": "p1",
+                        "generatedAt": "2026-10-11T12:00:00.000Z",
+                        "completeness": "local-fallback",
+                        "text": continuation_context,
+                        "omittedCompletedTurns": 3,
+                        "sourceWork": {
+                            "rootActive": False,
+                            "activeSubagents": 0,
+                            "queued": 0,
+                            "needsReview": 0,
+                        },
+                        "warnings": [
+                            "Полная история ещё загружается; проверьте краткий контекст."
+                        ],
+                    }
                 },
             )
         elif path == "/api/threads/t1" and request.method == "GET":
@@ -663,6 +747,15 @@ def main() -> int:
                         ]
                         if os.environ.get("CODEX_WEB_LAYOUT_ONLY") == "1" and queued_turn_visible
                         else []
+                    ),
+                    **(
+                        {
+                            "historyState": "degraded",
+                            "historyWarning": "HISTORY_LOADING_DEFERRED",
+                            "historyTruncated": True,
+                        }
+                        if continuation_only
+                        else {"historyState": "complete"}
                     ),
                 },
             )
@@ -865,7 +958,51 @@ def main() -> int:
                 },
             )
         elif path == "/api/threads/t1/attachments" and request.method == "GET":
+            if continuation_only:
+                continuation_attachment_failures += 1
+                payload(
+                    route,
+                    500,
+                    {"error": {"message": "attachment storage unavailable"}},
+                )
+            else:
+                payload(route, 200, {"data": []})
+        elif path == "/api/threads/t3" and request.method == "GET":
+            payload(
+                route,
+                200,
+                {
+                    "data": {
+                        "id": "t3",
+                        "projectId": "p1",
+                        "name": None,
+                        "preview": "",
+                        "archived": False,
+                        "status": "idle",
+                        "activeTurnId": None,
+                        "model": "gpt-6-astra",
+                        "reasoningEffort": "high",
+                        "permissionPreset": "full-access",
+                        "approvalPolicy": "on-request",
+                        "instructionSources": ["/srv/projects/demo/AGENTS.md"],
+                        "createdAt": "2026-10-11T12:01:00.000Z",
+                        "updatedAt": "2026-10-11T12:01:00.000Z",
+                    },
+                    "events": [],
+                    "historyState": "complete",
+                },
+            )
+        elif path == "/api/threads/t3/attachments" and request.method == "GET":
             payload(route, 200, {"data": []})
+        elif path == "/api/threads/t3/subagents" and request.method == "GET":
+            payload(route, 200, {"data": []})
+        elif path == "/api/threads/t3/push-subscriptions/status":
+            payload(route, 200, {"data": {"subscribed": False}})
+        elif path == "/api/threads/t3/events":
+            route.fulfill(status=200, content_type="text/event-stream", body="retry: 60000\n\n")
+        elif path.endswith("/turns") and request.method == "POST":
+            continuation_turn_starts.append(path)
+            payload(route, 409, {"error": {"message": "turn start forbidden in this smoke"}})
         elif path == "/api/threads/t1/project-files/download" and request.method == "HEAD":
             requested_file = parse_qs(parsed.query).get("path")
             if requested_file == ["reports/audit.md"]:
@@ -1170,6 +1307,78 @@ def main() -> int:
                 raise AssertionError(f"outage recovery introduced horizontal overflow: {overflow}")
             browser.close()
             print("browser-smoke: selected chat outage recovery passed")
+            return 0
+        if os.environ.get("CODEX_WEB_CONTINUATION_ONLY") == "1":
+            page.get_by_text("Проверить активную задачу", exact=True).wait_for()
+            page.get_by_text(
+                "Показаны последние сохранённые сообщения. Полная история загружается в фоне.",
+                exact=True,
+            ).wait_for()
+            page.get_by_text(
+                "Показаны последние сообщения; более ранняя история не загружена в окно",
+                exact=True,
+            ).wait_for()
+            page.get_by_text(
+                "История чата загружена, но список вложений временно недоступен.",
+                exact=False,
+            ).wait_for()
+            if continuation_attachment_failures < 1:
+                raise AssertionError("attachment failure path was not exercised")
+            if page.get_by_text("Проверить активную задачу", exact=True).count() != 1:
+                raise AssertionError("attachment failure hid or duplicated the saved transcript")
+            page.wait_for_timeout(1_800)
+            if thread_detail_reads < 2:
+                raise AssertionError("deferred history did not receive its bounded refresh")
+            page.wait_for_function(
+                "() => !document.querySelector('.continue-thread-button')?.disabled"
+            )
+            page.get_by_role("button", name="Продолжить в новом чате").click()
+            continuation_dialog = page.get_by_role(
+                "dialog", name="Продолжить в новом чате"
+            )
+            continuation_dialog.wait_for()
+            continuation_dialog.get_by_text(
+                "Полная история ещё загружается; проверьте краткий контекст.",
+                exact=True,
+            ).wait_for()
+            preview = continuation_dialog.get_by_label("Контекст для нового чата")
+            if preview.input_value() != continuation_context:
+                raise AssertionError("continuation preview does not match the server draft")
+            continuation_dialog.get_by_role(
+                "button", name="Создать новый чат"
+            ).click()
+            continuation_dialog.wait_for(state="detached")
+            page.get_by_role("heading", name="Новый чат", exact=True).wait_for()
+            composer = page.get_by_label("Сообщение Codex")
+            if composer.input_value() != continuation_context:
+                raise AssertionError("continuation draft was not prefilled into the new composer")
+            if page.get_by_label("Вложения к отправке").count():
+                raise AssertionError("source attachments were reused in the continuation")
+            if not continuation_created:
+                raise AssertionError("fresh continuation chat was not created")
+            if continuation_turn_starts:
+                raise AssertionError(
+                    f"continuation draft was sent automatically: {continuation_turn_starts}"
+                )
+            if continuation_source_mutations:
+                raise AssertionError(
+                    f"source chat was mutated during continuation: {continuation_source_mutations}"
+                )
+            if thread_name != "Переносимый чат" or archived:
+                raise AssertionError("source chat metadata changed during continuation")
+            unexpected_console_errors = [
+                error
+                for error in console_errors
+                if "401 (Unauthorized)" not in error
+                and "/api/threads/t1/attachments" not in error
+                and "project-files/download?path=reports%2Fmissing.md" not in error
+            ]
+            if unexpected_console_errors:
+                raise AssertionError(
+                    f"browser console errors: {unexpected_console_errors}"
+                )
+            browser.close()
+            print("browser-smoke: degraded history and safe continuation passed")
             return 0
         page.set_viewport_size({"width": 1440, "height": 900})
         page.get_by_label("Меню проекта Demo").click()

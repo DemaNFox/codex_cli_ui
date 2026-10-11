@@ -4,6 +4,9 @@ import type { SafeEvent } from './api.js';
 
 export type StreamState = 'connecting' | 'open' | 'offline';
 
+export const THREAD_EVENT_RETENTION_LIMIT = 120;
+export const PINNED_INTERACTION_RETENTION_LIMIT = 120;
+
 const safeEventKinds = [
   'thread',
   'turn',
@@ -23,6 +26,11 @@ const safeEventKinds = [
 ] as const satisfies readonly SafeEvent['kind'][];
 
 const safeEventKindSet = new Set<string>(safeEventKinds);
+const interactionKinds = new Set<SafeEvent['kind']>([
+  'approval',
+  'user-input',
+  'permission-approval',
+]);
 
 function isSafeEvent(value: unknown): value is SafeEvent {
   if (!value || typeof value !== 'object') return false;
@@ -37,6 +45,63 @@ function isSafeEvent(value: unknown): value is SafeEvent {
     !!event.payload &&
     typeof event.payload === 'object'
   );
+}
+
+function interactionEventKey(event: SafeEvent): string | null {
+  if (!interactionKinds.has(event.kind)) return null;
+  if (event.kind === 'approval') {
+    const nested = event.payload.approval;
+    const approval =
+      nested && typeof nested === 'object' ? (nested as Record<string, unknown>) : event.payload;
+    return typeof approval.id === 'string' && approval.id ? `${event.kind}:${approval.id}` : null;
+  }
+  const nested = event.payload.request;
+  const request =
+    nested && typeof nested === 'object' ? (nested as Record<string, unknown>) : event.payload;
+  return typeof request.id === 'string' && request.id ? `${event.kind}:${request.id}` : null;
+}
+
+function isPendingInteractionStart(event: SafeEvent): boolean {
+  if (event.kind === 'approval') return event.phase !== 'completed' && event.phase !== 'failed';
+  if (event.kind !== 'user-input' && event.kind !== 'permission-approval') return false;
+  const nested = event.payload.request;
+  const request =
+    nested && typeof nested === 'object' ? (nested as Record<string, unknown>) : event.payload;
+  return request.status === 'pending';
+}
+
+function retainedEventKey(event: SafeEvent): string {
+  if (event.id > 0) return `event:${event.id}`;
+  const interactionKey = interactionEventKey(event);
+  return interactionKey ? `synthetic:${interactionKey}` : `event:${event.id}`;
+}
+
+function isSyntheticInteraction(event: SafeEvent): boolean {
+  return event.id <= 0 && interactionEventKey(event) !== null;
+}
+
+function compareRetainedEvents(left: SafeEvent, right: SafeEvent): number {
+  if (left.id !== right.id) return left.id - right.id;
+  return retainedEventKey(left).localeCompare(retainedEventKey(right));
+}
+
+function retainRecentEvents(events: SafeEvent[]): SafeEvent[] {
+  const pendingInteractions = new Map<string, SafeEvent>();
+  for (const event of events) {
+    const key = interactionEventKey(event);
+    if (!key) continue;
+    if (isPendingInteractionStart(event)) pendingInteractions.set(key, event);
+    else pendingInteractions.delete(key);
+  }
+
+  const tail = events
+    .filter((event) => !isSyntheticInteraction(event))
+    .slice(-THREAD_EVENT_RETENTION_LIMIT);
+  const tailKeys = new Set(tail.map(retainedEventKey));
+  const pinned = [...pendingInteractions.values()]
+    .filter((event) => !tailKeys.has(retainedEventKey(event)))
+    .slice(-PINNED_INTERACTION_RETENTION_LIMIT);
+  return [...pinned, ...tail].sort(compareRetainedEvents);
 }
 
 export function useThreadEvents(
@@ -60,9 +125,9 @@ export function useThreadEvents(
     );
     if (!accepted.length) return;
     setEvents((current) => {
-      const byId = new Map(current.map((event) => [event.id, event]));
-      for (const event of accepted) byId.set(event.id, event);
-      return [...byId.values()].sort((left, right) => left.id - right.id);
+      const retained = new Map(current.map((event) => [retainedEventKey(event), event]));
+      for (const event of accepted) retained.set(retainedEventKey(event), event);
+      return retainRecentEvents([...retained.values()].sort(compareRetainedEvents));
     });
   }, []);
 

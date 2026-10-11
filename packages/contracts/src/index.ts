@@ -246,6 +246,23 @@ export const startThreadRequestSchema = z.object({
   approvalPolicy: approvalPolicySchema.default('on-request'),
 });
 
+export const threadContinuationDraftSchema = z.object({
+  sourceThreadId: z.string().min(1).max(200),
+  projectId: z.string().uuid(),
+  generatedAt: z.string().datetime(),
+  completeness: z.enum(['complete', 'local-fallback', 'insufficient']),
+  text: z.string().max(24_000),
+  omittedCompletedTurns: z.number().int().nonnegative(),
+  sourceWork: z.object({
+    rootActive: z.boolean(),
+    activeSubagents: z.number().int().nonnegative(),
+    queued: z.number().int().nonnegative(),
+    needsReview: z.number().int().nonnegative(),
+  }),
+  warnings: z.array(z.string().min(1).max(500)).max(8),
+});
+export type ThreadContinuationDraft = z.infer<typeof threadContinuationDraftSchema>;
+
 export const startTurnRequestSchema = z
   .object({
     text: z.string().trim().max(100_000),

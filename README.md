@@ -65,7 +65,16 @@ state instead of relying on a disappearing input value. A model change applies t
 the new subagents it creates; it cannot replace the model of a root turn that is already running, and the
 composer states that boundary while such a turn is active.
 Short Codex runtime outages keep the persisted project/chat navigation and already rendered transcript in
-place. A selected chat shows an in-place retry state instead of falling back to the new-chat welcome screen.
+place. An old or long chat opens immediately from the latest 120 persisted safe events while the first full
+native history hydration runs single-flight in the background. The UI labels a truncated window, and its live
+event stream attaches without waiting for hydration. If hydration is rejected, times out, loses its response
+or fails an integrity check, the available transcript remains visible with a classified degraded-history
+warning; the server backs off repeated hydration attempts for 30 seconds, and an independent attachment-list
+failure cannot hide the transcript. Outstanding approval, permission and user-input cards remain pinned outside
+the 120-event transcript window until they are resolved. The chat toolbar can prepare a bounded continuation draft
+from visible user prompts and final answers, create a truly fresh chat in the same project and place that draft
+in the new composer for review. It never forks the old native context, auto-sends the draft, reuses thread-bound
+attachments, or cancels/duplicates running and queued source work.
 Each chat has an optional per-device notification subscription. After an explicit bell-button action, the
 browser asks for notification permission and can report a terminal Codex result even while the page is
 closed. Notification text is deliberately generic and never contains transcript, command, attachment or

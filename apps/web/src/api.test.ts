@@ -227,6 +227,28 @@ describe('api response envelopes', () => {
     );
   });
 
+  it('loads a continuation draft without mutating the source chat', async () => {
+    const draft = {
+      sourceThreadId: thread.id,
+      projectId: project.id,
+      generatedAt: '2026-10-11T10:00:00.000Z',
+      completeness: 'complete' as const,
+      text: 'Краткий контекст',
+      omittedCompletedTurns: 0,
+      sourceWork: { rootActive: false, activeSubagents: 0, queued: 0, needsReview: 0 },
+      warnings: [],
+    };
+    const fetchMock = vi.fn<typeof fetch>(() => Promise.resolve(response({ data: draft })));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(api.continuationDraft(thread.id)).resolves.toEqual(draft);
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/threads/thread-1/continuation-draft',
+      expect.objectContaining({ credentials: 'same-origin' }),
+    );
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+  });
+
   it('sends versioned resource save and apply requests', async () => {
     const fetchMock = vi.fn(() => Promise.resolve(response({ data: resourceLimits })));
     vi.stubGlobal('fetch', fetchMock);

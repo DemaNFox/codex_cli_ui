@@ -26,6 +26,7 @@ import {
   startTurnResultSchema,
   steerTurnRequestSchema,
   threadUsageSchema,
+  threadContinuationDraftSchema,
   threadListQuerySchema,
   updateRuntimePreferencesRequestSchema,
   updateAutoRateLimitResetRequestSchema,
@@ -83,6 +84,7 @@ import type { ServerConfig } from './config.js';
 import {
   PushStorageLimitError,
   TurnQueueStorageLimitError,
+  type ApprovalRecord,
   type AttachmentRecord,
   type QueuedTurnRecord,
   type StoredAutoRateLimitReset,
@@ -117,12 +119,13 @@ import {
   type BrokerResourceSnapshot,
   type ResourceBroker,
 } from './resource-broker.js';
-import { createSseDelivery } from './sse.js';
+import { createSseDelivery, SSE_LIVE_QUEUE_LIMIT } from './sse.js';
 import { normalizeSubagentNotification } from './subagents.js';
 import {
   titleStillNeedsSemanticReplacement,
   type ThreadTitleGenerator,
 } from './thread-title-generator.js';
+import { buildThreadContinuationDraft } from './thread-continuation.js';
 
 const idParamsSchema = z.object({ id: z.string().min(1).max(200) });
 const attachmentParamsSchema = z.object({
@@ -164,6 +167,10 @@ const threadNameUpdatedSchema = z.object({
 const eventCursorSchema = z
   .union([z.number(), z.string().regex(/^\d+$/).transform(Number)])
   .pipe(z.number().int().min(0).max(Number.MAX_SAFE_INTEGER));
+const THREAD_DETAIL_EVENT_LIMIT = 120;
+const HISTORY_PUBLICATION_LIMIT = Math.min(THREAD_DETAIL_EVENT_LIMIT, SSE_LIVE_QUEUE_LIMIT);
+const PENDING_INTERACTION_LIMIT = 120;
+const HISTORY_HYDRATION_RETRY_MS = 30_000;
 const TRANSCRIPTION_RATE_LIMIT = 10;
 const TRANSCRIPTION_RATE_WINDOW_MS = 10 * 60 * 1_000;
 const TRANSCRIPTION_IDEMPOTENCY_TTL_MS = 10 * 60 * 1_000;
@@ -1176,6 +1183,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const approvalGenerations = new Map<string, number>();
   const loadedThreadGenerations = new Map<string, number>();
   const historyHydrations = new Map<string, Promise<Thread>>();
+  const historyHydrationFailures = new Map<string, { warning: string; retryAfter: number }>();
   const turnNavigationGenerations = new Map<string, number>();
   const turnNavigationMutationVersions = new Map<string, number>();
   const turnNavigationRefreshes = new Map<
@@ -2017,6 +2025,97 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return event;
   };
 
+  const interactionEventRequestId = (event: SafeEvent): string | null => {
+    if (!['approval', 'user-input', 'permission-approval'].includes(event.kind)) return null;
+    const container = event.kind === 'approval' ? event.payload.approval : event.payload.request;
+    if (container === null || typeof container !== 'object') return null;
+    const id = (container as Record<string, unknown>).id;
+    return typeof id === 'string' ? id : null;
+  };
+
+  const reconstructPendingInteractionEvent = (approval: ApprovalRecord): SafeEvent => {
+    let kind: SafeEvent['kind'] = 'approval';
+    let payload: Record<string, unknown>;
+    if (approval.method === 'item/tool/requestUserInput') {
+      kind = 'user-input';
+      const details = storedUserInputDetailsSchema.safeParse(approval.details);
+      payload = sanitizeEventPayload(
+        {
+          request: {
+            id: approval.id,
+            method: approval.method,
+            status: 'pending',
+            ...(details.success ? details.data : {}),
+          },
+        },
+        config.maxEventBytes,
+      );
+    } else if (approval.method === 'item/permissions/requestApproval') {
+      kind = 'permission-approval';
+      const details = storedPermissionDetailsSchema.safeParse(approval.details);
+      payload = sanitizeEventPayload(
+        {
+          request: {
+            id: approval.id,
+            method: approval.method,
+            status: 'pending',
+            ...(details.success ? details.data : {}),
+          },
+        },
+        config.maxEventBytes,
+      );
+    } else {
+      const full = sanitizeEventPayload({ approval }, config.maxEventBytes);
+      payload =
+        full.truncated === true
+          ? {
+              approval: {
+                id: approval.id,
+                threadId: approval.threadId,
+                turnId: approval.turnId,
+                method: approval.method,
+                status: 'pending',
+                createdAt: approval.createdAt,
+                summary: 'Approval details truncated',
+              },
+            }
+          : full;
+    }
+    const key = kind === 'approval' ? 'approval' : 'request';
+    if (!(key in payload)) payload = { [key]: { id: approval.id, status: 'pending' } };
+    return {
+      id: 0,
+      threadId: approval.threadId,
+      turnId: approval.turnId,
+      kind,
+      phase: 'state',
+      payload,
+      createdAt: approval.createdAt,
+    };
+  };
+
+  const pendingInteractionSnapshot = (
+    threadId: string,
+  ): { events: SafeEvent[]; truncated: boolean } => {
+    const pending = repository
+      .listUnfinishedApprovals()
+      .filter((approval) => approval.threadId === threadId && approval.status === 'pending');
+    const retainedByApprovalId = new Map<string, SafeEvent>();
+    for (const event of repository.listEvents(threadId, 0)) {
+      if (event.phase !== 'state') continue;
+      const approvalId = interactionEventRequestId(event);
+      if (approvalId !== null) retainedByApprovalId.set(approvalId, event);
+    }
+    const selected = pending.slice(-PENDING_INTERACTION_LIMIT);
+    return {
+      events: selected.map(
+        (approval) =>
+          retainedByApprovalId.get(approval.id) ?? reconstructPendingInteractionEvent(approval),
+      ),
+      truncated: pending.length > selected.length,
+    };
+  };
+
   for (const approval of repository.listUnfinishedApprovals()) {
     if (repository.cancelUnfinishedApproval(approval.id))
       appendInteractionTerminal(approval, 'cancelled');
@@ -2354,7 +2453,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   };
 
   const hydrateThreadHistory = async (existing: Thread): Promise<Thread> => {
-    if (repository.isThreadHistoryHydrated(existing.id)) return existing;
+    if (repository.isThreadHistoryHydrated(existing.id)) {
+      historyHydrationFailures.delete(existing.id);
+      return existing;
+    }
     const activeHydration = historyHydrations.get(existing.id);
     if (activeHydration) return activeHydration;
     const hydration = (async () => {
@@ -2364,11 +2466,11 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       const navigationMutationVersion = turnNavigationMutationVersions.get(existing.id) ?? 0;
       const result = await readThreadFromAppServer(existing, true);
       const safeTurns = redactAttachmentStorage(result.turns, attachmentStore.root);
-      for (const event of repository.reconcileThreadHistoryEvents(
+      const reconciledEvents = repository.reconcileThreadHistoryEvents(
         existing.id,
         normalizeThreadHistory(existing.id, safeTurns, config.maxEventBytes),
-      ))
-        publish(event);
+      );
+      for (const event of reconciledEvents.slice(-HISTORY_PUBLICATION_LIMIT)) publish(event);
       if ((turnNavigationMutationVersions.get(existing.id) ?? 0) === navigationMutationVersion) {
         repository.replaceTurnNavigation(
           existing.id,
@@ -2378,6 +2480,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           turnNavigationGenerations.set(existing.id, generation);
       }
       repository.markThreadHistoryHydrated(existing.id);
+      historyHydrationFailures.delete(existing.id);
       return result.thread;
     })();
     historyHydrations.set(existing.id, hydration);
@@ -2386,6 +2489,35 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     } finally {
       if (historyHydrations.get(existing.id) === hydration) historyHydrations.delete(existing.id);
     }
+  };
+
+  const historyHydrationWarning = (error: unknown): string => {
+    if (error instanceof AppServerRequestError) {
+      if (error.failureKind === 'notSent') return 'APP_SERVER_UNAVAILABLE';
+      if (error.failureKind === 'rejected') return 'APP_SERVER_REJECTED';
+      return 'APP_SERVER_OUTCOME_UNKNOWN';
+    }
+    if (error instanceof HttpError) return error.code;
+    return 'HISTORY_HYDRATION_FAILED';
+  };
+
+  const startThreadHistoryHydration = (existing: Thread): void => {
+    const failure = historyHydrationFailures.get(existing.id);
+    if (failure && Date.now() < failure.retryAfter) return;
+    if (failure) historyHydrationFailures.delete(existing.id);
+    if (historyHydrations.has(existing.id)) return;
+    void hydrateThreadHistory(existing).catch((error: unknown) => {
+      if (serverClosing) return;
+      const warning = historyHydrationWarning(error);
+      historyHydrationFailures.set(existing.id, {
+        warning,
+        retryAfter: Date.now() + HISTORY_HYDRATION_RETRY_MS,
+      });
+      repository.audit('thread.history', 'degraded', {
+        threadId: existing.id,
+        reason: warning,
+      });
+    });
   };
 
   const refreshTurnNavigation = async (existing: Thread): Promise<Thread> => {
@@ -2397,13 +2529,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       const mutationVersion = turnNavigationMutationVersions.get(existing.id) ?? 0;
       const read = await readThreadFromAppServer(existing, true);
       const safeTurns = redactAttachmentStorage(read.turns, attachmentStore.root);
-      for (const event of repository.reconcileThreadHistoryEvents(
+      const reconciledEvents = repository.reconcileThreadHistoryEvents(
         existing.id,
         recoverableCompletedHistory(
           normalizeThreadHistory(existing.id, safeTurns, config.maxEventBytes),
         ),
-      ))
-        publish(event);
+      );
+      for (const event of reconciledEvents.slice(-HISTORY_PUBLICATION_LIMIT)) publish(event);
       if ((turnNavigationMutationVersions.get(existing.id) ?? 0) !== mutationVersion)
         return read.thread;
       repository.replaceTurnNavigation(
@@ -3722,17 +3854,14 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const existing = repository.getThread(id);
     if (!existing) throw new HttpError(404, 'THREAD_NOT_FOUND');
     let thread = existing;
+    let historyState: 'complete' | 'degraded' = 'complete';
+    let historyWarning: string | undefined;
     if (!repository.isThreadHistoryHydrated(id)) {
-      try {
-        thread = await hydrateThreadHistory(existing);
-      } catch (error) {
-        if (!(error instanceof AppServerRequestError) || error.failureKind !== 'notSent')
-          throw error;
-        repository.audit('thread.history', 'degraded', {
-          threadId: id,
-          reason: 'app_server_unavailable',
-        });
-      }
+      historyState = 'degraded';
+      const failure = historyHydrationFailures.get(id);
+      historyWarning =
+        failure && Date.now() < failure.retryAfter ? failure.warning : 'HISTORY_LOADING_DEFERRED';
+      startThreadHistoryHydration(existing);
     } else {
       try {
         if (turnNavigationGenerations.get(id) !== appServer.generation)
@@ -3744,19 +3873,55 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           thread = (await readThreadFromAppServer(existing, false)).thread;
       } catch (error) {
         if (error instanceof HttpError) throw error;
-        repository.audit('thread.refresh', 'failed', { threadId: id });
+        if (!(error instanceof AppServerRequestError)) throw error;
+        historyState = 'degraded';
+        historyWarning =
+          error.failureKind === 'notSent'
+            ? 'APP_SERVER_UNAVAILABLE'
+            : error.failureKind === 'rejected'
+              ? 'APP_SERVER_REJECTED'
+              : 'APP_SERVER_OUTCOME_UNKNOWN';
+        repository.audit('thread.refresh', 'failed', {
+          threadId: id,
+          reason: historyWarning,
+        });
       }
     }
     const data = repository.getThread(id) ?? thread;
-    const events = repository.listEvents(id, 0);
+    const recent = repository.listRecentEvents(id, THREAD_DETAIL_EVENT_LIMIT);
+    const pendingInteractions = pendingInteractionSnapshot(id);
     return {
       data,
-      events,
-      eventCursor: events.at(-1)?.id ?? 0,
+      events: recent.events,
+      eventCursor: recent.highWater,
+      historyTruncated: recent.historyTruncated,
+      oldestEventId: recent.oldestEventId,
+      pendingInteractionEvents: pendingInteractions.events,
+      pendingInteractionsTruncated: pendingInteractions.truncated,
       turnNavigation: repository.listTurnNavigation(id),
       subagents: repository.listSubagents(id),
       queuedTurns: repository.listVisibleQueuedTurns(id).map(publicQueuedTurn),
+      historyState,
+      ...(historyWarning ? { historyWarning } : {}),
     };
+  });
+
+  app.get('/api/threads/:id/continuation-draft', (request) => {
+    auth.authenticate(request);
+    const id = parseId(request);
+    const thread = repository.getThread(id);
+    if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    const draft = buildThreadContinuationDraft({
+      sourceThreadId: thread.id,
+      projectId: thread.projectId,
+      generatedAt: new Date().toISOString(),
+      historyHydrated: repository.isThreadHistoryHydrated(id),
+      rootActive: thread.status === 'active' || thread.activeTurnId !== null,
+      activeSubagents: repository.countActiveSubagentsForRoot(id),
+      events: repository.listEvents(id, 0),
+      queuedTurns: repository.listVisibleQueuedTurns(id),
+    });
+    return { data: threadContinuationDraftSchema.parse(draft) };
   });
 
   app.get('/api/threads/:id/subagents', (request) => {
@@ -5214,7 +5379,6 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const id = parseId(request);
     const existing = repository.getThread(id);
     if (!existing) throw new HttpError(404, 'THREAD_NOT_FOUND');
-    if (!repository.isThreadHistoryHydrated(id)) await hydrateThreadHistory(existing);
     const query = z.object({ after: eventCursorSchema.optional() }).parse(request.query);
     const header = request.headers['last-event-id'];
     const headerAfter =
@@ -5229,6 +5393,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
+    reply.raw.flushHeaders?.();
     const listeners = sseListeners.get(id) ?? new Set<SseListener>();
     const highWater = repository.eventHighWater(id);
     const delivery = createSseDelivery(reply.raw, highWater);
@@ -5254,6 +5419,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
     await delivery.finishReplay();
     if (delivery.closed) return;
+    if (!repository.isThreadHistoryHydrated(id)) startThreadHistoryHydration(existing);
     connectionTimers.keepalive = setInterval(() => delivery.deliverComment('keepalive'), 15_000);
   });
 

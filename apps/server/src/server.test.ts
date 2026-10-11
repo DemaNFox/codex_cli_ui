@@ -40,7 +40,7 @@ import type { BrokerResourceSnapshot, ResourceBroker } from './resource-broker.j
 import type { PushNotificationPayload, PushSender } from './push-notifications.js';
 import type { PushSubscriptionInput } from '@codex-web/contracts';
 import { buildServer, projectFileReadStream } from './server.js';
-import { createSseDelivery } from './sse.js';
+import { createSseDelivery, SSE_LIVE_QUEUE_LIMIT } from './sse.js';
 import type { ThreadTitleGenerator } from './thread-title-generator.js';
 
 /* eslint-disable @typescript-eslint/require-await -- fake protocol methods intentionally implement async production interfaces. */
@@ -5599,7 +5599,7 @@ describe('Codex routes', () => {
   });
 
   it('hydrates existing thread history once through a strict public item allowlist', async () => {
-    const { app, appServer, attachmentStore, projectPath } = await fixture();
+    const { app, appServer, repository, attachmentStore, projectPath } = await fixture();
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const thread = { id: appServer.addExternalThread(projectPath) };
@@ -5670,12 +5670,24 @@ describe('Codex routes', () => {
       headers: { cookie: session.cookie },
     });
     expect(first.statusCode).toBe(200);
-    const firstBody = first.json<{
+    expect(first.json()).toMatchObject({
+      events: [],
+      historyState: 'degraded',
+      historyWarning: 'HISTORY_LOADING_DEFERRED',
+    });
+    await vi.waitFor(() => expect(repository.isThreadHistoryHydrated(thread.id)).toBe(true));
+
+    const second = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${thread.id}`,
+      headers: { cookie: session.cookie },
+    });
+    const secondBody = second.json<{
       events: { id: number; kind: string }[];
       turnNavigation: { turnId: string; label: string }[];
     }>();
-    const firstEvents = firstBody.events;
-    expect(firstEvents.map((event) => event.kind)).toEqual([
+    const hydratedEvents = secondBody.events;
+    expect(hydratedEvents.map((event) => event.kind)).toEqual([
       'user-message',
       'agent-message',
       'plan',
@@ -5684,31 +5696,25 @@ describe('Codex routes', () => {
       'file-change',
       'turn',
     ]);
-    expect(first.body).toContain('public reasoning summary');
-    expect(first.body).toContain('final_answer');
-    expect(first.body).toContain('src/safe.ts');
-    expect(first.body).not.toContain('hidden chain of thought');
-    expect(first.body).not.toContain('raw diff');
-    expect(first.body).not.toContain('unknown-secret');
-    expect(first.body).not.toContain('command-secret');
-    expect(first.body).not.toContain('output-secret');
-    expect(first.body).not.toContain('/private/image.png');
-    expect(first.body).not.toContain('supersecret');
-    expect(first.body).not.toContain(attachmentStore.root);
-    expect(first.body).toContain('[attachment-storage]/private-file.txt');
-    expect(firstBody.turnNavigation).toEqual([
+    expect(second.body).toContain('public reasoning summary');
+    expect(second.body).toContain('final_answer');
+    expect(second.body).toContain('src/safe.ts');
+    expect(second.body).not.toContain('hidden chain of thought');
+    expect(second.body).not.toContain('raw diff');
+    expect(second.body).not.toContain('unknown-secret');
+    expect(second.body).not.toContain('command-secret');
+    expect(second.body).not.toContain('output-secret');
+    expect(second.body).not.toContain('/private/image.png');
+    expect(second.body).not.toContain('supersecret');
+    expect(second.body).not.toContain(attachmentStore.root);
+    expect(second.body).toContain('[attachment-storage]/private-file.txt');
+    expect(secondBody.turnNavigation).toEqual([
       expect.objectContaining({
         turnId: 'historical-turn',
         label: 'hello token[REDACTED]',
       }),
     ]);
 
-    const second = await app.inject({
-      method: 'GET',
-      url: `/api/threads/${thread.id}`,
-      headers: { cookie: session.cookie },
-    });
-    expect(second.json<{ events: { id: number }[] }>().events).toEqual(firstEvents);
     expect(
       appServer.requests
         .filter((request) => request.method === 'thread/read')
@@ -5756,8 +5762,18 @@ describe('Codex routes', () => {
       headers: { cookie: session.cookie },
     });
     expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      events: [{ kind: 'warning', payload: { message: 'arrived before hydration' } }],
+      historyState: 'degraded',
+    });
+    await vi.waitFor(() => expect(repository.isThreadHistoryHydrated(thread.id)).toBe(true));
+    const hydrated = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${thread.id}`,
+      headers: { cookie: session.cookie },
+    });
     expect(
-      response.json<{ events: { kind: string }[] }>().events.map((event) => event.kind),
+      hydrated.json<{ events: { kind: string }[] }>().events.map((event) => event.kind),
     ).toEqual(['warning', 'user-message', 'turn']);
     expect(repository.isThreadHistoryHydrated(thread.id)).toBe(true);
   });
@@ -6026,7 +6042,9 @@ describe('Codex routes', () => {
     blockedRead.release();
     const first = await hydration;
     expect(first.statusCode).toBe(200);
-    expect(first.json<{ turnNavigation: { label: string }[] }>().turnNavigation).toEqual([
+    expect(first.json()).toMatchObject({ historyState: 'degraded' });
+    await vi.waitFor(() => expect(repository.isThreadHistoryHydrated(threadId)).toBe(true));
+    expect(repository.listTurnNavigation(threadId)).toEqual([
       expect.objectContaining({ label: 'live instruction' }),
     ]);
 
@@ -6179,19 +6197,34 @@ describe('Codex routes', () => {
     expect(snapshot).not.toContain(pending.id);
     expect(repository.listEventPage(thread.id, highWater, pending.id)).toEqual([pending]);
 
+    const allRetainedEvents = repository.listEvents(thread.id, 0);
     const response = await app.inject({
       method: 'GET',
       url: `/api/threads/${thread.id}`,
       headers: { cookie: session.cookie },
     });
-    const events = response.json<{ events: { id: number; kind: string; payload: unknown }[] }>()
-      .events;
-    expect(events).toHaveLength(1_000);
+    const detail = response.json<{
+      events: { id: number; kind: string; payload: unknown }[];
+      eventCursor: number;
+      historyTruncated: boolean;
+      oldestEventId: number | null;
+    }>();
+    const events = detail.events;
+    expect(events).toHaveLength(120);
+    expect(events.map((event) => event.id)).toEqual(
+      allRetainedEvents.slice(-120).map((event) => event.id),
+    );
     expect(events.at(-1)).toMatchObject({
       id: pending.id,
       kind: 'user-input',
       payload: { request: { id: 'pending-request', status: 'pending' } },
     });
+    expect(detail).toMatchObject({
+      eventCursor: pending.id,
+      historyTruncated: true,
+      oldestEventId: events[0]!.id,
+    });
+    expect(repository.listEventPage(thread.id, detail.eventCursor, pending.id)).toEqual([]);
 
     const boundedRepository = new SqliteRepository(':memory:', 3);
     try {
@@ -6298,13 +6331,94 @@ describe('Codex routes', () => {
       return replay;
     };
 
-    const queryReplay = await readThroughPending(events[899]!.id);
+    const queryReplay = await readThroughPending(allRetainedEvents[899]!.id);
     expect(queryReplay.match(/^id: /gm)).toHaveLength(100);
     expect(queryReplay).toContain(`id: ${pending.id}\nevent: user-input\n`);
 
-    const headerReplay = await readThroughPending(events[99]!.id, events[949]!.id);
+    const headerReplay = await readThroughPending(
+      allRetainedEvents[99]!.id,
+      allRetainedEvents[949]!.id,
+    );
     expect(headerReplay.match(/^id: /gm)).toHaveLength(50);
   }, 10_000);
+
+  it('returns every actionable pending interaction independently from the bounded event tail', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const createPending = (method: string, rpcRequestId: number) =>
+      repository.createApproval({
+        threadId,
+        turnId: `interaction-turn-${rpcRequestId}`,
+        rpcRequestId,
+        method,
+        summary: `Safe request ${rpcRequestId}`,
+        details: { apiKey: 'raw-secret-must-not-leak' },
+      });
+    const approval = createPending('item/commandExecution/requestApproval', 301);
+    const userInput = createPending('item/tool/requestUserInput', 302);
+    const permission = createPending('item/permissions/requestApproval', 303);
+    const reconstructed = createPending('item/fileChange/requestApproval', 304);
+    const startEvents = [
+      repository.appendEvent({
+        threadId,
+        turnId: approval.turnId,
+        kind: 'approval',
+        phase: 'state',
+        payload: { approval: { id: approval.id, status: 'pending', summary: 'Safe approval' } },
+      }),
+      repository.appendEvent({
+        threadId,
+        turnId: userInput.turnId,
+        kind: 'user-input',
+        phase: 'state',
+        payload: { request: { id: userInput.id, status: 'pending', questions: [] } },
+      }),
+      repository.appendEvent({
+        threadId,
+        turnId: permission.turnId,
+        kind: 'permission-approval',
+        phase: 'state',
+        payload: { request: { id: permission.id, status: 'pending', reason: 'Safe reason' } },
+      }),
+    ];
+    for (let index = 0; index < 130; index += 1) {
+      repository.appendEvent({
+        threadId,
+        turnId: null,
+        kind: 'warning',
+        phase: 'state',
+        payload: { index },
+      });
+    }
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(response.statusCode).toBe(200);
+    const body = response.json<{
+      events: SafeEvent[];
+      pendingInteractionEvents: SafeEvent[];
+      pendingInteractionsTruncated: boolean;
+    }>();
+    expect(body.events).toHaveLength(120);
+    expect(body.events.map((event) => event.id)).not.toEqual(
+      expect.arrayContaining(startEvents.map((event) => event.id)),
+    );
+    expect(body.pendingInteractionEvents).toHaveLength(4);
+    expect(body.pendingInteractionEvents.slice(0, 3)).toEqual(startEvents);
+    expect(body.pendingInteractionEvents[3]).toMatchObject({
+      id: 0,
+      kind: 'approval',
+      phase: 'state',
+      payload: { approval: { id: reconstructed.id, status: 'pending' } },
+    });
+    expect(body.pendingInteractionsTruncated).toBe(false);
+    expect(response.body).not.toContain('raw-secret-must-not-leak');
+  });
 
   it('returns unhealthy status when the pinned app-server is unavailable', async () => {
     const { app, appServer } = await fixture();
@@ -9475,53 +9589,330 @@ describe('Codex routes', () => {
     expect(appServer.requests.filter((item) => item.method === 'turn/start')).toHaveLength(0);
   });
 
-  it('serves hydrated journal history when a post-restart metadata refresh is unavailable', async () => {
+  it.each([
+    ['notSent', 'APP_SERVER_UNAVAILABLE'],
+    ['rejected', 'APP_SERVER_REJECTED'],
+    ['ambiguous', 'APP_SERVER_OUTCOME_UNKNOWN'],
+  ] as const)(
+    'serves hydrated journal history when a post-restart metadata refresh is %s',
+    async (failureKind, historyWarning) => {
+      const { app, appServer, repository, projectPath } = await fixture();
+      const session = await login(app);
+      const project = await createProject(app, projectPath, session.headers);
+      const thread = (
+        await app.inject({
+          method: 'POST',
+          url: '/api/threads',
+          headers: session.headers,
+          payload: { projectId: project.id },
+        })
+      ).json<{ data: { id: string } }>().data;
+      repository.appendEvent({
+        threadId: thread.id,
+        turnId: null,
+        kind: 'warning',
+        phase: 'state',
+        payload: { message: 'retained safe history' },
+      });
+
+      appServer.restart();
+      appServer.failNextRequestWith = new AppServerRequestError(
+        failureKind,
+        'APP_SERVER_REQUEST_FAILED',
+      );
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/threads/${thread.id}`,
+        headers: { cookie: session.headers.cookie },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        data: { id: thread.id },
+        events: [{ kind: 'warning', payload: { message: 'retained safe history' } }],
+        historyState: 'degraded',
+        historyWarning,
+      });
+      expect(appServer.requests.filter((item) => item.method === 'thread/read')).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ['notSent', 'APP_SERVER_UNAVAILABLE'],
+    ['rejected', 'APP_SERVER_REJECTED'],
+    ['ambiguous', 'APP_SERVER_OUTCOME_UNKNOWN'],
+  ] as const)(
+    'serves persisted local history when initial native hydration is %s',
+    async (failureKind, historyWarning) => {
+      const { app, appServer, repository, projectPath } = await fixture();
+      const session = await login(app);
+      const project = await createProject(app, projectPath, session.headers);
+      const threadId = await createThread(app, project.id, session.headers);
+      repository.database
+        .prepare('DELETE FROM thread_history_state WHERE thread_id=?')
+        .run(threadId);
+      repository.appendEvent({
+        threadId,
+        turnId: 'retained-turn',
+        kind: 'user-message',
+        phase: 'completed',
+        payload: { text: 'retained safe history' },
+      });
+      appServer.restart();
+      appServer.failNextRequestWith = new AppServerRequestError(
+        failureKind,
+        'APP_SERVER_REQUEST_FAILED',
+      );
+
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/threads/${threadId}`,
+        headers: { cookie: session.cookie },
+      });
+
+      expect(response.statusCode).toBe(200);
+      expect(response.json()).toMatchObject({
+        data: { id: threadId },
+        events: [{ kind: 'user-message', payload: { text: 'retained safe history' } }],
+        historyState: 'degraded',
+        historyWarning: 'HISTORY_LOADING_DEFERRED',
+      });
+      expect(repository.isThreadHistoryHydrated(threadId)).toBe(false);
+      await vi.waitFor(() =>
+        expect(
+          repository.database
+            .prepare(
+              "SELECT metadata_json FROM audit_events WHERE action='thread.history' AND outcome='degraded' ORDER BY id DESC LIMIT 1",
+            )
+            .get(),
+        ).toMatchObject({ metadata_json: JSON.stringify({ threadId, reason: historyWarning }) }),
+      );
+      const retryInsideBackoff = await app.inject({
+        method: 'GET',
+        url: `/api/threads/${threadId}`,
+        headers: { cookie: session.cookie },
+      });
+      expect(retryInsideBackoff.statusCode).toBe(200);
+      expect(retryInsideBackoff.json()).toMatchObject({
+        historyState: 'degraded',
+        historyWarning,
+      });
+      expect(appServer.requests.filter((item) => item.method === 'thread/read')).toHaveLength(1);
+    },
+  );
+
+  it('returns initial local history before blocked native hydration completes, then marks it complete', async () => {
     const { app, appServer, repository, projectPath } = await fixture();
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
-    const thread = (
-      await app.inject({
-        method: 'POST',
-        url: '/api/threads',
-        headers: session.headers,
-        payload: { projectId: project.id },
-      })
-    ).json<{ data: { id: string } }>().data;
-    repository.appendEvent({
-      threadId: thread.id,
-      turnId: null,
-      kind: 'warning',
-      phase: 'state',
-      payload: { message: 'retained safe history' },
-    });
-
-    appServer.restart();
-    appServer.failNextRequestWith = new AppServerRequestError('notSent', 'APP_SERVER_UNAVAILABLE');
-    const response = await app.inject({
+    const threadId = appServer.addExternalThread(projectPath);
+    await app.inject({
       method: 'GET',
-      url: `/api/threads/${thread.id}`,
-      headers: { cookie: session.headers.cookie },
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
     });
+    appServer.setThreadTurns(threadId, [
+      {
+        id: 'historical-turn',
+        status: 'completed',
+        items: [
+          {
+            type: 'userMessage',
+            content: [{ type: 'text', text: 'history arrived later' }],
+          },
+        ],
+      },
+    ]);
+    const blockedRead = appServer.blockThreadReads();
+    const detail = app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    await blockedRead.entered;
 
+    const response = await Promise.race([
+      detail,
+      new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 100)),
+    ]);
+    expect(response).not.toBe('timed-out');
+    if (response === 'timed-out') throw new Error('detail request waited for native hydration');
     expect(response.statusCode).toBe(200);
     expect(response.json()).toMatchObject({
-      data: { id: thread.id },
-      events: [{ kind: 'warning', payload: { message: 'retained safe history' } }],
+      data: { id: threadId },
+      events: [],
+      historyState: 'degraded',
+      historyWarning: 'HISTORY_LOADING_DEFERRED',
+    });
+    expect(repository.isThreadHistoryHydrated(threadId)).toBe(false);
+
+    blockedRead.release();
+    await vi.waitFor(() => expect(repository.isThreadHistoryHydrated(threadId)).toBe(true));
+    expect(repository.listEvents(threadId, 0)).toEqual([
+      expect.objectContaining({
+        kind: 'user-message',
+        payload: { text: 'history arrived later' },
+      }),
+      expect.objectContaining({ kind: 'turn', payload: { status: 'completed' } }),
+    ]);
+  });
+
+  it('opens SSE and delivers retained and live events while initial native hydration is blocked', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = appServer.addExternalThread(projectPath);
+    await app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
+    const retained = repository.appendEvent({
+      threadId,
+      turnId: 'retained-turn',
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'retained before hydration' },
+    });
+    const blockedRead = appServer.blockThreadReads();
+    const address = await app.listen({ host: '127.0.0.1', port: 0 });
+    const stream = await Promise.race([
+      fetch(`${address}/api/threads/${threadId}/events?after=0`, {
+        headers: { cookie: session.cookie },
+      }),
+      new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 100)),
+    ]);
+    expect(stream).not.toBe('timed-out');
+    if (stream === 'timed-out') throw new Error('SSE headers waited for native hydration');
+    expect(stream.status).toBe(200);
+    const reader = stream.body!.getReader();
+    const decoder = new TextDecoder();
+    let output = '';
+    while (!output.includes(`id: ${retained.id}\n`)) {
+      const chunk = await reader.read();
+      expect(chunk.done).toBe(false);
+      output += decoder.decode(chunk.value, { stream: true });
+    }
+    await blockedRead.entered;
+
+    appServer.emit({
+      method: 'turn/started',
+      params: {
+        threadId,
+        turn: { id: 'live-during-hydration', status: 'inProgress', items: [] },
+      },
+    });
+    while (!output.includes('live-during-hydration')) {
+      const chunk = await reader.read();
+      expect(chunk.done).toBe(false);
+      output += decoder.decode(chunk.value, { stream: true });
+    }
+    expect(repository.isThreadHistoryHydrated(threadId)).toBe(false);
+    await reader.cancel();
+    blockedRead.release();
+  });
+
+  it('publishes only the latest bounded tail when hydrating a large native history', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = appServer.addExternalThread(projectPath);
+    await app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
+    appServer.setThreadTurns(
+      threadId,
+      Array.from({ length: 80 }, (_, index) => ({
+        id: `historical-turn-${index}`,
+        status: 'completed',
+        items: [
+          {
+            type: 'userMessage',
+            content: [{ type: 'text', text: `historical-message-${index}` }],
+          },
+        ],
+      })),
+    );
+
+    const address = await app.listen({ host: '127.0.0.1', port: 0 });
+    const stream = await fetch(`${address}/api/threads/${threadId}/events?after=0`, {
+      headers: { cookie: session.cookie },
+    });
+    expect(stream.status).toBe(200);
+    await vi.waitFor(() => expect(repository.isThreadHistoryHydrated(threadId)).toBe(true));
+    const persisted = repository.listEvents(threadId, 0);
+    expect(persisted).toHaveLength(160);
+    const expectedPublishedIds = persisted
+      .slice(-Math.min(120, SSE_LIVE_QUEUE_LIMIT))
+      .map((event) => event.id);
+    const finalId = expectedPublishedIds.at(-1)!;
+    const reader = stream.body!.getReader();
+    const decoder = new TextDecoder();
+    let output = '';
+    while (!output.includes(`id: ${finalId}\n`)) {
+      const chunk = await reader.read();
+      expect(chunk.done).toBe(false);
+      output += decoder.decode(chunk.value, { stream: true });
+    }
+    await reader.cancel();
+    const publishedIds = [...output.matchAll(/^id: (\d+)$/gmu)].map((match) => Number(match[1]));
+    expect(publishedIds).toEqual(expectedPublishedIds);
+  });
+
+  it('caches an initial history integrity failure with its explicit warning', async () => {
+    const { app, appServer, repository, projectPath, root } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = appServer.addExternalThread(projectPath);
+    await app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
+    appServer.setThreadCwd(threadId, root);
+
+    const first = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({ historyWarning: 'HISTORY_LOADING_DEFERRED' });
+    await vi.waitFor(() =>
+      expect(
+        repository.database
+          .prepare(
+            "SELECT metadata_json FROM audit_events WHERE action='thread.history' AND outcome='degraded' ORDER BY id DESC LIMIT 1",
+          )
+          .get(),
+      ).toMatchObject({
+        metadata_json: JSON.stringify({ threadId, reason: 'APP_SERVER_CWD_MISMATCH' }),
+      }),
+    );
+
+    const second = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json()).toMatchObject({
+      historyState: 'degraded',
+      historyWarning: 'APP_SERVER_CWD_MISMATCH',
     });
     expect(appServer.requests.filter((item) => item.method === 'thread/read')).toHaveLength(1);
   });
 
-  it('does not mask a rejected thread history request as an offline fallback', async () => {
-    const { app, appServer, repository, projectPath } = await fixture();
+  it('does not mask a native cwd integrity mismatch during an awaited history refresh', async () => {
+    const { app, appServer, repository, projectPath, root } = await fixture();
     const session = await login(app);
     const project = await createProject(app, projectPath, session.headers);
     const threadId = await createThread(app, project.id, session.headers);
-    repository.database.prepare('DELETE FROM thread_history_state WHERE thread_id=?').run(threadId);
+    expect(repository.isThreadHistoryHydrated(threadId)).toBe(true);
     appServer.restart();
-    appServer.failNextRequestWith = new AppServerRequestError(
-      'rejected',
-      'APP_SERVER_REQUEST_FAILED',
-    );
+    appServer.setThreadCwd(threadId, root);
 
     const response = await app.inject({
       method: 'GET',
@@ -9529,8 +9920,79 @@ describe('Codex routes', () => {
       headers: { cookie: session.cookie },
     });
 
-    expect(response.statusCode).toBe(500);
-    expect(response.json()).toMatchObject({ error: { code: 'INTERNAL_ERROR' } });
+    expect(response.statusCode).toBe(502);
+    expect(response.json()).toMatchObject({ error: { code: 'APP_SERVER_CWD_MISMATCH' } });
+    expect(repository.isThreadHistoryHydrated(threadId)).toBe(true);
+  });
+
+  it('builds an authenticated continuation draft from the local safe journal without a native read', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const anonymous = await app.inject({
+      method: 'GET',
+      url: '/api/threads/missing/continuation-draft',
+    });
+    expect(anonymous.statusCode).toBe(401);
+
+    const session = await login(app);
+    const missing = await app.inject({
+      method: 'GET',
+      url: '/api/threads/missing/continuation-draft',
+      headers: { cookie: session.cookie },
+    });
+    expect(missing.statusCode).toBe(404);
+    expect(missing.json()).toMatchObject({ error: { code: 'THREAD_NOT_FOUND' } });
+
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    repository.appendEvent({
+      threadId,
+      turnId: 'turn-local',
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'Перенеси эту задачу' },
+    });
+    repository.appendEvent({
+      threadId,
+      turnId: 'turn-local',
+      kind: 'plan',
+      phase: 'completed',
+      payload: { text: 'PRIVATE REASONING' },
+    });
+    const nativeReadsBefore = appServer.requests.filter(
+      (request) => request.method === 'thread/read',
+    ).length;
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/continuation-draft`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json<{
+      data: {
+        sourceThreadId: string;
+        projectId: string;
+        completeness: string;
+        text: string;
+        omittedCompletedTurns: number;
+        sourceWork: Record<string, number | boolean>;
+      };
+    }>();
+    expect(body).toMatchObject({
+      data: {
+        sourceThreadId: threadId,
+        projectId: project.id,
+        completeness: 'complete',
+        omittedCompletedTurns: 0,
+        sourceWork: { rootActive: false, activeSubagents: 0, queued: 0, needsReview: 0 },
+      },
+    });
+    expect(body.data.text).toContain('Перенеси эту задачу');
+    expect(response.body).not.toContain('PRIVATE REASONING');
+    expect(appServer.requests.filter((request) => request.method === 'thread/read')).toHaveLength(
+      nativeReadsBefore,
+    );
   });
 
   it('does not mask a rejected native thread list as cached navigation', async () => {

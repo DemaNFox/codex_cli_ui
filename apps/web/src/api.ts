@@ -21,6 +21,7 @@ import type {
   Subagent,
   StartTurnResult,
   Thread,
+  ThreadContinuationDraft,
   TurnNavigationEntry,
 } from '@codex-web/contracts';
 
@@ -105,6 +106,11 @@ export interface ThreadHistory {
   data: Thread;
   events: SafeEvent[];
   eventCursor?: number;
+  historyState?: 'complete' | 'degraded';
+  historyWarning?: string;
+  historyTruncated?: boolean;
+  pendingInteractionEvents?: SafeEvent[];
+  pendingInteractionsTruncated?: boolean;
   queuedTurns?: QueuedTurn[];
   subagents?: Subagent[];
   turnNavigation?: TurnNavigationEntry[];
@@ -377,6 +383,10 @@ export const api = {
     ),
   thread: (threadId: string) =>
     request<ThreadHistory>(`/api/threads/${encodeURIComponent(threadId)}`),
+  continuationDraft: (threadId: string) =>
+    request<ThreadContinuationDraft | { data: ThreadContinuationDraft }>(
+      `/api/threads/${encodeURIComponent(threadId)}/continuation-draft`,
+    ).then(unwrapData),
   subagents: async (threadId: string) =>
     asList(
       await request<Subagent[] | { data: Subagent[] }>(
@@ -645,5 +655,6 @@ export type {
   Subagent,
   StartTurnResult,
   Thread,
+  ThreadContinuationDraft,
   TurnNavigationEntry,
 };

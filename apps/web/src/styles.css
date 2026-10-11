@@ -450,6 +450,62 @@ button:disabled {
   background: var(--panel);
   box-shadow: 0 1.2rem 3rem rgba(0, 0, 0, 0.5);
 }
+.continue-thread-dialog {
+  display: grid;
+  gap: 0.85rem;
+  width: min(44rem, 100%);
+  min-width: 0;
+  max-height: calc(100dvh - 2rem);
+  padding: 1rem;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 0.8rem;
+  background: var(--panel);
+  box-shadow: 0 1.2rem 3rem rgba(0, 0, 0, 0.5);
+}
+.continue-thread-dialog > header,
+.continue-thread-dialog > footer,
+.thread-history-warning {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+}
+.continue-thread-dialog h2 {
+  margin: 0;
+  font-size: 1rem;
+}
+.continue-thread-dialog header p {
+  margin: 0.35rem 0 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+  line-height: 1.45;
+}
+.continue-thread-dialog > footer {
+  justify-content: flex-end;
+}
+.continuation-preview {
+  display: grid;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+.continuation-preview textarea {
+  width: 100%;
+  min-height: min(18rem, 42dvh);
+  resize: vertical;
+  color: var(--text);
+  line-height: 1.5;
+}
+.thread-history-warning {
+  margin: 0 0 1rem;
+}
+.thread-history-truncated {
+  margin: 0 0 1rem;
+}
+.thread-history-warning .ghost {
+  flex: 0 0 auto;
+}
 .archived-projects-dialog > header,
 .archived-project-list li {
   display: flex;
@@ -2023,6 +2079,11 @@ button:disabled {
   border: 1px solid rgba(245, 196, 90, 0.2);
   margin-top: 0.5rem;
 }
+.notice.info {
+  color: #b8c9d8;
+  background: rgba(113, 147, 175, 0.08);
+  border: 1px solid rgba(113, 147, 175, 0.2);
+}
 .global-error {
   display: flex;
   justify-content: space-between;
@@ -2922,9 +2983,23 @@ button:disabled {
     content: '⚙';
     font-size: 1rem;
   }
+  .chat-toolbar .continue-thread-button::after {
+    content: '↗';
+  }
   .toolbar-actions {
     align-items: flex-start;
     min-width: 0;
+  }
+  .continue-thread-dialog {
+    width: 100%;
+    max-width: 100%;
+  }
+  .continue-thread-dialog > footer {
+    align-items: stretch;
+    flex-direction: column-reverse;
+  }
+  .continue-thread-dialog > footer button {
+    width: 100%;
   }
   .subagent-menu > summary {
     width: 2.35rem;
