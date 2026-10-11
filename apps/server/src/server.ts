@@ -166,6 +166,8 @@ const threadNameUpdatedSchema = z.object({
 const eventCursorSchema = z
   .union([z.number(), z.string().regex(/^\d+$/).transform(Number)])
   .pipe(z.number().int().min(0).max(Number.MAX_SAFE_INTEGER));
+const THREAD_DETAIL_EVENT_LIMIT = 120;
+const HISTORY_HYDRATION_RETRY_MS = 30_000;
 const TRANSCRIPTION_RATE_LIMIT = 10;
 const TRANSCRIPTION_RATE_WINDOW_MS = 10 * 60 * 1_000;
 const TRANSCRIPTION_IDEMPOTENCY_TTL_MS = 10 * 60 * 1_000;
@@ -1178,6 +1180,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   const approvalGenerations = new Map<string, number>();
   const loadedThreadGenerations = new Map<string, number>();
   const historyHydrations = new Map<string, Promise<Thread>>();
+  const historyHydrationFailures = new Map<string, { warning: string; retryAfter: number }>();
   const turnNavigationGenerations = new Map<string, number>();
   const turnNavigationMutationVersions = new Map<string, number>();
   const turnNavigationRefreshes = new Map<
@@ -2356,7 +2359,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   };
 
   const hydrateThreadHistory = async (existing: Thread): Promise<Thread> => {
-    if (repository.isThreadHistoryHydrated(existing.id)) return existing;
+    if (repository.isThreadHistoryHydrated(existing.id)) {
+      historyHydrationFailures.delete(existing.id);
+      return existing;
+    }
     const activeHydration = historyHydrations.get(existing.id);
     if (activeHydration) return activeHydration;
     const hydration = (async () => {
@@ -2380,6 +2386,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           turnNavigationGenerations.set(existing.id, generation);
       }
       repository.markThreadHistoryHydrated(existing.id);
+      historyHydrationFailures.delete(existing.id);
       return result.thread;
     })();
     historyHydrations.set(existing.id, hydration);
@@ -2388,6 +2395,35 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     } finally {
       if (historyHydrations.get(existing.id) === hydration) historyHydrations.delete(existing.id);
     }
+  };
+
+  const historyHydrationWarning = (error: unknown): string => {
+    if (error instanceof AppServerRequestError) {
+      if (error.failureKind === 'notSent') return 'APP_SERVER_UNAVAILABLE';
+      if (error.failureKind === 'rejected') return 'APP_SERVER_REJECTED';
+      return 'APP_SERVER_OUTCOME_UNKNOWN';
+    }
+    if (error instanceof HttpError) return error.code;
+    return 'HISTORY_HYDRATION_FAILED';
+  };
+
+  const startThreadHistoryHydration = (existing: Thread): void => {
+    const failure = historyHydrationFailures.get(existing.id);
+    if (failure && Date.now() < failure.retryAfter) return;
+    if (failure) historyHydrationFailures.delete(existing.id);
+    if (historyHydrations.has(existing.id)) return;
+    void hydrateThreadHistory(existing).catch((error: unknown) => {
+      if (serverClosing) return;
+      const warning = historyHydrationWarning(error);
+      historyHydrationFailures.set(existing.id, {
+        warning,
+        retryAfter: Date.now() + HISTORY_HYDRATION_RETRY_MS,
+      });
+      repository.audit('thread.history', 'degraded', {
+        threadId: existing.id,
+        reason: warning,
+      });
+    });
   };
 
   const refreshTurnNavigation = async (existing: Thread): Promise<Thread> => {
@@ -3725,32 +3761,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (!existing) throw new HttpError(404, 'THREAD_NOT_FOUND');
     let thread = existing;
     let historyState: 'complete' | 'degraded' = 'complete';
-    let historyWarning:
-      | 'APP_SERVER_UNAVAILABLE'
-      | 'APP_SERVER_REJECTED'
-      | 'APP_SERVER_OUTCOME_UNKNOWN'
-      | 'HISTORY_LOADING_DEFERRED'
-      | undefined;
+    let historyWarning: string | undefined;
     if (!repository.isThreadHistoryHydrated(id)) {
       historyState = 'degraded';
-      historyWarning = 'HISTORY_LOADING_DEFERRED';
-      void hydrateThreadHistory(existing).catch((error: unknown) => {
-        if (serverClosing) return;
-        const reason =
-          error instanceof AppServerRequestError
-            ? error.failureKind === 'notSent'
-              ? 'APP_SERVER_UNAVAILABLE'
-              : error.failureKind === 'rejected'
-                ? 'APP_SERVER_REJECTED'
-                : 'APP_SERVER_OUTCOME_UNKNOWN'
-            : error instanceof HttpError
-              ? error.code
-              : 'UNEXPECTED_HISTORY_HYDRATION_FAILURE';
-        repository.audit('thread.history', 'degraded', {
-          threadId: id,
-          reason,
-        });
-      });
+      const failure = historyHydrationFailures.get(id);
+      historyWarning =
+        failure && Date.now() < failure.retryAfter ? failure.warning : 'HISTORY_LOADING_DEFERRED';
+      startThreadHistoryHydration(existing);
     } else {
       try {
         if (turnNavigationGenerations.get(id) !== appServer.generation)
@@ -3777,11 +3794,13 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       }
     }
     const data = repository.getThread(id) ?? thread;
-    const events = repository.listEvents(id, 0);
+    const recent = repository.listRecentEvents(id, THREAD_DETAIL_EVENT_LIMIT);
     return {
       data,
-      events,
-      eventCursor: events.at(-1)?.id ?? 0,
+      events: recent.events,
+      eventCursor: recent.highWater,
+      historyTruncated: recent.historyTruncated,
+      oldestEventId: recent.oldestEventId,
       turnNavigation: repository.listTurnNavigation(id),
       subagents: repository.listSubagents(id),
       queuedTurns: repository.listVisibleQueuedTurns(id).map(publicQueuedTurn),
@@ -5263,7 +5282,6 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const id = parseId(request);
     const existing = repository.getThread(id);
     if (!existing) throw new HttpError(404, 'THREAD_NOT_FOUND');
-    if (!repository.isThreadHistoryHydrated(id)) await hydrateThreadHistory(existing);
     const query = z.object({ after: eventCursorSchema.optional() }).parse(request.query);
     const header = request.headers['last-event-id'];
     const headerAfter =
@@ -5278,6 +5296,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     });
+    reply.raw.flushHeaders?.();
     const listeners = sseListeners.get(id) ?? new Set<SseListener>();
     const highWater = repository.eventHighWater(id);
     const delivery = createSseDelivery(reply.raw, highWater);
@@ -5303,6 +5322,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
     await delivery.finishReplay();
     if (delivery.closed) return;
+    if (!repository.isThreadHistoryHydrated(id)) startThreadHistoryHydration(existing);
     connectionTimers.keepalive = setInterval(() => delivery.deliverComment('keepalive'), 15_000);
   });
 

@@ -6197,19 +6197,34 @@ describe('Codex routes', () => {
     expect(snapshot).not.toContain(pending.id);
     expect(repository.listEventPage(thread.id, highWater, pending.id)).toEqual([pending]);
 
+    const allRetainedEvents = repository.listEvents(thread.id, 0);
     const response = await app.inject({
       method: 'GET',
       url: `/api/threads/${thread.id}`,
       headers: { cookie: session.cookie },
     });
-    const events = response.json<{ events: { id: number; kind: string; payload: unknown }[] }>()
-      .events;
-    expect(events).toHaveLength(1_000);
+    const detail = response.json<{
+      events: { id: number; kind: string; payload: unknown }[];
+      eventCursor: number;
+      historyTruncated: boolean;
+      oldestEventId: number | null;
+    }>();
+    const events = detail.events;
+    expect(events).toHaveLength(120);
+    expect(events.map((event) => event.id)).toEqual(
+      allRetainedEvents.slice(-120).map((event) => event.id),
+    );
     expect(events.at(-1)).toMatchObject({
       id: pending.id,
       kind: 'user-input',
       payload: { request: { id: 'pending-request', status: 'pending' } },
     });
+    expect(detail).toMatchObject({
+      eventCursor: pending.id,
+      historyTruncated: true,
+      oldestEventId: events[0]!.id,
+    });
+    expect(repository.listEventPage(thread.id, detail.eventCursor, pending.id)).toEqual([]);
 
     const boundedRepository = new SqliteRepository(':memory:', 3);
     try {
@@ -6316,11 +6331,14 @@ describe('Codex routes', () => {
       return replay;
     };
 
-    const queryReplay = await readThroughPending(events[899]!.id);
+    const queryReplay = await readThroughPending(allRetainedEvents[899]!.id);
     expect(queryReplay.match(/^id: /gm)).toHaveLength(100);
     expect(queryReplay).toContain(`id: ${pending.id}\nevent: user-input\n`);
 
-    const headerReplay = await readThroughPending(events[99]!.id, events[949]!.id);
+    const headerReplay = await readThroughPending(
+      allRetainedEvents[99]!.id,
+      allRetainedEvents[949]!.id,
+    );
     expect(headerReplay.match(/^id: /gm)).toHaveLength(50);
   }, 10_000);
 
@@ -9542,6 +9560,7 @@ describe('Codex routes', () => {
   );
 
   it.each([
+    ['notSent', 'APP_SERVER_UNAVAILABLE'],
     ['rejected', 'APP_SERVER_REJECTED'],
     ['ambiguous', 'APP_SERVER_OUTCOME_UNKNOWN'],
   ] as const)(
@@ -9590,6 +9609,17 @@ describe('Codex routes', () => {
             .get(),
         ).toMatchObject({ metadata_json: JSON.stringify({ threadId, reason: historyWarning }) }),
       );
+      const retryInsideBackoff = await app.inject({
+        method: 'GET',
+        url: `/api/threads/${threadId}`,
+        headers: { cookie: session.cookie },
+      });
+      expect(retryInsideBackoff.statusCode).toBe(200);
+      expect(retryInsideBackoff.json()).toMatchObject({
+        historyState: 'degraded',
+        historyWarning,
+      });
+      expect(appServer.requests.filter((item) => item.method === 'thread/read')).toHaveLength(1);
     },
   );
 
@@ -9647,6 +9677,105 @@ describe('Codex routes', () => {
       }),
       expect.objectContaining({ kind: 'turn', payload: { status: 'completed' } }),
     ]);
+  });
+
+  it('opens SSE and delivers retained and live events while initial native hydration is blocked', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = appServer.addExternalThread(projectPath);
+    await app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
+    const retained = repository.appendEvent({
+      threadId,
+      turnId: 'retained-turn',
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'retained before hydration' },
+    });
+    const blockedRead = appServer.blockThreadReads();
+    const address = await app.listen({ host: '127.0.0.1', port: 0 });
+    const stream = await Promise.race([
+      fetch(`${address}/api/threads/${threadId}/events?after=0`, {
+        headers: { cookie: session.cookie },
+      }),
+      new Promise<'timed-out'>((resolve) => setTimeout(() => resolve('timed-out'), 100)),
+    ]);
+    expect(stream).not.toBe('timed-out');
+    if (stream === 'timed-out') throw new Error('SSE headers waited for native hydration');
+    expect(stream.status).toBe(200);
+    const reader = stream.body!.getReader();
+    const decoder = new TextDecoder();
+    let output = '';
+    while (!output.includes(`id: ${retained.id}\n`)) {
+      const chunk = await reader.read();
+      expect(chunk.done).toBe(false);
+      output += decoder.decode(chunk.value, { stream: true });
+    }
+    await blockedRead.entered;
+
+    appServer.emit({
+      method: 'turn/started',
+      params: {
+        threadId,
+        turn: { id: 'live-during-hydration', status: 'inProgress', items: [] },
+      },
+    });
+    while (!output.includes('live-during-hydration')) {
+      const chunk = await reader.read();
+      expect(chunk.done).toBe(false);
+      output += decoder.decode(chunk.value, { stream: true });
+    }
+    expect(repository.isThreadHistoryHydrated(threadId)).toBe(false);
+    await reader.cancel();
+    blockedRead.release();
+  });
+
+  it('caches an initial history integrity failure with its explicit warning', async () => {
+    const { app, appServer, repository, projectPath, root } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = appServer.addExternalThread(projectPath);
+    await app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
+    appServer.setThreadCwd(threadId, root);
+
+    const first = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(first.statusCode).toBe(200);
+    expect(first.json()).toMatchObject({ historyWarning: 'HISTORY_LOADING_DEFERRED' });
+    await vi.waitFor(() =>
+      expect(
+        repository.database
+          .prepare(
+            "SELECT metadata_json FROM audit_events WHERE action='thread.history' AND outcome='degraded' ORDER BY id DESC LIMIT 1",
+          )
+          .get(),
+      ).toMatchObject({
+        metadata_json: JSON.stringify({ threadId, reason: 'APP_SERVER_CWD_MISMATCH' }),
+      }),
+    );
+
+    const second = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(second.statusCode).toBe(200);
+    expect(second.json()).toMatchObject({
+      historyState: 'degraded',
+      historyWarning: 'APP_SERVER_CWD_MISMATCH',
+    });
+    expect(appServer.requests.filter((item) => item.method === 'thread/read')).toHaveLength(1);
   });
 
   it('does not mask a native cwd integrity mismatch during an awaited history refresh', async () => {
