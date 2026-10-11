@@ -5,6 +5,7 @@ import type { SafeEvent } from './api.js';
 export type StreamState = 'connecting' | 'open' | 'offline';
 
 export const THREAD_EVENT_RETENTION_LIMIT = 120;
+export const THREAD_HISTORY_RETENTION_LIMIT = 2_400;
 export const PINNED_INTERACTION_RETENTION_LIMIT = 120;
 
 const safeEventKinds = [
@@ -85,7 +86,7 @@ function compareRetainedEvents(left: SafeEvent, right: SafeEvent): number {
   return retainedEventKey(left).localeCompare(retainedEventKey(right));
 }
 
-function retainRecentEvents(events: SafeEvent[]): SafeEvent[] {
+function retainRecentEvents(events: SafeEvent[], historyKeys: Set<string>): SafeEvent[] {
   const pendingInteractions = new Map<string, SafeEvent>();
   for (const event of events) {
     const key = interactionEventKey(event);
@@ -94,14 +95,21 @@ function retainRecentEvents(events: SafeEvent[]): SafeEvent[] {
     else pendingInteractions.delete(key);
   }
 
+  const history = events
+    .filter((event) => !isSyntheticInteraction(event) && historyKeys.has(retainedEventKey(event)))
+    .slice(-THREAD_HISTORY_RETENTION_LIMIT);
+  const retainedHistoryKeys = new Set(history.map(retainedEventKey));
   const tail = events
-    .filter((event) => !isSyntheticInteraction(event))
+    .filter(
+      (event) =>
+        !isSyntheticInteraction(event) && !retainedHistoryKeys.has(retainedEventKey(event)),
+    )
     .slice(-THREAD_EVENT_RETENTION_LIMIT);
-  const tailKeys = new Set(tail.map(retainedEventKey));
+  const tailKeys = new Set([...history, ...tail].map(retainedEventKey));
   const pinned = [...pendingInteractions.values()]
     .filter((event) => !tailKeys.has(retainedEventKey(event)))
     .slice(-PINNED_INTERACTION_RETENTION_LIMIT);
-  return [...pinned, ...tail].sort(compareRetainedEvents);
+  return [...pinned, ...history, ...tail].sort(compareRetainedEvents);
 }
 
 export function useThreadEvents(
@@ -110,29 +118,94 @@ export function useThreadEvents(
 ): {
   events: SafeEvent[];
   streamState: StreamState;
-  mergeEvents: (incoming: SafeEvent[], expectedThreadId?: string) => void;
+  mergeEvents: (
+    incoming: SafeEvent[],
+    expectedThreadId?: string,
+    source?: 'snapshot' | 'live',
+  ) => void;
+  prependHistory: (incoming: SafeEvent[], expectedThreadId?: string) => void;
+  replaceSnapshot: (incoming: SafeEvent[], expectedThreadId?: string) => void;
 } {
   const [events, setEvents] = useState<SafeEvent[]>([]);
   const [streamState, setStreamState] = useState<StreamState>('offline');
   const threadIdRef = useRef(threadId);
+  const historyKeysRef = useRef(new Set<string>());
   threadIdRef.current = threadId;
 
-  const mergeEvents = useCallback((incoming: SafeEvent[], expectedThreadId?: string) => {
+  const mergeEvents = useCallback(
+    (incoming: SafeEvent[], expectedThreadId?: string, source: 'snapshot' | 'live' = 'live') => {
+      const activeThreadId = threadIdRef.current;
+      if (!activeThreadId || (expectedThreadId && expectedThreadId !== activeThreadId)) return;
+      const accepted = incoming.filter(
+        (event) => isSafeEvent(event) && event.threadId === activeThreadId,
+      );
+      if (!accepted.length) return;
+      if (source === 'snapshot') {
+        for (const event of accepted) historyKeysRef.current.add(retainedEventKey(event));
+      }
+      setEvents((current) => {
+        const retained = new Map(current.map((event) => [retainedEventKey(event), event]));
+        for (const event of accepted) retained.set(retainedEventKey(event), event);
+        return retainRecentEvents(
+          [...retained.values()].sort(compareRetainedEvents),
+          historyKeysRef.current,
+        );
+      });
+    },
+    [],
+  );
+
+  const prependHistory = useCallback((incoming: SafeEvent[], expectedThreadId?: string) => {
     const activeThreadId = threadIdRef.current;
     if (!activeThreadId || (expectedThreadId && expectedThreadId !== activeThreadId)) return;
     const accepted = incoming.filter(
       (event) => isSafeEvent(event) && event.threadId === activeThreadId,
     );
     if (!accepted.length) return;
+    for (const event of accepted) historyKeysRef.current.add(retainedEventKey(event));
     setEvents((current) => {
       const retained = new Map(current.map((event) => [retainedEventKey(event), event]));
       for (const event of accepted) retained.set(retainedEventKey(event), event);
-      return retainRecentEvents([...retained.values()].sort(compareRetainedEvents));
+      return retainRecentEvents(
+        [...retained.values()].sort(compareRetainedEvents),
+        historyKeysRef.current,
+      );
+    });
+  }, []);
+
+  const replaceSnapshot = useCallback((incoming: SafeEvent[], expectedThreadId?: string) => {
+    const activeThreadId = threadIdRef.current;
+    if (!activeThreadId || (expectedThreadId && expectedThreadId !== activeThreadId)) return;
+    const accepted = incoming.filter(
+      (event) => isSafeEvent(event) && event.threadId === activeThreadId,
+    );
+    const oldestAuthoritativeId = accepted.find((event) => event.id > 0)?.id ?? null;
+    setEvents((current) => {
+      const retained = new Map<string, SafeEvent>();
+      for (const event of current) {
+        if (
+          oldestAuthoritativeId !== null &&
+          event.id > 0 &&
+          event.id < oldestAuthoritativeId &&
+          historyKeysRef.current.has(retainedEventKey(event))
+        ) {
+          retained.set(retainedEventKey(event), event);
+        }
+      }
+      for (const event of accepted) {
+        historyKeysRef.current.add(retainedEventKey(event));
+        retained.set(retainedEventKey(event), event);
+      }
+      return retainRecentEvents(
+        [...retained.values()].sort(compareRetainedEvents),
+        historyKeysRef.current,
+      );
     });
   }, []);
 
   useEffect(() => {
     setEvents([]);
+    historyKeysRef.current = new Set();
     if (!threadId) {
       setStreamState('offline');
       return;
@@ -165,7 +238,7 @@ export function useThreadEvents(
         const event: unknown = JSON.parse(raw);
         if (!isSafeEvent(event) || event.threadId !== threadId) return;
         if (message.type !== 'message' && message.type !== event.kind) return;
-        mergeEvents([event], threadId);
+        mergeEvents([event], threadId, 'live');
       } catch {
         // Unknown or malformed events are intentionally ignored.
       }
@@ -185,5 +258,5 @@ export function useThreadEvents(
     };
   }, [afterCursor, mergeEvents, threadId]);
 
-  return { events, streamState, mergeEvents };
+  return { events, streamState, mergeEvents, prependHistory, replaceSnapshot };
 }

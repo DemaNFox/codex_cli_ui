@@ -5,6 +5,7 @@ import type { SafeEvent } from './api.js';
 import {
   PINNED_INTERACTION_RETENTION_LIMIT,
   THREAD_EVENT_RETENTION_LIMIT,
+  THREAD_HISTORY_RETENTION_LIMIT,
   useThreadEvents,
 } from './useThreadEvents.js';
 
@@ -198,5 +199,32 @@ describe('useThreadEvents', () => {
     expect(normalTail).toHaveLength(THREAD_EVENT_RETENTION_LIMIT);
     expect(normalTail[0]?.id).toBe(11);
     expect(normalTail.at(-1)?.id).toBe(130);
+  });
+
+  it('keeps paged history separate from the bounded live activity tail without duplicates', async () => {
+    const { result } = renderHook(() => useThreadEvents('thread-1', 360));
+    const source = FakeEventSource.instances[0]!;
+
+    act(() => {
+      result.current.prependHistory(
+        Array.from({ length: 240 }, (_, index) => event(index + 1)),
+        'thread-1',
+      );
+      result.current.prependHistory([event(120), event(121)], 'thread-1');
+    });
+    expect(result.current.events).toHaveLength(240);
+
+    act(() => {
+      for (let id = 241; id <= 390; id += 1) source.emit(event(id));
+    });
+
+    await waitFor(() => expect(result.current.events.at(-1)?.id).toBe(390));
+    expect(THREAD_HISTORY_RETENTION_LIMIT).toBe(2_400);
+    expect(result.current.events).toHaveLength(240 + THREAD_EVENT_RETENTION_LIMIT);
+    expect(new Set(result.current.events.map((candidate) => candidate.id)).size).toBe(
+      result.current.events.length,
+    );
+    expect(result.current.events[0]?.id).toBe(1);
+    expect(result.current.events[240]?.id).toBe(271);
   });
 });

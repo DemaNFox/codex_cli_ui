@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { App } from './App.js';
 import type { ResourceLimitSnapshot } from './api.js';
+import * as threadHistoryCache from './threadHistoryCache.js';
 
 const session = {
   authenticated: true,
@@ -1046,6 +1047,55 @@ describe('App', () => {
     await user.click(screen.getByRole('button', { name: 'Обновить' }));
   });
 
+  it('renders authenticated cached messages before a delayed server revalidation completes', async () => {
+    const cachedEvent = {
+      id: 10,
+      threadId: thread.id,
+      turnId: 'turn-cached',
+      kind: 'agent-message' as const,
+      phase: 'completed' as const,
+      payload: { text: 'Мгновенно из локального кэша' },
+      createdAt: '2026-10-11T08:00:00.000Z',
+    };
+    const authoritativeEvent = {
+      ...cachedEvent,
+      id: 11,
+      turnId: 'turn-server',
+      payload: { text: 'Свежий ответ сервера' },
+    };
+    const cacheRead = vi.spyOn(threadHistoryCache, 'readThreadHistoryCache').mockResolvedValueOnce({
+      username: 'nick',
+      threadId: thread.id,
+      events: [cachedEvent],
+      oldestEventId: 10,
+      hasMore: true,
+      savedAt: 1,
+    });
+    let releaseHistory!: (response: Response) => void;
+    const delayedHistory = new Promise<Response>((resolve) => {
+      releaseHistory = resolve;
+    });
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') return delayedHistory;
+      return undefined;
+    });
+    render(<App />);
+
+    expect(await screen.findByText('Мгновенно из локального кэша')).not.toBeNull();
+    expect(screen.queryByText('Свежий ответ сервера')).toBeNull();
+
+    releaseHistory(
+      jsonResponse({
+        data: thread,
+        events: [authoritativeEvent],
+        oldestEventId: 11,
+        historyTruncated: true,
+      }),
+    );
+    expect(await screen.findByText('Свежий ответ сервера')).not.toBeNull();
+    cacheRead.mockRestore();
+  });
+
   it('labels a bounded history tail without treating it as a load error', async () => {
     const event = {
       id: 1,
@@ -1070,10 +1120,69 @@ describe('App', () => {
 
     expect(await screen.findByText('Последняя сохранённая задача')).not.toBeNull();
     const notice = screen.getByText(
-      'Показаны последние сообщения; более ранняя история не загружена в окно',
+      'Показаны последние сообщения. Более ранняя история доступна по частям.',
     );
     expect(notice.closest('[role="status"]')).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Загрузить предыдущие сообщения' })).not.toBeNull();
     expect(screen.queryByText('Чат временно недоступен')).toBeNull();
+  });
+
+  it('loads an older history page in place and removes duplicate boundary events', async () => {
+    const latestEvent = {
+      id: 101,
+      threadId: thread.id,
+      turnId: 'turn-101',
+      kind: 'user-message' as const,
+      phase: 'completed' as const,
+      payload: { text: 'Последняя задача' },
+      createdAt: '2026-10-11T09:00:00.000Z',
+    };
+    const olderEvent = {
+      ...latestEvent,
+      id: 100,
+      turnId: 'turn-100',
+      payload: { text: 'Предыдущая задача' },
+      createdAt: '2026-10-11T08:00:00.000Z',
+    };
+    const fetchMock = installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({
+          data: thread,
+          events: [latestEvent],
+          oldestEventId: 101,
+          historyTruncated: true,
+        });
+      if (url === '/api/threads/thread-1/history?before=101&limit=120')
+        return jsonResponse({
+          events: [olderEvent, latestEvent],
+          oldestEventId: 100,
+          hasMore: false,
+        });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    const loadOlderButton = await screen.findByRole('button', {
+      name: 'Загрузить предыдущие сообщения',
+    });
+    const scroll = screen.getByLabelText<HTMLDivElement>('История чата');
+    Object.defineProperty(scroll, 'scrollHeight', {
+      configurable: true,
+      get: () => (screen.queryByText('Предыдущая задача') ? 1_300 : 1_000),
+    });
+    scroll.scrollTop = 50;
+    await user.click(loadOlderButton);
+
+    expect(await screen.findByText('Предыдущая задача')).not.toBeNull();
+    await waitFor(() => expect(scroll.scrollTop).toBe(350));
+    expect(screen.getAllByText('Последняя задача')).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: 'Загрузить предыдущие сообщения' })).toBeNull();
+    expect(
+      fetchMock.mock.calls.some(
+        ([input]) => requestUrl(input) === '/api/threads/thread-1/history?before=101&limit=120',
+      ),
+    ).toBe(true);
   });
 
   it('retries deferred lazy history once after the event stream opens', async () => {

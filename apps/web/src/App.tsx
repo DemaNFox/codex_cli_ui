@@ -24,6 +24,11 @@ import { ApiError, api } from './api.js';
 import { AgentMessageContent } from './AgentMessageContent.js';
 import { ImagePreviewDialog } from './ImagePreviewDialog.js';
 import { normalizeProjectFilePath, ProjectFileDownload } from './ProjectFileDownload.js';
+import {
+  clearThreadHistoryCache,
+  readThreadHistoryCache,
+  writeThreadHistoryCache,
+} from './threadHistoryCache.js';
 import type {
   Attachment,
   AutoRateLimitResetSnapshot,
@@ -3726,6 +3731,9 @@ function Workspace({
   const [threadHistoryWarning, setThreadHistoryWarning] = useState<string | null>(null);
   const [threadHistoryWarningCode, setThreadHistoryWarningCode] = useState<string | null>(null);
   const [threadHistoryTruncated, setThreadHistoryTruncated] = useState(false);
+  const [oldestEventId, setOldestEventId] = useState<number | null>(null);
+  const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
+  const [olderHistoryError, setOlderHistoryError] = useState<string | null>(null);
   const [pendingInteractionsTruncated, setPendingInteractionsTruncated] = useState(false);
   const [threadReloadToken, setThreadReloadToken] = useState(0);
   const [busy, setBusy] = useState(false);
@@ -3755,6 +3763,14 @@ function Workspace({
   const deferredHistoryRetryAttemptedRef = useRef<string | null>(null);
   const deferredHistoryRetryCompletedRef = useRef<string | null>(null);
   const deferredHistoryRetryTimerRef = useRef(0);
+  const historyCacheWriteTimerRef = useRef(0);
+  const historyCacheReadyThreadRef = useRef<string | null>(null);
+  const loadingOlderHistoryRef = useRef(false);
+  const pendingPrependScrollRef = useRef<{
+    threadId: string;
+    scrollHeight: number;
+    scrollTop: number;
+  } | null>(null);
   const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
   const attachmentThreadRef = useRef<string | null>(null);
   const csrfTokenRef = useRef(session.csrfToken);
@@ -3778,7 +3794,10 @@ function Workspace({
   } | null>(null);
   const eventStreamCursor =
     eventStreamStart?.threadId === threadId ? eventStreamStart.cursor : null;
-  const { events, streamState, mergeEvents } = useThreadEvents(threadId, eventStreamCursor);
+  const { events, streamState, mergeEvents, prependHistory, replaceSnapshot } = useThreadEvents(
+    threadId,
+    eventStreamCursor,
+  );
   const latestEvent = events.at(-1) ?? null;
   const latestEventId = latestEvent?.id ?? null;
   const latestCompletedTurnEventId = [...events]
@@ -3963,6 +3982,14 @@ function Workspace({
     positionAtLatestImmediately(scroll);
   }, [approvals, events, permissionRequests, queuedTurns, subagents, threadId, userInputRequests]);
 
+  useLayoutEffect(() => {
+    const pending = pendingPrependScrollRef.current;
+    const scroll = conversationScrollRef.current;
+    if (!pending || !scroll || pending.threadId !== threadId) return;
+    pendingPrependScrollRef.current = null;
+    scroll.scrollTop = pending.scrollTop + (scroll.scrollHeight - pending.scrollHeight);
+  }, [events, threadId]);
+
   useEffect(() => {
     const scroll = conversationScrollRef.current;
     const content = conversationContentRef.current;
@@ -4000,6 +4027,46 @@ function Workspace({
       followingLatestRef.current = false;
     }
     setShowScrollToLatest(!followingLatestRef.current);
+    if (
+      scroll.scrollTop <= 160 &&
+      userScrollIntentRef.current &&
+      threadHistoryTruncated &&
+      !loadingOlderHistoryRef.current
+    ) {
+      void loadOlderHistory();
+    }
+  }
+
+  async function loadOlderHistory(): Promise<void> {
+    if (!threadId || !oldestEventId || !threadHistoryTruncated || loadingOlderHistoryRef.current)
+      return;
+    const requestedThreadId = threadId;
+    const requestedBefore = oldestEventId;
+    const scroll = conversationScrollRef.current;
+    loadingOlderHistoryRef.current = true;
+    setLoadingOlderHistory(true);
+    setOlderHistoryError(null);
+    try {
+      const page = await api.threadHistory(requestedThreadId, requestedBefore);
+      if (attachmentThreadRef.current !== requestedThreadId) return;
+      if (scroll) {
+        pendingPrependScrollRef.current = {
+          threadId: requestedThreadId,
+          scrollHeight: scroll.scrollHeight,
+          scrollTop: scroll.scrollTop,
+        };
+      }
+      prependHistory(page.events, requestedThreadId);
+      setOldestEventId(page.oldestEventId);
+      setThreadHistoryTruncated(page.hasMore);
+    } catch (cause) {
+      if (attachmentThreadRef.current === requestedThreadId) {
+        setOlderHistoryError(`Не удалось загрузить предыдущие сообщения. ${errorMessage(cause)}`);
+      }
+    } finally {
+      loadingOlderHistoryRef.current = false;
+      if (attachmentThreadRef.current === requestedThreadId) setLoadingOlderHistory(false);
+    }
   }
 
   function markConversationScrollIntent(): void {
@@ -4720,7 +4787,13 @@ function Workspace({
     setThreadHistoryWarning(null);
     setThreadHistoryWarningCode(null);
     setThreadHistoryTruncated(false);
+    setOldestEventId(null);
+    setLoadingOlderHistory(false);
+    loadingOlderHistoryRef.current = false;
+    setOlderHistoryError(null);
     setPendingInteractionsTruncated(false);
+    historyCacheReadyThreadRef.current = null;
+    pendingPrependScrollRef.current = null;
     if (!threadId) {
       setThreadLoadState('idle');
       return;
@@ -4728,9 +4801,28 @@ function Workspace({
     setThreadLoadState('loading');
     const requestedThreadId = threadId;
     let cancelled = false;
-    void api
-      .thread(requestedThreadId)
-      .then((history) => {
+    void (async () => {
+      const historyRequest = api.thread(requestedThreadId).then(
+        (value) => ({ value, error: null as unknown }),
+        (cause: unknown) => ({ value: null, error: cause }),
+      );
+      const cached = await readThreadHistoryCache(session.username, requestedThreadId);
+      if (cancelled) return;
+      historyCacheReadyThreadRef.current = requestedThreadId;
+      if (cached?.events.length) {
+        mergeEvents(cached.events, requestedThreadId, 'snapshot');
+        setOldestEventId(cached.oldestEventId);
+        setThreadHistoryTruncated(cached.hasMore);
+        setThreadLoadState('ready');
+      }
+      try {
+        const result = await historyRequest;
+        if (result.error)
+          throw result.error instanceof Error
+            ? result.error
+            : new Error(errorMessage(result.error));
+        const history = result.value;
+        if (!history) throw new Error('История чата недоступна');
         if (cancelled) return;
         const historyCursor = history.eventCursor ?? history.events.at(-1)?.id ?? 0;
         runtimeSnapshotCursorRef.current = historyCursor;
@@ -4740,10 +4832,12 @@ function Workspace({
         setRecentThreads((current) =>
           current.map((item) => (item.id === requestedThreadId ? history.data : item)),
         );
-        mergeEvents(
+        replaceSnapshot(
           [...history.events, ...(history.pendingInteractionEvents ?? [])],
           requestedThreadId,
         );
+        const firstPersistedEventId = history.events.find((event) => event.id > 0)?.id ?? null;
+        setOldestEventId(history.oldestEventId ?? firstPersistedEventId);
         setEventStreamStart({ threadId: requestedThreadId, cursor: historyCursor });
         setServerTurnNavigation(history.turnNavigation ?? null);
         setQueuedTurns(
@@ -4784,14 +4878,21 @@ function Workspace({
         automaticThreadRetryRef.current = null;
         setThreadLoadState('ready');
         setThreadLoadError(null);
-      })
-      .catch((cause: unknown) => {
+      } catch (cause: unknown) {
         if (!cancelled) {
-          setThreadLoadState('error');
-          setThreadLoadError(errorMessage(cause));
+          if (!cached?.events.length) {
+            setThreadLoadState('error');
+            setThreadLoadError(errorMessage(cause));
+          } else {
+            setThreadHistoryWarning(
+              'Показана сохранённая история. Свежая сверка с сервером временно недоступна.',
+            );
+            setThreadHistoryWarningCode('CACHE_REVALIDATION_FAILED');
+          }
           setEventStreamStart({ threadId: requestedThreadId, cursor: 0 });
         }
-      });
+      }
+    })();
     void api
       .attachments(requestedThreadId)
       .then((attachments) => {
@@ -4817,7 +4918,32 @@ function Workspace({
     return () => {
       cancelled = true;
     };
-  }, [closeImagePreview, mergeEvents, threadId, threadReloadToken]);
+  }, [
+    closeImagePreview,
+    mergeEvents,
+    replaceSnapshot,
+    session.username,
+    threadId,
+    threadReloadToken,
+  ]);
+
+  useEffect(() => {
+    window.clearTimeout(historyCacheWriteTimerRef.current);
+    if (!threadId || historyCacheReadyThreadRef.current !== threadId || events.length === 0) return;
+    const cachedThreadId = threadId;
+    historyCacheWriteTimerRef.current = window.setTimeout(() => {
+      if (attachmentThreadRef.current !== cachedThreadId) return;
+      void writeThreadHistoryCache({
+        username: session.username,
+        threadId: cachedThreadId,
+        events,
+        oldestEventId,
+        hasMore: threadHistoryTruncated,
+        savedAt: Date.now(),
+      });
+    }, 250);
+    return () => window.clearTimeout(historyCacheWriteTimerRef.current);
+  }, [events, oldestEventId, session.username, threadHistoryTruncated, threadId]);
 
   useEffect(() => {
     if (
@@ -5839,7 +5965,11 @@ function Workspace({
         disabled={busy}
         mobileOpen={mobileNavigationOpen}
         onMobileClose={closeMobileNavigation}
-        onLogout={() => void api.logout(session.csrfToken).finally(onSignedOut)}
+        onLogout={() =>
+          void api.logout(session.csrfToken).finally(() => {
+            void clearThreadHistoryCache().finally(onSignedOut);
+          })
+        }
         settingsButtonRef={settingsButtonRef}
         onOpenSettings={() => void openSettings('account')}
       />
@@ -5967,7 +6097,28 @@ function Workspace({
           <div className="conversation-content" ref={conversationContentRef}>
             {threadId && threadHistoryTruncated ? (
               <section className="thread-history-truncated notice info" role="status">
-                Показаны последние сообщения; более ранняя история не загружена в окно
+                <span>Показаны последние сообщения. Более ранняя история доступна по частям.</span>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => void loadOlderHistory()}
+                  disabled={loadingOlderHistory || !oldestEventId}
+                >
+                  {loadingOlderHistory ? 'Загружаем…' : 'Загрузить предыдущие сообщения'}
+                </button>
+              </section>
+            ) : null}
+            {threadId && olderHistoryError ? (
+              <section className="thread-history-truncated notice warning" role="alert">
+                <span>{olderHistoryError}</span>
+                <button
+                  type="button"
+                  className="ghost"
+                  onClick={() => void loadOlderHistory()}
+                  disabled={loadingOlderHistory}
+                >
+                  Повторить
+                </button>
               </section>
             ) : null}
             {threadId && pendingInteractionsTruncated ? (
@@ -6545,9 +6696,8 @@ export function App() {
         setSession(value);
         setState('ready');
       })
-      .catch((error: unknown) => {
-        if (error instanceof ApiError && error.status === 401) setState('signed-out');
-        else setState('signed-out');
+      .catch(() => {
+        void clearThreadHistoryCache().finally(() => setState('signed-out'));
       });
   }, []);
 
