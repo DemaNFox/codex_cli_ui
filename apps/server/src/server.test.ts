@@ -749,7 +749,7 @@ async function fixture(
   codexUpdateBroker?: CodexUpdateBroker,
   codexVersionChecker?: CodexVersionChecker,
   codexUpdateStartupRetryMs?: number,
-  configOverrides: Partial<Pick<ServerConfig, 'eventRetentionPerThread'>> = {},
+  configOverrides: Partial<Pick<ServerConfig, 'eventRetentionPerThread' | 'runnerMode'>> = {},
   persistent?: { temp: string; appServer: FakeAppServer },
   threadTitleGenerator?: ThreadTitleGenerator,
   executionReconcileIntervalMs?: number,
@@ -770,6 +770,7 @@ async function fixture(
     sessionTtlMs: 60_000,
     webOrigin: 'https://codex.test',
     projectRoots: [root],
+    runnerMode: 'restricted',
     codexBinary: 'codex',
     codexVersionPin: 'codex-cli 0.153.4',
     cookieSecure: true,
@@ -1153,6 +1154,7 @@ describe('security and repository boundary', () => {
       CODEX_WEB_CODEX_VERSION_PIN: 'codex-cli 0.153.4',
     };
     expect(loadConfig(environment)).toMatchObject({
+      runnerMode: 'restricted',
       eventRetentionPerThread: 1_000,
       maxEventBytes: 32_768,
       transcriptionModel: 'onnx-community/whisper-base',
@@ -1214,6 +1216,10 @@ describe('security and repository boundary', () => {
       loadConfig({ ...environment, CODEX_WEB_EVENT_RETENTION_PER_THREAD: '1001' }),
     ).toThrow();
     expect(() => loadConfig({ ...environment, CODEX_WEB_MAX_EVENT_BYTES: '32769' })).toThrow();
+    expect(loadConfig({ ...environment, CODEX_WEB_RUNNER_MODE: 'host-admin' })).toMatchObject({
+      runnerMode: 'host-admin',
+    });
+    expect(() => loadConfig({ ...environment, CODEX_WEB_RUNNER_MODE: 'invalid' })).toThrow();
     expect(
       loadConfig({
         ...environment,
@@ -7682,6 +7688,153 @@ describe('Codex routes', () => {
     ).toMatchObject({ model: 'gpt-5.6-sol', effort: 'medium' });
   });
 
+  it('preserves selected sandbox policies for restricted direct turns', async () => {
+    const { app, appServer, projectPath } = await fixture(5);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const presets = ['read-only', 'workspace-write', 'full-access'] as const;
+    for (const [index, permissionPreset] of presets.entries()) {
+      const threadId = await createThread(app, project.id, session.headers);
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/threads/${threadId}/turns`,
+        headers: session.headers,
+        payload: {
+          text: `restricted ${permissionPreset}`,
+          permissionPreset,
+          idempotencyKey: `44000000-0000-4000-8000-00000000000${index + 2}`,
+        },
+      });
+      expect(response.statusCode).toBe(202);
+    }
+
+    const starts = appServer.requests.filter((request) => request.method === 'turn/start');
+    expect(starts).toHaveLength(3);
+    expect(starts[0]?.params).toMatchObject({
+      sandboxPolicy: { type: 'readOnly', networkAccess: true },
+    });
+    expect(starts[1]?.params).toMatchObject({
+      sandboxPolicy: {
+        type: 'workspaceWrite',
+        writableRoots: [projectPath],
+        networkAccess: true,
+        excludeTmpdirEnvVar: true,
+        excludeSlashTmp: true,
+      },
+    });
+    expect(starts[2]?.params).toMatchObject({
+      sandboxPolicy: { type: 'dangerFullAccess' },
+    });
+  });
+
+  it('forces host-admin direct and queued turns to use danger-full-access', async () => {
+    const { app, appServer, projectPath } = await fixture(
+      1,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { runnerMode: 'host-admin' },
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const activeThreadId = await createThread(app, project.id, session.headers);
+    const queuedThreadId = await createThread(app, project.id, session.headers);
+    const threadStarts = appServer.requests.filter((request) => request.method === 'thread/start');
+    expect(threadStarts).toHaveLength(2);
+    for (const request of threadStarts)
+      expect(request.params).toMatchObject({ sandbox: 'danger-full-access' });
+
+    const active = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${activeThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'host admin direct',
+        permissionPreset: 'read-only',
+        idempotencyKey: '44000000-0000-4000-8000-000000000005',
+      },
+    });
+    expect(active.json()).toMatchObject({ data: { status: 'started' } });
+    const queued = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'host admin queued',
+        permissionPreset: 'workspace-write',
+        approvalPolicy: 'never',
+        model: 'gpt-6.1-sol',
+        reasoningEffort: 'medium',
+        idempotencyKey: '44000000-0000-4000-8000-000000000006',
+      },
+    });
+    expect(queued.json()).toMatchObject({ data: { status: 'queued' } });
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(1);
+
+    appServer.restart();
+    appServer.setThreadStatus(activeThreadId, 'idle');
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: activeThreadId, turn: { id: 'turn-1', status: 'completed' } },
+    });
+    await vi.waitFor(() => {
+      expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(
+        2,
+      );
+    });
+    for (const request of appServer.requests.filter(
+      (candidate) => candidate.method === 'turn/start',
+    )) {
+      expect(request.params).toMatchObject({ sandboxPolicy: { type: 'dangerFullAccess' } });
+    }
+    const queuedResume = appServer.requests.find((request) => request.method === 'thread/resume');
+    expect(queuedResume?.params).toMatchObject({
+      threadId: queuedThreadId,
+      sandbox: 'danger-full-access',
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      model: 'gpt-6.1-sol',
+      config: { model_reasoning_effort: 'medium' },
+    });
+
+    appServer.setThreadStatus(queuedThreadId, 'idle');
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: queuedThreadId, turn: { id: 'turn-2', status: 'completed' } },
+    });
+    appServer.restart();
+    const resumedDirect = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'host admin direct after restart',
+        permissionPreset: 'read-only',
+        approvalPolicy: 'untrusted',
+        model: 'gpt-6-sol',
+        reasoningEffort: 'high',
+        idempotencyKey: '44000000-0000-4000-8000-000000000007',
+      },
+    });
+    expect(resumedDirect.json()).toMatchObject({ data: { status: 'started' } });
+    const resumes = appServer.requests.filter((request) => request.method === 'thread/resume');
+    expect(resumes).toHaveLength(2);
+    expect(resumes[1]?.params).toMatchObject({
+      threadId: queuedThreadId,
+      sandbox: 'danger-full-access',
+      approvalPolicy: 'untrusted',
+      approvalsReviewer: 'user',
+      model: 'gpt-6-sol',
+      config: { model_reasoning_effort: 'high' },
+    });
+  });
+
   it('drains only new turns and reports pending plus active work in health', async () => {
     const { app, appServer, projectPath, upgradeDrainPath } = await fixture();
     const session = await login(app);
@@ -9817,7 +9970,13 @@ describe('Codex routes', () => {
     expect(appServer.requests.filter((item) => item.method === 'thread/resume')).toHaveLength(1);
     expect(
       appServer.requests.find((item) => item.method === 'thread/resume')?.params,
-    ).toMatchObject({ config: { agents: { max_threads: 6 } } });
+    ).toMatchObject({
+      sandbox: 'workspace-write',
+      approvalPolicy: 'on-request',
+      approvalsReviewer: 'user',
+      model: null,
+      config: { agents: { max_threads: 6 } },
+    });
   });
 
   it('explains when an empty pre-restart chat was never persisted by Codex', async () => {

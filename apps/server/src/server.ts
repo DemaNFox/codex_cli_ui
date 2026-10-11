@@ -33,6 +33,7 @@ import {
   updateResourceLimitsRequestSchema,
   applyResourceLimitsRequestSchema,
   userInputQuestionSchema,
+  type ApprovalPolicy,
   type PermissionPreset,
   type Attachment,
   type AutoRateLimitResetSnapshot,
@@ -1034,15 +1035,58 @@ function mapThread(
   };
 }
 
-function sandboxPolicy(preset: PermissionPreset, projectPath: string): Record<string, unknown> {
-  if (preset === 'read-only') return { type: 'readOnly', networkAccess: true };
-  if (preset === 'full-access') return { type: 'dangerFullAccess' };
+function sandboxMode(
+  runnerMode: ServerConfig['runnerMode'],
+  preset: PermissionPreset,
+): 'read-only' | 'workspace-write' | 'danger-full-access' {
+  if (runnerMode === 'host-admin' || preset === 'full-access') return 'danger-full-access';
+  return preset;
+}
+
+function sandboxPolicy(
+  runnerMode: ServerConfig['runnerMode'],
+  preset: PermissionPreset,
+  projectPath: string,
+): Record<string, unknown> {
+  const mode = sandboxMode(runnerMode, preset);
+  if (mode === 'read-only') return { type: 'readOnly', networkAccess: true };
+  if (mode === 'danger-full-access') return { type: 'dangerFullAccess' };
   return {
     type: 'workspaceWrite',
     writableRoots: [projectPath],
     networkAccess: true,
     excludeTmpdirEnvVar: true,
     excludeSlashTmp: true,
+  };
+}
+
+function resumeThreadParams(input: {
+  threadId: string;
+  cwd: string;
+  runnerMode: ServerConfig['runnerMode'];
+  permissionPreset: PermissionPreset;
+  approvalPolicy: ApprovalPolicy | undefined;
+  model: string | null | undefined;
+  reasoningEffort: string | null | undefined;
+  executionAgentLimit: number | undefined;
+}): Record<string, unknown> {
+  const resumeConfig = {
+    ...(input.reasoningEffort === null || input.reasoningEffort === undefined
+      ? {}
+      : { model_reasoning_effort: input.reasoningEffort }),
+    ...(input.executionAgentLimit === undefined
+      ? {}
+      : { agents: { max_threads: input.executionAgentLimit } }),
+  };
+  return {
+    threadId: input.threadId,
+    cwd: input.cwd,
+    excludeTurns: true,
+    sandbox: sandboxMode(input.runnerMode, input.permissionPreset),
+    approvalPolicy: input.approvalPolicy ?? 'on-request',
+    approvalsReviewer: 'user',
+    model: input.model ?? null,
+    ...(Object.keys(resumeConfig).length === 0 ? {} : { config: resumeConfig }),
   };
 }
 
@@ -3837,7 +3881,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           model: input.model ?? project.defaultModel,
           approvalPolicy: input.approvalPolicy,
           approvalsReviewer: 'user',
-          sandbox: preset === 'full-access' ? 'danger-full-access' : preset,
+          sandbox: sandboxMode(config.runnerMode, preset),
           config:
             (reasoningEffort === null || reasoningEffort === undefined) &&
             configuredAgentLimit === null
@@ -4568,14 +4612,19 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       if (loadedThreadGenerations.get(thread.id) !== appServer.generation) {
         if (!repository.isThreadHistoryHydrated(thread.id)) await hydrateThreadHistory(thread);
         const resumed = threadResponseSchema.parse(
-          await appServer.request('thread/resume', {
-            threadId: thread.id,
-            cwd: resumeCwd,
-            excludeTurns: true,
-            ...(executionAgentLimit === undefined
-              ? {}
-              : { config: { agents: { max_threads: executionAgentLimit } } }),
-          }),
+          await appServer.request(
+            'thread/resume',
+            resumeThreadParams({
+              threadId: thread.id,
+              cwd: resumeCwd,
+              runnerMode: config.runnerMode,
+              permissionPreset: claimed.request.permissionPreset ?? project.defaultPermissionPreset,
+              approvalPolicy: claimed.request.approvalPolicy,
+              model: claimed.request.model ?? project.defaultModel,
+              reasoningEffort: claimed.request.reasoningEffort ?? project.defaultReasoningEffort,
+              executionAgentLimit,
+            }),
+          ),
         );
         if (resumed.thread.cwd !== resumeCwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
         loadedThreadGenerations.set(thread.id, appServer.generation);
@@ -4631,6 +4680,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           approvalPolicy: claimed.request.approvalPolicy,
           approvalsReviewer: 'user',
           sandboxPolicy: sandboxPolicy(
+            config.runnerMode,
             claimed.request.permissionPreset ?? project.defaultPermissionPreset,
             turnCwd,
           ),
@@ -5071,14 +5121,19 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         let resumed: z.infer<typeof threadResponseSchema>;
         try {
           resumed = threadResponseSchema.parse(
-            await appServer.request('thread/resume', {
-              threadId: id,
-              cwd: resumeCwd,
-              excludeTurns: true,
-              ...(executionAgentLimit === undefined
-                ? {}
-                : { config: { agents: { max_threads: executionAgentLimit } } }),
-            }),
+            await appServer.request(
+              'thread/resume',
+              resumeThreadParams({
+                threadId: id,
+                cwd: resumeCwd,
+                runnerMode: config.runnerMode,
+                permissionPreset: preset,
+                approvalPolicy: input.approvalPolicy,
+                model: input.model ?? project.defaultModel,
+                reasoningEffort: input.reasoningEffort ?? project.defaultReasoningEffort,
+                executionAgentLimit,
+              }),
+            ),
           );
         } catch (error) {
           const emptyLocalThread = repository.listEvents(id, 0, 1).length === 0;
@@ -5121,7 +5176,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           effort: input.reasoningEffort ?? project.defaultReasoningEffort,
           approvalPolicy: input.approvalPolicy,
           approvalsReviewer: 'user',
-          sandboxPolicy: sandboxPolicy(preset, turnCwd),
+          sandboxPolicy: sandboxPolicy(config.runnerMode, preset, turnCwd),
         }),
       );
       performanceState(id, result.turn.id).startedAtMono ??= turnStartIssuedAtMono;

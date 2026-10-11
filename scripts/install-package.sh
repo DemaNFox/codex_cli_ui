@@ -867,6 +867,7 @@ legacy = os.environ["LEGACY_ADOPTION"] == "true"
 updates = {
     "CODEX_WEB_CODEX_VERSION_PIN": f'"{os.environ["VERSION_PIN"]}"',
     "CODEX_WEB_PROJECT_ROOTS": os.environ["PROJECT_ROOTS"],
+    "CODEX_WEB_RUNNER_MODE": os.environ["RUNNER_MODE"],
 }
 if os.environ.get("RUNNER_MODE") == "host-admin":
     updates["CODEX_WEB_PROJECT_PATH_BROKER_SOCKET"] = "/run/codex-web-ui/project-path-broker.sock"
