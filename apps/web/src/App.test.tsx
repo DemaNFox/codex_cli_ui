@@ -4875,6 +4875,7 @@ describe('App', () => {
           events: laterEvents,
           eventCursor: 131,
           pendingInteractionEvents: [pendingApproval],
+          pendingInteractionsTruncated: true,
         });
       return undefined;
     });
@@ -4882,6 +4883,9 @@ describe('App', () => {
 
     expect(await screen.findByText('Разрешить долгую проверку?')).not.toBeNull();
     expect(screen.getByRole('button', { name: 'Разрешить' })).not.toBeNull();
+    expect(
+      screen.getByText('Показана только часть ожидающих действий; список ограничен сервером'),
+    ).not.toBeNull();
     await waitFor(() => expect(FakeEventSource.instances.length).toBeGreaterThan(0));
     act(() => {
       FakeEventSource.instances.at(-1)?.emit({

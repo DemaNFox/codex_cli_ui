@@ -74,6 +74,21 @@ function isPendingInteractionStart(event: SafeEvent): boolean {
   return request.status === 'pending';
 }
 
+function retainedEventKey(event: SafeEvent): string {
+  if (event.id > 0) return `event:${event.id}`;
+  const interactionKey = interactionEventKey(event);
+  return interactionKey ? `synthetic:${interactionKey}` : `event:${event.id}`;
+}
+
+function isSyntheticInteraction(event: SafeEvent): boolean {
+  return event.id <= 0 && interactionEventKey(event) !== null;
+}
+
+function compareRetainedEvents(left: SafeEvent, right: SafeEvent): number {
+  if (left.id !== right.id) return left.id - right.id;
+  return retainedEventKey(left).localeCompare(retainedEventKey(right));
+}
+
 function retainRecentEvents(events: SafeEvent[]): SafeEvent[] {
   const pendingInteractions = new Map<string, SafeEvent>();
   for (const event of events) {
@@ -83,12 +98,14 @@ function retainRecentEvents(events: SafeEvent[]): SafeEvent[] {
     else pendingInteractions.delete(key);
   }
 
-  const tail = events.slice(-THREAD_EVENT_RETENTION_LIMIT);
-  const tailIds = new Set(tail.map((event) => event.id));
+  const tail = events
+    .filter((event) => !isSyntheticInteraction(event))
+    .slice(-THREAD_EVENT_RETENTION_LIMIT);
+  const tailKeys = new Set(tail.map(retainedEventKey));
   const pinned = [...pendingInteractions.values()]
-    .filter((event) => !tailIds.has(event.id))
+    .filter((event) => !tailKeys.has(retainedEventKey(event)))
     .slice(-PINNED_INTERACTION_RETENTION_LIMIT);
-  return [...pinned, ...tail].sort((left, right) => left.id - right.id);
+  return [...pinned, ...tail].sort(compareRetainedEvents);
 }
 
 export function useThreadEvents(
@@ -112,10 +129,10 @@ export function useThreadEvents(
     );
     if (!accepted.length) return;
     setEvents((current) => {
-      const byId = new Map(current.map((event) => [event.id, event]));
-      for (const event of accepted) byId.set(event.id, event);
+      const retained = new Map(current.map((event) => [retainedEventKey(event), event]));
+      for (const event of accepted) retained.set(retainedEventKey(event), event);
       return retainRecentEvents(
-        [...byId.values()].sort((left, right) => left.id - right.id),
+        [...retained.values()].sort(compareRetainedEvents),
       );
     });
   }, []);

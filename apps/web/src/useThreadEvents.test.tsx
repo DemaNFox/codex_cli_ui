@@ -48,7 +48,11 @@ function event(id: number): SafeEvent {
   };
 }
 
-function approvalEvent(id: number, phase: 'started' | 'completed'): SafeEvent {
+function approvalEvent(
+  id: number,
+  phase: 'started' | 'completed',
+  approvalId = '22222222-2222-4222-8222-222222222222',
+): SafeEvent {
   return {
     id,
     threadId: 'thread-1',
@@ -56,7 +60,7 @@ function approvalEvent(id: number, phase: 'started' | 'completed'): SafeEvent {
     kind: 'approval',
     phase,
     payload: {
-      id: '22222222-2222-4222-8222-222222222222',
+      id: approvalId,
       ...(phase === 'started' ? { summary: 'Разрешить запуск тестов?' } : {}),
     },
     createdAt: '2026-10-11T12:00:00.000Z',
@@ -121,5 +125,56 @@ describe('useThreadEvents', () => {
     expect(result.current.events).toHaveLength(THREAD_EVENT_RETENTION_LIMIT);
     expect(result.current.events.some((candidate) => candidate.id === 1)).toBe(false);
     expect(result.current.events[0]?.id).toBe(13);
+  });
+
+  it('keeps distinct synthetic pending interactions and removes only the matching terminal one', async () => {
+    const approvalId = '33333333-3333-4333-8333-333333333333';
+    const syntheticInteractions: SafeEvent[] = [
+      approvalEvent(0, 'started', approvalId),
+      {
+        id: 0,
+        threadId: 'thread-1',
+        turnId: 'turn-input',
+        kind: 'user-input',
+        phase: 'started',
+        payload: { request: { id: 'input-1', status: 'pending', questions: [] } },
+        createdAt: '2026-10-11T12:00:00.000Z',
+      },
+      {
+        id: 0,
+        threadId: 'thread-1',
+        turnId: 'turn-permission',
+        kind: 'permission-approval',
+        phase: 'started',
+        payload: { request: { id: 'permission-1', status: 'pending' } },
+        createdAt: '2026-10-11T12:00:00.000Z',
+      },
+    ];
+    const { result } = renderHook(() => useThreadEvents('thread-1', 131));
+    const source = FakeEventSource.instances[0]!;
+
+    act(() => {
+      result.current.mergeEvents(
+        [
+          ...syntheticInteractions,
+          ...Array.from({ length: 130 }, (_, index) => event(index + 2)),
+        ],
+        'thread-1',
+      );
+    });
+    expect(result.current.events.filter((candidate) => candidate.id === 0)).toHaveLength(3);
+    expect(result.current.events).toHaveLength(THREAD_EVENT_RETENTION_LIMIT + 3);
+    expect(result.current.events.at(-1)?.id).toBe(131);
+
+    act(() => source.emit(approvalEvent(132, 'completed', approvalId)));
+
+    await waitFor(() => expect(result.current.events.at(-1)?.id).toBe(132));
+    const remainingSynthetic = result.current.events.filter((candidate) => candidate.id === 0);
+    expect(remainingSynthetic).toHaveLength(2);
+    expect(remainingSynthetic.map((candidate) => candidate.kind).sort()).toEqual([
+      'permission-approval',
+      'user-input',
+    ]);
+    expect(result.current.events).toHaveLength(THREAD_EVENT_RETENTION_LIMIT + 2);
   });
 });

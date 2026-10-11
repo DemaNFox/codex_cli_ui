@@ -3726,6 +3726,7 @@ function Workspace({
   const [threadHistoryWarning, setThreadHistoryWarning] = useState<string | null>(null);
   const [threadHistoryWarningCode, setThreadHistoryWarningCode] = useState<string | null>(null);
   const [threadHistoryTruncated, setThreadHistoryTruncated] = useState(false);
+  const [pendingInteractionsTruncated, setPendingInteractionsTruncated] = useState(false);
   const [threadReloadToken, setThreadReloadToken] = useState(0);
   const [busy, setBusy] = useState(false);
   const [interrupting, setInterrupting] = useState(false);
@@ -4719,6 +4720,7 @@ function Workspace({
     setThreadHistoryWarning(null);
     setThreadHistoryWarningCode(null);
     setThreadHistoryTruncated(false);
+    setPendingInteractionsTruncated(false);
     if (!threadId) {
       setThreadLoadState('idle');
       return;
@@ -4768,6 +4770,7 @@ function Workspace({
           history.historyState === 'degraded' ? (history.historyWarning ?? 'DEGRADED') : null,
         );
         setThreadHistoryTruncated(history.historyTruncated === true);
+        setPendingInteractionsTruncated(history.pendingInteractionsTruncated === true);
         if (deferredHistory && deferredHistoryRetryAttemptedRef.current !== requestedThreadId) {
           deferredHistoryRetryAttemptedRef.current = requestedThreadId;
           window.clearTimeout(deferredHistoryRetryTimerRef.current);
@@ -5260,6 +5263,7 @@ function Workspace({
           [...refreshed.events, ...(refreshed.pendingInteractionEvents ?? [])],
           threadId,
         );
+        setPendingInteractionsTruncated(refreshed.pendingInteractionsTruncated === true);
         setServerTurnNavigation(refreshed.turnNavigation ?? null);
         setSubagents(reconciledSubagents);
         targetActiveTurnId = reconciledThread.activeTurnId;
@@ -5510,6 +5514,7 @@ function Workspace({
           [...history.events, ...(history.pendingInteractionEvents ?? [])],
           targetThreadId,
         );
+        setPendingInteractionsTruncated(history.pendingInteractionsTruncated === true);
         setServerTurnNavigation(history.turnNavigation ?? null);
         setQueuedTurns(nextQueuedTurns);
       } catch {
@@ -5966,6 +5971,11 @@ function Workspace({
             {threadId && threadHistoryTruncated ? (
               <section className="thread-history-truncated notice info" role="status">
                 Показаны последние сообщения; более ранняя история не загружена в окно
+              </section>
+            ) : null}
+            {threadId && pendingInteractionsTruncated ? (
+              <section className="thread-history-truncated notice warning" role="status">
+                Показана только часть ожидающих действий; список ограничен сервером
               </section>
             ) : null}
             {threadId && threadHistoryWarning ? (
