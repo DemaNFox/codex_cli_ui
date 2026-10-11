@@ -2,7 +2,11 @@ import { act, renderHook, waitFor } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import type { SafeEvent } from './api.js';
-import { THREAD_EVENT_RETENTION_LIMIT, useThreadEvents } from './useThreadEvents.js';
+import {
+  PINNED_INTERACTION_RETENTION_LIMIT,
+  THREAD_EVENT_RETENTION_LIMIT,
+  useThreadEvents,
+} from './useThreadEvents.js';
 
 class FakeEventSource {
   static instances: FakeEventSource[] = [];
@@ -155,10 +159,7 @@ describe('useThreadEvents', () => {
 
     act(() => {
       result.current.mergeEvents(
-        [
-          ...syntheticInteractions,
-          ...Array.from({ length: 130 }, (_, index) => event(index + 2)),
-        ],
+        [...syntheticInteractions, ...Array.from({ length: 130 }, (_, index) => event(index + 2))],
         'thread-1',
       );
     });
@@ -176,5 +177,26 @@ describe('useThreadEvents', () => {
       'user-input',
     ]);
     expect(result.current.events).toHaveLength(THREAD_EVENT_RETENTION_LIMIT + 2);
+  });
+
+  it('retains 64 synthetic interactions alongside the full normal event tail', () => {
+    const syntheticInteractions = Array.from({ length: 64 }, (_, index) =>
+      approvalEvent(0, 'started', `approval-${index + 1}`),
+    );
+    const { result } = renderHook(() => useThreadEvents('thread-1', 130));
+
+    act(() => {
+      result.current.mergeEvents(
+        [...syntheticInteractions, ...Array.from({ length: 130 }, (_, index) => event(index + 1))],
+        'thread-1',
+      );
+    });
+
+    expect(PINNED_INTERACTION_RETENTION_LIMIT).toBe(120);
+    expect(result.current.events.filter((candidate) => candidate.id === 0)).toHaveLength(64);
+    const normalTail = result.current.events.filter((candidate) => candidate.id > 0);
+    expect(normalTail).toHaveLength(THREAD_EVENT_RETENTION_LIMIT);
+    expect(normalTail[0]?.id).toBe(11);
+    expect(normalTail.at(-1)?.id).toBe(130);
   });
 });

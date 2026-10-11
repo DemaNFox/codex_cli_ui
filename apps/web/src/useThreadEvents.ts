@@ -5,7 +5,7 @@ import type { SafeEvent } from './api.js';
 export type StreamState = 'connecting' | 'open' | 'offline';
 
 export const THREAD_EVENT_RETENTION_LIMIT = 120;
-export const PINNED_INTERACTION_RETENTION_LIMIT = 32;
+export const PINNED_INTERACTION_RETENTION_LIMIT = 120;
 
 const safeEventKinds = [
   'thread',
@@ -52,12 +52,8 @@ function interactionEventKey(event: SafeEvent): string | null {
   if (event.kind === 'approval') {
     const nested = event.payload.approval;
     const approval =
-      nested && typeof nested === 'object'
-        ? (nested as Record<string, unknown>)
-        : event.payload;
-    return typeof approval.id === 'string' && approval.id
-      ? `${event.kind}:${approval.id}`
-      : null;
+      nested && typeof nested === 'object' ? (nested as Record<string, unknown>) : event.payload;
+    return typeof approval.id === 'string' && approval.id ? `${event.kind}:${approval.id}` : null;
   }
   const nested = event.payload.request;
   const request =
@@ -131,9 +127,7 @@ export function useThreadEvents(
     setEvents((current) => {
       const retained = new Map(current.map((event) => [retainedEventKey(event), event]));
       for (const event of accepted) retained.set(retainedEventKey(event), event);
-      return retainRecentEvents(
-        [...retained.values()].sort(compareRetainedEvents),
-      );
+      return retainRecentEvents([...retained.values()].sort(compareRetainedEvents));
     });
   }, []);
 
