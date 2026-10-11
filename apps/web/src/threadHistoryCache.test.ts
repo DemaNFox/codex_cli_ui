@@ -3,6 +3,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SafeEvent } from './api.js';
 import {
   clearThreadHistoryCache,
+  disableThreadHistoryCacheWrites,
+  enableThreadHistoryCacheWrites,
   readThreadHistoryCache,
   writeThreadHistoryCache,
 } from './threadHistoryCache.js';
@@ -75,6 +77,42 @@ function memoryIndexedDb() {
   };
 }
 
+function delayedFirstOpenIndexedDb() {
+  const records = new Map<string, unknown>();
+  const database = {
+    objectStoreNames: { contains: () => true },
+    createObjectStore: () => ({ createIndex: vi.fn() }),
+    transaction: () => new MemoryTransaction(records),
+    close: vi.fn(),
+  };
+  let firstOpen: {
+    result: typeof database;
+    error: null;
+    onupgradeneeded: (() => void) | null;
+    onsuccess: (() => void) | null;
+    onerror: (() => void) | null;
+  } | null = null;
+  let openCount = 0;
+  return {
+    indexedDb: {
+      open: () => {
+        const target = {
+          result: database,
+          error: null,
+          onupgradeneeded: null as (() => void) | null,
+          onsuccess: null as (() => void) | null,
+          onerror: null as (() => void) | null,
+        };
+        if (openCount === 0) firstOpen = target;
+        else queueMicrotask(() => target.onsuccess?.());
+        openCount += 1;
+        return target;
+      },
+    },
+    releaseFirstOpen: () => queueMicrotask(() => firstOpen?.onsuccess?.()),
+  };
+}
+
 function event(id: number, text = `Event ${id}`): SafeEvent {
   return {
     id,
@@ -100,7 +138,10 @@ function completedTurn(id: number): SafeEvent {
 }
 
 describe('threadHistoryCache', () => {
-  beforeEach(() => vi.stubGlobal('indexedDB', memoryIndexedDb()));
+  beforeEach(() => {
+    enableThreadHistoryCacheWrites();
+    vi.stubGlobal('indexedDB', memoryIndexedDb());
+  });
   afterEach(() => vi.unstubAllGlobals());
 
   it('returns a cached transcript without waiting for a delayed server refresh', async () => {
@@ -143,6 +184,42 @@ describe('threadHistoryCache', () => {
     expect(await readThreadHistoryCache('nick', 'thread-1')).toBeNull();
   });
 
+  it('does not repopulate the cache when an earlier write opens after sign-out clear', async () => {
+    const controlled = delayedFirstOpenIndexedDb();
+    vi.stubGlobal('indexedDB', controlled.indexedDb);
+    const staleWrite = writeThreadHistoryCache({
+      username: 'nick',
+      threadId: 'thread-1',
+      events: [event(1, 'Private transcript')],
+      oldestEventId: 1,
+      hasMore: false,
+      savedAt: 10,
+    });
+    await Promise.resolve();
+
+    await clearThreadHistoryCache();
+    controlled.releaseFirstOpen();
+    await staleWrite;
+
+    expect(await readThreadHistoryCache('nick', 'thread-1')).toBeNull();
+  });
+
+  it('rejects a stale scheduled write that starts after sign-out disables the cache', async () => {
+    disableThreadHistoryCacheWrites();
+    const clearing = clearThreadHistoryCache();
+    await writeThreadHistoryCache({
+      username: 'nick',
+      threadId: 'thread-1',
+      events: [event(1, 'Private transcript')],
+      oldestEventId: 1,
+      hasMore: false,
+      savedAt: 10,
+    });
+    await clearing;
+
+    expect(await readThreadHistoryCache('nick', 'thread-1')).toBeNull();
+  });
+
   it('bounds a cached thread to the newest 600 normalized events', async () => {
     await writeThreadHistoryCache({
       username: 'nick',
@@ -158,6 +235,68 @@ describe('threadHistoryCache', () => {
     expect(cached?.events[0]?.id).toBe(101);
     expect(cached?.events.at(-1)?.id).toBe(700);
     expect(cached?.oldestEventId).toBe(101);
+    expect(cached?.hasMore).toBe(true);
+  });
+
+  it('does not move the contiguous page cursor to a separately restored older turn', async () => {
+    await writeThreadHistoryCache({
+      username: 'nick',
+      threadId: 'thread-1',
+      events: [event(10, 'Restored old turn'), event(1_000, 'Current page')],
+      oldestEventId: 1_000,
+      hasMore: true,
+      savedAt: 10,
+    });
+
+    const cached = await readThreadHistoryCache('nick', 'thread-1');
+    expect(cached?.events.map((item) => item.id)).toEqual([10, 1_000]);
+    expect(cached?.oldestEventId).toBe(1_000);
+    expect(cached?.hasMore).toBe(true);
+  });
+
+  it('preserves the contiguous page cursor when sparse restored turns exceed cache capacity', async () => {
+    const sparseTurnEvents = Array.from({ length: 200 }, (_, index) => event(index + 1));
+    const contiguousPageEvents = Array.from({ length: 500 }, (_, index) => event(index + 1_000));
+    await writeThreadHistoryCache({
+      username: 'nick',
+      threadId: 'thread-1',
+      events: [...sparseTurnEvents, ...contiguousPageEvents],
+      oldestEventId: 1_000,
+      hasMore: true,
+      savedAt: 10,
+    });
+
+    const cached = await readThreadHistoryCache('nick', 'thread-1');
+    expect(cached?.events).toHaveLength(600);
+    expect(cached?.events.slice(0, 100).map((item) => item.id)).toEqual(
+      Array.from({ length: 100 }, (_, index) => index + 101),
+    );
+    expect(cached?.events.slice(100).map((item) => item.id)).toEqual(
+      Array.from({ length: 500 }, (_, index) => index + 1_000),
+    );
+    expect(cached?.oldestEventId).toBe(1_000);
+    expect(cached?.hasMore).toBe(true);
+  });
+
+  it('reserves cache space for a restored turn when the contiguous page is full', async () => {
+    const sparseTurnEvents = [event(10), completedTurn(11)];
+    const contiguousPageEvents = Array.from({ length: 600 }, (_, index) => event(index + 1_000));
+    await writeThreadHistoryCache({
+      username: 'nick',
+      threadId: 'thread-1',
+      events: [...sparseTurnEvents, ...contiguousPageEvents],
+      oldestEventId: 1_000,
+      hasMore: true,
+      savedAt: 10,
+    });
+
+    const cached = await readThreadHistoryCache('nick', 'thread-1');
+    expect(cached?.events).toHaveLength(600);
+    expect(cached?.events.slice(0, 2).map((item) => item.id)).toEqual([10, 11]);
+    expect(cached?.events.slice(2).map((item) => item.id)).toEqual(
+      Array.from({ length: 598 }, (_, index) => index + 1_002),
+    );
+    expect(cached?.oldestEventId).toBe(1_002);
     expect(cached?.hasMore).toBe(true);
   });
 

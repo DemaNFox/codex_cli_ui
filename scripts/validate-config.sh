@@ -100,6 +100,7 @@ required = (
     "CODEX_WEB_PUBLIC_ORIGIN",
     "CODEX_WEB_DATABASE_PATH",
     "CODEX_WEB_PROJECT_ROOTS",
+    "CODEX_WEB_RUNNER_MODE",
     "CODEX_WEB_ATTACHMENT_STORAGE_PATH",
     "CODEX_WEB_APP_SERVER_SOCKET",
     "CODEX_WEB_CODEX_VERSION_PIN",
@@ -126,6 +127,8 @@ if not re.fullmatch(r"https://[^/]+", values["CODEX_WEB_PUBLIC_ORIGIN"]):
     fail("CODEX_WEB_PUBLIC_ORIGIN must be one HTTPS origin without a path")
 if values.get("CODEX_WEB_COOKIE_SECURE", "true") != "true":
     fail("CODEX_WEB_COOKIE_SECURE must remain true")
+if values["CODEX_WEB_RUNNER_MODE"] not in {"restricted", "host-admin"}:
+    fail("invalid CODEX_WEB_RUNNER_MODE")
 if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", values["CODEX_WEB_ADMIN_USERNAME"]):
     fail("invalid admin username")
 validate_admin_hash(values["CODEX_WEB_ADMIN_PASSWORD_HASH"])

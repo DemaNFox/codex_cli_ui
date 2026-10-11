@@ -4,6 +4,7 @@ import {
   type CodexUpdateSnapshot,
   type SafeEvent,
   type Thread,
+  type TurnNavigationEntry,
 } from '@codex-web/contracts';
 import { hash } from 'argon2';
 import { EventEmitter } from 'node:events';
@@ -749,7 +750,7 @@ async function fixture(
   codexUpdateBroker?: CodexUpdateBroker,
   codexVersionChecker?: CodexVersionChecker,
   codexUpdateStartupRetryMs?: number,
-  configOverrides: Partial<Pick<ServerConfig, 'eventRetentionPerThread'>> = {},
+  configOverrides: Partial<Pick<ServerConfig, 'eventRetentionPerThread' | 'runnerMode'>> = {},
   persistent?: { temp: string; appServer: FakeAppServer },
   threadTitleGenerator?: ThreadTitleGenerator,
   executionReconcileIntervalMs?: number,
@@ -770,6 +771,7 @@ async function fixture(
     sessionTtlMs: 60_000,
     webOrigin: 'https://codex.test',
     projectRoots: [root],
+    runnerMode: 'restricted',
     codexBinary: 'codex',
     codexVersionPin: 'codex-cli 0.153.4',
     cookieSecure: true,
@@ -1153,6 +1155,7 @@ describe('security and repository boundary', () => {
       CODEX_WEB_CODEX_VERSION_PIN: 'codex-cli 0.153.4',
     };
     expect(loadConfig(environment)).toMatchObject({
+      runnerMode: 'restricted',
       eventRetentionPerThread: 1_000,
       maxEventBytes: 32_768,
       transcriptionModel: 'onnx-community/whisper-base',
@@ -1214,6 +1217,10 @@ describe('security and repository boundary', () => {
       loadConfig({ ...environment, CODEX_WEB_EVENT_RETENTION_PER_THREAD: '1001' }),
     ).toThrow();
     expect(() => loadConfig({ ...environment, CODEX_WEB_MAX_EVENT_BYTES: '32769' })).toThrow();
+    expect(loadConfig({ ...environment, CODEX_WEB_RUNNER_MODE: 'host-admin' })).toMatchObject({
+      runnerMode: 'host-admin',
+    });
+    expect(() => loadConfig({ ...environment, CODEX_WEB_RUNNER_MODE: 'invalid' })).toThrow();
     expect(
       loadConfig({
         ...environment,
@@ -6436,6 +6443,508 @@ describe('Codex routes', () => {
     }
   });
 
+  it('reloads retained transcript boundaries for a noisy turn outside the recent event tail', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'older-noisy-turn';
+    repository.appendTurnNavigation({ threadId, turnId, label: 'Older noisy task' });
+    const user = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'Build the retained result' },
+    });
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Interim progress', messagePhase: 'commentary' },
+    });
+    const finalAnswer = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'The retained result is ready', messagePhase: 'final_answer' },
+    });
+    const fileChange = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'file-change',
+      phase: 'completed',
+      payload: { status: 'completed', changes: [{ path: 'result.md', kind: 'add' }] },
+    });
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'file-change',
+      phase: 'delta',
+      payload: { diff: 'must not be returned' },
+    });
+    const terminal = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+    for (let index = 0; index < 140; index += 1) {
+      repository.appendEvent({
+        threadId,
+        turnId: `newer-turn-${index}`,
+        kind: 'warning',
+        phase: 'state',
+        payload: { index },
+      });
+    }
+
+    const recent = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(recent.statusCode).toBe(200);
+    expect(
+      recent.json<{ events: SafeEvent[] }>().events.some((event) => event.turnId === turnId),
+    ).toBe(false);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history`,
+      headers: { cookie: session.cookie },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json<{ events: SafeEvent[] }>().events).toEqual([
+      user,
+      finalAnswer,
+      fileChange,
+      terminal,
+    ]);
+    expect(response.body).not.toContain('Interim progress');
+    expect(response.body).not.toContain('must not be returned');
+  });
+
+  it('reserves transcript boundaries before filling a turn history page with file changes', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'file-change-heavy-turn';
+    repository.appendTurnNavigation({ threadId, turnId, label: 'File-change-heavy task' });
+    const user = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'Keep this prompt even after many file changes' },
+    });
+    const fileChanges = Array.from({ length: 220 }, (_, index) =>
+      repository.appendEvent({
+        threadId,
+        turnId,
+        kind: 'file-change',
+        phase: 'completed',
+        payload: { status: 'completed', changes: [{ path: `file-${index}.txt`, kind: 'add' }] },
+      }),
+    );
+    const finalAnswer = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'All files are ready', messagePhase: 'final_answer' },
+    });
+    const terminal = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const events = response.json<{ events: SafeEvent[] }>().events;
+    expect(events).toHaveLength(200);
+    expect(events).toContainEqual(user);
+    expect(events).toContainEqual(finalAnswer);
+    expect(events).toContainEqual(terminal);
+    expect(events.filter((event) => event.kind === 'file-change').map((event) => event.id)).toEqual(
+      fileChanges.slice(-197).map((event) => event.id),
+    );
+    expect(new Set(events.map((event) => event.id))).toHaveProperty('size', 200);
+    expect(events.map((event) => event.id)).toEqual(
+      [...events.map((event) => event.id)].sort((left, right) => left - right),
+    );
+  });
+
+  it('keeps the original prompt, latest final answer and terminal after more than 200 steering messages', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'steering-heavy-turn';
+    repository.appendTurnNavigation({ threadId, turnId, label: 'Steering-heavy task' });
+    const originalPrompt = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'Original prompt must remain available' },
+    });
+    const fillers: SafeEvent[] = [];
+    for (let index = 0; index < 220; index += 1) {
+      fillers.push(
+        repository.appendEvent({
+          threadId,
+          turnId,
+          kind: 'user-message',
+          phase: 'completed',
+          payload: { text: `Steering message ${index}` },
+        }),
+      );
+      fillers.push(
+        repository.appendEvent({
+          threadId,
+          turnId,
+          kind: 'file-change',
+          phase: 'completed',
+          payload: {
+            status: 'completed',
+            changes: [{ path: `steering-${index}.txt`, kind: 'add' }],
+          },
+        }),
+      );
+    }
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Superseded final answer', messagePhase: 'final_answer' },
+    });
+    const latestFinal = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Latest final answer', messagePhase: 'final_answer' },
+    });
+    const terminal = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const events = response.json<{ events: SafeEvent[] }>().events;
+    expect(events).toHaveLength(200);
+    expect(events).toContainEqual(originalPrompt);
+    expect(events).toContainEqual(latestFinal);
+    expect(events).toContainEqual(terminal);
+    expect(events.filter((event) => event.kind === 'agent-message')).toEqual([latestFinal]);
+    expect(events.filter((event) => fillers.some((filler) => filler.id === event.id))).toEqual(
+      fillers.slice(-197),
+    );
+    expect(events.map((event) => event.id)).toEqual(
+      [...events.map((event) => event.id)].sort((left, right) => left - right),
+    );
+  });
+
+  it('anchors identical steering rail entries to their exact retained user messages', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'identical-steering-turn';
+    const identicalText = 'Check the same thing again';
+    const firstUser = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: identicalText },
+    });
+    const firstNavigation = repository.appendTurnNavigation({
+      threadId,
+      turnId,
+      label: identicalText,
+    });
+    const secondUser = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: identicalText },
+    });
+    const secondNavigation = repository.appendTurnNavigation({
+      threadId,
+      turnId,
+      label: identicalText,
+    });
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+    for (let index = 0; index < 140; index += 1) {
+      repository.appendEvent({
+        threadId,
+        turnId: `newer-identical-${index}`,
+        kind: 'warning',
+        phase: 'state',
+        payload: { index },
+      });
+    }
+
+    const recent = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(recent.statusCode).toBe(200);
+    expect(
+      recent.json<{ events: SafeEvent[] }>().events.some((event) => event.turnId === turnId),
+    ).toBe(false);
+
+    for (const [navigationId, anchorEventId] of [
+      [firstNavigation.id, firstUser.id],
+      [secondNavigation.id, secondUser.id],
+    ]) {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/threads/${threadId}/turns/${turnId}/history?navigationId=${navigationId}`,
+        headers: { cookie: session.cookie },
+      });
+      expect(response.statusCode).toBe(200);
+      expect(response.json<{ anchorEventId: number }>().anchorEventId).toBe(anchorEventId);
+    }
+  });
+
+  it('does not let an outcome-unknown user state shift a completed navigation anchor', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'outcome-unknown-anchor-turn';
+    const text = 'Retry this identical steering message';
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'state',
+      payload: { text, outcomeUnknown: true },
+    });
+    const completedUser = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text },
+    });
+    const navigation = repository.appendTurnNavigation({ threadId, turnId, label: text });
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history?navigationId=${navigation.id}`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json<{ anchorEventId: number }>().anchorEventId).toBe(completedUser.id);
+  });
+
+  it('pins an older steering rail entry inside a capped turn history response', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'targeted-steering-heavy-turn';
+    const original = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'Original targeted task' },
+    });
+    repository.appendTurnNavigation({
+      threadId,
+      turnId,
+      label: 'Original targeted task',
+    });
+    const steerEvents: SafeEvent[] = [];
+    const steerNavigation: TurnNavigationEntry[] = [];
+    for (let index = 0; index < 220; index += 1) {
+      const text = `Targeted steering message ${index}`;
+      steerEvents.push(
+        repository.appendEvent({
+          threadId,
+          turnId,
+          kind: 'user-message',
+          phase: 'completed',
+          payload: { text },
+        }),
+      );
+      steerNavigation.push(repository.appendTurnNavigation({ threadId, turnId, label: text }));
+    }
+    const finalAnswer = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Targeted work complete', messagePhase: 'final_answer' },
+    });
+    const terminal = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+    const targetIndex = 5;
+
+    const unanchored = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history`,
+      headers: { cookie: session.cookie },
+    });
+    expect(unanchored.statusCode).toBe(200);
+    expect(
+      unanchored
+        .json<{ events: SafeEvent[] }>()
+        .events.some((event) => event.id === steerEvents[targetIndex]!.id),
+    ).toBe(false);
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history?navigationId=${steerNavigation[targetIndex]!.id}`,
+      headers: { cookie: session.cookie },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const body = response.json<{ events: SafeEvent[]; anchorEventId: number }>();
+    expect(body.anchorEventId).toBe(steerEvents[targetIndex]!.id);
+    expect(body.events).toHaveLength(200);
+    expect(body.events).toContainEqual(original);
+    expect(body.events).toContainEqual(steerEvents[targetIndex]);
+    expect(body.events).toContainEqual(finalAnswer);
+    expect(body.events).toContainEqual(terminal);
+    expect(body.events).not.toContainEqual(steerEvents[targetIndex + 1]);
+  });
+
+  it('recovers only the last phase-less agent message for a legacy completed turn', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const turnId = 'legacy-completed-turn';
+    repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Earlier legacy progress' },
+    });
+    const lastAgent = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Legacy final response' },
+    });
+    const terminal = repository.appendEvent({
+      threadId,
+      turnId,
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'completed' },
+    });
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/turns/${turnId}/history`,
+      headers: { cookie: session.cookie },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.json<{ events: SafeEvent[] }>().events).toEqual([
+      { ...lastAgent, payload: { ...lastAgent.payload, messagePhase: 'final_answer' } },
+      terminal,
+    ]);
+    expect(response.body).not.toContain('Earlier legacy progress');
+  });
+
+  it('fails closed for unknown or cross-thread turn history', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const firstThreadId = await createThread(app, project.id, session.headers);
+    const secondThreadId = await createThread(app, project.id, session.headers);
+    const foreignNavigation = repository.appendTurnNavigation({
+      threadId: secondThreadId,
+      turnId: 'foreign-turn',
+      label: 'Foreign turn',
+    });
+    repository.appendTurnNavigation({
+      threadId: firstThreadId,
+      turnId: 'navigation-only-turn',
+      label: 'Navigation only turn',
+    });
+
+    for (const turnId of ['unknown-turn', 'foreign-turn']) {
+      const response = await app.inject({
+        method: 'GET',
+        url: `/api/threads/${firstThreadId}/turns/${turnId}/history`,
+        headers: { cookie: session.cookie },
+      });
+      expect(response.statusCode).toBe(404);
+      expect(response.json()).toMatchObject({ error: { code: 'TURN_NOT_FOUND' } });
+    }
+
+    const navigationOnly = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${firstThreadId}/turns/navigation-only-turn/history`,
+      headers: { cookie: session.cookie },
+    });
+    expect(navigationOnly.statusCode).toBe(200);
+    expect(navigationOnly.json()).toEqual({ events: [], anchorEventId: null });
+
+    const crossThreadNavigation = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${firstThreadId}/turns/navigation-only-turn/history?navigationId=${foreignNavigation.id}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(crossThreadNavigation.statusCode).toBe(404);
+    expect(crossThreadNavigation.json()).toMatchObject({
+      error: { code: 'TURN_NAVIGATION_NOT_FOUND' },
+    });
+  });
+
   it('returns every actionable pending interaction independently from the bounded event tail', async () => {
     const { app, repository, projectPath } = await fixture();
     const session = await login(app);
@@ -7518,6 +8027,156 @@ describe('Codex routes', () => {
     expect(
       appServer.requests.find((request) => request.method === 'turn/start')?.params,
     ).toMatchObject({ model: 'gpt-5.6-sol', effort: 'medium' });
+  });
+
+  it('preserves selected sandbox policies for restricted direct turns', async () => {
+    const { app, appServer, projectPath } = await fixture(5);
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const presets = ['read-only', 'workspace-write', 'full-access'] as const;
+    for (const [index, permissionPreset] of presets.entries()) {
+      const threadId = await createThread(app, project.id, session.headers);
+      const response = await app.inject({
+        method: 'POST',
+        url: `/api/threads/${threadId}/turns`,
+        headers: session.headers,
+        payload: {
+          text: `restricted ${permissionPreset}`,
+          permissionPreset,
+          idempotencyKey: `44000000-0000-4000-8000-00000000000${index + 2}`,
+        },
+      });
+      expect(response.statusCode).toBe(202);
+    }
+
+    const starts = appServer.requests.filter((request) => request.method === 'turn/start');
+    expect(starts).toHaveLength(3);
+    expect(starts[0]?.params).toMatchObject({
+      sandboxPolicy: { type: 'readOnly', networkAccess: true },
+    });
+    expect(starts[1]?.params).toMatchObject({
+      sandboxPolicy: {
+        type: 'workspaceWrite',
+        writableRoots: [projectPath],
+        networkAccess: true,
+        excludeTmpdirEnvVar: true,
+        excludeSlashTmp: true,
+      },
+    });
+    expect(starts[2]?.params).toMatchObject({
+      sandboxPolicy: { type: 'dangerFullAccess' },
+    });
+  });
+
+  it('preserves explicit host-admin presets across direct and queued cold resumes', async () => {
+    const { app, appServer, projectPath } = await fixture(
+      1,
+      undefined,
+      (root) => new AttachmentStore(root),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { runnerMode: 'host-admin' },
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const activeThreadId = await createThread(app, project.id, session.headers);
+    const queuedThreadId = await createThread(app, project.id, session.headers);
+    const threadStarts = appServer.requests.filter((request) => request.method === 'thread/start');
+    expect(threadStarts).toHaveLength(2);
+    for (const request of threadStarts)
+      expect(request.params).toMatchObject({ sandbox: 'workspace-write' });
+
+    const active = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${activeThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'host admin direct',
+        permissionPreset: 'full-access',
+        idempotencyKey: '44000000-0000-4000-8000-000000000005',
+      },
+    });
+    expect(active.json()).toMatchObject({ data: { status: 'started' } });
+    const queued = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'host admin queued',
+        permissionPreset: 'full-access',
+        approvalPolicy: 'never',
+        model: 'gpt-6.1-sol',
+        reasoningEffort: 'medium',
+        idempotencyKey: '44000000-0000-4000-8000-000000000006',
+      },
+    });
+    expect(queued.json()).toMatchObject({ data: { status: 'queued' } });
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(1);
+
+    appServer.restart();
+    appServer.setThreadStatus(activeThreadId, 'idle');
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: activeThreadId, turn: { id: 'turn-1', status: 'completed' } },
+    });
+    await vi.waitFor(() => {
+      expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(
+        2,
+      );
+    });
+    for (const request of appServer.requests.filter(
+      (candidate) => candidate.method === 'turn/start',
+    )) {
+      expect(request.params).toMatchObject({ sandboxPolicy: { type: 'dangerFullAccess' } });
+    }
+    const queuedResume = appServer.requests.find((request) => request.method === 'thread/resume');
+    expect(queuedResume?.params).toMatchObject({
+      threadId: queuedThreadId,
+      sandbox: 'danger-full-access',
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      model: 'gpt-6.1-sol',
+      config: { model_reasoning_effort: 'medium' },
+    });
+
+    appServer.setThreadStatus(queuedThreadId, 'idle');
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: queuedThreadId, turn: { id: 'turn-2', status: 'completed' } },
+    });
+    appServer.restart();
+    const resumedDirect = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${queuedThreadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'host admin direct after restart',
+        permissionPreset: 'read-only',
+        approvalPolicy: 'untrusted',
+        model: 'gpt-6-sol',
+        reasoningEffort: 'high',
+        idempotencyKey: '44000000-0000-4000-8000-000000000007',
+      },
+    });
+    expect(resumedDirect.json()).toMatchObject({ data: { status: 'started' } });
+    const resumes = appServer.requests.filter((request) => request.method === 'thread/resume');
+    expect(resumes).toHaveLength(2);
+    expect(resumes[1]?.params).toMatchObject({
+      threadId: queuedThreadId,
+      sandbox: 'read-only',
+      approvalPolicy: 'untrusted',
+      approvalsReviewer: 'user',
+      model: 'gpt-6-sol',
+      config: { model_reasoning_effort: 'high' },
+    });
+    expect(
+      appServer.requests.filter((candidate) => candidate.method === 'turn/start').at(-1)?.params,
+    ).toMatchObject({ sandboxPolicy: { type: 'readOnly', networkAccess: true } });
   });
 
   it('drains only new turns and reports pending plus active work in health', async () => {
@@ -9655,7 +10314,17 @@ describe('Codex routes', () => {
     expect(appServer.requests.filter((item) => item.method === 'thread/resume')).toHaveLength(1);
     expect(
       appServer.requests.find((item) => item.method === 'thread/resume')?.params,
-    ).toMatchObject({ config: { agents: { max_threads: 6 } } });
+    ).toMatchObject({
+      sandbox: 'workspace-write',
+      model: null,
+      config: { agents: { max_threads: 6 } },
+    });
+    expect(
+      appServer.requests.find((item) => item.method === 'thread/resume')?.params,
+    ).not.toHaveProperty('approvalPolicy');
+    expect(
+      appServer.requests.find((item) => item.method === 'thread/resume')?.params,
+    ).not.toHaveProperty('approvalsReviewer');
   });
 
   it('explains when an empty pre-restart chat was never persisted by Codex', async () => {

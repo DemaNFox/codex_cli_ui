@@ -217,8 +217,15 @@ class InfraStaticTest(unittest.TestCase):
             'bash "$SCRIPT_DIR/migrate-runner-host-admin.sh"',
             'python3 "$package/scripts/install-local-host-instructions.py"',
             'python3 "$package/scripts/rebase-codex-home.py"',
+            '"CODEX_WEB_RUNNER_MODE": os.environ["RUNNER_MODE"]',
         ):
             self.assertIn(expected, installer)
+        environment = (ROOT / "infra/env/codex-web-ui.env.example").read_text(
+            encoding="utf-8"
+        )
+        validator = (ROOT / "scripts/validate-config.sh").read_text(encoding="utf-8")
+        self.assertIn("CODEX_WEB_RUNNER_MODE=restricted", environment)
+        self.assertIn('values["CODEX_WEB_RUNNER_MODE"]', validator)
         self.assertLess(
             installer.index('bash "$SCRIPT_DIR/migrate-runner-host-admin.sh"'),
             installer.index(

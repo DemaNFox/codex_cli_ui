@@ -24,6 +24,9 @@ Browser
   host filesystem ownership by design, so Web/API isolation prevents accidental API privilege but is not a
   security boundary against a hostile root Codex turn.
 - JSON-RPC requests are correlated by generated numeric IDs. Server-initiated approval and input requests are recorded as pending UI actions.
+- A cold `thread/resume` repeats the selected sandbox, approval, model/reasoning and agent-limit settings before
+  the first resumed turn. Runner mode never widens an explicit `read-only` or `workspace-write` selection;
+  only `full-access` maps to Codex `danger-full-access`, including under the host-admin identity.
 - The backend projects safe, normalized events to per-thread SSE streams. Reconnect uses the last event ID and the durable event journal.
 - Subagent lifecycle notifications are projected into a server-owned table keyed by the root chat and are
   published as safe SSE state snapshots. The projection includes public identity, hierarchy, model, effort,
@@ -34,7 +37,11 @@ Browser
   transcript pages for fast first paint and upward history navigation. That mirror is never authoritative:
   the selected transcript is reconciled with the server snapshot and then follows it through SSE. Cache reads
   fail closed on schema/version mismatch, attachment bytes and secrets are never stored, least-recently-used
-  threads are evicted, and logout or an unauthenticated startup clears the origin-local mirror. Active-turn
+  threads are evicted, and logout or an unauthenticated startup clears the origin-local mirror. Its backward
+  page cursor tracks the contiguous page boundary rather than separately restored sparse turn events, so a
+  targeted rail recovery cannot make later upward paging skip an unloaded range. Sparse restored turns use
+  only otherwise-free cache capacity, and logout disables writes before clearing storage so an older timer or
+  in-flight write cannot repopulate private history afterward. Active-turn
   steering is also written as a canonical user event so it remains visible after reconnect and on every device.
 - The thread projection stores the current active turn ID instead of asking the browser to infer it from a
   bounded event journal. A process restart clears that runtime-only projection before Codex is queried, so an
@@ -139,10 +146,13 @@ Browser
   turn state and file changes from the redacted native history into the durable journal without duplicating
   events already observed. Final answers, successful terminal turn markers and completed file changes each
   have their own bounded retention allowance, so a retained answer can still be summarized and expose its
-  generated-file fallback. A compact server-persisted prompt rail navigates between
-  calls without changing server state. When an older prompt predates the retained activity window, its rail
-  entry targets the first retained event from that turn, or the transcript start if the entire turn has aged
-  out. On narrow screens the same rail becomes horizontally scrollable.
+  generated-file fallback. A compact server-persisted prompt rail navigates between calls without changing
+  server state. When an older prompt predates the initial activity window and browser cache, selecting its rail
+  entry first uses any currently loaded anchor and then performs one authenticated, navigation-entry-scoped
+  reconciliation of retained transcript boundaries. The response pins that exact prompt even for repeated
+  steering text, merges the recovered prompt/final/terminal boundary without duplicating events and re-targets
+  the real prompt anchor. The read is capped, excludes commentary and deltas, and fails closed for unknown or
+  cross-thread navigation entries. On narrow screens the same rail becomes horizontally scrollable.
 - Relative Markdown links emitted by Codex are presented as generated project-file downloads. If a completed
   final answer omits a link, the transcript also presents completed file-change paths as authenticated project
   downloads. Both paths first check current availability through `HEAD` and use the same download component.
@@ -352,7 +362,8 @@ Codex enter `needsReview`.
   `POST /api/projects/:id/archive`, `POST /api/projects/:id/unarchive` preserve all chat history
 - `GET /api/models`
 - `GET/POST /api/threads`, `GET/PATCH /api/threads/:id`, and bounded backward
-  `GET /api/threads/:id/history?before=<event-id>&limit=<page-size>`
+  `GET /api/threads/:id/history?before=<event-id>&limit=<page-size>`; retained prompt/final boundaries outside
+  the loaded tail are available through bounded `GET /api/threads/:id/turns/:turnId/history`
 - `POST /api/threads/:id/archive`, `POST /api/threads/:id/unarchive`; listing accepts a project-scoped `archived` filter
 - `POST /api/threads/:id/turns`, `GET /api/threads/:id/queued-turns`,
   `POST /api/threads/:id/queued-turns/:queuedTurnId/reconcile`,

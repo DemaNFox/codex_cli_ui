@@ -102,6 +102,7 @@ if [[ ! -e $config ]]; then
     printf 'CODEX_WEB_PUBLIC_ORIGIN=%s\n' "$public_origin"
     printf 'CODEX_WEB_DATABASE_PATH=/var/lib/codex-web-ui/data/codex-web-ui.sqlite3\n'
     printf 'CODEX_WEB_PROJECT_ROOTS=%s\n' "$roots_csv"
+    printf 'CODEX_WEB_RUNNER_MODE=restricted\n'
     printf 'CODEX_BIN=%s\n' "$codex_bin"
     printf 'CODEX_HOME=%s\n' "$codex_home"
     printf 'CODEX_WEB_CODEX_VERSION_PIN="codex-cli 0.160.0"\n'
@@ -125,6 +126,9 @@ if [[ ! -e $config ]]; then
     printf 'CODEX_WEB_MAX_DATABASE_BYTES=2147483648\n'
     printf 'CODEX_WEB_MAX_RELEASES=5\n'
   } >"$config"
+fi
+if [[ -z $(sed -n 's/^CODEX_WEB_RUNNER_MODE=//p' "$config") ]]; then
+  printf 'CODEX_WEB_RUNNER_MODE=restricted\n' >>"$config"
 fi
 [[ -f $config && ! -L $config ]] || die 'configuration must be a regular non-symlink file'
 chown root:root "$config"

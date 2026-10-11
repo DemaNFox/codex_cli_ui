@@ -6,8 +6,21 @@ const DATABASE_VERSION = 1;
 const CACHE_SCHEMA_VERSION = 1;
 const MAX_CACHED_THREADS = 20;
 const MAX_EVENTS_PER_THREAD = 600;
+const MAX_SPARSE_EVENTS_PER_THREAD = 100;
 const MAX_CACHE_BYTES = 10 * 1024 * 1024;
 const DATABASE_OPEN_TIMEOUT_MS = 750;
+let cacheGeneration = 0;
+let cacheWritesEnabled = true;
+
+export function enableThreadHistoryCacheWrites(): void {
+  cacheGeneration += 1;
+  cacheWritesEnabled = true;
+}
+
+export function disableThreadHistoryCacheWrites(): void {
+  cacheWritesEnabled = false;
+  cacheGeneration += 1;
+}
 
 const safeEventKinds = new Set([
   'thread',
@@ -82,7 +95,11 @@ function isSafeEvent(value: unknown, threadId: string): value is SafeEvent {
   );
 }
 
-function normalizeEvents(events: SafeEvent[], threadId: string): SafeEvent[] {
+function normalizeEvents(
+  events: SafeEvent[],
+  threadId: string,
+  limit: number | null = MAX_EVENTS_PER_THREAD,
+): SafeEvent[] {
   const retained = new Map<string, SafeEvent>();
   for (const event of events) {
     if (!isSafeEvent(event, threadId) || !isCacheableEvent(event)) continue;
@@ -99,9 +116,8 @@ function normalizeEvents(events: SafeEvent[], threadId: string): SafeEvent[] {
     const key = event.id > 0 ? `event:${event.id}` : `synthetic:${event.kind}:${syntheticId}`;
     retained.set(key, event);
   }
-  return [...retained.values()]
-    .sort((left, right) => left.id - right.id)
-    .slice(-MAX_EVENTS_PER_THREAD);
+  const normalized = [...retained.values()].sort((left, right) => left.id - right.id);
+  return limit === null ? normalized : normalized.slice(-limit);
 }
 
 function validateStored(
@@ -216,20 +232,40 @@ export async function readThreadHistoryCache(
 }
 
 export async function writeThreadHistoryCache(entry: ThreadHistoryCacheEntry): Promise<void> {
+  if (!cacheWritesEnabled) return;
+  const writeGeneration = cacheGeneration;
   try {
-    const events = normalizeEvents(entry.events, entry.threadId);
-    const cacheableEventCount = entry.events.filter(
-      (event) => isSafeEvent(event, entry.threadId) && isCacheableEvent(event),
-    ).length;
-    const cachedOldestEventId = events.find((event) => event.id > 0)?.id ?? null;
+    const normalizedEvents = normalizeEvents(entry.events, entry.threadId, null);
+    const contiguousEvents =
+      entry.oldestEventId === null
+        ? normalizedEvents
+        : normalizedEvents.filter((event) => event.id <= 0 || event.id >= entry.oldestEventId!);
+    const sparseEvents =
+      entry.oldestEventId === null
+        ? []
+        : normalizedEvents.filter((event) => event.id > 0 && event.id < entry.oldestEventId!);
+    const sparseCapacity = Math.min(MAX_SPARSE_EVENTS_PER_THREAD, sparseEvents.length);
+    const retainedContiguousEvents = contiguousEvents.slice(
+      -(MAX_EVENTS_PER_THREAD - sparseCapacity),
+    );
+    const events = [...sparseEvents.slice(-sparseCapacity), ...retainedContiguousEvents].sort(
+      (left, right) => left.id - right.id,
+    );
+    const contiguousEventsDropped = contiguousEvents.length > retainedContiguousEvents.length;
+    const cachedOldestContiguousEventId = retainedContiguousEvents.find(
+      (event) => event.id > 0,
+    )?.id;
+    const cacheDroppedEvents = normalizedEvents.length > events.length;
     const base = {
       key: cacheKey(entry.username, entry.threadId),
       schemaVersion: CACHE_SCHEMA_VERSION,
       username: entry.username,
       threadId: entry.threadId,
       events,
-      oldestEventId: cachedOldestEventId ?? entry.oldestEventId,
-      hasMore: entry.hasMore || cacheableEventCount > events.length,
+      oldestEventId: contiguousEventsDropped
+        ? (cachedOldestContiguousEventId ?? entry.oldestEventId)
+        : entry.oldestEventId,
+      hasMore: entry.hasMore || cacheDroppedEvents,
       savedAt: entry.savedAt,
     };
     const stored: StoredThreadHistory = {
@@ -239,6 +275,7 @@ export async function writeThreadHistoryCache(entry: ThreadHistoryCacheEntry): P
     const database = await openDatabase();
     if (!database) return;
     try {
+      if (!cacheWritesEnabled || writeGeneration !== cacheGeneration) return;
       const write = database.transaction(STORE_NAME, 'readwrite');
       write.objectStore(STORE_NAME).put(stored);
       await transactionDone(write);
@@ -269,6 +306,7 @@ export async function writeThreadHistoryCache(entry: ThreadHistoryCacheEntry): P
 }
 
 export async function clearThreadHistoryCache(): Promise<void> {
+  cacheGeneration += 1;
   try {
     const database = await openDatabase();
     if (!database) return;

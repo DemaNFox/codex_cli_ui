@@ -904,6 +904,14 @@ button:disabled {
 .turn-jump:focus-visible span {
   width: 1rem;
 }
+.turn-jump[aria-busy='true'] span {
+  width: 0.55rem;
+  height: 0.55rem;
+  border: 1px solid currentColor;
+  border-top-color: transparent;
+  background: transparent;
+  animation: spin 0.8s linear infinite;
+}
 .turn-jump::after {
   position: absolute;
   top: 50%;

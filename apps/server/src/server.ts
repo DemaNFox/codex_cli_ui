@@ -33,6 +33,7 @@ import {
   updateResourceLimitsRequestSchema,
   applyResourceLimitsRequestSchema,
   userInputQuestionSchema,
+  type ApprovalPolicy,
   type PermissionPreset,
   type Attachment,
   type AutoRateLimitResetSnapshot,
@@ -156,6 +157,10 @@ const subagentParamsSchema = z.object({
   id: z.string().min(1).max(200),
   subagentId: z.string().min(1).max(200),
 });
+const turnHistoryParamsSchema = z.object({
+  id: z.string().min(1).max(200),
+  turnId: z.string().min(1).max(200),
+});
 const threadStatusChangedSchema = z.object({
   threadId: z.string().min(1),
   status: z.object({ type: z.enum(['notLoaded', 'idle', 'active', 'systemError']) }).passthrough(),
@@ -186,7 +191,11 @@ const threadHistoryPageQuerySchema = z
       .default(120),
   })
   .strict();
+const turnHistoryQuerySchema = z
+  .object({ navigationId: positiveEventCursorSchema.optional() })
+  .strict();
 const THREAD_DETAIL_EVENT_LIMIT = 120;
+const TURN_HISTORY_EVENT_LIMIT = 200;
 const HISTORY_PUBLICATION_LIMIT = Math.min(THREAD_DETAIL_EVENT_LIMIT, SSE_LIVE_QUEUE_LIMIT);
 const PENDING_INTERACTION_LIMIT = 120;
 const HISTORY_HYDRATION_RETRY_MS = 30_000;
@@ -1029,15 +1038,53 @@ function mapThread(
   };
 }
 
+function sandboxMode(
+  preset: PermissionPreset,
+): 'read-only' | 'workspace-write' | 'danger-full-access' {
+  if (preset === 'full-access') return 'danger-full-access';
+  return preset;
+}
+
 function sandboxPolicy(preset: PermissionPreset, projectPath: string): Record<string, unknown> {
-  if (preset === 'read-only') return { type: 'readOnly', networkAccess: true };
-  if (preset === 'full-access') return { type: 'dangerFullAccess' };
+  const mode = sandboxMode(preset);
+  if (mode === 'read-only') return { type: 'readOnly', networkAccess: true };
+  if (mode === 'danger-full-access') return { type: 'dangerFullAccess' };
   return {
     type: 'workspaceWrite',
     writableRoots: [projectPath],
     networkAccess: true,
     excludeTmpdirEnvVar: true,
     excludeSlashTmp: true,
+  };
+}
+
+function resumeThreadParams(input: {
+  threadId: string;
+  cwd: string;
+  permissionPreset: PermissionPreset;
+  approvalPolicy: ApprovalPolicy | undefined;
+  model: string | null | undefined;
+  reasoningEffort: string | null | undefined;
+  executionAgentLimit: number | undefined;
+}): Record<string, unknown> {
+  const resumeConfig = {
+    ...(input.reasoningEffort === null || input.reasoningEffort === undefined
+      ? {}
+      : { model_reasoning_effort: input.reasoningEffort }),
+    ...(input.executionAgentLimit === undefined
+      ? {}
+      : { agents: { max_threads: input.executionAgentLimit } }),
+  };
+  return {
+    threadId: input.threadId,
+    cwd: input.cwd,
+    excludeTurns: true,
+    sandbox: sandboxMode(input.permissionPreset),
+    ...(input.approvalPolicy === undefined
+      ? {}
+      : { approvalPolicy: input.approvalPolicy, approvalsReviewer: 'user' }),
+    model: input.model ?? null,
+    ...(Object.keys(resumeConfig).length === 0 ? {} : { config: resumeConfig }),
   };
 }
 
@@ -3832,7 +3879,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           model: input.model ?? project.defaultModel,
           approvalPolicy: input.approvalPolicy,
           approvalsReviewer: 'user',
-          sandbox: preset === 'full-access' ? 'danger-full-access' : preset,
+          sandbox: sandboxMode(preset),
           config:
             (reasoningEffort === null || reasoningEffort === undefined) &&
             configuredAgentLimit === null
@@ -3949,6 +3996,40 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
     const query = threadHistoryPageQuerySchema.parse(request.query);
     return repository.listEventsBefore(id, query.before, query.limit);
+  });
+
+  app.get('/api/threads/:id/turns/:turnId/history', (request) => {
+    auth.authenticate(request);
+    const { id, turnId } = turnHistoryParamsSchema.parse(request.params);
+    const query = turnHistoryQuerySchema.parse(request.query);
+    if (!repository.getThread(id)) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    if (!repository.hasRetainedTurnEvidence(id, turnId)) throw new HttpError(404, 'TURN_NOT_FOUND');
+    let anchorEventId: number | null = null;
+    if (query.navigationId !== undefined) {
+      const navigation = repository.getTurnNavigationOccurrence(id, turnId, query.navigationId);
+      if (!navigation) throw new HttpError(404, 'TURN_NAVIGATION_NOT_FOUND');
+      const matchingUserMessages = repository
+        .listRetainedTurnUserMessages(id, turnId)
+        .filter(
+          (event) =>
+            typeof event.payload.text === 'string' &&
+            normalizeTurnNavigationLabel(event.payload.text, config.maxEventBytes) ===
+              navigation.entry.label,
+        );
+      anchorEventId = matchingUserMessages[navigation.occurrence]?.id ?? null;
+      if (anchorEventId === null) throw new HttpError(404, 'TURN_NAVIGATION_ANCHOR_NOT_FOUND');
+    }
+    const events = repository.listRetainedTurnTranscriptEvents(
+      id,
+      turnId,
+      TURN_HISTORY_EVENT_LIMIT,
+      anchorEventId ?? undefined,
+    );
+    return {
+      events,
+      anchorEventId:
+        anchorEventId ?? events.find((event) => event.kind === 'user-message')?.id ?? null,
+    };
   });
 
   app.get('/api/threads/:id/subagents', (request) => {
@@ -4553,14 +4634,18 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       if (loadedThreadGenerations.get(thread.id) !== appServer.generation) {
         if (!repository.isThreadHistoryHydrated(thread.id)) await hydrateThreadHistory(thread);
         const resumed = threadResponseSchema.parse(
-          await appServer.request('thread/resume', {
-            threadId: thread.id,
-            cwd: resumeCwd,
-            excludeTurns: true,
-            ...(executionAgentLimit === undefined
-              ? {}
-              : { config: { agents: { max_threads: executionAgentLimit } } }),
-          }),
+          await appServer.request(
+            'thread/resume',
+            resumeThreadParams({
+              threadId: thread.id,
+              cwd: resumeCwd,
+              permissionPreset: claimed.request.permissionPreset ?? project.defaultPermissionPreset,
+              approvalPolicy: claimed.request.approvalPolicy,
+              model: claimed.request.model ?? project.defaultModel,
+              reasoningEffort: claimed.request.reasoningEffort ?? project.defaultReasoningEffort,
+              executionAgentLimit,
+            }),
+          ),
         );
         if (resumed.thread.cwd !== resumeCwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
         loadedThreadGenerations.set(thread.id, appServer.generation);
@@ -5056,14 +5141,18 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         let resumed: z.infer<typeof threadResponseSchema>;
         try {
           resumed = threadResponseSchema.parse(
-            await appServer.request('thread/resume', {
-              threadId: id,
-              cwd: resumeCwd,
-              excludeTurns: true,
-              ...(executionAgentLimit === undefined
-                ? {}
-                : { config: { agents: { max_threads: executionAgentLimit } } }),
-            }),
+            await appServer.request(
+              'thread/resume',
+              resumeThreadParams({
+                threadId: id,
+                cwd: resumeCwd,
+                permissionPreset: preset,
+                approvalPolicy: input.approvalPolicy,
+                model: input.model ?? project.defaultModel,
+                reasoningEffort: input.reasoningEffort ?? project.defaultReasoningEffort,
+                executionAgentLimit,
+              }),
+            ),
           );
         } catch (error) {
           const emptyLocalThread = repository.listEvents(id, 0, 1).length === 0;

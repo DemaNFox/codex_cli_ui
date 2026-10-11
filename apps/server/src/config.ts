@@ -12,6 +12,7 @@ const envSchema = z.object({
   CODEX_WEB_SESSION_TTL_SECONDS: z.coerce.number().int().min(300).max(2_592_000).default(28_800),
   CODEX_WEB_PUBLIC_ORIGIN: z.string().url(),
   CODEX_WEB_PROJECT_ROOTS: z.string().min(1),
+  CODEX_WEB_RUNNER_MODE: z.enum(['restricted', 'host-admin']).default('restricted'),
   CODEX_BIN: z.string().min(1).default('codex'),
   CODEX_HOME: z.string().min(1).optional(),
   CODEX_WEB_APP_SERVER_SOCKET: z.string().startsWith('/').optional(),
@@ -88,6 +89,7 @@ export interface ServerConfig {
   readonly sessionTtlMs: number;
   readonly webOrigin: string;
   readonly projectRoots: readonly string[];
+  readonly runnerMode: 'restricted' | 'host-admin';
   readonly codexBinary: string;
   readonly codexHome?: string;
   readonly appServerSocket?: string;
@@ -146,6 +148,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     sessionTtlMs: parsed.CODEX_WEB_SESSION_TTL_SECONDS * 1_000,
     webOrigin: new URL(parsed.CODEX_WEB_PUBLIC_ORIGIN).origin,
     projectRoots: roots,
+    runnerMode: parsed.CODEX_WEB_RUNNER_MODE,
     codexBinary: parsed.CODEX_BIN,
     ...(parsed.CODEX_HOME === undefined ? {} : { codexHome: parsed.CODEX_HOME }),
     ...(parsed.CODEX_WEB_APP_SERVER_SOCKET === undefined
