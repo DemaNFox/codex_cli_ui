@@ -5259,10 +5259,7 @@ function Workspace({
         setRecentThreads((current) =>
           current.map((item) => (item.id === threadId ? reconciledThread : item)),
         );
-        mergeEvents(
-          [...refreshed.events, ...(refreshed.pendingInteractionEvents ?? [])],
-          threadId,
-        );
+        mergeEvents([...refreshed.events, ...(refreshed.pendingInteractionEvents ?? [])], threadId);
         setPendingInteractionsTruncated(refreshed.pendingInteractionsTruncated === true);
         setServerTurnNavigation(refreshed.turnNavigation ?? null);
         setSubagents(reconciledSubagents);

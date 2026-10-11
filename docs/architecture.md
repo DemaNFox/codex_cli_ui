@@ -47,9 +47,23 @@ Browser
 - A project is a display name plus a canonical existing directory under an allowlisted root. Codex has no separate project entity; thread `cwd` binds execution to a project.
 - Models and reasoning efforts come from `model/list`; the UI never hard-codes account availability.
 - Persisted project and chat navigation remains readable when `thread/list` cannot reach Codex. Likewise, a
-  selected chat whose first native history hydration is temporarily unavailable returns its persisted safe
-  journal and metadata. The browser loads navigation independently from the model/capability catalog and keeps
-  a selected failed chat in an explicit loading/retry state rather than rendering the blank-chat welcome view.
+  selected unhydrated chat returns the latest 120 persisted safe events immediately and starts the existing
+  single-flight native hydration in the background. The detail snapshot publishes its high-water cursor and a
+  truncation marker, so SSE begins strictly after the snapshot while the UI labels the bounded window. SSE
+  attaches and replays without waiting for native hydration. Classified app-server request failures (`notSent`,
+  rejected or ambiguous) and integrity failures such as a cwd mismatch leave the saved window visible with an
+  explicit degraded state; failures are cached for 30 seconds to prevent hot retry, and the hydration marker
+  stays unset so a later read can recover authoritative history. The browser loads history independently from
+  attachments and optional runtime projections, so either auxiliary failure cannot hide the transcript. The
+  detail projection carries a separately bounded list of authoritative unfinished approval, permission and
+  user-input events; the browser pins those actionable cards outside its 120-event transcript cap until a
+  matching terminal event resolves them.
+- `GET /api/threads/:id/continuation-draft` is a read-only, authenticated projection over the bounded safe
+  journal, visible queue previews and aggregate source-work state. It never reads raw native history, hidden
+  reasoning, command output, audit data or attachment storage paths. The browser previews this bounded handoff,
+  creates a normal empty thread in the same project only after confirmation and places the text in its composer
+  without sending it. The source chat and its active, descendant, queued or ambiguous work are not interrupted,
+  moved, retried or archived; warnings make those independent states explicit.
 - `instructionSources` from thread start/resume and `skills/list` are visible in the Skills tab of the
   account/settings dialog so the operator can verify that `AGENTS.md` and required skills loaded. The browser
   may insert an enabled `$skill-name` reference into the composer, but never auto-sends that prompt.
