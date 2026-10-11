@@ -26,6 +26,7 @@ import {
   startTurnResultSchema,
   steerTurnRequestSchema,
   threadUsageSchema,
+  threadContinuationDraftSchema,
   threadListQuerySchema,
   updateRuntimePreferencesRequestSchema,
   updateAutoRateLimitResetRequestSchema,
@@ -123,6 +124,7 @@ import {
   titleStillNeedsSemanticReplacement,
   type ThreadTitleGenerator,
 } from './thread-title-generator.js';
+import { buildThreadContinuationDraft } from './thread-continuation.js';
 
 const idParamsSchema = z.object({ id: z.string().min(1).max(200) });
 const attachmentParamsSchema = z.object({
@@ -3722,17 +3724,33 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const existing = repository.getThread(id);
     if (!existing) throw new HttpError(404, 'THREAD_NOT_FOUND');
     let thread = existing;
+    let historyState: 'complete' | 'degraded' = 'complete';
+    let historyWarning:
+      | 'APP_SERVER_UNAVAILABLE'
+      | 'APP_SERVER_REJECTED'
+      | 'APP_SERVER_OUTCOME_UNKNOWN'
+      | 'HISTORY_LOADING_DEFERRED'
+      | undefined;
     if (!repository.isThreadHistoryHydrated(id)) {
-      try {
-        thread = await hydrateThreadHistory(existing);
-      } catch (error) {
-        if (!(error instanceof AppServerRequestError) || error.failureKind !== 'notSent')
-          throw error;
+      historyState = 'degraded';
+      historyWarning = 'HISTORY_LOADING_DEFERRED';
+      void hydrateThreadHistory(existing).catch((error: unknown) => {
+        if (serverClosing) return;
+        const reason =
+          error instanceof AppServerRequestError
+            ? error.failureKind === 'notSent'
+              ? 'APP_SERVER_UNAVAILABLE'
+              : error.failureKind === 'rejected'
+                ? 'APP_SERVER_REJECTED'
+                : 'APP_SERVER_OUTCOME_UNKNOWN'
+            : error instanceof HttpError
+              ? error.code
+              : 'UNEXPECTED_HISTORY_HYDRATION_FAILURE';
         repository.audit('thread.history', 'degraded', {
           threadId: id,
-          reason: 'app_server_unavailable',
+          reason,
         });
-      }
+      });
     } else {
       try {
         if (turnNavigationGenerations.get(id) !== appServer.generation)
@@ -3744,7 +3762,18 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           thread = (await readThreadFromAppServer(existing, false)).thread;
       } catch (error) {
         if (error instanceof HttpError) throw error;
-        repository.audit('thread.refresh', 'failed', { threadId: id });
+        if (!(error instanceof AppServerRequestError)) throw error;
+        historyState = 'degraded';
+        historyWarning =
+          error.failureKind === 'notSent'
+            ? 'APP_SERVER_UNAVAILABLE'
+            : error.failureKind === 'rejected'
+              ? 'APP_SERVER_REJECTED'
+              : 'APP_SERVER_OUTCOME_UNKNOWN';
+        repository.audit('thread.refresh', 'failed', {
+          threadId: id,
+          reason: historyWarning,
+        });
       }
     }
     const data = repository.getThread(id) ?? thread;
@@ -3756,7 +3785,27 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       turnNavigation: repository.listTurnNavigation(id),
       subagents: repository.listSubagents(id),
       queuedTurns: repository.listVisibleQueuedTurns(id).map(publicQueuedTurn),
+      historyState,
+      ...(historyWarning ? { historyWarning } : {}),
     };
+  });
+
+  app.get('/api/threads/:id/continuation-draft', (request) => {
+    auth.authenticate(request);
+    const id = parseId(request);
+    const thread = repository.getThread(id);
+    if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    const draft = buildThreadContinuationDraft({
+      sourceThreadId: thread.id,
+      projectId: thread.projectId,
+      generatedAt: new Date().toISOString(),
+      historyHydrated: repository.isThreadHistoryHydrated(id),
+      rootActive: thread.status === 'active' || thread.activeTurnId !== null,
+      activeSubagents: repository.countActiveSubagentsForRoot(id),
+      events: repository.listEvents(id, 0),
+      queuedTurns: repository.listVisibleQueuedTurns(id),
+    });
+    return { data: threadContinuationDraftSchema.parse(draft) };
   });
 
   app.get('/api/threads/:id/subagents', (request) => {
