@@ -7,6 +7,7 @@ const CACHE_SCHEMA_VERSION = 1;
 const MAX_CACHED_THREADS = 20;
 const MAX_EVENTS_PER_THREAD = 600;
 const MAX_CACHE_BYTES = 10 * 1024 * 1024;
+const DATABASE_OPEN_TIMEOUT_MS = 750;
 
 const safeEventKinds = new Set([
   'thread',
@@ -35,6 +36,15 @@ const cacheableEventKinds = new Set([
   'warning',
   'error',
 ]);
+
+function isCacheableEvent(event: SafeEvent): boolean {
+  if (cacheableEventKinds.has(event.kind)) return true;
+  return (
+    event.kind === 'turn' &&
+    event.payload.runtime !== true &&
+    (event.phase === 'completed' || event.phase === 'failed')
+  );
+}
 
 export interface ThreadHistoryCacheEntry {
   username: string;
@@ -75,7 +85,7 @@ function isSafeEvent(value: unknown, threadId: string): value is SafeEvent {
 function normalizeEvents(events: SafeEvent[], threadId: string): SafeEvent[] {
   const retained = new Map<string, SafeEvent>();
   for (const event of events) {
-    if (!isSafeEvent(event, threadId) || !cacheableEventKinds.has(event.kind)) continue;
+    if (!isSafeEvent(event, threadId) || !isCacheableEvent(event)) continue;
     const nestedRequest =
       event.payload.request && typeof event.payload.request === 'object'
         ? (event.payload.request as Record<string, unknown>)
@@ -127,6 +137,17 @@ function openDatabase(): Promise<IDBDatabase | null> {
   if (typeof indexedDB === 'undefined') return Promise.resolve(null);
   return new Promise((resolve, reject) => {
     const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
+    let settled = false;
+    const finish = (database: IDBDatabase | null) => {
+      if (settled) {
+        database?.close();
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      resolve(database);
+    };
+    const timeout = setTimeout(() => finish(null), DATABASE_OPEN_TIMEOUT_MS);
     request.onupgradeneeded = () => {
       const database = request.result;
       if (!database.objectStoreNames.contains(STORE_NAME)) {
@@ -134,8 +155,14 @@ function openDatabase(): Promise<IDBDatabase | null> {
         store.createIndex('savedAt', 'savedAt');
       }
     };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error('IndexedDB open failed'));
+    request.onsuccess = () => finish(request.result);
+    request.onblocked = () => finish(null);
+    request.onerror = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      reject(request.error ?? new Error('IndexedDB open failed'));
+    };
   });
 }
 
@@ -191,6 +218,9 @@ export async function readThreadHistoryCache(
 export async function writeThreadHistoryCache(entry: ThreadHistoryCacheEntry): Promise<void> {
   try {
     const events = normalizeEvents(entry.events, entry.threadId);
+    const cacheableEventCount = entry.events.filter(
+      (event) => isSafeEvent(event, entry.threadId) && isCacheableEvent(event),
+    ).length;
     const cachedOldestEventId = events.find((event) => event.id > 0)?.id ?? null;
     const base = {
       key: cacheKey(entry.username, entry.threadId),
@@ -199,7 +229,7 @@ export async function writeThreadHistoryCache(entry: ThreadHistoryCacheEntry): P
       threadId: entry.threadId,
       events,
       oldestEventId: cachedOldestEventId ?? entry.oldestEventId,
-      hasMore: entry.hasMore,
+      hasMore: entry.hasMore || cacheableEventCount > events.length,
       savedAt: entry.savedAt,
     };
     const stored: StoredThreadHistory = {
@@ -239,14 +269,16 @@ export async function writeThreadHistoryCache(entry: ThreadHistoryCacheEntry): P
 }
 
 export async function clearThreadHistoryCache(): Promise<void> {
-  if (typeof indexedDB === 'undefined') return;
   try {
-    await new Promise<void>((resolve, reject) => {
-      const request = indexedDB.deleteDatabase(DATABASE_NAME);
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error ?? new Error('IndexedDB delete failed'));
-      request.onblocked = () => resolve();
-    });
+    const database = await openDatabase();
+    if (!database) return;
+    try {
+      const clear = database.transaction(STORE_NAME, 'readwrite');
+      clear.objectStore(STORE_NAME).clear();
+      await transactionDone(clear);
+    } finally {
+      database.close();
+    }
   } catch {
     // Logout must succeed even when private browsing disables IndexedDB.
   }

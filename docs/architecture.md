@@ -29,10 +29,13 @@ Browser
   published as safe SSE state snapshots. The projection includes public identity, hierarchy, model, effort,
   exact lifecycle state and timestamps, but never the delegated prompt or chain-of-thought. Every authenticated
   device therefore sees the same running and completed subagents after reconnect.
-- Projects, thread metadata, authenticated sessions and the safe event journal are server-owned. Browsers keep
-  only transient view/composer state: a second authenticated device loads the same project and chat inventory,
-  hydrates the selected transcript from the server and then follows it through SSE. Active-turn steering is
-  also written as a canonical user event so it remains visible after reconnect and on every device.
+- Projects, thread metadata, authenticated sessions and the safe event journal are server-owned. After session
+  authentication, each browser may keep a versioned, bounded IndexedDB mirror of normalized `SafeEvent`
+  transcript pages for fast first paint and upward history navigation. That mirror is never authoritative:
+  the selected transcript is reconciled with the server snapshot and then follows it through SSE. Cache reads
+  fail closed on schema/version mismatch, attachment bytes and secrets are never stored, least-recently-used
+  threads are evicted, and logout or an unauthenticated startup clears the origin-local mirror. Active-turn
+  steering is also written as a canonical user event so it remains visible after reconnect and on every device.
 - The thread projection stores the current active turn ID instead of asking the browser to infer it from a
   bounded event journal. A process restart clears that runtime-only projection before Codex is queried, so an
   old `inProgress` history row cannot create a phantom running task. Interrupt acceptance is journaled and
@@ -47,9 +50,11 @@ Browser
 - A project is a display name plus a canonical existing directory under an allowlisted root. Codex has no separate project entity; thread `cwd` binds execution to a project.
 - Models and reasoning efforts come from `model/list`; the UI never hard-codes account availability.
 - Persisted project and chat navigation remains readable when `thread/list` cannot reach Codex. Likewise, a
-  selected unhydrated chat returns the latest 120 persisted safe events immediately and starts the existing
-  single-flight native hydration in the background. The detail snapshot publishes its high-water cursor and a
-  truncation marker, so SSE begins strictly after the snapshot while the UI labels the bounded window. SSE
+  selected unhydrated chat returns the latest bounded persisted safe-event page immediately and starts the
+  existing single-flight native hydration in the background. The detail snapshot publishes its high-water and
+  oldest cursors plus a truncation marker, so SSE begins strictly after the snapshot while the UI can request
+  older retained pages with an exclusive backward cursor. IndexedDB may paint already validated pages first,
+  but the current server snapshot and later SSE events always reconcile that non-authoritative mirror. SSE
   attaches and replays without waiting for native hydration. Classified app-server request failures (`notSent`,
   rejected or ambiguous) and integrity failures such as a cwd mismatch leave the saved window visible with an
   explicit degraded state; failures are cached for 30 seconds to prevent hot retry, and the hydration marker
@@ -346,7 +351,8 @@ Codex enter `needsReview`.
 - `GET/POST/PATCH/DELETE /api/projects`; listing accepts an `archived` filter and
   `POST /api/projects/:id/archive`, `POST /api/projects/:id/unarchive` preserve all chat history
 - `GET /api/models`
-- `GET/POST /api/threads`, `GET/PATCH /api/threads/:id`
+- `GET/POST /api/threads`, `GET/PATCH /api/threads/:id`, and bounded backward
+  `GET /api/threads/:id/history?before=<event-id>&limit=<page-size>`
 - `POST /api/threads/:id/archive`, `POST /api/threads/:id/unarchive`; listing accepts a project-scoped `archived` filter
 - `POST /api/threads/:id/turns`, `GET /api/threads/:id/queued-turns`,
   `POST /api/threads/:id/queued-turns/:queuedTurnId/reconcile`,
@@ -399,9 +405,11 @@ that changed while it was running. The result is written back through `thread/na
 server projection and streamed to open clients. Background and visibility refreshes reconcile project/thread
 navigation changed from another device.
 Messages and visible execution stages render their persisted ISO event time in the browser's local timezone.
-The transcript follows new events only while the reader remains near its bottom. Scrolling upward exposes a
-floating jump control; newly streamed events keep that control visible instead of moving the reader, and the
-control returns to the latest event on demand.
+The transcript follows new events only while the reader remains near its bottom. Reaching its top loads an
+older bounded page, prepends it without moving the current viewport and stores the validated result in the
+browser mirror; an explicit load-more control remains available when automatic loading cannot run. Scrolling
+upward exposes a floating jump control; newly streamed events keep that control visible instead of moving the
+reader, and the control returns to the latest event on demand.
 For live work this is the server receipt time. Older history first imported from Codex may only have the import
 time when the protocol item did not expose a trustworthy occurrence timestamp.
 At `820px` and below, the navigation is an off-canvas drawer with focus containment, Escape close and focus

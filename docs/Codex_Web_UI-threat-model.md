@@ -11,7 +11,7 @@ sessions, TLS, audit and an explicit fail-closed mode choice are mandatory; seco
 
 ## Scope and assumptions
 
-- In scope: the standalone reverse-proxied web/API service, SQLite metadata, bounded attachment storage,
+- In scope: the standalone reverse-proxied web/API service, SQLite metadata, bounded browser transcript cache, bounded attachment storage,
   ephemeral voice transcription, per-device Web Push subscriptions and delivery queue, private app-server
   socket, registered project roots, server Codex home, package/bootstrap installer and runtime units.
 - Out of scope: product CRM/Admin code, product databases and Provider/Telegram controls, browser-controlled
@@ -35,6 +35,7 @@ sessions, TLS, audit and an explicit fail-closed mode choice are mandatory; seco
 
 - TLS reverse proxy and rate limits.
 - React browser client.
+- Versioned, bounded IndexedDB transcript mirror inside the authenticated browser origin.
 - Node.js API, session and authorization boundary.
 - SQLite metadata/session/audit/event store.
 - Mode-0600 systemd Unix socket and bounded JSON-RPC adapter.
@@ -44,6 +45,9 @@ sessions, TLS, audit and an explicit fail-closed mode choice are mandatory; seco
 ### Data flows and trust boundaries
 
 - Browser -> edge: credentials, session cookie and UI requests over HTTPS; protected by TLS, limits and security headers.
+- Authenticated Web UI -> IndexedDB: normalized `SafeEvent` pages only; no attachment bytes, credentials,
+  approval answers or raw native history. The mirror is non-authoritative and is cleared at logout or when
+  startup establishes that no authenticated session exists.
 - Edge -> API: authenticated REST/SSE; exact Origin, CSRF on mutations, schema and size validation.
 - API -> SQLite: hashed sessions, projects, mappings, normalized events and audit records; no OpenAI token or chain-of-thought.
 - API -> app-server: typed JSON-RPC over a private Unix socket; allowlisted methods, bounded messages and
@@ -116,6 +120,7 @@ flowchart LR
 | `AGENTS.md`, skills and config  | They control agent behavior and safety                                     | I         |
 | Project secrets                 | May authorize external systems                                             | C/I       |
 | Chats, diffs and command output | Can contain sensitive development data                                     | C/I/A     |
+| Browser transcript mirror       | Persists a bounded subset of normalized chat content on an operator device | C/I       |
 | Host resources                  | Shared-host availability                                                   | A         |
 | Uploaded images and files       | May contain private data or hostile content                                | C/I/A     |
 | Temporary voice recordings      | May contain private speech and incur API cost                              | C/A       |
@@ -143,22 +148,23 @@ flowchart LR
 
 ## Entry points and attack surfaces
 
-| Surface               | How reached           | Boundary                     | Planned controls                                                                        |
-| --------------------- | --------------------- | ---------------------------- | --------------------------------------------------------------------------------------- |
-| Login                 | Public HTTPS          | Internet to session          | Argon2id, throttling, lockout, generic errors                                           |
-| REST mutations        | Authenticated browser | Session to API               | CSRF, exact Origin, Zod, turn/action idempotency; bounded upload cleanup                |
-| SSE                   | Authenticated browser | API to browser               | Per-thread authorization, replay cursor, no secrets                                     |
-| Markdown/diffs/output | Codex events          | Untrusted output to DOM      | text-safe rendering, no raw HTML, CSP                                                   |
-| Project registration  | Admin form            | API to filesystem            | configured roots, realpath, symlink/path rejection                                      |
-| JSON-RPC              | Local child stdio     | API to Codex                 | method/schema allowlist, IDs, size bounds                                               |
-| Attachment upload     | Authenticated browser | Browser to bounded storage   | multipart/type/signature/size limits, opaque IDs                                        |
-| Attachment content    | Authenticated browser | Storage to browser           | thread ownership, `nosniff`, download non-images                                        |
-| Voice transcription   | Authenticated browser | Browser/API to local model   | CSRF/origin, canonical WAV/size/time/rate bounds, idempotency, no persistence           |
-| Push subscription     | Authenticated browser | Browser/API to push service  | Explicit permission; CSRF/origin; bounded HTTPS endpoint/keys; generic payload          |
-| Skills and rules      | Project/server files  | Filesystem to agent policy   | pinned bundle, checksums, visible loaded sources                                        |
-| Codex update          | Authenticated browser | API to narrow root broker    | fixed reviewed candidate, peer credentials, no caller path/command, checksums, rollback |
-| Runner-mode install   | Local root terminal   | Operator to systemd/Codex    | restricted default, explicit host-admin value, protected persisted mode                 |
-| Runner migration      | Local root terminal   | Non-root state to root state | idle drain, collision rejection, complete state copy, health-gated rollback             |
+| Surface               | How reached           | Boundary                     | Planned controls                                                                                              |
+| --------------------- | --------------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Login                 | Public HTTPS          | Internet to session          | Argon2id, throttling, lockout, generic errors                                                                 |
+| REST mutations        | Authenticated browser | Session to API               | CSRF, exact Origin, Zod, turn/action idempotency; bounded upload cleanup                                      |
+| SSE                   | Authenticated browser | API to browser               | Per-thread authorization, replay cursor, no secrets                                                           |
+| IndexedDB transcript  | Authenticated Web UI  | DOM to browser profile       | normalized events only, schema/version validation, LRU bounds, auth-gated reads, logout/unauthenticated clear |
+| Markdown/diffs/output | Codex events          | Untrusted output to DOM      | text-safe rendering, no raw HTML, CSP                                                                         |
+| Project registration  | Admin form            | API to filesystem            | configured roots, realpath, symlink/path rejection                                                            |
+| JSON-RPC              | Local child stdio     | API to Codex                 | method/schema allowlist, IDs, size bounds                                                                     |
+| Attachment upload     | Authenticated browser | Browser to bounded storage   | multipart/type/signature/size limits, opaque IDs                                                              |
+| Attachment content    | Authenticated browser | Storage to browser           | thread ownership, `nosniff`, download non-images                                                              |
+| Voice transcription   | Authenticated browser | Browser/API to local model   | CSRF/origin, canonical WAV/size/time/rate bounds, idempotency, no persistence                                 |
+| Push subscription     | Authenticated browser | Browser/API to push service  | Explicit permission; CSRF/origin; bounded HTTPS endpoint/keys; generic payload                                |
+| Skills and rules      | Project/server files  | Filesystem to agent policy   | pinned bundle, checksums, visible loaded sources                                                              |
+| Codex update          | Authenticated browser | API to narrow root broker    | fixed reviewed candidate, peer credentials, no caller path/command, checksums, rollback                       |
+| Runner-mode install   | Local root terminal   | Operator to systemd/Codex    | restricted default, explicit host-admin value, protected persisted mode                                       |
+| Runner migration      | Local root terminal   | Non-root state to root state | idle drain, collision rejection, complete state copy, health-gated rollback                                   |
 
 ## Top abuse paths
 
@@ -195,6 +201,8 @@ flowchart LR
     host takeover without a deliberate trust decision.
 23. A partial or colliding migration starts root Codex with an empty or unrelated profile, loses rollout/chat
     continuity, or leaves duplicated credentials readable by the previous non-root identity.
+24. A stale or shared browser profile exposes cached transcript content after logout, or
+    forged cache records are treated as authoritative runtime state.
 
 ## Threat model table
 
@@ -232,6 +240,7 @@ flowchart LR
 | TM-030 | Lost consume response or malformed post-check loops, double-spends or blocks silently      | App-server failure classification and visible recovery state                                 | Retry only the same redemption key; accept only `reset`/`alreadyRedeemed` then require a same-account `ordinaryUsageAllowed === true` post-read; expose terminal no-credit/nothing-to-reset/failure states; never burn a second credit within the same blocked epoch                                                                                            | medium     | high     | high     |
 | TM-031 | Reset/account identifiers or backend-provided labels leak through API, events or audit     | Authenticated bounded projections and safe audit metadata                                    | Hash the account binding; keep credit IDs and raw RPC payloads server-side; expose only supported/enabled state, aggregate count, bounded outcome/time and resumed count; audit safe enums and local task IDs                                                                                                                                                   | low        | medium   | medium   |
 | TM-032 | Included usage is exhausted but Codex silently continues against paid credits              | ChatGPT-authenticated root start, queued dispatch and active-turn steer                      | Fresh account/rate-limit read immediately before each native request; deny 100% included windows with `credits.hasCredits`; fail closed on unavailable state; never expose the balance; keep queued work cancellable and document that an already running turn can cross the boundary before notification                                                       | low        | high     | high     |
+| TM-033 | Persisted browser history leaks across logout or overrides server state                    | Cache is same-origin and contains only normalized browser-visible events                     | Read only after authenticated startup; version/schema validate every record; never cache attachment bytes, credentials or interaction answers; bound per-thread/global retention with LRU eviction; clear on logout and unauthenticated startup; treat server snapshot/SSE as authoritative and cached runtime projections as display-only until reconciled     | medium     | medium   | medium   |
 
 ## Criticality calibration
 
@@ -252,7 +261,7 @@ flowchart LR
 | `apps/server/src/audio-transcription.ts` | Local model integrity and ephemeral audio     | TM-021                         |
 | `apps/server/src/push-notifications.ts`  | External delivery, retry and stale endpoints  | TM-022                         |
 | `apps/web/public/push-service-worker.js` | Background display and click navigation       | TM-002, TM-022                 |
-| `apps/web/src/`                          | Rendering of untrusted content                | TM-002, TM-005                 |
+| `apps/web/src/`                          | Rendering and bounded local transcript cache  | TM-002, TM-005, TM-033         |
 | `infra/`                                 | TLS, runner modes and resource limits         | TM-001, TM-006, TM-009, TM-024 |
 | `scripts/install-package.sh`             | Explicit mode selection and upgrade guards    | TM-016, TM-017, TM-024, TM-025 |
 | `scripts/` migration/instruction helpers | State preservation and root policy injection  | TM-007, TM-024, TM-025         |
@@ -286,3 +295,6 @@ flowchart LR
 - Web Push providers necessarily observe a device endpoint and delivery timing. The application minimizes
   payload content but cannot hide that metadata from the device vendor's push service. Browser permission is
   per device, and a valid trusted HTTPS context is required.
+- A trusted personal browser profile is assumed. IndexedDB improves reload latency but is not encryption at
+  rest against another local user or compromised browser profile; explicit logout and unauthenticated startup
+  remove the mirror, while clearing site data remains the recovery path for a lost device profile.

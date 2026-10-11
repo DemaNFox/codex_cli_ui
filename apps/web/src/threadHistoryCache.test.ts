@@ -37,6 +37,11 @@ class MemoryTransaction {
         queueMicrotask(() => this.oncomplete?.());
         return request(undefined);
       },
+      clear: () => {
+        this.records.clear();
+        queueMicrotask(() => this.oncomplete?.());
+        return request(undefined);
+      },
     };
   }
 }
@@ -67,10 +72,6 @@ function memoryIndexedDb() {
       queueMicrotask(() => target.onsuccess?.());
       return target;
     },
-    deleteDatabase: () => {
-      records.clear();
-      return request(undefined);
-    },
   };
 }
 
@@ -82,6 +83,18 @@ function event(id: number, text = `Event ${id}`): SafeEvent {
     kind: 'agent-message',
     phase: 'completed',
     payload: { text },
+    createdAt: '2026-10-11T12:00:00.000Z',
+  };
+}
+
+function completedTurn(id: number): SafeEvent {
+  return {
+    id,
+    threadId: 'thread-1',
+    turnId: `turn-${id}`,
+    kind: 'turn',
+    phase: 'completed',
+    payload: { status: 'completed' },
     createdAt: '2026-10-11T12:00:00.000Z',
   };
 }
@@ -145,5 +158,25 @@ describe('threadHistoryCache', () => {
     expect(cached?.events[0]?.id).toBe(101);
     expect(cached?.events.at(-1)?.id).toBe(700);
     expect(cached?.oldestEventId).toBe(101);
+    expect(cached?.hasMore).toBe(true);
+  });
+
+  it('keeps terminal turn evidence but excludes stale live runtime projections', async () => {
+    const runtime: SafeEvent = {
+      ...completedTurn(3),
+      phase: 'state',
+      payload: { runtime: true, status: 'active' },
+    };
+    await writeThreadHistoryCache({
+      username: 'nick',
+      threadId: 'thread-1',
+      events: [event(1), completedTurn(2), runtime],
+      oldestEventId: 1,
+      hasMore: false,
+      savedAt: 10,
+    });
+
+    const cached = await readThreadHistoryCache('nick', 'thread-1');
+    expect(cached?.events.map((item) => item.id)).toEqual([1, 2]);
   });
 });

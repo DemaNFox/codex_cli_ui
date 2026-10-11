@@ -4837,7 +4837,13 @@ function Workspace({
           requestedThreadId,
         );
         const firstPersistedEventId = history.events.find((event) => event.id > 0)?.id ?? null;
-        setOldestEventId(history.oldestEventId ?? firstPersistedEventId);
+        const serverOldestEventId = history.oldestEventId ?? firstPersistedEventId;
+        const retainedOldestEventId =
+          cached?.oldestEventId &&
+          (!serverOldestEventId || cached.oldestEventId < serverOldestEventId)
+            ? cached.oldestEventId
+            : serverOldestEventId;
+        setOldestEventId(retainedOldestEventId);
         setEventStreamStart({ threadId: requestedThreadId, cursor: historyCursor });
         setServerTurnNavigation(history.turnNavigation ?? null);
         setQueuedTurns(
@@ -4863,7 +4869,11 @@ function Workspace({
         setThreadHistoryWarningCode(
           history.historyState === 'degraded' ? (history.historyWarning ?? 'DEGRADED') : null,
         );
-        setThreadHistoryTruncated(history.historyTruncated === true);
+        setThreadHistoryTruncated(
+          retainedOldestEventId === cached?.oldestEventId
+            ? cached.hasMore
+            : history.historyTruncated === true,
+        );
         setPendingInteractionsTruncated(history.pendingInteractionsTruncated === true);
         if (deferredHistory && deferredHistoryRetryAttemptedRef.current !== requestedThreadId) {
           deferredHistoryRetryAttemptedRef.current = requestedThreadId;
@@ -4880,7 +4890,22 @@ function Workspace({
         setThreadLoadError(null);
       } catch (cause: unknown) {
         if (!cancelled) {
-          if (!cached?.events.length) {
+          const authoritativeCacheRejection =
+            cause instanceof ApiError && [401, 403, 404].includes(cause.status);
+          if (authoritativeCacheRejection) {
+            replaceSnapshot([], requestedThreadId);
+            setOldestEventId(null);
+            setThreadHistoryTruncated(false);
+            setEventStreamStart(null);
+            await clearThreadHistoryCache();
+            if (cause.status === 401) {
+              onSignedOut();
+              return;
+            }
+            if (cancelled || attachmentThreadRef.current !== requestedThreadId) return;
+            setThreadLoadState('error');
+            setThreadLoadError(errorMessage(cause));
+          } else if (!cached?.events.length) {
             setThreadLoadState('error');
             setThreadLoadError(errorMessage(cause));
           } else {
@@ -4889,7 +4914,8 @@ function Workspace({
             );
             setThreadHistoryWarningCode('CACHE_REVALIDATION_FAILED');
           }
-          setEventStreamStart({ threadId: requestedThreadId, cursor: 0 });
+          if (!authoritativeCacheRejection)
+            setEventStreamStart({ threadId: requestedThreadId, cursor: 0 });
         }
       }
     })();
@@ -4922,6 +4948,7 @@ function Workspace({
     closeImagePreview,
     mergeEvents,
     replaceSnapshot,
+    onSignedOut,
     session.username,
     threadId,
     threadReloadToken,
@@ -6688,6 +6715,10 @@ function Workspace({
 export function App() {
   const [state, setState] = useState<LoadState>('loading');
   const [session, setSession] = useState<Session | null>(null);
+  const handleSignedOut = useCallback(() => {
+    setSession(null);
+    setState('signed-out');
+  }, []);
 
   useEffect(() => {
     void api
@@ -6718,13 +6749,6 @@ export function App() {
       />
     );
   return (
-    <Workspace
-      session={session}
-      onSessionRefresh={setSession}
-      onSignedOut={() => {
-        setSession(null);
-        setState('signed-out');
-      }}
-    />
+    <Workspace session={session} onSessionRefresh={setSession} onSignedOut={handleSignedOut} />
   );
 }

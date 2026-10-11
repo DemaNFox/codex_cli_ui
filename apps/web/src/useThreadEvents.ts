@@ -5,7 +5,6 @@ import type { SafeEvent } from './api.js';
 export type StreamState = 'connecting' | 'open' | 'offline';
 
 export const THREAD_EVENT_RETENTION_LIMIT = 120;
-export const THREAD_HISTORY_RETENTION_LIMIT = 2_400;
 export const PINNED_INTERACTION_RETENTION_LIMIT = 120;
 
 const safeEventKinds = [
@@ -95,9 +94,9 @@ function retainRecentEvents(events: SafeEvent[], historyKeys: Set<string>): Safe
     else pendingInteractions.delete(key);
   }
 
-  const history = events
-    .filter((event) => !isSyntheticInteraction(event) && historyKeys.has(retainedEventKey(event)))
-    .slice(-THREAD_HISTORY_RETENTION_LIMIT);
+  const history = events.filter(
+    (event) => !isSyntheticInteraction(event) && historyKeys.has(retainedEventKey(event)),
+  );
   const retainedHistoryKeys = new Set(history.map(retainedEventKey));
   const tail = events
     .filter(

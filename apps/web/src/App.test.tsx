@@ -1096,6 +1096,78 @@ describe('App', () => {
     cacheRead.mockRestore();
   });
 
+  it('clears cached history and signs out when revalidation reports an expired session', async () => {
+    const cacheRead = vi.spyOn(threadHistoryCache, 'readThreadHistoryCache').mockResolvedValueOnce({
+      username: 'nick',
+      threadId: thread.id,
+      events: [
+        {
+          id: 10,
+          threadId: thread.id,
+          turnId: 'turn-cached',
+          kind: 'agent-message',
+          phase: 'completed',
+          payload: { text: 'Кэш с истёкшей сессией' },
+          createdAt: '2026-10-11T08:00:00.000Z',
+        },
+      ],
+      oldestEventId: 10,
+      hasMore: false,
+      savedAt: 1,
+    });
+    const cacheClear = vi
+      .spyOn(threadHistoryCache, 'clearThreadHistoryCache')
+      .mockResolvedValueOnce();
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ error: { code: 'SESSION_INVALID', message: 'expired' } }, 401);
+      return undefined;
+    });
+    render(<App />);
+
+    expect(await screen.findByRole('button', { name: 'Войти' })).not.toBeNull();
+    expect(cacheClear).toHaveBeenCalled();
+    expect(screen.queryByText('Кэш с истёкшей сессией')).toBeNull();
+    cacheRead.mockRestore();
+    cacheClear.mockRestore();
+  });
+
+  it('discards cached history when the authoritative thread is no longer available', async () => {
+    const cacheRead = vi.spyOn(threadHistoryCache, 'readThreadHistoryCache').mockResolvedValueOnce({
+      username: 'nick',
+      threadId: thread.id,
+      events: [
+        {
+          id: 10,
+          threadId: thread.id,
+          turnId: 'turn-cached',
+          kind: 'agent-message',
+          phase: 'completed',
+          payload: { text: 'Удалённый сервером кэш' },
+          createdAt: '2026-10-11T08:00:00.000Z',
+        },
+      ],
+      oldestEventId: 10,
+      hasMore: false,
+      savedAt: 1,
+    });
+    const cacheClear = vi
+      .spyOn(threadHistoryCache, 'clearThreadHistoryCache')
+      .mockResolvedValueOnce();
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({ error: { code: 'THREAD_NOT_FOUND', message: 'missing' } }, 404);
+      return undefined;
+    });
+    render(<App />);
+
+    expect(await screen.findByText('Чат временно недоступен')).not.toBeNull();
+    expect(cacheClear).toHaveBeenCalled();
+    expect(screen.queryByText('Удалённый сервером кэш')).toBeNull();
+    cacheRead.mockRestore();
+    cacheClear.mockRestore();
+  });
+
   it('labels a bounded history tail without treating it as a load error', async () => {
     const event = {
       id: 1,
