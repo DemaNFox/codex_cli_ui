@@ -26,6 +26,8 @@ import { ImagePreviewDialog } from './ImagePreviewDialog.js';
 import { normalizeProjectFilePath, ProjectFileDownload } from './ProjectFileDownload.js';
 import {
   clearThreadHistoryCache,
+  disableThreadHistoryCacheWrites,
+  enableThreadHistoryCacheWrites,
   readThreadHistoryCache,
   writeThreadHistoryCache,
 } from './threadHistoryCache.js';
@@ -2159,11 +2161,21 @@ function Transcript({
   events,
   serverTurnNavigation,
   onNavigateTurn,
+  loadingTurnNavigationKey,
   onPreviewImage,
 }: {
   events: SafeEvent[];
   serverTurnNavigation: TurnNavigationEntry[] | null;
-  onNavigateTurn: (anchorId: string) => void;
+  onNavigateTurn: (target: {
+    key: string;
+    anchorId: string;
+    turnId: string | null;
+    label: string;
+    requiresHistoryRestore: boolean;
+    serverBacked: boolean;
+    navigationId: number | null;
+  }) => void;
+  loadingTurnNavigationKey: string | null;
   onPreviewImage: (image: PreviewImage) => void;
 }) {
   const displayEvents = useMemo(() => {
@@ -2295,11 +2307,23 @@ function Transcript({
       return retainedUserMessages.map((event) => ({
         key: `event-turn-${event.id}`,
         anchorId: `turn-message-${event.id}`,
+        turnId: event.turnId,
         label: messageLabel(event),
+        requiresHistoryRestore: false,
+        serverBacked: false,
+        navigationId: null,
       }));
     }
     const claimedMessageIds = new Set<number>();
-    const navigation = serverTurnNavigation.map((entry) => {
+    const navigation: Array<{
+      key: string;
+      anchorId: string;
+      turnId: string | null;
+      label: string;
+      requiresHistoryRestore: boolean;
+      serverBacked: boolean;
+      navigationId: number | null;
+    }> = serverTurnNavigation.map((entry) => {
       const exactMessage = retainedUserMessages.find(
         (event) =>
           !claimedMessageIds.has(event.id) &&
@@ -2308,10 +2332,19 @@ function Transcript({
       );
       if (exactMessage) {
         claimedMessageIds.add(exactMessage.id);
+        const hasLoadedFinal = visibleEvents.some(
+          (event) => event.turnId === entry.turnId && finalAgentMessageIds.has(event.id),
+        );
         return {
           key: `server-turn-${entry.id}`,
           anchorId: `turn-message-${exactMessage.id}`,
+          turnId: entry.turnId,
           label: entry.label,
+          requiresHistoryRestore:
+            !turnCompletionById.has(entry.turnId) ||
+            (completedTurnIds.has(entry.turnId) && !hasLoadedFinal),
+          serverBacked: true,
+          navigationId: entry.id,
         };
       }
       const firstVisible = firstVisibleByTurn.get(entry.turnId);
@@ -2320,18 +2353,38 @@ function Transcript({
           ? `turn-message-${firstVisible.id}`
           : `turn-retained-${firstVisible.id}`
         : 'transcript-start';
-      return { key: `server-turn-${entry.id}`, anchorId, label: entry.label };
+      return {
+        key: `server-turn-${entry.id}`,
+        anchorId,
+        turnId: entry.turnId,
+        label: entry.label,
+        requiresHistoryRestore: true,
+        serverBacked: true,
+        navigationId: entry.id,
+      };
     });
     for (const event of retainedUserMessages) {
       if (claimedMessageIds.has(event.id)) continue;
       navigation.push({
         key: `event-turn-${event.id}`,
         anchorId: `turn-message-${event.id}`,
+        turnId: event.turnId,
         label: messageLabel(event),
+        requiresHistoryRestore: false,
+        serverBacked: false,
+        navigationId: null,
       });
     }
     return navigation;
-  }, [serverTurnNavigation, visibleEvents]);
+  }, [
+    completedTurnIds,
+    finalAgentMessageIds,
+    serverTurnNavigation,
+    turnCompletionById,
+    visibleEvents,
+  ]);
+  const showTurnNavigation =
+    turnNavigation.length > 1 || turnNavigation.some((turn) => turn.requiresHistoryRestore);
   const retainedTurnAnchorIds = useMemo(
     () => new Set(turnNavigation.map((turn) => turn.anchorId)),
     [turnNavigation],
@@ -2366,8 +2419,8 @@ function Transcript({
   }
 
   return (
-    <div className={`transcript-shell${turnNavigation.length > 1 ? ' has-turn-navigation' : ''}`}>
-      {turnNavigation.length > 1 && (
+    <div className={`transcript-shell${showTurnNavigation ? ' has-turn-navigation' : ''}`}>
+      {showTurnNavigation && (
         <nav className="turn-navigation" aria-label="Переходы по задачам">
           {turnNavigation.map((turn, index) => (
             <button
@@ -2377,7 +2430,9 @@ function Transcript({
               aria-label={`Перейти к задаче ${index + 1}: ${turn.label}`}
               title={turn.label}
               data-preview={turn.label}
-              onClick={() => onNavigateTurn(turn.anchorId)}
+              aria-busy={loadingTurnNavigationKey === turn.key}
+              disabled={loadingTurnNavigationKey !== null}
+              onClick={() => onNavigateTurn(turn)}
             >
               <span aria-hidden="true" />
             </button>
@@ -3733,6 +3788,7 @@ function Workspace({
   const [threadHistoryTruncated, setThreadHistoryTruncated] = useState(false);
   const [oldestEventId, setOldestEventId] = useState<number | null>(null);
   const [loadingOlderHistory, setLoadingOlderHistory] = useState(false);
+  const [loadingTurnNavigationKey, setLoadingTurnNavigationKey] = useState<string | null>(null);
   const [olderHistoryError, setOlderHistoryError] = useState<string | null>(null);
   const [pendingInteractionsTruncated, setPendingInteractionsTruncated] = useState(false);
   const [threadReloadToken, setThreadReloadToken] = useState(0);
@@ -3770,7 +3826,14 @@ function Workspace({
     threadId: string;
     scrollHeight: number;
     scrollTop: number;
+    anchorId: string | null;
+    anchorOffset: number;
   } | null>(null);
+  const pendingTurnNavigationRef = useRef<{
+    threadId: string;
+    anchorId: string;
+  } | null>(null);
+  const restoredTurnNavigationKeysRef = useRef(new Set<string>());
   const queuedAttachmentsRef = useRef<QueuedAttachment[]>([]);
   const attachmentThreadRef = useRef<string | null>(null);
   const csrfTokenRef = useRef(session.csrfToken);
@@ -3987,6 +4050,14 @@ function Workspace({
     const scroll = conversationScrollRef.current;
     if (!pending || !scroll || pending.threadId !== threadId) return;
     pendingPrependScrollRef.current = null;
+    if (pending.anchorId) {
+      const anchor = document.getElementById(pending.anchorId);
+      if (anchor && scroll.contains(anchor)) {
+        const nextOffset = anchor.getBoundingClientRect().top - scroll.getBoundingClientRect().top;
+        scroll.scrollTop += nextOffset - pending.anchorOffset;
+        return;
+      }
+    }
     scroll.scrollTop = pending.scrollTop + (scroll.scrollHeight - pending.scrollHeight);
   }, [events, threadId]);
 
@@ -4050,10 +4121,21 @@ function Workspace({
       const page = await api.threadHistory(requestedThreadId, requestedBefore);
       if (attachmentThreadRef.current !== requestedThreadId) return;
       if (scroll) {
+        const scrollRect = scroll.getBoundingClientRect();
+        const visibleAnchor = [...scroll.querySelectorAll<HTMLElement>('[id^="turn-"]')].find(
+          (candidate) => {
+            const rect = candidate.getBoundingClientRect();
+            return rect.height > 0 && rect.bottom > scrollRect.top;
+          },
+        );
         pendingPrependScrollRef.current = {
           threadId: requestedThreadId,
           scrollHeight: scroll.scrollHeight,
           scrollTop: scroll.scrollTop,
+          anchorId: visibleAnchor?.id ?? null,
+          anchorOffset: visibleAnchor
+            ? visibleAnchor.getBoundingClientRect().top - scrollRect.top
+            : 0,
         };
       }
       prependHistory(page.events, requestedThreadId);
@@ -4088,15 +4170,77 @@ function Workspace({
     positionAtLatestImmediately(scroll);
   }
 
-  function navigateToTurn(anchorId: string): void {
+  function scrollToTurnAnchor(anchorId: string): boolean {
     const target = document.getElementById(anchorId);
-    if (!target) return;
+    if (!target) return false;
     followingLatestRef.current = false;
     userScrollIntentRef.current = true;
     setShowScrollToLatest(true);
     target.scrollIntoView({ behavior: 'smooth', block: 'start' });
     target.focus({ preventScroll: true });
+    return true;
   }
+
+  async function navigateToTurn(target: {
+    key: string;
+    anchorId: string;
+    turnId: string | null;
+    label: string;
+    requiresHistoryRestore: boolean;
+    serverBacked: boolean;
+    navigationId: number | null;
+  }): Promise<void> {
+    const requiresServerReconciliation =
+      target.serverBacked &&
+      target.requiresHistoryRestore &&
+      !restoredTurnNavigationKeysRef.current.has(target.key);
+    scrollToTurnAnchor(target.anchorId);
+    if (!requiresServerReconciliation) return;
+    if (!threadId || !target.turnId || target.navigationId === null || loadingTurnNavigationKey)
+      return;
+    const requestedThreadId = threadId;
+    setLoadingTurnNavigationKey(target.key);
+    setOlderHistoryError(null);
+    try {
+      const history = await api.threadTurnHistory(
+        requestedThreadId,
+        target.turnId,
+        target.navigationId,
+      );
+      if (attachmentThreadRef.current !== requestedThreadId) return;
+      const anchoredPrompt = history.events.find(
+        (event) => event.kind === 'user-message' && event.id === history.anchorEventId,
+      );
+      const matchingPrompt = history.events.find(
+        (event) =>
+          event.kind === 'user-message' &&
+          event.turnId === target.turnId &&
+          turnNavigationLabel(eventText(event)) === target.label,
+      );
+      const firstTurnEvent = history.events.find((event) => event.turnId === target.turnId);
+      const anchorEvent = anchoredPrompt ?? matchingPrompt ?? firstTurnEvent;
+      if (!anchorEvent) throw new Error('Сообщения этой задачи больше не сохранены на сервере.');
+      const anchorId =
+        anchorEvent.kind === 'user-message'
+          ? `turn-message-${anchorEvent.id}`
+          : `turn-retained-${anchorEvent.id}`;
+      pendingTurnNavigationRef.current = { threadId: requestedThreadId, anchorId };
+      restoredTurnNavigationKeysRef.current.add(target.key);
+      prependHistory(history.events, requestedThreadId);
+    } catch (cause) {
+      if (attachmentThreadRef.current === requestedThreadId) {
+        setOlderHistoryError(`Не удалось восстановить сообщения задачи. ${errorMessage(cause)}`);
+      }
+    } finally {
+      if (attachmentThreadRef.current === requestedThreadId) setLoadingTurnNavigationKey(null);
+    }
+  }
+
+  useLayoutEffect(() => {
+    const pending = pendingTurnNavigationRef.current;
+    if (!pending || pending.threadId !== threadId) return;
+    if (scrollToTurnAnchor(pending.anchorId)) pendingTurnNavigationRef.current = null;
+  }, [events, threadId]);
 
   useEffect(() => {
     const nameEvent = [...events]
@@ -4789,11 +4933,14 @@ function Workspace({
     setThreadHistoryTruncated(false);
     setOldestEventId(null);
     setLoadingOlderHistory(false);
+    setLoadingTurnNavigationKey(null);
     loadingOlderHistoryRef.current = false;
     setOlderHistoryError(null);
     setPendingInteractionsTruncated(false);
     historyCacheReadyThreadRef.current = null;
     pendingPrependScrollRef.current = null;
+    pendingTurnNavigationRef.current = null;
+    restoredTurnNavigationKeysRef.current.clear();
     if (!threadId) {
       setThreadLoadState('idle');
       return;
@@ -4832,12 +4979,17 @@ function Workspace({
         setRecentThreads((current) =>
           current.map((item) => (item.id === requestedThreadId ? history.data : item)),
         );
-        replaceSnapshot(
-          [...history.events, ...(history.pendingInteractionEvents ?? [])],
-          requestedThreadId,
-        );
         const firstPersistedEventId = history.events.find((event) => event.id > 0)?.id ?? null;
         const serverOldestEventId = history.oldestEventId ?? firstPersistedEventId;
+        const cachedEarlierEvents =
+          cached?.events.filter(
+            (event) =>
+              event.id > 0 && (serverOldestEventId === null || event.id < serverOldestEventId),
+          ) ?? [];
+        replaceSnapshot(
+          [...cachedEarlierEvents, ...history.events, ...(history.pendingInteractionEvents ?? [])],
+          requestedThreadId,
+        );
         const retainedOldestEventId =
           cached?.oldestEventId &&
           (!serverOldestEventId || cached.oldestEventId < serverOldestEventId)
@@ -4897,11 +5049,13 @@ function Workspace({
             setOldestEventId(null);
             setThreadHistoryTruncated(false);
             setEventStreamStart(null);
-            await clearThreadHistoryCache();
             if (cause.status === 401) {
+              disableThreadHistoryCacheWrites();
               onSignedOut();
+              await clearThreadHistoryCache();
               return;
             }
+            await clearThreadHistoryCache();
             if (cancelled || attachmentThreadRef.current !== requestedThreadId) return;
             setThreadLoadState('error');
             setThreadLoadError(errorMessage(cause));
@@ -5994,7 +6148,9 @@ function Workspace({
         onMobileClose={closeMobileNavigation}
         onLogout={() =>
           void api.logout(session.csrfToken).finally(() => {
-            void clearThreadHistoryCache().finally(onSignedOut);
+            disableThreadHistoryCacheWrites();
+            onSignedOut();
+            void clearThreadHistoryCache();
           })
         }
         settingsButtonRef={settingsButtonRef}
@@ -6188,7 +6344,8 @@ function Workspace({
               <Transcript
                 events={events}
                 serverTurnNavigation={serverTurnNavigation}
-                onNavigateTurn={navigateToTurn}
+                onNavigateTurn={(target) => void navigateToTurn(target)}
+                loadingTurnNavigationKey={loadingTurnNavigationKey}
                 onPreviewImage={openImagePreview}
               />
             ) : null}
@@ -6724,6 +6881,7 @@ export function App() {
     void api
       .session()
       .then((value) => {
+        enableThreadHistoryCacheWrites();
         setSession(value);
         setState('ready');
       })
@@ -6743,6 +6901,7 @@ export function App() {
     return (
       <Login
         onLogin={(value) => {
+          enableThreadHistoryCacheWrites();
           setSession(value);
           setState('ready');
         }}

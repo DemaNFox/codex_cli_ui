@@ -3318,7 +3318,9 @@ export class SqliteRepository {
       terminalRow,
     ]
       .filter((row): row is EventRow => row !== undefined)
-      .filter((row, index, rows) => rows.findIndex((candidate) => candidate.id === row.id) === index)
+      .filter(
+        (row, index, rows) => rows.findIndex((candidate) => candidate.id === row.id) === index,
+      )
       .slice(0, boundedLimit);
     const remainingLimit = Math.max(0, boundedLimit - reservedRows.length);
     const reservedIds = reservedRows.map((row) => row.id);

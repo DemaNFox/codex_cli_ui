@@ -1093,6 +1093,7 @@ describe('App', () => {
       }),
     );
     expect(await screen.findByText('Свежий ответ сервера')).not.toBeNull();
+    expect(screen.getByText('Мгновенно из локального кэша')).not.toBeNull();
     cacheRead.mockRestore();
   });
 
@@ -2588,9 +2589,78 @@ describe('App', () => {
         label: 'Сохранившийся запрос',
       },
     ];
-    installAuthenticatedApi((url) => {
+    const restoredEvents = [
+      {
+        id: 90,
+        threadId: 'thread-1',
+        turnId: 'fully-pruned-turn',
+        kind: 'user-message' as const,
+        phase: 'completed' as const,
+        payload: { text: 'Полностью старая задача' },
+        createdAt: '2026-09-27T10:00:00.000Z',
+      },
+      {
+        id: 91,
+        threadId: 'thread-1',
+        turnId: 'fully-pruned-turn',
+        kind: 'agent-message' as const,
+        phase: 'completed' as const,
+        payload: { text: 'Восстановленный финальный ответ', messagePhase: 'final_answer' },
+        createdAt: '2026-09-27T10:01:00.000Z',
+      },
+      {
+        id: 92,
+        threadId: 'thread-1',
+        turnId: 'fully-pruned-turn',
+        kind: 'turn' as const,
+        phase: 'completed' as const,
+        payload: { status: 'completed' },
+        createdAt: '2026-09-27T10:02:00.000Z',
+      },
+    ];
+    const fetchMock = installAuthenticatedApi((url) => {
       if (url === '/api/threads/thread-1') {
         return jsonResponse({ data: thread, events: retainedEvents, turnNavigation });
+      }
+      if (url === '/api/threads/thread-1/turns/fully-pruned-turn/history?navigationId=1') {
+        return jsonResponse({ events: restoredEvents, anchorEventId: 90 });
+      }
+      if (url === '/api/threads/thread-1/turns/partially-retained-turn/history?navigationId=2') {
+        return jsonResponse({
+          anchorEventId: 95,
+          events: [
+            {
+              id: 95,
+              threadId: 'thread-1',
+              turnId: 'partially-retained-turn',
+              kind: 'user-message',
+              phase: 'completed',
+              payload: { text: 'Частично сохранённая задача' },
+              createdAt: '2026-09-27T10:30:00.000Z',
+            },
+            {
+              id: 96,
+              threadId: 'thread-1',
+              turnId: 'partially-retained-turn',
+              kind: 'agent-message',
+              phase: 'completed',
+              payload: {
+                text: 'Восстановленный ответ частично сохранённой задачи',
+                messagePhase: 'final_answer',
+              },
+              createdAt: '2026-09-27T10:31:00.000Z',
+            },
+            {
+              id: 97,
+              threadId: 'thread-1',
+              turnId: 'partially-retained-turn',
+              kind: 'turn',
+              phase: 'completed',
+              payload: { status: 'completed' },
+              createdAt: '2026-09-27T10:32:00.000Z',
+            },
+          ],
+        });
       }
       return undefined;
     });
@@ -2617,15 +2687,35 @@ describe('App', () => {
         name: 'Перейти к задаче 2: Частично сохранённая задача',
       }),
     );
+    expect(
+      await screen.findByText('Восстановленный ответ частично сохранённой задачи'),
+    ).not.toBeNull();
     expect(scrollIntoView).toHaveBeenLastCalledWith({ behavior: 'smooth', block: 'start' });
-    expect(document.activeElement).toBe(document.getElementById('turn-retained-101'));
+    expect(document.activeElement).toBe(document.getElementById('turn-message-95'));
 
     await user.click(
       within(navigation).getByRole('button', {
         name: 'Перейти к задаче 1: Полностью старая задача',
       }),
     );
-    expect(document.activeElement).toBe(document.getElementById('transcript-start'));
+    expect(await screen.findByText('Восстановленный финальный ответ')).not.toBeNull();
+    await waitFor(() =>
+      expect(document.activeElement).toBe(document.getElementById('turn-message-90')),
+    );
+    expect(screen.getAllByText('Полностью старая задача')).toHaveLength(1);
+
+    await user.click(
+      within(navigation).getByRole('button', {
+        name: 'Перейти к задаче 1: Полностью старая задача',
+      }),
+    );
+    expect(
+      fetchMock.mock.calls.filter(
+        ([input]) =>
+          requestUrl(input) ===
+          '/api/threads/thread-1/turns/fully-pruned-turn/history?navigationId=1',
+      ),
+    ).toHaveLength(1);
 
     await user.click(
       within(navigation).getByRole('button', {
@@ -2633,6 +2723,142 @@ describe('App', () => {
       }),
     );
     expect(document.activeElement).toBe(document.getElementById('turn-message-102'));
+  });
+
+  it('offers targeted recovery when the only task is outside the loaded transcript', async () => {
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') {
+        return jsonResponse({
+          data: thread,
+          events: [],
+          turnNavigation: [
+            {
+              id: 1,
+              threadId: 'thread-1',
+              turnId: 'only-pruned-turn',
+              label: 'Единственная старая задача',
+            },
+          ],
+        });
+      }
+      if (url === '/api/threads/thread-1/turns/only-pruned-turn/history?navigationId=1') {
+        return jsonResponse({
+          anchorEventId: 90,
+          events: [
+            {
+              id: 90,
+              threadId: 'thread-1',
+              turnId: 'only-pruned-turn',
+              kind: 'user-message',
+              phase: 'completed',
+              payload: { text: 'Единственная старая задача' },
+              createdAt: '2026-09-27T10:00:00.000Z',
+            },
+            {
+              id: 91,
+              threadId: 'thread-1',
+              turnId: 'only-pruned-turn',
+              kind: 'agent-message',
+              phase: 'completed',
+              payload: { text: 'Единственный старый ответ', messagePhase: 'final_answer' },
+              createdAt: '2026-09-27T10:01:00.000Z',
+            },
+            {
+              id: 92,
+              threadId: 'thread-1',
+              turnId: 'only-pruned-turn',
+              kind: 'turn',
+              phase: 'completed',
+              payload: { status: 'completed' },
+              createdAt: '2026-09-27T10:02:00.000Z',
+            },
+          ],
+        });
+      }
+      return undefined;
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    const navigation = await screen.findByRole('navigation', { name: 'Переходы по задачам' });
+    await user.click(
+      within(navigation).getByRole('button', {
+        name: 'Перейти к задаче 1: Единственная старая задача',
+      }),
+    );
+
+    expect(await screen.findByText('Единственный старый ответ')).not.toBeNull();
+    expect(document.activeElement).toBe(document.getElementById('turn-message-90'));
+  });
+
+  it('targets the matching repeated prompt occurrence within one restored turn', async () => {
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1') {
+        return jsonResponse({
+          data: thread,
+          events: [],
+          turnNavigation: [
+            { id: 1, threadId: 'thread-1', turnId: 'shared-turn', label: 'продолжай' },
+            { id: 2, threadId: 'thread-1', turnId: 'shared-turn', label: 'продолжай' },
+          ],
+        });
+      }
+      if (url.startsWith('/api/threads/thread-1/turns/shared-turn/history?navigationId=')) {
+        return jsonResponse({
+          anchorEventId: url.endsWith('navigationId=2') ? 91 : 90,
+          events: [
+            {
+              id: 90,
+              threadId: 'thread-1',
+              turnId: 'shared-turn',
+              kind: 'user-message',
+              phase: 'completed',
+              payload: { text: 'продолжай' },
+              createdAt: '2026-09-27T10:00:00.000Z',
+            },
+            {
+              id: 91,
+              threadId: 'thread-1',
+              turnId: 'shared-turn',
+              kind: 'user-message',
+              phase: 'completed',
+              payload: { text: 'продолжай' },
+              createdAt: '2026-09-27T10:01:00.000Z',
+            },
+            {
+              id: 92,
+              threadId: 'thread-1',
+              turnId: 'shared-turn',
+              kind: 'agent-message',
+              phase: 'completed',
+              payload: { text: 'Готово после второго запроса', messagePhase: 'final_answer' },
+              createdAt: '2026-09-27T10:02:00.000Z',
+            },
+            {
+              id: 93,
+              threadId: 'thread-1',
+              turnId: 'shared-turn',
+              kind: 'turn',
+              phase: 'completed',
+              payload: { status: 'completed' },
+              createdAt: '2026-09-27T10:03:00.000Z',
+            },
+          ],
+        });
+      }
+      return undefined;
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    const navigation = await screen.findByRole('navigation', { name: 'Переходы по задачам' });
+    const repeatedButtons = within(navigation).getAllByRole('button', {
+      name: /Перейти к задаче \d: продолжай/,
+    });
+    await user.click(repeatedButtons[1]!);
+
+    expect(await screen.findByText('Готово после второго запроса')).not.toBeNull();
+    expect(document.activeElement).toBe(document.getElementById('turn-message-91'));
   });
 
   it('matches multiple truncated server navigation labels to their exact retained prompts', async () => {

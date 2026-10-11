@@ -639,7 +639,7 @@ def main() -> int:
                     },
                     "events": [
                         {
-                            "id": 0,
+                            "id": 100,
                             "threadId": "t1",
                             "turnId": "history-0",
                             "kind": "user-message",
@@ -665,7 +665,7 @@ def main() -> int:
                     ]
                     + [
                         {
-                            "id": index,
+                            "id": index + 100,
                             "threadId": "t1",
                             "turnId": "history-0" if index <= 2 else f"history-{index}",
                             "kind": "agent-message",
@@ -699,7 +699,7 @@ def main() -> int:
                     ]
                     + [
                         {
-                            "id": 49,
+                            "id": 149,
                             "threadId": "t1",
                             "turnId": "history-0",
                             "kind": "turn",
@@ -708,7 +708,7 @@ def main() -> int:
                             "createdAt": "2026-09-27T11:59:01.000Z",
                         },
                         {
-                            "id": 50,
+                            "id": 150,
                             "threadId": "t1",
                             "turnId": "turn-1",
                             "kind": "user-message",
@@ -716,6 +716,26 @@ def main() -> int:
                             "payload": {"text": "Проверить активную задачу"},
                             "createdAt": "2026-09-27T11:59:02.000Z",
                         }
+                    ],
+                    "turnNavigation": [
+                        {
+                            "id": 1,
+                            "threadId": "t1",
+                            "turnId": "pruned-turn",
+                            "label": "Старая задача после обновления страницы",
+                        },
+                        {
+                            "id": 2,
+                            "threadId": "t1",
+                            "turnId": "history-0",
+                            "label": "Проверка_очень_длинной_неразрывной_строки_которая_не_должна_расширять_мобильный_чат_за_границы_экрана",
+                        },
+                        {
+                            "id": 3,
+                            "threadId": "t1",
+                            "turnId": "turn-1",
+                            "label": "Проверить активную задачу",
+                        },
                     ],
                     "queuedTurns": (
                         [
@@ -1064,11 +1084,51 @@ def main() -> int:
         elif path == "/api/threads/t1/unarchive":
             archived = False
             payload(route, 200, {"data": {"id": "t1", "archived": False}})
+        elif path == "/api/threads/t1/turns/pruned-turn/history":
+            payload(
+                route,
+                200,
+                {
+                    "anchorEventId": 90,
+                    "events": [
+                        {
+                            "id": 90,
+                            "threadId": "t1",
+                            "turnId": "pruned-turn",
+                            "kind": "user-message",
+                            "phase": "completed",
+                            "payload": {"text": "Старая задача после обновления страницы"},
+                            "createdAt": "2026-09-27T11:57:00.000Z",
+                        },
+                        {
+                            "id": 91,
+                            "threadId": "t1",
+                            "turnId": "pruned-turn",
+                            "kind": "agent-message",
+                            "phase": "completed",
+                            "payload": {
+                                "text": "Старый финальный ответ восстановлен по переходу.",
+                                "messagePhase": "final_answer",
+                            },
+                            "createdAt": "2026-09-27T11:57:01.000Z",
+                        },
+                        {
+                            "id": 92,
+                            "threadId": "t1",
+                            "turnId": "pruned-turn",
+                            "kind": "turn",
+                            "phase": "completed",
+                            "payload": {"status": "completed"},
+                            "createdAt": "2026-09-27T11:57:02.000Z",
+                        },
+                    ]
+                },
+            )
         elif path == "/api/threads/t1/events":
             events = [
                 *[
                     {
-                        "id": 97 + index,
+                            "id": 197 + index,
                         "threadId": "t1",
                         "turnId": "turn-1",
                         "kind": "tool",
@@ -1085,7 +1145,7 @@ def main() -> int:
                     for index in range(4)
                 ],
                 {
-                    "id": 101,
+                    "id": 201,
                     "threadId": "t1",
                     "turnId": None,
                     "kind": "thread",
@@ -1094,7 +1154,7 @@ def main() -> int:
                     "createdAt": "2026-09-27T12:00:00.000Z",
                 },
                 {
-                    "id": 102,
+                    "id": 202,
                     "threadId": "t1",
                     "turnId": "turn-1",
                     "kind": "tool",
@@ -1105,7 +1165,7 @@ def main() -> int:
                     "createdAt": "2026-09-27T12:00:00.100Z",
                 },
                 {
-                    "id": 103,
+                    "id": 203,
                     "threadId": "t1",
                     "turnId": "turn-1",
                     "kind": "tool",
@@ -1114,7 +1174,7 @@ def main() -> int:
                     "createdAt": "2026-09-27T12:00:00.200Z",
                 },
                 {
-                    "id": 104,
+                    "id": 204,
                     "threadId": "t1",
                     "turnId": "turn-1",
                     "kind": "tool",
@@ -1130,7 +1190,7 @@ def main() -> int:
                     "createdAt": "2026-09-27T12:00:00.300Z",
                 },
                 {
-                    "id": 105,
+                    "id": 205,
                     "threadId": "t1",
                     "turnId": "turn-1",
                     "kind": "user-input",
@@ -1157,7 +1217,7 @@ def main() -> int:
                     "createdAt": "2026-09-27T12:00:01.000Z",
                 },
                 {
-                    "id": 106,
+                    "id": 206,
                     "threadId": "t1",
                     "turnId": "turn-1",
                     "kind": "permission-approval",
@@ -1745,7 +1805,7 @@ def main() -> int:
             raise AssertionError("completed turn commentary remains visible after its final answer")
         turn_navigation = page.get_by_role("navigation", name="Переходы по задачам")
         turn_navigation.wait_for()
-        if turn_navigation.get_by_role("button").count() != 2:
+        if turn_navigation.get_by_role("button").count() != 3:
             raise AssertionError("turn navigation does not expose every user call")
         navigation_box = turn_navigation.bounding_box()
         if navigation_box is None:
@@ -1757,6 +1817,38 @@ def main() -> int:
                 f"turn navigation is not centered in the window: navigation={navigation_box}, viewport={page.viewport_size}"
             )
         turn_navigation.get_by_role("button").first.click()
+        page.get_by_text(
+            "Старый финальный ответ восстановлен по переходу.", exact=True
+        ).wait_for()
+        page.wait_for_function(
+            """async () => {
+                const request = indexedDB.open('codex-web-ui-thread-history');
+                const database = await new Promise((resolve, reject) => {
+                    request.onsuccess = () => resolve(request.result);
+                    request.onerror = () => reject(request.error);
+                });
+                try {
+                    const transaction = database.transaction('threads', 'readonly');
+                    const stored = await new Promise((resolve, reject) => {
+                        const read = transaction.objectStore('threads').get('owner:t1');
+                        read.onsuccess = () => resolve(read.result);
+                        read.onerror = () => reject(read.error);
+                    });
+                    return stored?.events?.some(
+                        (event) => event.id === 91 && event.payload?.text === 'Старый финальный ответ восстановлен по переходу.'
+                    );
+                } finally {
+                    database.close();
+                }
+            }"""
+        )
+        page.reload()
+        page.get_by_role("heading", name="Переносимый чат").wait_for()
+        turn_navigation = page.get_by_role("navigation", name="Переходы по задачам")
+        turn_navigation.get_by_role("button").first.click()
+        page.get_by_text(
+            "Старый финальный ответ восстановлен по переходу.", exact=True
+        ).wait_for()
         if page.get_by_role("button", name="Перейти к новым сообщениям").count() != 1:
             raise AssertionError("turn navigation did not leave follow-latest mode")
         page.get_by_role("button", name="Перейти к новым сообщениям").evaluate(
@@ -1804,7 +1896,7 @@ def main() -> int:
             raise AssertionError("scroll-to-latest control remains visible at the bottom")
         first_time = page.locator(".message time").first
         first_time.wait_for()
-        if first_time.get_attribute("datetime") != "2026-09-27T11:58:00.000Z":
+        if first_time.get_attribute("datetime") != "2026-09-27T11:57:00.000Z":
             raise AssertionError("message timestamp lost its canonical server time")
         if page.get_by_label("Уровень доступа").input_value() != "full-access":
             raise AssertionError("server-owned runtime preferences were not restored")

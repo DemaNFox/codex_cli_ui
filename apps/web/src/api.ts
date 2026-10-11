@@ -123,6 +123,11 @@ export interface ThreadHistoryPage {
   hasMore: boolean;
 }
 
+export interface ThreadTurnHistory {
+  events: SafeEvent[];
+  anchorEventId: number | null;
+}
+
 export interface AttachmentUpload {
   promise: Promise<Attachment>;
   abort: () => void;
@@ -393,6 +398,10 @@ export const api = {
   threadHistory: (threadId: string, before: number, limit = 120) =>
     request<ThreadHistoryPage>(
       `/api/threads/${encodeURIComponent(threadId)}/history?before=${encodeURIComponent(String(before))}&limit=${encodeURIComponent(String(limit))}`,
+    ),
+  threadTurnHistory: (threadId: string, turnId: string, navigationId: number) =>
+    request<ThreadTurnHistory>(
+      `/api/threads/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(turnId)}/history?navigationId=${encodeURIComponent(String(navigationId))}`,
     ),
   continuationDraft: (threadId: string) =>
     request<ThreadContinuationDraft | { data: ThreadContinuationDraft }>(
