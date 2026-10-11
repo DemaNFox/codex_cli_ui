@@ -4,6 +4,8 @@ import type { SafeEvent } from './api.js';
 
 export type StreamState = 'connecting' | 'open' | 'offline';
 
+export const THREAD_EVENT_RETENTION_LIMIT = 120;
+
 const safeEventKinds = [
   'thread',
   'turn',
@@ -62,7 +64,9 @@ export function useThreadEvents(
     setEvents((current) => {
       const byId = new Map(current.map((event) => [event.id, event]));
       for (const event of accepted) byId.set(event.id, event);
-      return [...byId.values()].sort((left, right) => left.id - right.id);
+      return [...byId.values()]
+        .sort((left, right) => left.id - right.id)
+        .slice(-THREAD_EVENT_RETENTION_LIMIT);
     });
   }, []);
 
