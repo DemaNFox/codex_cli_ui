@@ -109,11 +109,18 @@ export interface ThreadHistory {
   historyState?: 'complete' | 'degraded';
   historyWarning?: string;
   historyTruncated?: boolean;
+  oldestEventId?: number | null;
   pendingInteractionEvents?: SafeEvent[];
   pendingInteractionsTruncated?: boolean;
   queuedTurns?: QueuedTurn[];
   subagents?: Subagent[];
   turnNavigation?: TurnNavigationEntry[];
+}
+
+export interface ThreadHistoryPage {
+  events: SafeEvent[];
+  oldestEventId: number | null;
+  hasMore: boolean;
 }
 
 export interface AttachmentUpload {
@@ -383,6 +390,10 @@ export const api = {
     ),
   thread: (threadId: string) =>
     request<ThreadHistory>(`/api/threads/${encodeURIComponent(threadId)}`),
+  threadHistory: (threadId: string, before: number, limit = 120) =>
+    request<ThreadHistoryPage>(
+      `/api/threads/${encodeURIComponent(threadId)}/history?before=${encodeURIComponent(String(before))}&limit=${encodeURIComponent(String(limit))}`,
+    ),
   continuationDraft: (threadId: string) =>
     request<ThreadContinuationDraft | { data: ThreadContinuationDraft }>(
       `/api/threads/${encodeURIComponent(threadId)}/continuation-draft`,

@@ -503,6 +503,15 @@ button:disabled {
 .thread-history-truncated {
   margin: 0 0 1rem;
 }
+.thread-history-truncated.notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+.thread-history-truncated .ghost {
+  flex: 0 0 auto;
+}
 .thread-history-warning .ghost {
   flex: 0 0 auto;
 }

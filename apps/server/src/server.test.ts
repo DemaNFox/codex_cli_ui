@@ -6342,6 +6342,100 @@ describe('Codex routes', () => {
     expect(headerReplay.match(/^id: /gm)).toHaveLength(50);
   }, 10_000);
 
+  it('pages retained thread history backwards without gaps or duplicate boundary events', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const retained = Array.from({ length: 45 }, (_, index) =>
+      repository.appendEvent({
+        threadId,
+        turnId: `history-turn-${index}`,
+        kind: 'user-message',
+        phase: 'completed',
+        payload: { text: `history message ${index}` },
+      }),
+    );
+
+    const first = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/history?before=${retained.at(-1)!.id + 1}&limit=20`,
+      headers: { cookie: session.cookie },
+    });
+    expect(first.statusCode).toBe(200);
+    const firstPage = first.json<{
+      events: SafeEvent[];
+      oldestEventId: number | null;
+      hasMore: boolean;
+    }>();
+    expect(firstPage.events.map((event) => event.id)).toEqual(
+      retained.slice(-20).map((event) => event.id),
+    );
+    expect(firstPage.oldestEventId).toBe(retained[25]!.id);
+    expect(firstPage.hasMore).toBe(true);
+
+    const second = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/history?before=${firstPage.oldestEventId}&limit=20`,
+      headers: { cookie: session.cookie },
+    });
+    const secondPage = second.json<{
+      events: SafeEvent[];
+      oldestEventId: number | null;
+      hasMore: boolean;
+    }>();
+    expect(secondPage.events.map((event) => event.id)).toEqual(
+      retained.slice(5, 25).map((event) => event.id),
+    );
+    expect(secondPage.hasMore).toBe(true);
+    expect(
+      firstPage.events.some((event) =>
+        secondPage.events.some((olderEvent) => olderEvent.id === event.id),
+      ),
+    ).toBe(false);
+
+    const final = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/history?before=${secondPage.oldestEventId}&limit=20`,
+      headers: { cookie: session.cookie },
+    });
+    expect(final.json()).toEqual({
+      events: retained.slice(0, 5),
+      oldestEventId: retained[0]!.id,
+      hasMore: false,
+    });
+  });
+
+  it('validates history page queries after confirming the thread exists', async () => {
+    const { app, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+
+    const missingThread = await app.inject({
+      method: 'GET',
+      url: '/api/threads/missing-thread/history?before=invalid&limit=1',
+      headers: { cookie: session.cookie },
+    });
+    expect(missingThread.statusCode).toBe(404);
+    expect(missingThread.json()).toMatchObject({ error: { code: 'THREAD_NOT_FOUND' } });
+
+    for (const query of [
+      '',
+      '?before=0',
+      '?before=invalid',
+      '?before=1&limit=19',
+      '?before=1&limit=201',
+    ]) {
+      const invalid = await app.inject({
+        method: 'GET',
+        url: `/api/threads/${threadId}/history${query}`,
+        headers: { cookie: session.cookie },
+      });
+      expect(invalid.statusCode).toBe(400);
+    }
+  });
+
   it('returns every actionable pending interaction independently from the bounded event tail', async () => {
     const { app, repository, projectPath } = await fixture();
     const session = await login(app);
