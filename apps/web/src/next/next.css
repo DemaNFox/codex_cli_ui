@@ -1,0 +1,293 @@
+.next-app {
+  display: grid;
+  grid-template-columns: clamp(15rem, 20vw, 19rem) minmax(0, 1fr);
+  width: 100%;
+  height: 100dvh;
+  min-width: 0;
+  overflow: hidden;
+  background: #101214;
+}
+
+.next-sidebar {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding: 1.25rem 0.75rem;
+  border-right: 1px solid var(--border);
+  overflow-y: auto;
+}
+
+.next-brand {
+  padding: 0 0.75rem 0.75rem;
+  font-weight: 800;
+}
+
+.next-brand span,
+.next-section-label {
+  color: var(--muted);
+  font-size: 0.76rem;
+  font-weight: 500;
+}
+
+.next-classic-link {
+  display: block;
+  margin: 0 0.75rem 1.5rem;
+  color: var(--accent);
+  font-size: 0.82rem;
+}
+
+.next-section-label {
+  margin: 0.6rem 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.next-sidebar nav {
+  display: grid;
+  gap: 0.2rem;
+  min-width: 0;
+}
+
+.next-sidebar nav button,
+.next-logout {
+  width: 100%;
+  min-width: 0;
+  padding: 0.7rem 0.75rem;
+  border: 0;
+  border-radius: 0.65rem;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.next-sidebar nav button:hover,
+.next-sidebar nav .next-selected {
+  background: #24292d;
+}
+
+.next-thread-list {
+  flex: 1;
+  align-content: start;
+}
+
+.next-thread-list button span {
+  display: block;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.next-thread-list small {
+  display: block;
+  margin-top: 0.3rem;
+  color: var(--accent);
+}
+
+.next-logout {
+  margin-top: auto;
+  border-top: 1px solid var(--border);
+  border-radius: 0;
+}
+
+.next-main {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  min-width: 0;
+  min-height: 0;
+}
+
+.next-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  min-width: 0;
+  padding: 0.85rem clamp(1rem, 3vw, 2.5rem);
+  border-bottom: 1px solid var(--border);
+}
+
+.next-header h1 {
+  margin: 0;
+  overflow: hidden;
+  font-size: 1rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.next-header p {
+  margin: 0.35rem 0 0;
+  color: var(--muted);
+  font-size: 0.75rem;
+}
+
+.next-header button,
+.next-older {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 0.55rem;
+  background: var(--panel-2);
+  cursor: pointer;
+}
+
+.next-history {
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 1.4rem clamp(0.8rem, 4vw, 3rem) 2rem;
+}
+
+.next-reading-column {
+  display: grid;
+  justify-items: stretch;
+  gap: 1rem;
+  width: min(100%, 54rem);
+  min-width: 0;
+  margin: 0 auto;
+}
+
+.next-message {
+  min-width: 0;
+  max-width: 100%;
+  padding: 1rem 1.15rem;
+  border-radius: 1rem;
+  overflow-wrap: anywhere;
+}
+
+.next-user {
+  justify-self: end;
+  width: min(85%, 36rem);
+  background: #214b85;
+}
+
+.next-codex {
+  width: 100%;
+  background: #1a1d1d;
+}
+
+.next-final {
+  border-left: 3px solid var(--accent);
+}
+
+.next-message-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0.5rem;
+  margin-bottom: 0.6rem;
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
+.next-message-meta span {
+  color: var(--accent);
+}
+
+.next-message-meta time {
+  margin-left: auto;
+}
+
+.next-user-text {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+.next-message .markdown-body,
+.next-message pre,
+.next-message table {
+  max-width: 100%;
+}
+
+.next-message pre {
+  overflow-x: auto;
+}
+
+.next-older {
+  justify-self: center;
+}
+
+.next-empty {
+  margin: 15vh auto;
+  color: var(--muted);
+  text-align: center;
+}
+
+.next-activities {
+  padding: 0.8rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 0.7rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.next-activities summary {
+  cursor: pointer;
+}
+
+.next-activities ol {
+  max-height: 16rem;
+  overflow-y: auto;
+}
+
+.next-error {
+  padding: 0.7rem;
+  border: 1px solid #813537;
+  border-radius: 0.55rem;
+  color: #ffb7b5;
+}
+
+.next-footer {
+  padding: 0.8rem 1rem;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 0.76rem;
+  text-align: center;
+}
+
+.next-footer a {
+  color: var(--accent);
+}
+
+@media (max-width: 700px) {
+  .next-app {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .next-sidebar {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.4rem;
+    overflow: auto hidden;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .next-brand,
+  .next-classic-link,
+  .next-section-label,
+  .next-thread-list small,
+  .next-logout {
+    display: none;
+  }
+
+  .next-sidebar nav {
+    display: flex;
+    flex: none;
+  }
+
+  .next-sidebar nav button {
+    width: auto;
+    max-width: 9rem;
+    white-space: nowrap;
+  }
+
+  .next-main {
+    min-height: 0;
+  }
+
+  .next-user {
+    width: min(95%, 36rem);
+  }
+}

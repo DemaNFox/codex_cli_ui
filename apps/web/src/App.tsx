@@ -11,6 +11,8 @@ import {
   useMemo,
   useRef,
   useState,
+  lazy,
+  Suspense,
 } from 'react';
 import { createPortal } from 'react-dom';
 import type {
@@ -54,6 +56,10 @@ import type {
 } from './api.js';
 import { useThreadEvents } from './useThreadEvents.js';
 import { VoiceInputButton } from './VoiceInputButton.js';
+
+const NextWorkspace = lazy(() =>
+  import('./next/NextWorkspace.js').then((module) => ({ default: module.NextWorkspace })),
+);
 
 type LoadState = 'loading' | 'ready' | 'signed-out';
 type SettingsTab = 'account' | 'updates' | 'resources' | 'skills';
@@ -6923,6 +6929,12 @@ export function App() {
           setState('ready');
         }}
       />
+    );
+  if (new URLSearchParams(window.location.search).get('ui') === 'next')
+    return (
+      <Suspense fallback={<main className="loading-screen">Открываем новый интерфейс…</main>}>
+        <NextWorkspace session={session} onSignedOut={handleSignedOut} />
+      </Suspense>
     );
   return (
     <Workspace session={session} onSessionRefresh={setSession} onSignedOut={handleSignedOut} />

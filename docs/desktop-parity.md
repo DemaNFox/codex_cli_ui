@@ -2,6 +2,8 @@
 
 Status: implementation baseline, 2026-10-12. This is a functional target for the self-hosted browser client, not a claim that the proprietary desktop UI is reproduced or that future upstream features appear automatically.
 
+The staged replacement is specified in [Web UI v2 rebuild contract](v2-rebuild.md). The existing client remains the default until the v2 parity and rollback gates pass.
+
 ## Reference and compatibility rule
 
 The execution and conversation reference is the official Codex app-server protocol, pinned with the CLI in `infra/toolchain.env` and `protocol/manifest.json`. The browser must continue to use only the authenticated Web API; app-server is private. OpenAI's App Server documentation calls the interface experimental, so a new Codex version is a review candidate, not an unattended production update.
