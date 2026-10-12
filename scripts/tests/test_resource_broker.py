@@ -120,6 +120,7 @@ class ResourceBrokerTest(unittest.TestCase):
         self.assertEqual(snapshot["effective"]["cpuQuotaPercent"], 700)
         self.assertEqual(snapshot["effective"]["memoryMaxBytes"], expected_memory)
         self.assertEqual(snapshot["effective"]["tasksMax"], 32768)
+        self.assertEqual(snapshot["effective"]["memoryCurrentBytes"], 128 * 1024 * 1024)
         self.assertEqual(snapshot["policy"]["mode"], "auto")
         self.assertIsNone(snapshot["policy"]["memoryMaxBytes"])
         self.assertEqual(snapshot["capacity"]["memoryAvailableBytes"], 12 * BROKER.ONE_GIB)

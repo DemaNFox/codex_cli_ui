@@ -105,6 +105,7 @@ function unwrapData<T>(value: T | { data: T }): T {
 export interface ThreadHistory {
   data: Thread;
   events: SafeEvent[];
+  conversationEvents?: SafeEvent[];
   eventCursor?: number;
   historyState?: 'complete' | 'degraded';
   historyWarning?: string;

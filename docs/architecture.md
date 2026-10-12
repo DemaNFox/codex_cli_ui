@@ -53,13 +53,16 @@ Browser
   request when it is eventually dispatched. Active-turn guidance uses `turn/steer`, whose protocol has no
   model override, so changing the selector cannot replace an already running root turn or its existing
   descendants; the UI identifies the selection as applying to the next new task and its new subagents.
-- Codex rollout files remain the source of truth for Codex conversation history. SQLite stores the local project registry, thread-to-project mapping, UI metadata, sessions, audit records and a bounded reconnect journal. The journal keeps the newest configured event window plus a separately bounded window of user prompts so command/subagent noise cannot evict every transcript anchor. A bounded per-thread turn-navigation index is rebuilt from authoritative Codex history once per app-server generation and updated with every accepted local prompt; it restores navigation after reload without making the activity journal unbounded.
+- Codex rollout files remain the source of truth for Codex conversation history. SQLite stores the local project registry, thread-to-project mapping, UI metadata, sessions, audit records and a bounded reconnect journal. The journal keeps the newest configured event window plus separately bounded windows of user prompts, completed visible agent messages, successful and unsuccessful turn terminals, and completed file changes. Command/subagent noise therefore cannot evict the most recent conversation boundaries. A bounded per-thread turn-navigation index is rebuilt from authoritative Codex history once per app-server generation and updated with every accepted local prompt; it restores navigation after reload without making the activity journal unbounded.
 - A project is a display name plus a canonical existing directory under an allowlisted root. Codex has no separate project entity; thread `cwd` binds execution to a project.
 - Models and reasoning efforts come from `model/list`; the UI never hard-codes account availability.
 - Persisted project and chat navigation remains readable when `thread/list` cannot reach Codex. Likewise, a
   selected unhydrated chat returns the latest bounded persisted safe-event page immediately and starts the
   existing single-flight native hydration in the background. The detail snapshot publishes its high-water and
-  oldest cursors plus a truncation marker, so SSE begins strictly after the snapshot while the UI can request
+  oldest cursors plus a truncation marker. It also carries a separately bounded conversation spine of recent
+  prompts, completed visible agent replies, final answers and terminal states, including those older than the
+  noisy activity tail. That spine does not change the contiguous backward-pagination cursor. SSE begins
+  strictly after the snapshot while the UI can request
   older retained pages with an exclusive backward cursor. IndexedDB may paint already validated pages first,
   but the current server snapshot and later SSE events always reconcile that non-authoritative mirror. SSE
   attaches and replays without waiting for native hydration. Classified app-server request failures (`notSent`,
@@ -145,7 +148,9 @@ Browser
   events. After an app-server generation change, the server count-reconciles missed terminal answers, terminal
   turn state and file changes from the redacted native history into the durable journal without duplicating
   events already observed. Final answers, successful terminal turn markers and completed file changes each
-  have their own bounded retention allowance, so a retained answer can still be summarized and expose its
+  have their own bounded retention allowance; completed commentary and failed/interrupted terminals are also
+  retained independently of technical activity. Native reconciliation may restore a previously pruned recent
+  completed agent message once, but it never repeats a native action. A retained answer can still be summarized and expose its
   generated-file fallback. A compact server-persisted prompt rail navigates between calls without changing
   server state. When an older prompt predates the initial activity window and browser cache, selecting its rail
   entry first uses any currently loaded anchor and then performs one authenticated, navigation-entry-scoped
@@ -287,8 +292,12 @@ that run without the broker; it does not silently cap automatic or custom broker
 The effective agent ceiling is also passed to the pinned Codex thread configuration as `agents.max_threads`
 when an idle thread is resumed, so descendants share the same concurrency limit; the cgroup remains the final
 machine-level enforcement boundary. Automatic concurrency allows at most eight threads and budgets at least
-one CPU core and 2 GiB of the selected workload memory per concurrent root/subagent slot; a custom value above
-that derived ceiling is rejected.
+one CPU core per concurrent root/subagent slot and reserves 2 GiB for the app-server plus 3 GiB per slot;
+a custom value above that derived ceiling is rejected. New root starts additionally require at least 2 GiB
+free in both the host and the workload slice as reported by the resource broker. These are admission guards,
+not a guarantee against later growth: if the app-server unexpectedly disconnects, active roots and descendants
+are marked interrupted and an explicit chat error is recorded. Unknown external actions are never replayed
+automatically.
 
 Ordinary saturation of the effective root-turn ceiling is a scheduling state, not an admission error. The API
 persists the complete root-turn request in SQLite, including its idempotency key, runtime settings and attachment

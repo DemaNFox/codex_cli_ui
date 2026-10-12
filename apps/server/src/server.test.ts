@@ -545,6 +545,7 @@ class FakeResourceBroker implements ResourceBroker {
     effective: {
       cpuQuotaPercent: 700,
       memoryMaxBytes: 13 * 1_024 * 1_024 * 1_024,
+      memoryCurrentBytes: 1 * 1_024 * 1_024 * 1_024,
       tasksMax: 3_500,
     },
     policy: { mode: 'auto', cpuQuotaPercent: null, memoryMaxBytes: null, tasksMax: null },
@@ -606,6 +607,7 @@ class FakeResourceBroker implements ResourceBroker {
       effective: {
         cpuQuotaPercent: request.cpuQuotaPercent ?? 700,
         memoryMaxBytes: request.memoryMaxBytes ?? 13 * 1_024 * 1_024 * 1_024,
+        memoryCurrentBytes: this.current.effective.memoryCurrentBytes,
         tasksMax: request.tasksMax ?? 3_500,
       },
       generation: this.current.generation + 1,
@@ -5925,10 +5927,10 @@ describe('Codex routes', () => {
     ).toMatchObject({ phase: 'completed', payload: { status: 'completed' } });
     expect(
       repeatedEvents.find((event) => event.kind === 'turn' && event.turnId === 'failed-turn'),
-    ).toBeUndefined();
+    ).toMatchObject({ phase: 'failed', payload: { status: 'failed' } });
     expect(
       repeatedEvents.find((event) => event.kind === 'turn' && event.turnId === 'interrupted-turn'),
-    ).toBeUndefined();
+    ).toMatchObject({ phase: 'completed', payload: { status: 'interrupted' } });
 
     appServer.emit({
       method: 'item/completed',
@@ -6411,6 +6413,143 @@ describe('Codex routes', () => {
       oldestEventId: retained[0]!.id,
       hasMore: false,
     });
+  });
+
+  it('returns a bounded conversational spine alongside a noisy recent tail', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const prompt = repository.appendEvent({
+      threadId,
+      turnId: 'older-turn',
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'Earlier user request' },
+    });
+    const reply = repository.appendEvent({
+      threadId,
+      turnId: 'older-turn',
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Earlier visible reply', messagePhase: 'commentary' },
+    });
+    const terminal = repository.appendEvent({
+      threadId,
+      turnId: 'older-turn',
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'interrupted' },
+    });
+    for (let index = 0; index < 140; index += 1) {
+      repository.appendEvent({
+        threadId,
+        turnId: 'noisy-turn',
+        kind: 'tool',
+        phase: 'completed',
+        payload: { index },
+      });
+    }
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(detail.statusCode).toBe(200);
+    const body = detail.json<{ events: SafeEvent[]; conversationEvents: SafeEvent[] }>();
+    expect(body.events.some((event) => event.id === prompt.id)).toBe(false);
+    expect(body.conversationEvents.map((event) => event.id)).toEqual([
+      prompt.id,
+      reply.id,
+      terminal.id,
+    ]);
+  });
+
+  it('bounds completed replies independently of final answers and interrupted terminals', async () => {
+    const { repository, projectPath, app } = await fixture(
+      2,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      { eventRetentionPerThread: 3 },
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const reply = repository.appendEvent({
+      threadId,
+      turnId: 'retained-turn',
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Visible answer during work', messagePhase: 'commentary' },
+    });
+    const terminal = repository.appendEvent({
+      threadId,
+      turnId: 'retained-turn',
+      kind: 'turn',
+      phase: 'completed',
+      payload: { status: 'interrupted' },
+    });
+    const finalAnswer = repository.appendEvent({
+      threadId,
+      turnId: 'earlier-completed-turn',
+      kind: 'agent-message',
+      phase: 'completed',
+      payload: { text: 'Earlier final answer', messagePhase: 'final_answer' },
+    });
+    for (let index = 0; index < 10; index += 1) {
+      repository.appendEvent({
+        threadId,
+        turnId: 'other-turn',
+        kind: index < 5 ? 'agent-message' : 'warning',
+        phase: index < 5 ? 'completed' : 'state',
+        payload:
+          index < 5 ? { text: `Newer commentary ${index}`, messagePhase: 'commentary' } : { index },
+      });
+    }
+    const retainedIds = repository.listEvents(threadId, 0).map((event) => event.id);
+    expect(retainedIds).toContain(finalAnswer.id);
+    expect(retainedIds).toContain(terminal.id);
+    expect(retainedIds).not.toContain(reply.id);
+    expect(
+      repository
+        .listEvents(threadId, 0)
+        .some(
+          (event) => event.kind === 'agent-message' && event.payload.text === 'Newer commentary 4',
+        ),
+    ).toBe(true);
+  });
+
+  it('restores a previously pruned visible reply from native history only once', async () => {
+    const { repository, projectPath, app } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const normalized = [
+      {
+        threadId,
+        turnId: 'old-active-turn',
+        kind: 'agent-message' as const,
+        phase: 'completed' as const,
+        payload: {
+          text: 'Visible reply before a long noisy operation',
+          messagePhase: 'commentary',
+        },
+      },
+    ];
+    const first = repository.reconcileThreadHistoryEvents(threadId, normalized);
+    expect(first).toHaveLength(1);
+    repository.database.prepare('DELETE FROM events WHERE id=?').run(first[0]!.id);
+
+    const recovered = repository.reconcileThreadHistoryEvents(threadId, normalized);
+    expect(recovered).toHaveLength(1);
+    expect(repository.reconcileThreadHistoryEvents(threadId, normalized)).toHaveLength(0);
   });
 
   it('validates history page queries after confirming the thread exists', async () => {
@@ -7300,6 +7439,9 @@ describe('Codex routes', () => {
         }),
       ]),
     );
+    expect(
+      disconnectEvents.find((event) => event.kind === 'error' && event.phase === 'failed'),
+    ).toMatchObject({ payload: { code: 'APP_SERVER_DISCONNECTED' } });
     expect(disconnectEvents.find((event) => event.kind === 'subagent')?.payload.subagent).toEqual(
       expect.objectContaining({ id: 'child-disconnected', status: 'interrupted' }),
     );
@@ -9972,10 +10114,10 @@ describe('Codex routes', () => {
     await new Promise((resolve) => setImmediate(resolve));
     const project = await createProject(app, projectPath, session.headers);
     const threadIds = await Promise.all(
-      Array.from({ length: 7 }, () => createThread(app, project.id, session.headers)),
+      Array.from({ length: 4 }, () => createThread(app, project.id, session.headers)),
     );
 
-    for (const [index, threadId] of threadIds.slice(0, 6).entries()) {
+    for (const [index, threadId] of threadIds.slice(0, 3).entries()) {
       const response = await app.inject({
         method: 'POST',
         url: `/api/threads/${threadId}/turns`,
@@ -9991,7 +10133,7 @@ describe('Codex routes', () => {
     const saturatedKey = '00000000-0000-4000-8000-000000000200';
     const saturated = await app.inject({
       method: 'POST',
-      url: `/api/threads/${threadIds[6]}/turns`,
+      url: `/api/threads/${threadIds[3]}/turns`,
       headers: session.headers,
       payload: { text: 'wait for capacity', idempotencyKey: saturatedKey },
     });
@@ -9999,10 +10141,10 @@ describe('Codex routes', () => {
     expect(saturated.json()).toMatchObject({
       data: { status: 'queued', queuedTurn: { position: 1 } },
     });
-    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(6);
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(3);
     await vi.waitFor(async () => {
       expect((await app.inject({ method: 'GET', url: '/api/health' })).json()).toMatchObject({
-        upgradeDrain: { activeTurns: 6, pendingTurnStarts: 0 },
+        upgradeDrain: { activeTurns: 3, pendingTurnStarts: 0 },
       });
     });
 
@@ -10012,18 +10154,18 @@ describe('Codex routes', () => {
     });
     await vi.waitFor(() => {
       expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(
-        7,
+        4,
       );
     });
     const retried = await app.inject({
       method: 'POST',
-      url: `/api/threads/${threadIds[6]}/turns`,
+      url: `/api/threads/${threadIds[3]}/turns`,
       headers: session.headers,
       payload: { text: 'wait for capacity', idempotencyKey: saturatedKey },
     });
     expect(retried.statusCode).toBe(200);
     expect(retried.json()).toMatchObject({ data: { status: 'started' } });
-    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(7);
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(4);
   });
 
   it('keeps descendant work visible and reconciles missed child terminals before rejecting capacity', async () => {
@@ -10274,7 +10416,7 @@ describe('Codex routes', () => {
       })
     ).json<{ data: { id: string } }>().data;
     expect(appServer.requests.find((item) => item.method === 'thread/start')?.params).toMatchObject(
-      { config: { agents: { max_threads: 6 } } },
+      { config: { agents: { max_threads: 3 } } },
     );
 
     const first = await app.inject({
@@ -10317,7 +10459,7 @@ describe('Codex routes', () => {
     ).toMatchObject({
       sandbox: 'workspace-write',
       model: null,
-      config: { agents: { max_threads: 6 } },
+      config: { agents: { max_threads: 3 } },
     });
     expect(
       appServer.requests.find((item) => item.method === 'thread/resume')?.params,
@@ -11492,7 +11634,7 @@ describe('Codex routes', () => {
         desired: {
           mode: 'custom',
           cpuCores: 4,
-          memoryBytes: 8 * 1_024 * 1_024 * 1_024,
+          memoryBytes: 11 * 1_024 * 1_024 * 1_024,
           tasks: 1_024,
           maxParallelAgents: 3,
         },
@@ -11502,7 +11644,7 @@ describe('Codex routes', () => {
     expect(broker.applyRequests.at(-1)).toEqual({
       mode: 'custom',
       cpuQuotaPercent: 400,
-      memoryMaxBytes: 8 * 1_024 * 1_024 * 1_024,
+      memoryMaxBytes: 11 * 1_024 * 1_024 * 1_024,
       tasksMax: 1_024,
     });
 
@@ -11515,7 +11657,7 @@ describe('Codex routes', () => {
         desired: {
           mode: 'custom',
           cpuCores: 9,
-          memoryBytes: 8 * 1_024 * 1_024 * 1_024,
+          memoryBytes: 11 * 1_024 * 1_024 * 1_024,
           tasks: 1_024,
           maxParallelAgents: null,
         },
@@ -11545,6 +11687,43 @@ describe('Codex routes', () => {
     expect(unsafeConcurrency.json<{ error: { code: string } }>().error.code).toBe(
       'RESOURCE_AGENT_LIMIT_EXCEEDS_CAPACITY',
     );
+  });
+
+  it('bounds automatic concurrency and queues starts when the workload cgroup lacks headroom', async () => {
+    const broker = new FakeResourceBroker();
+    broker.current.effective.memoryCurrentBytes = 12 * 1_024 * 1_024 * 1_024;
+    const { app, repository, projectPath } = await fixture(
+      2,
+      undefined,
+      (root) => new AttachmentStore(root),
+      broker,
+    );
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    await vi.waitFor(() => expect(repository.getResourceLimits().state).toBe('applied'));
+
+    const limits = await app.inject({
+      method: 'GET',
+      url: '/api/system/resource-limits',
+      headers: { cookie: session.cookie },
+    });
+    expect(
+      limits.json<{ data: { effective: { maxParallelAgents: number } } }>().data.effective
+        .maxParallelAgents,
+    ).toBe(3);
+
+    const start = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Do not start under cgroup pressure',
+        idempotencyKey: '88000000-0000-4000-8000-000000000001',
+      },
+    });
+    expect(start.statusCode).toBe(202);
+    expect(repository.listVisibleQueuedTurns(threadId)).toHaveLength(1);
   });
 
   it('persists and returns sanitized subagent lifecycle projections', async () => {
@@ -11655,7 +11834,7 @@ describe('Codex routes', () => {
         desired: {
           mode: 'custom',
           cpuCores: 4,
-          memoryBytes: 8 * 1_024 * 1_024 * 1_024,
+          memoryBytes: 11 * 1_024 * 1_024 * 1_024,
           tasks: 1_024,
           maxParallelAgents: 3,
         },
@@ -11673,7 +11852,7 @@ describe('Codex routes', () => {
           cpuCores: 2,
           memoryBytes: 4 * 1_024 * 1_024 * 1_024,
           tasks: 512,
-          maxParallelAgents: 2,
+          maxParallelAgents: 1,
         },
       },
     });
@@ -11719,7 +11898,7 @@ describe('Codex routes', () => {
     });
     expect(turn.statusCode).toBe(202);
     const startedThread = appServer.requests.find((request) => request.method === 'thread/start');
-    expect(startedThread?.params).toMatchObject({ config: { agents: { max_threads: 6 } } });
+    expect(startedThread?.params).toMatchObject({ config: { agents: { max_threads: 3 } } });
     expect(appServer.requests.filter((request) => request.method === 'thread/resume')).toHaveLength(
       0,
     );

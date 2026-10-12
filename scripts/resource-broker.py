@@ -383,7 +383,7 @@ class ResourceBroker:
             "ok": True,
             "snapshot": {
                 "capacity": capacity.json(),
-                "effective": current.limits.json(),
+                "effective": {**current.limits.json(), "memoryCurrentBytes": current.memory_current_bytes},
                 "policy": public_policy,
                 "generation": generation,
             },
@@ -582,7 +582,7 @@ class ResourceBroker:
             "ok": True,
             "snapshot": {
                 "capacity": capacity.json(),
-                "effective": applied.limits.json(),
+                "effective": {**applied.limits.json(), "memoryCurrentBytes": applied.memory_current_bytes},
                 "policy": public_policy,
                 "generation": generation,
             },

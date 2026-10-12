@@ -13,6 +13,7 @@ const brokerSnapshotSchema = z.object({
   effective: z.object({
     cpuQuotaPercent: z.number().int().positive(),
     memoryMaxBytes: z.number().int().positive(),
+    memoryCurrentBytes: z.number().int().nonnegative().optional(),
     tasksMax: z.number().int().positive(),
   }),
   policy: z.object({

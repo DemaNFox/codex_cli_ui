@@ -1753,13 +1753,23 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
   };
 
+  const gib = 1_024 * 1_024 * 1_024;
+  const minimumStartMemoryHeadroom = 2 * gib;
+  const hasMemoryHeadroom = (snapshot: BrokerResourceSnapshot): boolean =>
+    Math.min(
+      snapshot.capacity.memoryAvailableBytes,
+      snapshot.effective.memoryCurrentBytes === undefined
+        ? snapshot.capacity.memoryAvailableBytes
+        : Math.max(0, snapshot.effective.memoryMaxBytes - snapshot.effective.memoryCurrentBytes),
+    ) >= minimumStartMemoryHeadroom;
+
   const safeParallelAgents = (cpuQuotaPercent: number, memoryBytes: number): number =>
     Math.max(
       1,
       Math.min(
         8,
         Math.floor(cpuQuotaPercent / 100),
-        Math.floor(memoryBytes / (2 * 1_024 * 1_024 * 1_024)),
+        Math.floor(Math.max(0, memoryBytes - 2 * gib) / (3 * gib)),
       ),
     );
 
@@ -3204,6 +3214,19 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           payload: { threadRuntime, appServerDisconnected: true },
         }),
       );
+      publish(
+        repository.appendEvent({
+          threadId: rootThreadId,
+          turnId: null,
+          kind: 'error',
+          phase: 'failed',
+          payload: {
+            message:
+              'Соединение с Codex оборвалось. Выполнявшиеся задачи и агенты остановлены; их действия не запускаются повторно без проверки.',
+            code: 'APP_SERVER_DISCONNECTED',
+          },
+        }),
+      );
     }
     for (const snapshot of activeSubagents) {
       const subagent = repository.getSubagent(snapshot.id);
@@ -3959,6 +3982,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return {
       data,
       events: recent.events,
+      conversationEvents: repository.listRecentConversationEvents(id),
       eventCursor: recent.highWater,
       historyTruncated: recent.historyTruncated,
       oldestEventId: recent.oldestEventId,
@@ -4599,10 +4623,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
           activeExecutionUnits =
             activeRootCount() + pendingTurnStarts + repository.countActiveSubagents();
         }
-        if (
-          activeExecutionUnits > maximumExecutionUnits ||
-          capacity.capacity.memoryAvailableBytes < 512 * 1_024 * 1_024
-        ) {
+        if (activeExecutionUnits > maximumExecutionUnits || !hasMemoryHeadroom(capacity)) {
           endPendingTurnStart(record.threadId);
           return 'wait';
         }
@@ -5107,7 +5128,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
             'RESOURCE_CAPACITY_EXHAUSTED',
             'All resource-safe execution slots are currently in use',
           );
-        if (capacity.capacity.memoryAvailableBytes < 512 * 1_024 * 1_024)
+        if (!hasMemoryHeadroom(capacity))
           throw new HttpError(
             429,
             'RESOURCE_CAPACITY_EXHAUSTED',

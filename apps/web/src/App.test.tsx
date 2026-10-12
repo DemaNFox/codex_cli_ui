@@ -1097,6 +1097,54 @@ describe('App', () => {
     cacheRead.mockRestore();
   });
 
+  it('restores recent conversation messages outside a noisy event tail after reload', async () => {
+    const prompt = {
+      id: 10,
+      threadId: thread.id,
+      turnId: 'older-turn',
+      kind: 'user-message' as const,
+      phase: 'completed' as const,
+      payload: { text: 'Запрос до длинного хода работы' },
+      createdAt: '2026-10-12T07:00:00.000Z',
+    };
+    const answer = {
+      ...prompt,
+      id: 11,
+      kind: 'agent-message' as const,
+      payload: { text: 'Ответ до длинного хода работы', messagePhase: 'final_answer' },
+    };
+    const terminal = {
+      ...prompt,
+      id: 12,
+      kind: 'turn' as const,
+      payload: { status: 'completed' },
+    };
+    installAuthenticatedApi((url) => {
+      if (url === '/api/threads/thread-1')
+        return jsonResponse({
+          data: thread,
+          events: [
+            {
+              ...prompt,
+              id: 200,
+              turnId: 'newer-turn',
+              kind: 'warning',
+              payload: { message: 'recent activity' },
+            },
+          ],
+          conversationEvents: [prompt, answer, terminal],
+          oldestEventId: 200,
+          historyTruncated: true,
+        });
+      return undefined;
+    });
+    render(<App />);
+
+    expect(await screen.findByText('Запрос до длинного хода работы')).not.toBeNull();
+    expect(screen.getByText('Ответ до длинного хода работы')).not.toBeNull();
+    expect(screen.getByLabelText('Итоговый ответ Codex')).not.toBeNull();
+  });
+
   it('clears cached history and signs out when revalidation reports an expired session', async () => {
     const cacheRead = vi.spyOn(threadHistoryCache, 'readThreadHistoryCache').mockResolvedValueOnce({
       username: 'nick',

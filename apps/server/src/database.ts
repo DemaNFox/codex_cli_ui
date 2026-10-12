@@ -2864,11 +2864,19 @@ export class SqliteRepository {
       const value = fingerprint(event);
       retainedCounts.set(value, (retainedCounts.get(value) ?? 0) + 1);
     }
+    const recentAgentMessageFingerprints = new Set(
+      events
+        .filter((event) => event.kind === 'agent-message' && event.phase === 'completed')
+        .slice(-this.eventRetentionPerThread)
+        .map(fingerprint),
+    );
     const baselineCounts = new Map<string, number>();
     for (const value of authoritativeCounts.keys()) {
       baselineCounts.set(
         value,
-        Math.max(observedCounts.get(value) ?? 0, retainedCounts.get(value) ?? 0),
+        recentAgentMessageFingerprints.has(value)
+          ? (retainedCounts.get(value) ?? 0)
+          : Math.max(observedCounts.get(value) ?? 0, retainedCounts.get(value) ?? 0),
       );
     }
 
@@ -2925,8 +2933,14 @@ export class SqliteRepository {
              )
              AND id NOT IN (
                SELECT id FROM events
-               WHERE thread_id=? AND kind='agent-message'
+               WHERE thread_id=? AND kind='agent-message' AND phase='completed'
                  AND json_extract(payload_json,'$.messagePhase')='final_answer'
+               ORDER BY id DESC LIMIT ?
+             )
+             AND id NOT IN (
+               SELECT id FROM events
+               WHERE thread_id=? AND kind='agent-message' AND phase='completed'
+                 AND COALESCE(json_extract(payload_json,'$.messagePhase'),'')!='final_answer'
                ORDER BY id DESC LIMIT ?
              )
              AND id NOT IN (
@@ -2950,10 +2964,24 @@ export class SqliteRepository {
                    OR json_extract(payload_json,'$.turn.status')='completed'
                  )
                ORDER BY id DESC LIMIT ?
+             )
+             AND id NOT IN (
+               SELECT id FROM events
+               WHERE thread_id=? AND kind='turn' AND phase IN ('completed','failed')
+                 AND COALESCE(
+                   json_extract(payload_json,'$.status'),
+                   json_extract(payload_json,'$.turn.status'),
+                   ''
+                 )!='completed'
+               ORDER BY id DESC LIMIT ?
              )`,
         )
         .run(
           threadId,
+          threadId,
+          this.eventRetentionPerThread,
+          threadId,
+          this.eventRetentionPerThread,
           threadId,
           this.eventRetentionPerThread,
           threadId,
@@ -3010,8 +3038,14 @@ export class SqliteRepository {
            )
            AND id NOT IN (
              SELECT id FROM events
-             WHERE thread_id=? AND kind='agent-message'
+             WHERE thread_id=? AND kind='agent-message' AND phase='completed'
                AND json_extract(payload_json,'$.messagePhase')='final_answer'
+             ORDER BY id DESC LIMIT ?
+           )
+           AND id NOT IN (
+             SELECT id FROM events
+             WHERE thread_id=? AND kind='agent-message' AND phase='completed'
+               AND COALESCE(json_extract(payload_json,'$.messagePhase'),'')!='final_answer'
              ORDER BY id DESC LIMIT ?
            )
            AND id NOT IN (
@@ -3035,10 +3069,24 @@ export class SqliteRepository {
                  OR json_extract(payload_json,'$.turn.status')='completed'
                )
              ORDER BY id DESC LIMIT ?
+           )
+           AND id NOT IN (
+             SELECT id FROM events
+             WHERE thread_id=? AND kind='turn' AND phase IN ('completed','failed')
+               AND COALESCE(
+                 json_extract(payload_json,'$.status'),
+                 json_extract(payload_json,'$.turn.status'),
+                 ''
+               )!='completed'
+             ORDER BY id DESC LIMIT ?
            )`,
       )
       .run(
         event.threadId,
+        event.threadId,
+        this.eventRetentionPerThread,
+        event.threadId,
+        this.eventRetentionPerThread,
         event.threadId,
         this.eventRetentionPerThread,
         event.threadId,
@@ -3178,6 +3226,37 @@ export class SqliteRepository {
         .prepare('SELECT 1 FROM events WHERE thread_id=? AND id<? LIMIT 1')
         .get(threadId, oldestEventId) !== undefined;
     return { events, highWater, historyTruncated, oldestEventId };
+  }
+
+  listRecentConversationEvents(threadId: string, perKindLimit = 120): SafeEvent[] {
+    const boundedLimit = Math.max(1, Math.min(120, perKindLimit));
+    const categories = [
+      "kind='user-message' AND phase='completed'",
+      "kind='agent-message' AND phase='completed' AND json_extract(payload_json,'$.messagePhase')='final_answer'",
+      "kind='agent-message' AND phase='completed' AND COALESCE(json_extract(payload_json,'$.messagePhase'),'')!='final_answer'",
+      "kind='turn' AND phase IN ('completed','failed')",
+    ];
+    const rows = new Map<number, EventRow>();
+    for (const condition of categories) {
+      const selected = this.database
+        .prepare(
+          `SELECT * FROM events WHERE thread_id=? AND ${condition}
+           ORDER BY id DESC LIMIT ?`,
+        )
+        .all(threadId, boundedLimit) as unknown as EventRow[];
+      for (const row of selected) rows.set(row.id, row);
+    }
+    return [...rows.values()]
+      .sort((left, right) => left.id - right.id)
+      .map((row) => ({
+        id: row.id,
+        threadId: row.thread_id,
+        turnId: row.turn_id,
+        kind: row.kind,
+        phase: row.phase,
+        payload: jsonRecord(row.payload_json),
+        createdAt: row.created_at,
+      }));
   }
 
   listEventsBefore(

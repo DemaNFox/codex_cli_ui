@@ -2591,7 +2591,10 @@ function ResourceSettings({
     Math.min(
       8,
       Math.floor(draft.cpuCores ?? snapshot.effective.cpuCores),
-      Math.floor((draft.memoryBytes ?? snapshot.effective.memoryBytes) / (2 * 1024 ** 3)),
+      Math.floor(
+        Math.max(0, (draft.memoryBytes ?? snapshot.effective.memoryBytes) - 2 * 1024 ** 3) /
+          (3 * 1024 ** 3),
+      ),
     ),
   );
   const fieldsValid =
@@ -4990,6 +4993,7 @@ function Workspace({
           [...cachedEarlierEvents, ...history.events, ...(history.pendingInteractionEvents ?? [])],
           requestedThreadId,
         );
+        prependHistory(history.conversationEvents ?? [], requestedThreadId);
         const retainedOldestEventId =
           cached?.oldestEventId &&
           (!serverOldestEventId || cached.oldestEventId < serverOldestEventId)
@@ -5566,7 +5570,15 @@ function Workspace({
         setRecentThreads((current) =>
           current.map((item) => (item.id === threadId ? reconciledThread : item)),
         );
-        mergeEvents([...refreshed.events, ...(refreshed.pendingInteractionEvents ?? [])], threadId);
+        mergeEvents(
+          [
+            ...(refreshed.conversationEvents ?? []),
+            ...refreshed.events,
+            ...(refreshed.pendingInteractionEvents ?? []),
+          ],
+          threadId,
+          'snapshot',
+        );
         setPendingInteractionsTruncated(refreshed.pendingInteractionsTruncated === true);
         setServerTurnNavigation(refreshed.turnNavigation ?? null);
         setSubagents(reconciledSubagents);
@@ -5815,8 +5827,13 @@ function Workspace({
           current.map((item) => (item.id === targetThreadId ? history.data : item)),
         );
         mergeEvents(
-          [...history.events, ...(history.pendingInteractionEvents ?? [])],
+          [
+            ...(history.conversationEvents ?? []),
+            ...history.events,
+            ...(history.pendingInteractionEvents ?? []),
+          ],
           targetThreadId,
+          'snapshot',
         );
         setPendingInteractionsTruncated(history.pendingInteractionsTruncated === true);
         setServerTurnNavigation(history.turnNavigation ?? null);

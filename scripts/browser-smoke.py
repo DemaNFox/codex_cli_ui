@@ -637,6 +637,44 @@ def main() -> int:
                         "createdAt": "2026-09-27T12:00:00.000Z",
                         "updatedAt": "2026-09-27T12:00:00.000Z",
                     },
+                    **(
+                        {
+                            "conversationEvents": [
+                                {
+                                    "id": 90,
+                                    "threadId": "t1",
+                                    "turnId": "pruned-turn",
+                                    "kind": "user-message",
+                                    "phase": "completed",
+                                    "payload": {"text": "Старая задача после обновления страницы"},
+                                    "createdAt": "2026-09-27T11:57:00.000Z",
+                                },
+                                {
+                                    "id": 91,
+                                    "threadId": "t1",
+                                    "turnId": "pruned-turn",
+                                    "kind": "agent-message",
+                                    "phase": "completed",
+                                    "payload": {
+                                        "text": "Старый финальный ответ восстановлен по переходу.",
+                                        "messagePhase": "final_answer",
+                                    },
+                                    "createdAt": "2026-09-27T11:57:01.000Z",
+                                },
+                                {
+                                    "id": 92,
+                                    "threadId": "t1",
+                                    "turnId": "pruned-turn",
+                                    "kind": "turn",
+                                    "phase": "completed",
+                                    "payload": {"status": "completed"},
+                                    "createdAt": "2026-09-27T11:57:02.000Z",
+                                },
+                            ],
+                        }
+                        if os.environ.get("CODEX_WEB_CONVERSATION_SPINE_ONLY") == "1"
+                        else {}
+                    ),
                     "events": [
                         {
                             "id": 100,
@@ -1350,6 +1388,16 @@ def main() -> int:
         page.get_by_label("Пароль").fill("correct-horse-battery-staple")
         page.get_by_role("button", name="Войти").click()
         page.get_by_role("heading", name="Переносимый чат").wait_for()
+        if os.environ.get("CODEX_WEB_CONVERSATION_SPINE_ONLY") == "1":
+            for _ in range(2):
+                page.get_by_text("Старая задача после обновления страницы", exact=True).wait_for()
+                page.get_by_text(
+                    "Старый финальный ответ восстановлен по переходу.", exact=True
+                ).wait_for()
+                page.reload()
+            browser.close()
+            print("browser-smoke: conversational spine survives reload")
+            return 0
         if os.environ.get("CODEX_WEB_OUTAGE_ONLY") == "1":
             page.get_by_text("Чат временно недоступен", exact=True).wait_for()
             if page.get_by_text("Что будем делать?", exact=True).count():
