@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { readNativeThreadHistory, readNativeTurnHead } from './native-thread-history.js';
+import {
+  findNativeClientMessageEvidence,
+  readNativeThreadHistory,
+  readNativeTurnHead,
+} from './native-thread-history.js';
 
 const turn = (id: string) => ({ id, status: 'completed', items: [], itemsView: 'full' });
 
@@ -70,5 +74,40 @@ describe('native thread history pagination', () => {
       itemsView: 'notLoaded',
       limit: 25,
     });
+  });
+
+  it('finds an exact client message on an older page without retaining the full history', async () => {
+    const request = vi.fn((_method: string, params: unknown) => {
+      const cursor = (params as { cursor?: string }).cursor;
+      return Promise.resolve(
+        cursor === undefined
+          ? { data: [turn('recent')], nextCursor: 'older' }
+          : {
+              data: [
+                {
+                  id: 'matching',
+                  status: 'inProgress',
+                  itemsView: 'full',
+                  items: [{ type: 'userMessage', clientId: 'exact-key' }],
+                },
+              ],
+              nextCursor: 'not-needed',
+            },
+      );
+    });
+    expect(await findNativeClientMessageEvidence({ request }, 'thread-1', 'exact-key')).toEqual({
+      turnId: 'matching',
+      matchingTurnIsInProgress: true,
+    });
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects incomplete pages before it can claim a client message is absent', async () => {
+    const request = vi.fn(() =>
+      Promise.resolve({ data: [{ ...turn('older'), itemsView: 'summary' }], nextCursor: null }),
+    );
+    await expect(findNativeClientMessageEvidence({ request }, 'thread-1', 'key')).rejects.toThrow(
+      'NATIVE_HISTORY_ITEMS_INCOMPLETE',
+    );
   });
 });

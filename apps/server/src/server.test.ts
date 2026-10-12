@@ -9706,6 +9706,11 @@ describe('Codex routes', () => {
         status: 'completed',
         items: [{ type: 'userMessage', clientId: key, content: [] }],
       },
+      ...Array.from({ length: 30 }, (_, index) => ({
+        id: `unrelated-${index}`,
+        status: 'completed',
+        items: [],
+      })),
     ]);
 
     const rejectedWithoutCsrf = await app.inject({
@@ -9732,6 +9737,21 @@ describe('Codex routes', () => {
     });
     expect(repository.getThread(threadId)).toMatchObject({ status: 'idle', activeTurnId: null });
     expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(0);
+    expect(
+      appServer.requests.filter(
+        (request) =>
+          request.method === 'thread/turns/list' &&
+          (request.params as { threadId?: string }).threadId === threadId,
+      ).length,
+    ).toBeGreaterThan(1);
+    expect(
+      appServer.requests.filter(
+        (request) =>
+          request.method === 'thread/read' &&
+          (request.params as { threadId?: string; includeTurns?: boolean }).threadId === threadId &&
+          (request.params as { includeTurns?: boolean }).includeTurns === true,
+      ),
+    ).toHaveLength(0);
     expect(
       repository.database
         .prepare("SELECT outcome FROM audit_events WHERE action='turn.queue.reconcile.manual'")
@@ -9947,6 +9967,40 @@ describe('Codex routes', () => {
         .prepare("SELECT outcome FROM audit_events WHERE action='turn.queue.reconcile.manual'")
         .get(),
     ).toEqual({ outcome: 'deferred' });
+  });
+
+  it('does not offer local dismissal when native history changes during a paged absence check', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const queued = seedUnknownQueuedTurn(
+      repository,
+      threadId,
+      '43000000-0000-4000-8000-000000000009',
+    );
+    const nativeRequest = appServer.request.bind(appServer);
+    let changed = false;
+    vi.spyOn(appServer, 'request').mockImplementation(async (method, params) => {
+      const result = await nativeRequest(method, params);
+      if (!changed && method === 'thread/turns/list') {
+        changed = true;
+        appServer.setThreadUpdatedAt(threadId, Math.floor(Date.now() / 1_000) + 60);
+      }
+      return result;
+    });
+
+    const response = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/queued-turns/${queued.id}/reconcile`,
+      headers: session.headers,
+      payload: { action: 'dismissLocal' },
+    });
+    expect(response.json()).toEqual({
+      data: { status: 'stillNeedsReview', reason: 'readFailed', canDismissLocal: false },
+    });
+    expect(repository.getQueuedTurn(queued.id)?.status).toBe('unknown');
+    expect(appServer.requests.filter((request) => request.method === 'turn/start')).toHaveLength(0);
   });
 
   it('rejects queue overflow without consuming the idempotency key', async () => {

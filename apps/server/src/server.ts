@@ -101,7 +101,11 @@ import {
   normalizeTurnNavigation,
   normalizeTurnNavigationLabel,
 } from './history-normalizer.js';
-import { readNativeThreadHistory, readNativeTurnHead } from './native-thread-history.js';
+import {
+  findNativeClientMessageEvidence,
+  readNativeThreadHistory,
+  readNativeTurnHead,
+} from './native-thread-history.js';
 import {
   normalizePermissionRequest,
   normalizeUserInputRequest,
@@ -915,28 +919,6 @@ function quotaErrorFromHistory(
     return code === 'usageLimitExceeded' || code === 'rateLimitExceeded' ? code : null;
   }
   return null;
-}
-
-function queuedClientMessageEvidence(
-  turns: unknown,
-  clientUserMessageId: string,
-): { turnId: string | null; matchingTurnIsInProgress: boolean } {
-  if (!Array.isArray(turns)) return { turnId: null, matchingTurnIsInProgress: false };
-  for (const turnValue of turns) {
-    const turn = inputRecord(turnValue);
-    if (!turn) continue;
-    if (!Array.isArray(turn.items)) continue;
-    for (const itemValue of turn.items) {
-      const item = inputRecord(itemValue);
-      if (
-        item?.type === 'userMessage' &&
-        item.clientId === clientUserMessageId &&
-        typeof turn.id === 'string'
-      )
-        return { turnId: turn.id, matchingTurnIsInProgress: turn.status === 'inProgress' };
-    }
-  }
-  return { turnId: null, matchingTurnIsInProgress: false };
 }
 
 function turnStartWasDefinitelyNotAccepted(error: unknown): boolean {
@@ -4810,14 +4792,20 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         const thread = repository.getThread(record.threadId);
         if (!thread) return;
         try {
+          const project = repository.getProject(thread.projectId);
+          if (!project) return;
+          const cwd = await canonicalProjectPath(pathPolicy, project);
           const read = threadResponseSchema.parse(
             await appServer.request('thread/read', {
               threadId: record.threadId,
-              includeTurns: true,
+              includeTurns: false,
             }),
           );
-          const evidence = queuedClientMessageEvidence(
-            inputRecord(read.thread)?.turns,
+          if (read.thread.id !== record.threadId || read.thread.cwd !== cwd)
+            throw new Error('APP_SERVER_CWD_MISMATCH');
+          const evidence = await findNativeClientMessageEvidence(
+            appServer,
+            record.threadId,
             current.idempotencyKey,
           );
           if (evidence.turnId === null) return;
@@ -4925,15 +4913,27 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         const read = threadResponseSchema.parse(
           await appServer.request('thread/read', {
             threadId: params.id,
-            includeTurns: true,
+            includeTurns: false,
           }),
         );
-        if (read.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
-        const evidence = queuedClientMessageEvidence(
-          inputRecord(read.thread)?.turns,
+        if (read.thread.id !== params.id || read.thread.cwd !== cwd)
+          throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
+        const evidence = await findNativeClientMessageEvidence(
+          appServer,
+          params.id,
           record.idempotencyKey,
         );
         if (evidence.turnId === null) {
+          // Absence is actionable only after a complete, stable native scan.
+          const confirmation = threadResponseSchema.parse(
+            await appServer.request('thread/read', { threadId: params.id, includeTurns: false }),
+          );
+          if (
+            confirmation.thread.id !== params.id ||
+            confirmation.thread.cwd !== cwd ||
+            confirmation.thread.updatedAt !== read.thread.updatedAt
+          )
+            throw new Error('NATIVE_HISTORY_CHANGED_DURING_SCAN');
           const canDismissLocal = record.dismissedAt === null;
           if (input.action === 'dismissLocal' && canDismissLocal) {
             if (!repository.dismissUnknownQueuedTurn(params.id, params.queuedTurnId))
