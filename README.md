@@ -66,7 +66,7 @@ the new subagents it creates; it cannot replace the model of a root turn that is
 composer states that boundary while such a turn is active.
 Short Codex runtime outages keep the persisted project/chat navigation and already rendered transcript in
 place. An old or long chat opens immediately from the latest 120 persisted safe events while the first full
-native history hydration runs single-flight in the background. The UI labels a truncated window, and its live
+native history hydration reads bounded turn pages single-flight in the background. The UI labels a truncated window, and its live
 event stream attaches without waiting for hydration. If hydration is rejected, times out, loses its response
 or fails an integrity check, the available transcript remains visible with a classified degraded-history
 warning; the server backs off repeated hydration attempts for 30 seconds, and an independent attachment-list
@@ -92,7 +92,7 @@ Browser -> HTTPS edge -> Web API/SSE -> private Unix socket -> Codex app-server
                    SQLite + uploads                 CODEX_HOME + projects
 ```
 
-See [architecture](docs/architecture.md) and the [threat model](docs/Codex_Web_UI-threat-model.md).
+See [architecture](docs/architecture.md), the [desktop parity baseline](docs/desktop-parity.md), and the [threat model](docs/Codex_Web_UI-threat-model.md).
 
 ## Portability contract
 

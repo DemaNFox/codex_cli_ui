@@ -80,6 +80,7 @@ class FakeAppServer implements AppServerClient {
   failNextResponseWith: Error | null = null;
   failAccountStatusReads = false;
   failThreadUsageReads = false;
+  historyItemsView: 'full' | 'summary' = 'full';
   failAccountLoginCancels = false;
   accountLoginCancelStatus: 'canceled' | 'notFound' = 'canceled';
   beforeThreadReadReturn: (() => Promise<void>) | null = null;
@@ -375,6 +376,22 @@ class FakeAppServer implements AppServerClient {
         thread: thread && values.includeTurns === false ? { ...thread, turns: undefined } : thread,
         model: thread?.model ?? 'gpt-test',
         instructionSources: [],
+      };
+    }
+    if (method === 'thread/turns/list') {
+      const turns = this.threads.get(String(values.threadId))?.turns;
+      const descending: Record<string, unknown>[] = Array.isArray(turns)
+        ? (turns as Record<string, unknown>[]).slice().reverse()
+        : [];
+      const offset = values.cursor === undefined ? 0 : Number(values.cursor);
+      const end = Math.min(descending.length, offset + Number(values.limit));
+      return {
+        data: descending.slice(offset, end).map((turn) => ({
+          ...turn,
+          items: values.itemsView === 'notLoaded' ? [] : turn.items,
+          itemsView: values.itemsView === 'notLoaded' ? 'notLoaded' : this.historyItemsView,
+        })),
+        nextCursor: end < descending.length ? String(end) : null,
       };
     }
     if (method === 'thread/resume') {
@@ -5729,9 +5746,18 @@ describe('Codex routes', () => {
         .filter((request) => request.method === 'thread/read')
         .map((request) => request.params),
     ).toEqual([
-      { threadId: thread.id, includeTurns: true },
+      { threadId: thread.id, includeTurns: false },
       { threadId: thread.id, includeTurns: false },
     ]);
+    expect(appServer.requests).toContainEqual({
+      method: 'thread/turns/list',
+      params: {
+        threadId: thread.id,
+        sortDirection: 'desc',
+        itemsView: 'full',
+        limit: 25,
+      },
+    });
   });
 
   it('uses an explicit hydration marker and merges history after a pre-hydration event', async () => {
@@ -6127,12 +6153,15 @@ describe('Codex routes', () => {
     expect(second.statusCode).toBe(200);
     expect(second.json<{ turnNavigation: unknown[] }>().turnNavigation).toHaveLength(2);
     expect(
+      appServer.requests.filter((request) => request.method === 'thread/turns/list'),
+    ).toHaveLength(1);
+    expect(
       appServer.requests.filter(
         (request) =>
           request.method === 'thread/read' &&
           (request.params as { includeTurns?: boolean }).includeTurns === true,
       ),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
   });
 
   it('persists separate live turn and steer navigation entries for the same turn id', async () => {
@@ -7489,7 +7518,14 @@ describe('Codex routes', () => {
         .filter((request) => request.method === 'thread/read')
         .slice(-1)
         .map((request) => request.params),
-    ).toEqual([{ threadId, includeTurns: true }]);
+    ).toEqual([{ threadId, includeTurns: false }]);
+    expect(
+      appServer.requests.some(
+        (request) =>
+          request.method === 'thread/turns/list' &&
+          (request.params as { itemsView?: string }).itemsView === 'notLoaded',
+      ),
+    ).toBe(true);
   });
 
   it('clears a stale native active status when every retained turn is terminal', async () => {
@@ -10662,6 +10698,46 @@ describe('Codex routes', () => {
     ]);
   });
 
+  it('retains the saved transcript and leaves hydration retryable when Codex returns summary-only turns', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = appServer.addExternalThread(projectPath);
+    await app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
+    repository.appendEvent({
+      threadId,
+      turnId: 'retained-turn',
+      kind: 'user-message',
+      phase: 'completed',
+      payload: { text: 'keep this message' },
+    });
+    appServer.setThreadTurns(threadId, [{ id: 'historical', status: 'completed', items: [] }]);
+    appServer.historyItemsView = 'summary';
+
+    const response = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(response.statusCode).toBe(200);
+    expect(response.body).toContain('keep this message');
+    await vi.waitFor(() =>
+      expect(
+        repository.database
+          .prepare(
+            "SELECT 1 FROM audit_events WHERE action='thread.history' AND outcome='degraded' ORDER BY id DESC LIMIT 1",
+          )
+          .get(),
+      ).toBeDefined(),
+    );
+    expect(repository.isThreadHistoryHydrated(threadId)).toBe(false);
+    expect(repository.listEvents(threadId, 0)).toHaveLength(1);
+  });
+
   it('opens SSE and delivers retained and live events while initial native hydration is blocked', async () => {
     const { app, appServer, repository, projectPath } = await fixture();
     const session = await login(app);
@@ -10749,6 +10825,16 @@ describe('Codex routes', () => {
     await vi.waitFor(() => expect(repository.isThreadHistoryHydrated(threadId)).toBe(true));
     const persisted = repository.listEvents(threadId, 0);
     expect(persisted).toHaveLength(160);
+    expect(
+      appServer.requests.filter((request) => request.method === 'thread/turns/list'),
+    ).toHaveLength(4);
+    expect(
+      appServer.requests.filter(
+        (request) =>
+          request.method === 'thread/read' &&
+          (request.params as { includeTurns?: boolean }).includeTurns === true,
+      ),
+    ).toHaveLength(0);
     const expectedPublishedIds = persisted
       .slice(-Math.min(120, SSE_LIVE_QUEUE_LIMIT))
       .map((event) => event.id);

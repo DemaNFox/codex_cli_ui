@@ -78,7 +78,7 @@ function emitLifecycle(emitter: EventEmitter, event: AppServerLifecycleEvent): v
   }
 }
 
-const ALLOWED_REQUESTS = new Set([
+export const ALLOWED_REQUESTS = new Set([
   'account/login/cancel',
   'account/login/start',
   'account/read',
@@ -90,6 +90,7 @@ const ALLOWED_REQUESTS = new Set([
   'thread/start',
   'thread/resume',
   'thread/read',
+  'thread/turns/list',
   'thread/list',
   'thread/name/set',
   'thread/archive',

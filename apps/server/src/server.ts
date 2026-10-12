@@ -101,6 +101,7 @@ import {
   normalizeTurnNavigation,
   normalizeTurnNavigationLabel,
 } from './history-normalizer.js';
+import { readNativeThreadHistory, readNativeTurnHead } from './native-thread-history.js';
 import {
   normalizePermissionRequest,
   normalizeUserInputRequest,
@@ -2214,37 +2215,45 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (result.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
     let liveActiveTurnId = activeTurnIdForThread(existing.id);
     let authoritativeStatus = statusType(result.thread.status);
+    let turnsForRuntime: unknown = result.thread.turns;
     if (
       authoritativeStatus === 'active' &&
       liveActiveTurnId === null &&
-      !Array.isArray(result.thread.turns)
+      (!includeTurns || !Array.isArray(turnsForRuntime))
     ) {
       if (serverClosing) throw new Error('SERVER_CLOSING');
-      result = threadResponseSchema.parse(
-        await appServer.request('thread/read', { threadId: existing.id, includeTurns: true }),
-      );
+      if (includeTurns) {
+        result = threadResponseSchema.parse(
+          await appServer.request('thread/read', { threadId: existing.id, includeTurns: true }),
+        );
+        turnsForRuntime = result.thread.turns;
+      } else turnsForRuntime = await readNativeTurnHead(appServer, existing.id);
       if (serverClosing) throw new Error('SERVER_CLOSING');
       if (result.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
       authoritativeStatus = statusType(result.thread.status);
     }
-    const turnHistoryAvailable = Array.isArray(result.thread.turns);
+    const turnHistoryAvailable = Array.isArray(turnsForRuntime);
     let recoveredTurnId: string | null = null;
     if (authoritativeStatus === 'active' && liveActiveTurnId === null && turnHistoryAvailable) {
-      recoveredTurnId = activeTurnIdFromHistory(result.thread.turns);
+      recoveredTurnId = activeTurnIdFromHistory(turnsForRuntime);
       if (recoveredTurnId) {
         liveActiveTurnId = recoveredTurnId;
       } else if (repository.listSubagents(existing.id).length > 0) {
         if (serverClosing) throw new Error('SERVER_CLOSING');
         const confirmation = threadResponseSchema.parse(
-          await appServer.request('thread/read', { threadId: existing.id, includeTurns: true }),
+          await appServer.request('thread/read', { threadId: existing.id, includeTurns }),
         );
         if (serverClosing) throw new Error('SERVER_CLOSING');
         if (confirmation.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
-        const confirmationTurnId = activeTurnIdFromHistory(confirmation.thread.turns);
+        const confirmationTurns = includeTurns
+          ? confirmation.thread.turns
+          : await readNativeTurnHead(appServer, existing.id);
+        const confirmationTurnId = activeTurnIdFromHistory(confirmationTurns);
         const stableNativeSnapshot =
           statusType(confirmation.thread.status) === 'active' &&
           confirmation.thread.updatedAt === result.thread.updatedAt;
         result = confirmation;
+        turnsForRuntime = confirmationTurns;
         authoritativeStatus = statusType(confirmation.thread.status);
         if (confirmationTurnId) {
           recoveredTurnId = confirmationTurnId;
@@ -2312,7 +2321,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         }),
       );
     }
-    return { thread, turns: result.thread.turns };
+    return { thread, turns: turnsForRuntime };
   };
 
   const runStaleExecutionCapacityReconciliation = async (): Promise<void> => {
@@ -2540,8 +2549,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         return repository.getThread(existing.id) ?? existing;
       const generation = appServer.generation;
       const navigationMutationVersion = turnNavigationMutationVersions.get(existing.id) ?? 0;
-      const result = await readThreadFromAppServer(existing, true);
-      const safeTurns = redactAttachmentStorage(result.turns, attachmentStore.root);
+      const result = await readThreadFromAppServer(existing, false);
+      const nativeTurns = await readNativeThreadHistory(appServer, existing.id);
+      if (appServer.generation !== generation) throw new Error('APP_SERVER_GENERATION_CHANGED');
+      const safeTurns = redactAttachmentStorage(nativeTurns, attachmentStore.root);
       const reconciledEvents = repository.reconcileThreadHistoryEvents(
         existing.id,
         normalizeThreadHistory(existing.id, safeTurns, config.maxEventBytes),
@@ -2603,8 +2614,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (activeRefresh?.generation === generation) return activeRefresh.result;
     const result = (async () => {
       const mutationVersion = turnNavigationMutationVersions.get(existing.id) ?? 0;
-      const read = await readThreadFromAppServer(existing, true);
-      const safeTurns = redactAttachmentStorage(read.turns, attachmentStore.root);
+      const read = await readThreadFromAppServer(existing, false);
+      const nativeTurns = await readNativeThreadHistory(appServer, existing.id);
+      if (appServer.generation !== generation) throw new Error('APP_SERVER_GENERATION_CHANGED');
+      const safeTurns = redactAttachmentStorage(nativeTurns, attachmentStore.root);
       const reconciledEvents = repository.reconcileThreadHistoryEvents(
         existing.id,
         recoverableCompletedHistory(
