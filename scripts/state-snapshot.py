@@ -20,6 +20,7 @@ from pathlib import Path
 
 FORMAT = "codex-web-ui-state-v1"
 STORES = ("web-data", "codex-home")
+CODEX_TEMP_DIRS = frozenset(("tmp", ".tmp"))
 UNITS = (
     "codex-web-ui@api.service",
     "codex-web-ui-app-server.socket",
@@ -49,13 +50,16 @@ def require_directory(path: Path, *, empty: bool = False) -> Path:
     return path.resolve(strict=True)
 
 
-def inventory(root: Path) -> dict[str, dict[str, object]]:
+def inventory(root: Path, *, ignore_codex_temp: bool = False) -> dict[str, dict[str, object]]:
     result: dict[str, dict[str, object]] = {}
     for path in sorted(root.rglob("*")):
+        relative_path = path.relative_to(root)
+        if ignore_codex_temp and relative_path.parts[0] in CODEX_TEMP_DIRS:
+            continue
         mode = path.lstat().st_mode
         if stat.S_ISLNK(mode) or not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)):
             raise ValueError(f"Unsupported link or special file in state: {path}")
-        relative = path.relative_to(root).as_posix()
+        relative = relative_path.as_posix()
         if stat.S_ISDIR(mode):
             result[relative] = {"type": "dir", "mode": stat.S_IMODE(mode)}
         else:
@@ -98,12 +102,21 @@ def snapshot(web_data: Path, codex_home: Path, output: Path) -> None:
     if any(root == resolved_output or root in resolved_output.parents for root in source):
         raise ValueError("Snapshot destination must be outside state stores")
     # Validate sources before creating output. Stop work first so they remain stable.
-    for root in source:
-        inventory(root)
+    inventory(source[0])
+    inventory(source[1], ignore_codex_temp=True)
     output.mkdir(mode=0o700)
     try:
         for store, root in zip(STORES, source, strict=True):
-            shutil.copytree(root, output / store, symlinks=True)
+            shutil.copytree(
+                root,
+                output / store,
+                symlinks=True,
+                ignore=(
+                    (lambda directory, names: CODEX_TEMP_DIRS.intersection(names) if Path(directory) == root else set())
+                    if store == "codex-home"
+                    else None
+                ),
+            )
         manifest = {
             "format": FORMAT,
             "stores": {store: inventory(output / store) for store in STORES},

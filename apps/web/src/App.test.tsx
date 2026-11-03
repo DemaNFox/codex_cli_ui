@@ -1396,10 +1396,16 @@ describe('App', () => {
         'Показаны последние сохранённые сообщения. Полная история загружается в фоне.',
       ),
     ).not.toBeNull();
+    await waitFor(() =>
+      expect(
+        FakeEventSource.instances.find((instance) =>
+          instance.url.includes('/api/threads/thread-1/events'),
+        ),
+      ).toBeDefined(),
+    );
     const stream = FakeEventSource.instances.find((instance) =>
       instance.url.includes('/api/threads/thread-1/events'),
     );
-    expect(stream).toBeDefined();
     await act(() => stream?.dispatchEvent(new Event('open')));
 
     await waitFor(() => expect(detailReads).toBe(2));

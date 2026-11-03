@@ -59,6 +59,13 @@ class StateSnapshotTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "link"):
             module.snapshot(self.web, self.codex, self.root / "other-snapshot")
 
+    def test_codex_ephemeral_links_are_excluded(self):
+        (self.codex / "tmp").mkdir()
+        (self.codex / "tmp" / "codex-linux-sandbox").symlink_to(self.root)
+        module.snapshot(self.web, self.codex, self.archive)
+        self.assertFalse((self.archive / "codex-home" / "tmp").exists())
+        self.assertTrue((self.archive / "codex-home" / "sessions" / "a.jsonl").exists())
+
     def test_active_unit_blocks_state_operation(self):
         with patch.object(module.sys, "platform", "linux"), patch.object(
             module.subprocess, "run"
