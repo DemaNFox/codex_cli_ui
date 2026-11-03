@@ -487,6 +487,49 @@ describe('App', () => {
     expect(await screen.findByRole('dialog', { name: 'Настройки' })).not.toBeNull();
   });
 
+  it('submits an API key from account settings and shows the separate billing mode', async () => {
+    const key = 'sk-test-secret-key-0123456789';
+    let connected = false;
+    const fetchMock = installAuthenticatedApi((url, init) => {
+      if (url.startsWith('/api/system/capabilities'))
+        return jsonResponse({
+          ...capabilities,
+          authenticated: connected,
+          account: connected ? { type: 'apiKey', email: null, planType: null } : null,
+        });
+      if (url === '/api/system/codex-account/api-key' && init?.method === 'POST') {
+        connected = true;
+        return jsonResponse({ data: { type: 'apiKey', connected: true } });
+      }
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Подключить Codex' }));
+    const keyInput = screen.getByLabelText<HTMLInputElement>('Или подключить OpenAI API-ключ');
+    expect(keyInput.type).toBe('password');
+    await user.type(keyInput, key);
+    await user.click(screen.getByRole('button', { name: 'Подключить API-ключ' }));
+    expect(await screen.findByText('Codex переключён на API-ключ.')).not.toBeNull();
+    expect(screen.getByText('OpenAI API · отдельная оплата')).not.toBeNull();
+    expect(keyInput.value).toBe('');
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/system/codex-account/api-key',
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ apiKey: key }),
+      }),
+    );
+    expect(
+      new Headers(
+        fetchMock.mock.calls.find(
+          ([url]) => requestUrl(url) === '/api/system/codex-account/api-key',
+        )?.[1]?.headers,
+      ).get('X-CSRF-Token'),
+    ).toBe(session.csrfToken);
+    expect(JSON.stringify(localStorage)).not.toContain(key);
+  });
+
   it.each(['TURN_CAPACITY_EXHAUSTED', 'RESOURCE_CAPACITY_EXHAUSTED'] as const)(
     'explains %s and preserves the unsent draft',
     async (capacityCode) => {
@@ -6297,6 +6340,31 @@ describe('App', () => {
     );
     expect(checkCall?.[1]?.body).toBe('{}');
     expect(new Headers(checkCall?.[1]?.headers).get('X-CSRF-Token')).toBe('csrf-token');
+  });
+
+  it('starts ChatGPT device-code sign-in from a fresh disconnected Web session', async () => {
+    installAuthenticatedApi((url, init) => {
+      if (url.startsWith('/api/system/capabilities'))
+        return jsonResponse({ ...capabilities, authenticated: false, account: null });
+      if (url === '/api/system/codex-account/login' && init?.method === 'POST')
+        return jsonResponse({
+          data: {
+            state: 'pending',
+            loginId: 'login-fresh',
+            userCode: 'FRESH-CODE',
+            verificationUrl: 'https://auth.openai.com/device',
+            expiresAt: '2027-01-01T00:10:00.000Z',
+            message: null,
+          },
+        });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole('button', { name: 'Подключить Codex' }));
+    await user.click(screen.getByRole('button', { name: 'Подключить подписку ChatGPT' }));
+    expect(await screen.findByRole('dialog', { name: 'Подключение Codex' })).not.toBeNull();
+    expect(screen.getByLabelText('Одноразовый код').textContent).toContain('FRESH-CODE');
   });
 
   it('starts Codex account login and presents the device code without accepting credentials', async () => {

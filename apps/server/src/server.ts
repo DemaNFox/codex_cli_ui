@@ -211,6 +211,16 @@ const MAX_TRANSCRIPTION_IDEMPOTENCY_ENTRIES = 200;
 const transcriptionIdempotencyKeySchema = z.string().uuid();
 const CODEX_ACCOUNT_LOGIN_TTL_MS = 15 * 60 * 1_000;
 const codexAccountLoginRequestSchema = z.object({ type: z.literal('chatgptDeviceCode') }).strict();
+const codexApiKeyLoginRequestSchema = z
+  .object({
+    apiKey: z
+      .string()
+      .min(16)
+      .max(4_096)
+      .startsWith('sk-')
+      .regex(/^[\x21-\x7E]+$/),
+  })
+  .strict();
 const accountLoginIdSchema = z
   .string()
   .min(1)
@@ -1659,6 +1669,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
   });
   let accountLoginTimer: NodeJS.Timeout | null = null;
   let accountLoginInterlocked = false;
+  let apiKeyLoginOutcomeUnknown = false;
   let accountLoginStartInFlight = false;
   let accountLoginAttempt = 0;
   let earlyAccountLoginCompletion: { loginId: string; success: boolean } | null = null;
@@ -1687,6 +1698,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       return false;
     clearAccountLoginTimer();
     accountLoginInterlocked = false;
+    apiKeyLoginOutcomeUnknown = false;
     earlyAccountLoginCompletion = null;
     accountLogin = codexAccountLoginSchema.parse({
       state,
@@ -1708,6 +1720,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       return false;
     clearAccountLoginTimer();
     accountLoginInterlocked = false;
+    apiKeyLoginOutcomeUnknown = false;
     earlyAccountLoginCompletion = null;
     accountLogin = codexAccountLoginSchema.parse({
       state: 'idle',
@@ -3211,7 +3224,8 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         appendInteractionTerminal(approval, 'cancelled');
     }
     approvalGenerations.clear();
-    if (accountLoginInterlocked) setTerminalAccountLogin('failed', 'Connection to Codex was lost.');
+    if (accountLoginInterlocked && !apiKeyLoginOutcomeUnknown)
+      setTerminalAccountLogin('failed', 'Connection to Codex was lost.');
 
     for (const rootThreadId of affectedRoots) {
       const threadRuntime = threadRuntimePayload(rootThreadId);
@@ -5597,9 +5611,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return { data: codexAccountLoginSchema.parse(accountLogin) };
   });
 
-  app.post('/api/system/codex-account/login', async (request, reply) => {
-    csrfGuard(auth, request);
-    const input = codexAccountLoginRequestSchema.parse(request.body);
+  const requireAccountLoginIdle = (): void => {
     if (codexUpdateInterlocked || upgradeDrainRequested())
       throw new HttpError(409, 'CODEX_UPDATE_PENDING');
     if (accountLoginInterlocked) throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
@@ -5615,6 +5627,72 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
         'CODEX_ACCOUNT_LOGIN_BUSY',
         'Account login requires all tasks and subagents to be idle',
       );
+  };
+
+  app.post('/api/system/codex-account/api-key', async (request) => {
+    csrfGuard(auth, request);
+    const input = codexApiKeyLoginRequestSchema.safeParse(request.body);
+    if (!input.success) throw new HttpError(400, 'INVALID_API_KEY');
+    requireAccountLoginIdle();
+    accountLoginInterlocked = true;
+    apiKeyLoginOutcomeUnknown = false;
+    accountLogin = codexAccountLoginSchema.parse({
+      state: 'pending',
+      loginId: null,
+      userCode: null,
+      verificationUrl: null,
+      expiresAt: null,
+      message: 'Проверяем переключение Codex на API-ключ.',
+    });
+    let result: unknown;
+    try {
+      result = await appServer.request('account/login/start', {
+        type: 'apiKey',
+        apiKey: input.data.apiKey,
+      });
+    } catch (error) {
+      if (
+        error instanceof AppServerRequestError &&
+        (error.failureKind === 'notSent' || error.failureKind === 'rejected')
+      ) {
+        setTerminalAccountLogin('failed', 'Codex отклонил вход по API-ключу.');
+        throw new HttpError(502, 'CODEX_API_KEY_LOGIN_REJECTED');
+      }
+      apiKeyLoginOutcomeUnknown = true;
+      accountLogin = {
+        ...accountLogin,
+        message: 'Результат входа неизвестен. Запуск задач приостановлен.',
+      };
+      throw new HttpError(503, 'CODEX_API_KEY_LOGIN_OUTCOME_UNKNOWN', accountLogin.message!);
+    }
+    if (!z.object({ type: z.literal('apiKey') }).safeParse(result).success) {
+      apiKeyLoginOutcomeUnknown = true;
+      accountLogin = { ...accountLogin, message: 'Ответ Codex не подтверждает вход по API-ключу.' };
+      throw new HttpError(502, 'CODEX_API_KEY_LOGIN_INVALID_RESPONSE', accountLogin.message!);
+    }
+    let connected: z.infer<typeof accountResponseSchema>;
+    try {
+      connected = accountResponseSchema.parse(
+        await appServer.request('account/read', { refreshToken: false }),
+      );
+    } catch {
+      apiKeyLoginOutcomeUnknown = true;
+      accountLogin = { ...accountLogin, message: 'Не удалось подтвердить выбранный способ входа.' };
+      throw new HttpError(503, 'CODEX_API_KEY_LOGIN_OUTCOME_UNKNOWN', accountLogin.message!);
+    }
+    if (publicCodexAccount(connected.account)?.type !== 'apiKey') {
+      apiKeyLoginOutcomeUnknown = true;
+      accountLogin = { ...accountLogin, message: 'Codex не подтвердил переход на API-ключ.' };
+      throw new HttpError(502, 'CODEX_API_KEY_LOGIN_UNCONFIRMED', accountLogin.message!);
+    }
+    setTerminalAccountLogin('succeeded', 'Codex использует API-ключ.');
+    return { data: { type: 'apiKey', connected: true } };
+  });
+
+  app.post('/api/system/codex-account/login', async (request, reply) => {
+    csrfGuard(auth, request);
+    const input = codexAccountLoginRequestSchema.parse(request.body);
+    requireAccountLoginIdle();
 
     accountLoginInterlocked = true;
     accountLoginStartInFlight = true;

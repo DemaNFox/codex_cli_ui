@@ -17,6 +17,15 @@ const protocol = JSON.parse(protocolBytes.toString('utf8')) as {
     ClientRequest: {
       oneOf: Array<{ properties?: { method?: { enum?: string[] } } }>;
     };
+    LoginAccountParams: {
+      oneOf: Array<{
+        properties?: { type?: { enum?: string[] }; apiKey?: { type?: string } };
+        required?: string[];
+      }>;
+    };
+    LoginAccountResponse: {
+      oneOf: Array<{ properties?: { type?: { enum?: string[] } }; required?: string[] }>;
+    };
   };
 };
 
@@ -38,5 +47,17 @@ describe('reviewed Codex protocol parity', () => {
     );
     expect([...ALLOWED_REQUESTS].filter((method) => !methods.has(method))).toEqual([]);
     expect(ALLOWED_REQUESTS.has('thread/turns/list')).toBe(true);
+  });
+
+  it('keeps the reviewed API-key login request and non-secret acknowledgement', () => {
+    const request = protocol.definitions.LoginAccountParams.oneOf.find((entry) =>
+      entry.properties?.type?.enum?.includes('apiKey'),
+    );
+    expect(request?.required).toEqual(expect.arrayContaining(['type', 'apiKey']));
+    expect(request?.properties?.apiKey?.type).toBe('string');
+    const response = protocol.definitions.LoginAccountResponse.oneOf.find((entry) =>
+      entry.properties?.type?.enum?.includes('apiKey'),
+    );
+    expect(response?.required).toEqual(['type']);
   });
 });

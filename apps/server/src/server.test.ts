@@ -462,6 +462,10 @@ class FakeAppServer implements AppServerClient {
         })),
       };
     if (method === 'account/login/start') {
+      if (values.type === 'apiKey') {
+        this.account = { type: 'apiKey' };
+        return { type: 'apiKey' };
+      }
       this.signalAccountLoginStart?.();
       this.signalAccountLoginStart = null;
       if (this.accountLoginStartGate) await this.accountLoginStartGate;
@@ -4985,6 +4989,140 @@ describe('Codex routes', () => {
     expect(blockedTurn.json()).toMatchObject({ error: { code: 'CODEX_NOT_CONNECTED' } });
     expect(repository.listQueuedTurns(threadId)).toHaveLength(0);
     expect(appServer.requests.filter((entry) => entry.method === 'turn/start')).toHaveLength(0);
+  });
+
+  it('connects an API key only from an authenticated CSRF-protected request without echoing it', async () => {
+    const { app, appServer } = await fixture();
+    const key = 'sk-test-secret-key-0123456789';
+    const anonymous = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/api-key',
+      payload: { apiKey: key },
+    });
+    expect(anonymous.statusCode).toBe(401);
+    const session = await login(app);
+    const wrongOrigin = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/api-key',
+      headers: { ...session.headers, origin: 'https://wrong.example' },
+      payload: { apiKey: key },
+    });
+    expect(wrongOrigin.statusCode).toBe(403);
+    const missingCsrf = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/api-key',
+      headers: { origin: 'https://codex.test', cookie: session.cookie },
+      payload: { apiKey: key },
+    });
+    expect(missingCsrf.statusCode).toBe(403);
+    const malformed = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/api-key',
+      headers: session.headers,
+      payload: { apiKey: 'bad secret' },
+    });
+    expect(malformed.statusCode).toBe(400);
+    expect(malformed.body).not.toContain('bad secret');
+    const connected = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/api-key',
+      headers: session.headers,
+      payload: { apiKey: key },
+    });
+    expect(connected.statusCode).toBe(200);
+    expect(connected.json()).toMatchObject({ data: { type: 'apiKey', connected: true } });
+    expect(connected.body).not.toContain(key);
+    expect(appServer.requests).toContainEqual({
+      method: 'account/login/start',
+      params: { type: 'apiKey', apiKey: key },
+    });
+    const status = await app.inject({
+      method: 'GET',
+      url: '/api/system/capabilities',
+      headers: { cookie: session.cookie },
+    });
+    expect(status.json()).toMatchObject({ authenticated: true, account: { type: 'apiKey' } });
+    expect(status.body).not.toContain(key);
+  });
+
+  it('keeps API-key switching fail-closed when its result is uncertain', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    appServer.failNextRequestWith = new AppServerRequestError(
+      'ambiguous',
+      'APP_SERVER_REQUEST_TIMEOUT',
+    );
+    const result = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/api-key',
+      headers: session.headers,
+      payload: { apiKey: 'sk-test-secret-key-0123456789' },
+    });
+    expect(result.statusCode).toBe(503);
+    expect(result.json()).toMatchObject({ error: { code: 'CODEX_API_KEY_LOGIN_OUTCOME_UNKNOWN' } });
+    const blocked = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json()).toMatchObject({ error: { code: 'CODEX_ACCOUNT_LOGIN_PENDING' } });
+    appServer.disconnect();
+    appServer.restart();
+    const stillBlocked = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(stillBlocked.statusCode).toBe(409);
+    expect(stillBlocked.json()).toMatchObject({
+      error: { code: 'CODEX_ACCOUNT_LOGIN_PENDING' },
+    });
+  });
+
+  it('rejects API-key switching during work and releases admission after a definite refusal', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.emit({
+      method: 'turn/started',
+      params: { threadId, turn: { id: 'turn-api-key-busy', status: 'inProgress', items: [] } },
+    });
+    const blocked = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/api-key',
+      headers: session.headers,
+      payload: { apiKey: 'sk-test-secret-key-0123456789' },
+    });
+    expect(blocked.statusCode).toBe(409);
+    expect(blocked.json()).toMatchObject({ error: { code: 'CODEX_ACCOUNT_LOGIN_BUSY' } });
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId, turn: { id: 'turn-api-key-busy', status: 'completed', items: [] } },
+    });
+    appServer.failNextRequestWith = new AppServerRequestError(
+      'rejected',
+      'APP_SERVER_REQUEST_FAILED',
+    );
+    const rejected = await app.inject({
+      method: 'POST',
+      url: '/api/system/codex-account/api-key',
+      headers: session.headers,
+      payload: { apiKey: 'sk-test-secret-key-0123456789' },
+    });
+    expect(rejected.statusCode).toBe(502);
+    expect(rejected.json()).toMatchObject({ error: { code: 'CODEX_API_KEY_LOGIN_REJECTED' } });
+    const accepted = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(accepted.statusCode).toBe(201);
   });
 
   it('runs a bounded device-code login and accepts only its matching completion', async () => {

@@ -3103,6 +3103,7 @@ function SettingsDialog({
   onTabChange,
   onClose,
   onStartAccountLogin,
+  onSaveApiKey,
   onApplyCodexUpdate,
   onCheckCodexUpdate,
   onRefreshResources,
@@ -3129,6 +3130,7 @@ function SettingsDialog({
   onTabChange: (tab: SettingsTab) => void;
   onClose: () => void;
   onStartAccountLogin: () => void;
+  onSaveApiKey: (apiKey: string) => Promise<void>;
   onApplyCodexUpdate: () => void;
   onCheckCodexUpdate: () => void;
   onRefreshResources: () => void;
@@ -3138,6 +3140,10 @@ function SettingsDialog({
   onUseSkill: (name: string) => void;
 }) {
   const dialogRef = useRef<HTMLElement>(null);
+  const [apiKeyDraft, setApiKeyDraft] = useState('');
+  const [apiKeyBusy, setApiKeyBusy] = useState(false);
+  const [apiKeyError, setApiKeyError] = useState<string | null>(null);
+  const [apiKeySaved, setApiKeySaved] = useState(false);
   useEffect(() => {
     dialogRef.current?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
@@ -3251,6 +3257,14 @@ function SettingsDialog({
                 <dd>{capability?.account?.planType ?? 'нет данных'}</dd>
                 <dt>Авторизация</dt>
                 <dd>{capability?.authenticated ? 'активна' : 'нет'}</dd>
+                <dt>Режим</dt>
+                <dd>
+                  {capability?.account?.type === 'chatgpt'
+                    ? 'Подписка ChatGPT'
+                    : capability?.account?.type === 'apiKey'
+                      ? 'OpenAI API · отдельная оплата'
+                      : 'не выбран'}
+                </dd>
                 <dt>Codex</dt>
                 <dd>{capability?.codexVersion ?? 'нет данных'}</dd>
                 <dt>App Server</dt>
@@ -3262,8 +3276,58 @@ function SettingsDialog({
                 type="button"
                 onClick={onStartAccountLogin}
               >
-                Сменить аккаунт
+                {capability?.authenticated ? 'Сменить аккаунт' : 'Подключить подписку ChatGPT'}
               </button>
+              <form
+                className="codex-api-key-form"
+                autoComplete="off"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  if (apiKeyBusy || !apiKeyDraft.trim()) return;
+                  const key = apiKeyDraft.trim();
+                  setApiKeyDraft('');
+                  setApiKeyError(null);
+                  setApiKeySaved(false);
+                  setApiKeyBusy(true);
+                  void onSaveApiKey(key)
+                    .then(() => setApiKeySaved(true))
+                    .catch((cause: unknown) => setApiKeyError(errorMessage(cause)))
+                    .finally(() => setApiKeyBusy(false));
+                }}
+              >
+                <label htmlFor="codex-api-key">Или подключить OpenAI API-ключ</label>
+                <input
+                  id="codex-api-key"
+                  type="password"
+                  autoComplete="off"
+                  spellCheck={false}
+                  value={apiKeyDraft}
+                  onChange={(event) => setApiKeyDraft(event.target.value)}
+                  disabled={apiKeyBusy}
+                  placeholder="sk-…"
+                />
+                <p>
+                  API-ключ оплачивается отдельно от подписки ChatGPT. Ключ хранит только Codex на
+                  сервере.
+                </p>
+                <button
+                  type="submit"
+                  className="secondary"
+                  disabled={apiKeyBusy || !apiKeyDraft.trim()}
+                >
+                  {apiKeyBusy ? 'Подключаем…' : 'Подключить API-ключ'}
+                </button>
+                {apiKeyError && (
+                  <p className="notice error" role="alert">
+                    {apiKeyError}
+                  </p>
+                )}
+                {apiKeySaved && (
+                  <p className="notice success" role="status">
+                    Codex переключён на API-ключ.
+                  </p>
+                )}
+              </form>
             </section>
           )}
           {activeTab === 'updates' && (
@@ -3573,6 +3637,7 @@ function AccountLoginDialog({
   busy,
   error,
   copyNotice,
+  wasConnected,
   onCopy,
   onCancel,
   onClose,
@@ -3581,6 +3646,7 @@ function AccountLoginDialog({
   busy: boolean;
   error: string | null;
   copyNotice: string | null;
+  wasConnected: boolean;
   onCopy: () => void;
   onCancel: () => void;
   onClose: () => void;
@@ -3634,7 +3700,9 @@ function AccountLoginDialog({
         aria-modal="true"
         aria-labelledby="account-login-title"
       >
-        <h2 id="account-login-title">Смена аккаунта Codex</h2>
+        <h2 id="account-login-title">
+          {wasConnected ? 'Смена аккаунта Codex' : 'Подключение Codex'}
+        </h2>
         {busy && !login ? <p role="status">Запрашиваем код входа…</p> : null}
         {pending ? (
           <>
@@ -3678,7 +3746,9 @@ function AccountLoginDialog({
         ) : null}
         {succeeded ? (
           <div className="notice success" role="status">
-            Аккаунт Codex успешно сменён. Новые задачи будут использовать его.
+            {wasConnected
+              ? 'Аккаунт Codex успешно сменён. Новые задачи будут использовать его.'
+              : 'Аккаунт Codex подключён. Новые задачи будут использовать его.'}
           </div>
         ) : null}
         {login?.state === 'failed' && !error ? (
@@ -6868,6 +6938,10 @@ function Workspace({
           onTabChange={setSettingsTab}
           onClose={closeSettings}
           onStartAccountLogin={() => void startAccountLogin()}
+          onSaveApiKey={async (apiKey) => {
+            await api.connectCodexApiKey(session.csrfToken, apiKey);
+            await refreshCapabilityForThread(threadId);
+          }}
           onApplyCodexUpdate={() => void applyCodexUpdate()}
           onCheckCodexUpdate={() => void checkCodexUpdate()}
           onRefreshResources={() => void refreshResourceLimits()}
@@ -6887,6 +6961,7 @@ function Workspace({
           busy={accountLoginBusy}
           error={accountLoginError}
           copyNotice={accountLoginCopyNotice}
+          wasConnected={capability?.authenticated === true}
           onCopy={() => void copyAccountLoginCode()}
           onCancel={() => void cancelAccountLogin()}
           onClose={closeAccountLoginDialog}

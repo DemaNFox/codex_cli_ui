@@ -648,6 +648,16 @@ export const api = {
         { method: 'POST', csrfToken, body: { type: 'chatgptDeviceCode' } },
       ),
     ),
+  connectCodexApiKey: async (csrfToken: string, apiKey: string) =>
+    unwrapData(
+      await request<
+        { type: 'apiKey'; connected: true } | { data: { type: 'apiKey'; connected: true } }
+      >('/api/system/codex-account/api-key', {
+        method: 'POST',
+        csrfToken,
+        body: { apiKey },
+      }),
+    ),
   cancelCodexAccountLogin: async (csrfToken: string) =>
     unwrapData(
       await request<CodexAccountLogin | { data: CodexAccountLogin }>(

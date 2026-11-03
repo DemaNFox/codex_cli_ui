@@ -179,6 +179,9 @@ Codex authentication, website passwords, `.env` values, databases, transcripts a
 host state and are never committed. A fresh installer resolves the latest stable Codex CLI, verifies the
 published archive checksums and requires its generated protocol to match the reviewed adapter before
 activation. Existing installations retain an explicit, separately checked update path.
+After opening the HTTPS UI, connect Codex through a ChatGPT subscription using a one-time device code or
+enter an OpenAI API key in Account settings. API-key usage is billed separately from the subscription;
+the key is handed to the local Codex runner and is not returned in status responses.
 Voice transcription is optional and independent from Codex device authentication. Each verified release
 ships a pinned, manifest-checked quantized Whisper model; production inference stays on-host and requires no
 transcription API key or runtime model download. The browser stops long recordings, while the API enforces
