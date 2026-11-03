@@ -878,6 +878,15 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn('runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login status', installer)
         self.assertIn("Finish sign-in from the authenticated Web UI after installation", installer)
 
+    def test_fresh_install_has_no_previous_release(self) -> None:
+        installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        self.assertIn("previous=\nif [[ -L /opt/codex-web-ui/current ]]; then", installer)
+        self.assertIn("die 'current release link is broken'", installer)
+        self.assertLess(
+            installer.index("previous=\nif [[ -L /opt/codex-web-ui/current ]]"),
+            installer.index('copy_release "$package" "$release_dir"'),
+        )
+
     def test_install_update_and_rollback_keep_release_and_codex_state_boundaries(self) -> None:
         install_script = (ROOT / "scripts/install-ubuntu.sh").read_text(encoding="utf-8")
         update_script = (ROOT / "scripts/update-ubuntu.sh").read_text(encoding="utf-8")

@@ -495,8 +495,12 @@ if $legacy_single_service; then
   systemctl is-active --quiet "codex-web-ui@${legacy_service_user}.service" && \
     die 'legacy API service did not stop after its idle drain'
 fi
-copy_release "$package" "$release_dir"
-previous=$(readlink -f /opt/codex-web-ui/current 2>/dev/null || true)
+previous=
+if [[ -L /opt/codex-web-ui/current ]]; then
+  previous=$(readlink -f /opt/codex-web-ui/current) || die 'current release link is broken'
+elif [[ -e /opt/codex-web-ui/current ]]; then
+  die 'current release path is not a symlink'
+fi
 previous_web=
 if [[ -L /opt/codex-web-ui/web-current ]]; then
   previous_web=$(readlink -f /opt/codex-web-ui/web-current) || die 'current web release link is broken'
@@ -512,6 +516,7 @@ if [[ -n $previous ]]; then
   chown root:codex-web-ui /var/lib/codex-web-ui/previous-release
   chmod 0640 /var/lib/codex-web-ui/previous-release
 fi
+copy_release "$package" "$release_dir"
 runner_config_backup=
 config_backup=
 config_temporary=
