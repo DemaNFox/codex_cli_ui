@@ -609,8 +609,7 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("preflight_origin", wrapper)
         for expected in (
             'prepare-package.sh" --verify',
-            "starting device login",
-            "login --device-auth",
+            "Finish sign-in from the authenticated Web UI after installation",
             "installation exists; rerun with --upgrade",
             "setup-admin.mjs",
             "setup-push.mjs",
@@ -625,7 +624,6 @@ class InfraStaticTest(unittest.TestCase):
             "changing the runner user requires an explicit migration workflow",
             "managed_codex_bin=",
             "an explicit --codex-home must already exist",
-            "exec {tty_fd}<>/dev/tty",
             "runner_config_backup=",
             "load_toolchain_pins",
             "trap rollback_activation EXIT",
@@ -636,6 +634,8 @@ class InfraStaticTest(unittest.TestCase):
             "--check-releases --additional-releases 1",
         ):
             self.assertIn(expected, installer)
+        self.assertNotIn('login --device-auth', installer)
+        self.assertNotIn('exec {tty_fd}<>/dev/tty', installer)
         self.assertNotIn("http://", installer)
         self.assertNotIn('source "$PACKAGE_ROOT/infra/toolchain.env"', installer)
         self.assertNotIn('source "$REPO_ROOT/infra/toolchain.env"', bootstrap)

@@ -1283,6 +1283,7 @@ function NavigationSidebar({
   settingsButtonRef,
   username,
   disabled,
+  newChatDisabled,
   mobileOpen,
   onMobileClose,
 }: {
@@ -1316,6 +1317,7 @@ function NavigationSidebar({
   settingsButtonRef: RefObject<HTMLButtonElement | null>;
   username: string;
   disabled: boolean;
+  newChatDisabled: boolean;
   mobileOpen: boolean;
   onMobileClose: () => void;
 }) {
@@ -1412,7 +1414,11 @@ function NavigationSidebar({
         </button>
       </div>
       <div className="navigation-scroll">
-        <button className="new-chat-button" onClick={onNew} disabled={!projects.length || disabled}>
+        <button
+          className="new-chat-button"
+          onClick={onNew}
+          disabled={!projects.length || disabled || newChatDisabled}
+        >
           <span aria-hidden="true">＋</span>
           Новый чат
         </button>
@@ -1474,7 +1480,7 @@ function NavigationSidebar({
                   className="icon-button subtle"
                   aria-label={`Новый чат в проекте ${project.name}`}
                   title="Новый чат в проекте"
-                  disabled={disabled}
+                  disabled={disabled || newChatDisabled}
                   onClick={() => onNewInProject(project.id)}
                 >
                   ＋
@@ -6167,6 +6173,7 @@ function Workspace({
         onRestoreProject={(id) => void restoreProject(id)}
         username={session.username}
         disabled={busy}
+        newChatDisabled={capability?.authenticated === false}
         mobileOpen={mobileNavigationOpen}
         onMobileClose={closeMobileNavigation}
         onLogout={() =>
@@ -6208,11 +6215,13 @@ function Workspace({
                 ? subagentsOnlyActive
                   ? `Основной ответ готов · продолжают работать субагенты: ${activeSubagentCount}`
                   : `Codex работает${activeTurnDuration ? ` уже ${activeTurnDuration}` : ''}`
-                : streamState === 'offline'
-                  ? 'Нет подключения'
-                  : streamState === 'connecting'
-                    ? 'Подключаемся…'
-                    : 'Готов'}
+                : capability?.authenticated === false
+                  ? 'Codex не подключён'
+                  : streamState === 'offline'
+                    ? 'Нет подключения'
+                    : streamState === 'connecting'
+                      ? 'Подключаемся…'
+                      : 'Готов'}
             </span>
           </div>
           <div className="toolbar-actions">
@@ -6287,6 +6296,18 @@ function Workspace({
         {!error && actionNotice && (
           <div className="notice success global-error" role="status">
             <span>{actionNotice}</span>
+          </div>
+        )}
+        {!error && !actionNotice && capability?.authenticated === false && (
+          <div className="notice warning global-error codex-connection-notice" role="status">
+            <span>Codex не подключён. Войдите в аккаунт, чтобы запускать задачи.</span>
+            <button
+              type="button"
+              className="secondary"
+              onClick={() => void openSettings('account')}
+            >
+              Подключить Codex
+            </button>
           </div>
         )}
         <div
@@ -6766,7 +6787,7 @@ function Workspace({
                   void send();
                 }
               }}
-              disabled={!threadId || archiveView}
+              disabled={!threadId || archiveView || capability?.authenticated === false}
               rows={1}
             />
             <div className="composer-controls">
@@ -6774,7 +6795,7 @@ function Workspace({
                 type="button"
                 className="attach-button"
                 onClick={() => fileInputRef.current?.click()}
-                disabled={!threadId || archiveView || busy}
+                disabled={!threadId || archiveView || busy || capability?.authenticated === false}
                 aria-label="Прикрепить файлы"
                 title="Прикрепить файлы"
               >
@@ -6783,7 +6804,7 @@ function Workspace({
               <VoiceInputButton
                 available={capability?.transcription?.available ?? false}
                 csrfToken={session.csrfToken}
-                disabled={!threadId || archiveView || busy}
+                disabled={!threadId || archiveView || busy || capability?.authenticated === false}
                 maxBytes={capability?.transcription?.maxBytes ?? 10 * 1024 * 1024}
                 maxDurationSeconds={capability?.transcription?.maxDurationSeconds ?? 120}
                 onError={setError}
@@ -6798,6 +6819,7 @@ function Workspace({
                 disabled={
                   !threadId ||
                   archiveView ||
+                  capability?.authenticated === false ||
                   (!composer.trim() && !queuedAttachments.length) ||
                   busy
                 }

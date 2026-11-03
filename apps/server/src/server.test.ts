@@ -4946,6 +4946,47 @@ describe('Codex routes', () => {
     expect(accepted.statusCode).toBe(201);
   });
 
+  it('serves Web setup without a Codex login and closes task admission until connected', async () => {
+    const { app, appServer, projectPath, repository } = await fixture();
+    const session = await login(app);
+    appServer.account = null;
+    const capabilities = await app.inject({
+      method: 'GET',
+      url: '/api/system/capabilities',
+      headers: { cookie: session.cookie },
+    });
+    expect(capabilities.statusCode).toBe(200);
+    expect(capabilities.json()).toMatchObject({ authenticated: false, account: null });
+
+    const project = await createProject(app, projectPath, session.headers);
+    const blockedThread = await app.inject({
+      method: 'POST',
+      url: '/api/threads',
+      headers: session.headers,
+      payload: { projectId: project.id },
+    });
+    expect(blockedThread.statusCode).toBe(409);
+    expect(blockedThread.json()).toMatchObject({ error: { code: 'CODEX_NOT_CONNECTED' } });
+    expect(appServer.requests.filter((entry) => entry.method === 'thread/start')).toHaveLength(0);
+
+    appServer.account = { type: 'apiKey' };
+    const threadId = await createThread(app, project.id, session.headers);
+    appServer.account = null;
+    const blockedTurn = await app.inject({
+      method: 'POST',
+      url: `/api/threads/${threadId}/turns`,
+      headers: session.headers,
+      payload: {
+        text: 'Do not admit without a Codex account',
+        idempotencyKey: '00000000-0000-4000-8000-000000000245',
+      },
+    });
+    expect(blockedTurn.statusCode).toBe(409);
+    expect(blockedTurn.json()).toMatchObject({ error: { code: 'CODEX_NOT_CONNECTED' } });
+    expect(repository.listQueuedTurns(threadId)).toHaveLength(0);
+    expect(appServer.requests.filter((entry) => entry.method === 'turn/start')).toHaveLength(0);
+  });
+
   it('runs a bounded device-code login and accepts only its matching completion', async () => {
     const { app, appServer } = await fixture();
     const session = await login(app);

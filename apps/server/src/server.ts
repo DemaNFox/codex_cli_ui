@@ -1308,19 +1308,35 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     };
   };
 
-  const enforceIncludedUsageOnly = async (model: string | null | undefined): Promise<void> => {
+  const requireCodexConnected = async (): Promise<z.infer<typeof accountResponseSchema>> => {
     let account: z.infer<typeof accountResponseSchema>;
     try {
       account = accountResponseSchema.parse(
         await appServer.request('account/read', { refreshToken: false }),
       );
     } catch {
-      paidCreditFallbackInterlocked = true;
       throw new HttpError(
         503,
-        'CREDIT_USAGE_POLICY_UNAVAILABLE',
-        'Не удалось проверить источник использования Codex. Новая задача не запущена, чтобы не расходовать платные кредиты.',
+        'CODEX_ACCOUNT_STATUS_UNAVAILABLE',
+        'Не удалось проверить подключение Codex. Новая задача не запущена.',
       );
+    }
+    if (account.account == null)
+      throw new HttpError(
+        409,
+        'CODEX_NOT_CONNECTED',
+        'Codex не подключён. Войдите через настройки аккаунта перед запуском задачи.',
+      );
+    return account;
+  };
+
+  const enforceIncludedUsageOnly = async (model: string | null | undefined): Promise<void> => {
+    let account: z.infer<typeof accountResponseSchema>;
+    try {
+      account = await requireCodexConnected();
+    } catch (error) {
+      paidCreditFallbackInterlocked = true;
+      throw error;
     }
     if (!isChatgptAccount(account.account)) {
       paidCreditFallbackInterlocked = false;
@@ -3882,6 +3898,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (codexUpdateInterlocked || upgradeDrainRequested())
       throw new HttpError(503, 'SERVICE_DRAINING');
     if (accountLoginInterlocked) throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
+    await requireCodexConnected();
     beginPendingThreadStart(project.id);
     try {
       const cwd = await canonicalProjectPath(pathPolicy, project);
@@ -4641,6 +4658,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     const project = thread && repository.getProject(thread.projectId);
     let turnStartIssued = false;
     try {
+      await requireCodexConnected();
       if (!thread || thread.archived || !project) {
         repository.requeueTurn(claimed.id);
         return 'wait';
@@ -5040,6 +5058,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (codexUpdateInterlocked || upgradeDrainRequested())
       throw new HttpError(503, 'SERVICE_DRAINING');
     if (accountLoginInterlocked) throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
+    await requireCodexConnected();
     const operation = `turn:${id}`;
     const reservation = repository.reserveIdempotent(operation, input.idempotencyKey, hash);
     if (!reservation.reserved) {

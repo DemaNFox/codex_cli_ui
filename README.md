@@ -173,7 +173,7 @@ A new host needs only:
 1. Ubuntu 22.04 or 24.04 on x64/arm64, Git, internet access and a normal sudo-capable user;
 2. an HTTPS domain/proxy or an existing certificate and private key;
 3. write access for the selected Codex user to the intended project roots, unless explicit `host-admin` is used;
-4. an interactive terminal for the first Codex device login and Web UI administrator bootstrap.
+4. an interactive terminal for the Web UI administrator bootstrap. Codex sign-in can follow in the browser.
 
 Codex authentication, website passwords, `.env` values, databases, transcripts and project worktrees are
 host state and are never committed. A fresh installer resolves the latest stable Codex CLI, verifies the

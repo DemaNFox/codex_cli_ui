@@ -17,11 +17,12 @@ This repository is a standalone, portable Codex server package. Its supported Ub
   app-server protocol byte-for-byte before any installed configuration changes.
 - Projects are existing directories beneath configured real-path allowlisted roots. Reject traversal, symlink escape, and unregistered working directories.
 - OpenAI credentials remain in the server-side `CODEX_HOME`; never return, log, persist, or accept them through the browser API.
-- Bootstrap Codex authentication only as the selected runner identity through its direct terminal. Root device
-  authentication is allowed only after the operator explicitly selects `host-admin`; restricted mode must still
-  reject it. After bootstrap, an authenticated owner may start the pinned app-server device flow in the Web UI
-  only while all root turns, pending starts and subagents are idle. Never persist or log a device code, or
-  accept an OpenAI token through installer arguments, logs, or the Web UI.
+- Start fresh installs without requiring Codex login. The selected runner identity owns `CODEX_HOME`; an
+  authenticated Web administrator may start the reviewed app-server device flow only while all root turns,
+  pending starts and subagents are idle. Root authentication is allowed only after the operator explicitly
+  selects `host-admin`; restricted mode must still reject it. Never persist or log a device code, or accept
+  an OpenAI token through installer arguments or logs. The dedicated API-key Web flow requires separate
+  server-side protection and must not expose the key in browser storage or response payloads.
 - The installed global Codex instruction states that the runner already executes on the physical Web UI host.
   Use local filesystem and service-manager commands for that host and never SSH to localhost, loopback, the
   current hostname or another address assigned to the same machine. SSH is for a user-identified remote host.

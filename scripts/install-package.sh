@@ -382,12 +382,7 @@ PY
   fresh_runtime_stage=
 fi
 if ! runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login status >/dev/null 2>&1; then
-  exec {tty_fd}<>/dev/tty || die "Codex login is required; rerun interactively or run: sudo -u $runner_user -H $codex_bin login --device-auth"
-  printf 'Codex is not authenticated for %s; starting device login. Never share the displayed device code.\n' "$runner_user" >&${tty_fd}
-  runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login --device-auth <&${tty_fd} >&${tty_fd} 2>&${tty_fd} || \
-    die "Codex device login failed; retry with: sudo -u $runner_user -H $codex_bin login --device-auth"
-  exec {tty_fd}>&-
-  runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login status >/dev/null 2>&1 || die 'Codex login did not produce an authenticated state'
+  printf 'Codex is not connected for %s. Finish sign-in from the authenticated Web UI after installation.\n' "$runner_user" >&2
 fi
 
 if $external_proxy; then

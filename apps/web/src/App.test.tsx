@@ -461,6 +461,32 @@ describe('App', () => {
     ).not.toContain('В работе');
   });
 
+  it('shows the disconnected Codex setup state and disables task entry', async () => {
+    installAuthenticatedApi((url) => {
+      if (url.startsWith('/api/system/capabilities'))
+        return jsonResponse({ ...capabilities, authenticated: false, account: null });
+      return undefined;
+    });
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(
+      await screen.findByText('Codex не подключён. Войдите в аккаунт, чтобы запускать задачи.'),
+    ).not.toBeNull();
+    expect(screen.getByRole<HTMLButtonElement>('button', { name: 'Новый чат' }).disabled).toBe(
+      true,
+    );
+    await user.click(screen.getByRole('button', { name: 'Открыть недавний чат Frontend task' }));
+    expect((await screen.findByLabelText<HTMLTextAreaElement>('Сообщение Codex')).disabled).toBe(
+      true,
+    );
+    expect(
+      screen.getByRole<HTMLButtonElement>('button', { name: 'Отправить сообщение' }).disabled,
+    ).toBe(true);
+    await user.click(screen.getByRole('button', { name: 'Подключить Codex' }));
+    expect(await screen.findByRole('dialog', { name: 'Настройки' })).not.toBeNull();
+  });
+
   it.each(['TURN_CAPACITY_EXHAUSTED', 'RESOURCE_CAPACITY_EXHAUSTED'] as const)(
     'explains %s and preserves the unsent draft',
     async (capacityCode) => {
