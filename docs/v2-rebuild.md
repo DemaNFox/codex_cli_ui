@@ -2,6 +2,8 @@
 
 Status: in progress, 2026-10-12. This document describes a replacement client, not a completed release.
 
+The approved installation and first-run authentication target is [ADR-0003](0003-fresh-install-and-auth.md). Its six slices will be implemented and checked sequentially; this v2 client remains read-only until its write flows pass acceptance.
+
 ## Goal and reference
 
 Build a Linux-hosted, browser-accessible Codex client whose conversation, execution and account workflows follow the reviewed official Codex app-server protocol. The `lencx/ChatGPT` repository is a useful desktop-shell design reference, but it wraps ChatGPT and is not the Codex desktop source or a Codex protocol specification. Pixel identity or unattended adoption of proprietary desktop features is not promised.

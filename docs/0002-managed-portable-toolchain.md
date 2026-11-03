@@ -1,6 +1,6 @@
 # ADR-0002: Managed portable Codex toolchain
 
-Status: accepted
+Status: historical fresh-install baseline; superseded for the target installer by [ADR-0003](0003-fresh-install-and-auth.md). Current installations still use this behavior until the new implementation is verified.
 
 ## Context
 

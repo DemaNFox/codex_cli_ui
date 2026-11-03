@@ -94,6 +94,8 @@ Browser -> HTTPS edge -> Web API/SSE -> private Unix socket -> Codex app-server
 
 See [architecture](docs/architecture.md), the [desktop parity baseline](docs/desktop-parity.md), and the [threat model](docs/Codex_Web_UI-threat-model.md).
 
+The [fresh-install and browser-authentication target](docs/0003-fresh-install-and-auth.md) is approved but not yet implemented. The installation instructions below describe the current package.
+
 ## Portability contract
 
 The repository is the complete distributable source. On Ubuntu 22.04/24.04
