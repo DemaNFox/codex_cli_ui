@@ -75,6 +75,7 @@ class FakeAppServer implements AppServerClient {
   private readonly archivedThreadIds = new Set<string>();
   private readonly unloadedThreadIds = new Set<string>();
   failNextRequestWith: Error | null = null;
+  failNextRequestMethod: string | null = null;
   failTurnStartWith: Error | null = null;
   failSteerWith: Error | null = null;
   failNextResponseWith: Error | null = null;
@@ -310,9 +311,10 @@ class FakeAppServer implements AppServerClient {
 
   async request(method: string, params: unknown): Promise<unknown> {
     this.requests.push({ method, params });
-    if (this.failNextRequestWith) {
+    if (this.failNextRequestWith && (!this.failNextRequestMethod || this.failNextRequestMethod === method)) {
       const error = this.failNextRequestWith;
       this.failNextRequestWith = null;
+      this.failNextRequestMethod = null;
       throw error;
     }
     const values = params as Record<string, unknown>;
@@ -9540,6 +9542,7 @@ describe('Codex routes', () => {
       completedAt: null,
     });
     appServer.failNextRequestWith = new Error('thread/read unavailable');
+    appServer.failNextRequestMethod = 'thread/read';
 
     const queued = await app.inject({
       method: 'POST',
@@ -10745,6 +10748,7 @@ describe('Codex routes', () => {
     const threadId = await createThread(app, project.id, session.headers);
     appServer.restart();
     appServer.failNextRequestWith = new Error('APP_SERVER_REQUEST_FAILED');
+    appServer.failNextRequestMethod = 'thread/resume';
 
     const response = await app.inject({
       method: 'POST',

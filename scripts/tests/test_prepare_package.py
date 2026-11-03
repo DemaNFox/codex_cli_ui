@@ -56,6 +56,7 @@ class PreparePackageTest(unittest.TestCase):
             "scripts/install-local-host-instructions.py": "#!/usr/bin/env python3\n",
             "scripts/migrate-runner-host-admin.sh": "#!/usr/bin/env bash\n",
             "scripts/rebase-codex-home.py": "#!/usr/bin/env python3\n",
+            "scripts/state-snapshot.py": "#!/usr/bin/env python3\n",
             "scripts/bootstrap-ubuntu.sh": "#!/usr/bin/env bash\n",
             "scripts/codex-runtime-update-stage.py": "#!/usr/bin/env python3\n",
             "apps/server/dist/index.js": "console.log('server');\n",

@@ -872,12 +872,11 @@ class InfraStaticTest(unittest.TestCase):
         self.assertNotIn("systemctl stop codex-web-ui@api.service", drain)
         self.assertIn("fence external turn admission", drain)
 
-    def test_device_login_never_runs_as_root_or_captures_the_code(self) -> None:
+    def test_install_does_not_require_terminal_codex_login(self) -> None:
         installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
-        login_line = next(line for line in installer.splitlines() if 'login --device-auth <&' in line)
-        self.assertIn('runuser -u "$runner_user"', login_line)
-        self.assertIn('>&${tty_fd} 2>&${tty_fd}', login_line)
-        self.assertIn("Never share the displayed device code", installer)
+        self.assertNotIn("login --device-auth", installer)
+        self.assertIn('runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login status', installer)
+        self.assertIn("Finish sign-in from the authenticated Web UI after installation", installer)
 
     def test_install_update_and_rollback_keep_release_and_codex_state_boundaries(self) -> None:
         install_script = (ROOT / "scripts/install-ubuntu.sh").read_text(encoding="utf-8")
