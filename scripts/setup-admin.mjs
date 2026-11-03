@@ -5,7 +5,6 @@ import fs from 'node:fs';
 import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
-import readline from 'node:readline';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -148,27 +147,28 @@ function setAdminValues(parsed, replacements) {
   return `${lines.join('\n').replace(/\n+$/, '')}\n`;
 }
 
-async function readTtyLine(ttyFd, prompt, hidden) {
-  const input = fs.createReadStream(null, { fd: ttyFd, autoClose: false });
-  const output = fs.createWriteStream(null, { fd: ttyFd, autoClose: false });
-  const interface_ = readline.createInterface({ input, output, terminal: true });
+function readTtyLine(ttyFd, prompt, hidden) {
   let echoDisabled = false;
   try {
-    output.write(prompt);
     if (hidden) {
       const result = spawnSync('stty', ['-echo'], { stdio: [ttyFd, ttyFd, ttyFd] });
       if (result.status !== 0) fail('unable to disable terminal echo');
       echoDisabled = true;
     }
-    return await new Promise((resolve) => interface_.once('line', resolve));
+    fs.writeSync(ttyFd, prompt);
+    const bytes = [];
+    const byte = Buffer.allocUnsafe(1);
+    while (bytes.length < 4096) {
+      if (fs.readSync(ttyFd, byte, 0, 1, null) === 0) fail('terminal input ended');
+      if (byte[0] === 10) return Buffer.from(bytes).toString('utf8').replace(/\r$/, '');
+      bytes.push(byte[0]);
+    }
+    fail('terminal input is too long');
   } finally {
     if (echoDisabled) {
       spawnSync('stty', ['echo'], { stdio: [ttyFd, ttyFd, ttyFd] });
-      output.write('\n');
+      fs.writeSync(ttyFd, '\n');
     }
-    interface_.close();
-    input.destroy();
-    output.destroy();
   }
 }
 
