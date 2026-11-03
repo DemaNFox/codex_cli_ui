@@ -1,20 +1,20 @@
 {
   "schemaVersion": 1,
   "package": "@openai/codex",
-  "version": "0.160.0",
+  "version": "0.166.0",
   "tarballs": {
     "main": {
-      "sha512": "904b551b38d101800c3b0271377f5b19c9daecb4f7203420abae0d349fdd0d37eee0ecd96a870973235be7f80627f21517f563ee82bb1369b79e64da9fb9698e"
+      "sha512": "d92ce5a75975733e535f571ca57e19a24dc366ba2df717997b4926fbaff5bfc266ab1003c3227128125a878741ca6930b52db98ffbba762a49bac4ce23ded9f1"
     },
     "linux-x64": {
-      "sha512": "288ffbdcea86ac7991d7cb3bc9aec4d4da95eab4f4cb7971af4b3c4b5a91da6eb353a41117f1e5479dbd8c02cb879be37549ec453e00868c6dd1ac5be2463df6"
+      "sha512": "0b10e6dfe0f57296c625e1eb77320da06fb7c27f4156770fe2aa5969a3589317bc88fb5124e6320899e73e8563591201bc8f6f3ca6d1a227ec312039c43694a7"
     },
     "linux-arm64": {
-      "sha512": "56755db12d3a6250ec2fc3b06898d0df176a749346e22f9e049055dcbcad75d927cd2685feeae28cbcd5837a6d930be88fc0bb1a7ee25a9544fb2f1611a3e20a"
+      "sha512": "c3449c02c06bf5a64ab4816b87a1cde8a536ca328a7920b361f6dbec307409c8f80583f3799b54790a6b6f270b0b0b97dc015075b7636a998b868da2a2def88d"
     }
   },
   "protocolFiles": {
-    "codex_app_server_protocol.schemas.json": "8683f6fd9fbb994fa2bfb704ab5b02c9890238fa507a4c0ff33ff45884cd0a2e",
-    "codex_app_server_protocol.v2.schemas.json": "81a88c04ae4984b16d73080f4109d0477682bc76c8adbe483e371175ce54c054"
+    "codex_app_server_protocol.schemas.json": "9b6d53647b00d68a04181b826599025a810cfa78acb3ec4d518c68b4120499c0",
+    "codex_app_server_protocol.v2.schemas.json": "e025e54fb11354eb82767ea040b40efa17b34dfc706c9433a6115b5f4771c465"
   }
 }

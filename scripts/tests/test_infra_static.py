@@ -13,6 +13,22 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class InfraStaticTest(unittest.TestCase):
+    def test_fresh_install_selects_latest_and_checks_protocol_before_activation(self) -> None:
+        source_installer = (ROOT / "install.sh").read_text(encoding="utf-8")
+        bootstrap = (ROOT / "scripts/bootstrap-ubuntu.sh").read_text(encoding="utf-8")
+        installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
+        package = (ROOT / "scripts/prepare-package.sh").read_text(encoding="utf-8")
+        self.assertIn('bootstrap-ubuntu.sh" --build-tools-only', source_installer)
+        self.assertIn("--build-tools-only) build_tools_only=true", bootstrap)
+        self.assertIn('bootstrap_args+=(--build-tools-only)', installer)
+        self.assertIn('--output "$fresh_runtime_stage" --latest', installer)
+        self.assertIn('"scripts/codex-runtime-update-stage.py"', package)
+        protocol_check = installer.index('candidate Codex protocol does not match the reviewed package snapshot')
+        runtime_manifest = installer.index('"install-manifest.json"')
+        activation = installer.index('atomic_symlink "$release_dir" /opt/codex-web-ui/current')
+        self.assertLess(protocol_check, runtime_manifest)
+        self.assertLess(runtime_manifest, activation)
+
     def test_codex_update_boundary_is_packaged_and_installed_as_fixed_helpers(self) -> None:
         release = (ROOT / "scripts/prepare-release.sh").read_text(encoding="utf-8")
         installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
@@ -566,7 +582,7 @@ class InfraStaticTest(unittest.TestCase):
             "CODEX_WEB_VAPID_SUBJECT",
         ):
             self.assertIn(f"{name}=\n", environment)
-        self.assertIn('CODEX_WEB_CODEX_VERSION_PIN="codex-cli 0.160.0"', environment)
+        self.assertIn('CODEX_WEB_CODEX_VERSION_PIN="codex-cli 0.166.0"', environment)
         self.assertIn("CODEX_WEB_MIN_FREE_BYTES=5368709120", environment)
         self.assertIn("CODEX_WEB_MAX_DATABASE_BYTES=2147483648", environment)
         self.assertIn("CODEX_WEB_MAX_RELEASES=5", environment)

@@ -57,6 +57,7 @@ class PreparePackageTest(unittest.TestCase):
             "scripts/migrate-runner-host-admin.sh": "#!/usr/bin/env bash\n",
             "scripts/rebase-codex-home.py": "#!/usr/bin/env python3\n",
             "scripts/bootstrap-ubuntu.sh": "#!/usr/bin/env bash\n",
+            "scripts/codex-runtime-update-stage.py": "#!/usr/bin/env python3\n",
             "apps/server/dist/index.js": "console.log('server');\n",
             "apps/web/dist/index.html": "<!doctype html>\n",
             "models/codex-web-ui-transcription-manifest.json": '{"schemaVersion":1}\n',

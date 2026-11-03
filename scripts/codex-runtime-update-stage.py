@@ -111,17 +111,24 @@ def _metadata(version: str, suffix: str = "") -> tuple[str, str]:
 
 
 def _require_latest(version: str) -> None:
+    if _latest_version() != version:
+        raise StageError("npm latest is not the reviewed compatible target; a full app package is required")
+
+
+def _latest_version() -> str:
     try:
         value = json.loads(_fetch(f"{REGISTRY_ORIGIN}/@openai%2Fcodex/latest", METADATA_LIMIT))
     except (UnicodeError, json.JSONDecodeError) as error:
         raise StageError("npm latest metadata is invalid") from error
     if not isinstance(value, dict) or value.get("name") != PACKAGE_NAME:
         raise StageError("npm latest package identity is invalid")
-    if value.get("version") != version:
-        raise StageError("npm latest is not the reviewed compatible target; a full app package is required")
+    version = value.get("version")
+    if not isinstance(version, str) or not VERSION_RE.fullmatch(version):
+        raise StageError("npm latest is not a stable Codex release")
+    return version
 
 
-def _verify_archive(payload: bytes, published_integrity: str, committed_hex: str) -> None:
+def _verify_archive(payload: bytes, published_integrity: str, committed_hex: str | None) -> None:
     digest = hashlib.sha512(payload).digest()
     try:
         published = base64.b64decode(published_integrity.removeprefix("sha512-"), validate=True)
@@ -129,7 +136,7 @@ def _verify_archive(payload: bytes, published_integrity: str, committed_hex: str
         raise StageError("published npm integrity is invalid") from error
     if digest != published:
         raise StageError("downloaded Codex archive does not match published integrity")
-    if digest.hex() != committed_hex:
+    if committed_hex is not None and digest.hex() != committed_hex:
         raise StageError("published Codex archive does not match the reviewed integrity pin")
 
 
@@ -170,29 +177,34 @@ def _extract_archive(payload: bytes, destination: Path) -> None:
             target.chmod(0o755 if member.mode & 0o111 else 0o644)
 
 
-def stage(package_root: Path, output: Path, machine: str | None = None) -> dict[str, str]:
+def _require_root_owned(output: Path) -> None:
     if os.name == "posix" and os.geteuid() != 0:
         raise StageError("runtime staging must run as root")
+    if os.name == "posix" and output.stat().st_uid != 0:
+        raise StageError("runtime staging destination is not root-owned")
+
+
+def stage(package_root: Path, output: Path, machine: str | None = None, *, latest: bool = False) -> dict[str, str]:
     architecture = {"x86_64": "x64", "aarch64": "arm64"}.get(machine or platform.machine())
     if architecture is None:
         raise StageError("host architecture is unsupported")
     if output.is_symlink() or not output.is_dir() or any(output.iterdir()):
         raise StageError("runtime staging destination is not an empty real directory")
-    if os.name == "posix" and output.stat().st_uid != 0:
-        raise StageError("runtime staging destination is not root-owned")
-    target = _load_target(package_root)
-    version = target["version"]
-    _require_latest(version)
+    _require_root_owned(output)
+    target = None if latest else _load_target(package_root)
+    version = _latest_version() if latest else target["version"]
+    if not latest:
+        _require_latest(version)
     platform_suffix = f"-linux-{architecture}"
     main_url, main_integrity = _metadata(version)
     platform_url, platform_integrity = _metadata(version, platform_suffix)
     main = _fetch(main_url, ARCHIVE_LIMIT)
     platform_payload = _fetch(platform_url, ARCHIVE_LIMIT)
-    _verify_archive(main, main_integrity, target["tarballs"]["main"]["sha512"])
+    _verify_archive(main, main_integrity, None if latest else target["tarballs"]["main"]["sha512"])
     _verify_archive(
         platform_payload,
         platform_integrity,
-        target["tarballs"][f"linux-{architecture}"]["sha512"],
+        None if latest else target["tarballs"][f"linux-{architecture}"]["sha512"],
     )
     try:
         main_dir = output / "lib/node_modules/@openai/codex"
@@ -210,6 +222,8 @@ def stage(package_root: Path, output: Path, machine: str | None = None) -> dict[
         "version": version,
         "architecture": f"linux-{architecture}",
         "codexBin": str(main_dir / "bin/codex.js"),
+        "mainSha512": hashlib.sha512(main).hexdigest(),
+        "platformSha512": hashlib.sha512(platform_payload).hexdigest(),
     }
 
 
@@ -217,9 +231,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package-root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--latest", action="store_true", help="resolve the latest stable release for a fresh installation")
     arguments = parser.parse_args()
     try:
-        result = stage(arguments.package_root.resolve(strict=True), arguments.output)
+        result = stage(arguments.package_root.resolve(strict=True), arguments.output, latest=arguments.latest)
     except (OSError, StageError) as error:
         print(f"Codex runtime staging failed: {error}", file=os.sys.stderr)
         return 1

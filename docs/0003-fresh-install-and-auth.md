@@ -1,6 +1,6 @@
 # ADR-0003: Fresh Codex install and browser first-run authentication
 
-Status: accepted target, implementation pending, 2026-11-03.
+Status: accepted target; phase 2 runtime selection implemented locally, later phases pending, 2026-11-03.
 
 ## Scope
 
@@ -23,3 +23,5 @@ The Web administrator session and the Codex account are distinct identities. Fir
 Keep Codex sessions, rollout history, settings and skills under the runner's CODEX_HOME. Keep Web authentication, project mapping, queue and bounded display projection in the Web SQLite database. Do not replace either with one cache file. Backup and restore must include both stores and verify that resumed threads, skills and UI mappings agree after recovery.
 
 The implementation proceeds in this order, with a focused test gate after each slice: (1) this contract, (2) latest-stable install and compatibility gate, (3) unauthenticated service bootstrap, (4) browser sign-in for both modes, (5) complete browser workflow and dual-store recovery, (6) clean Ubuntu x64/arm64 install, upgrade and rollback acceptance. Run the full repository and system acceptance gates only after all six slices pass their focused checks. Switching the v2 UI to default and deploying to a live server are separate release actions.
+
+The local phase 2 installer resolves npm's current stable `@openai/codex/latest` only for a fresh installation, verifies the official package and architecture artifact SHA-512 digests, and records the selected version and digests next to its installed runtime. The reviewed Web adapter still requires an exact generated protocol snapshot match before service activation; a newer incompatible upstream release therefore fails installation visibly. Existing installations remain on their explicit upgrade route. Phase 3 will remove the remaining terminal login requirement.

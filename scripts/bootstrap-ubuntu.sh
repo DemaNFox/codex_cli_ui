@@ -5,6 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 
 install_nginx=false
+build_tools_only=false
 
 die() {
   printf 'codex-web-ui bootstrap: %s\n' "$*" >&2
@@ -36,10 +37,10 @@ load_toolchain_pins "$REPO_ROOT/infra/toolchain.env"
 
 usage() {
   cat <<'EOF'
-Usage: sudo scripts/bootstrap-ubuntu.sh [--install-nginx]
+Usage: sudo scripts/bootstrap-ubuntu.sh [--install-nginx] [--build-tools-only]
 
 Installs the pinned system toolchain required by Codex Web UI on Ubuntu
-22.04/24.04: base utilities, Node.js 22, pnpm, and @openai/codex. Node archives
+22.04/24.04: base utilities, Node.js 22, pnpm, and optionally @openai/codex. Node archives
 are downloaded from nodejs.org and checked against repository-pinned SHA-256
 digests before extraction. This command never authenticates Codex or reads its
 credential store.
@@ -49,6 +50,7 @@ EOF
 while (($#)); do
   case "$1" in
     --install-nginx) install_nginx=true; shift ;;
+    --build-tools-only) build_tools_only=true; shift ;;
     --help|-h) usage; exit 0 ;;
     *) die "unknown argument: $1" ;;
   esac
@@ -146,8 +148,12 @@ install_managed_link "$node_dir/bin/npx" /usr/local/bin/npx
 
 export PATH="/usr/local/bin:$PATH"
 [[ $(node --version 2>/dev/null || true) == "v$NODE_VERSION" ]] || die 'managed Node.js activation failed'
-toolchain_dir="$runtime_root/toolchain-pnpm-${PNPM_VERSION}-codex-${CODEX_CLI_VERSION}-${node_arch}"
-if [[ ! -x $toolchain_dir/bin/pnpm || ! -x $toolchain_dir/bin/codex ]]; then
+if $build_tools_only; then
+  toolchain_dir="$runtime_root/toolchain-pnpm-${PNPM_VERSION}-${node_arch}"
+else
+  toolchain_dir="$runtime_root/toolchain-pnpm-${PNPM_VERSION}-codex-${CODEX_CLI_VERSION}-${node_arch}"
+fi
+if [[ ! -x $toolchain_dir/bin/pnpm ]] || { ! $build_tools_only && [[ ! -x $toolchain_dir/bin/codex ]]; }; then
   [[ ! -e $toolchain_dir ]] || die "managed npm toolchain directory is incomplete: $toolchain_dir"
   toolchain_stage=$(mktemp -d "$runtime_root/.toolchain.XXXXXX")
   case "$toolchain_stage" in "$runtime_root"/.toolchain.*) ;; *) die 'temporary toolchain path escaped the managed runtime root' ;; esac
@@ -158,24 +164,27 @@ if [[ ! -x $toolchain_dir/bin/pnpm || ! -x $toolchain_dir/bin/codex ]]; then
   platform_archive="$toolchain_stage/codex-linux-${node_arch}.tgz"
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
     --output "$pnpm_archive" "https://registry.npmjs.org/pnpm/-/pnpm-${PNPM_VERSION}.tgz"
-  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-    --output "$codex_archive" "https://registry.npmjs.org/@openai/codex/-/codex-${CODEX_CLI_VERSION}.tgz"
-  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
-    --output "$platform_archive" "https://registry.npmjs.org/@openai/codex/-/codex-${CODEX_CLI_VERSION}-linux-${node_arch}.tgz"
   printf '%s  %s\n' "$PNPM_TARBALL_SHA512" "$pnpm_archive" | sha512sum --check --strict --status || die 'pnpm tarball checksum mismatch'
-  printf '%s  %s\n' "$CODEX_TARBALL_SHA512" "$codex_archive" | sha512sum --check --strict --status || die 'Codex CLI tarball checksum mismatch'
-  printf '%s  %s\n' "$codex_platform_sha" "$platform_archive" | sha512sum --check --strict --status || die 'Codex native tarball checksum mismatch'
-  install -d -m 0755 "$toolchain_stage/bin" "$toolchain_stage/lib/node_modules/pnpm" \
-    "$toolchain_stage/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-${node_arch}"
+  install -d -m 0755 "$toolchain_stage/bin" "$toolchain_stage/lib/node_modules/pnpm"
   tar -xzf "$pnpm_archive" --strip-components=1 --no-same-owner --no-same-permissions -C "$toolchain_stage/lib/node_modules/pnpm"
-  tar -xzf "$codex_archive" --strip-components=1 --no-same-owner --no-same-permissions -C "$toolchain_stage/lib/node_modules/@openai/codex"
-  tar -xzf "$platform_archive" --strip-components=1 --no-same-owner --no-same-permissions -C "$toolchain_stage/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-${node_arch}"
   ln -s ../lib/node_modules/pnpm/bin/pnpm.cjs "$toolchain_stage/bin/pnpm"
-  ln -s ../lib/node_modules/@openai/codex/bin/codex.js "$toolchain_stage/bin/codex"
-  chmod 0755 "$toolchain_stage/lib/node_modules/pnpm/bin/pnpm.cjs" "$toolchain_stage/lib/node_modules/@openai/codex/bin/codex.js"
+  chmod 0755 "$toolchain_stage/lib/node_modules/pnpm/bin/pnpm.cjs"
+  if ! $build_tools_only; then
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+      --output "$codex_archive" "https://registry.npmjs.org/@openai/codex/-/codex-${CODEX_CLI_VERSION}.tgz"
+    curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+      --output "$platform_archive" "https://registry.npmjs.org/@openai/codex/-/codex-${CODEX_CLI_VERSION}-linux-${node_arch}.tgz"
+    printf '%s  %s\n' "$CODEX_TARBALL_SHA512" "$codex_archive" | sha512sum --check --strict --status || die 'Codex CLI tarball checksum mismatch'
+    printf '%s  %s\n' "$codex_platform_sha" "$platform_archive" | sha512sum --check --strict --status || die 'Codex native tarball checksum mismatch'
+    install -d -m 0755 "$toolchain_stage/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-${node_arch}"
+    tar -xzf "$codex_archive" --strip-components=1 --no-same-owner --no-same-permissions -C "$toolchain_stage/lib/node_modules/@openai/codex"
+    tar -xzf "$platform_archive" --strip-components=1 --no-same-owner --no-same-permissions -C "$toolchain_stage/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-${node_arch}"
+    ln -s ../lib/node_modules/@openai/codex/bin/codex.js "$toolchain_stage/bin/codex"
+    chmod 0755 "$toolchain_stage/lib/node_modules/@openai/codex/bin/codex.js"
+    [[ $($toolchain_stage/bin/codex --version) == "codex-cli $CODEX_CLI_VERSION" ]] || die 'staged Codex CLI version verification failed'
+  fi
   rm -f -- "$pnpm_archive" "$codex_archive" "$platform_archive"
   [[ $($toolchain_stage/bin/pnpm --version) == "$PNPM_VERSION" ]] || die 'staged pnpm version verification failed'
-  [[ $($toolchain_stage/bin/codex --version) == "codex-cli $CODEX_CLI_VERSION" ]] || die 'staged Codex CLI version verification failed'
   chown -R root:root "$toolchain_stage"
   chmod -R go-w "$toolchain_stage"
   chmod 0755 "$toolchain_stage"
@@ -184,6 +193,10 @@ if [[ ! -x $toolchain_dir/bin/pnpm || ! -x $toolchain_dir/bin/codex ]]; then
   cleanup_toolchain
 fi
 install_managed_link "$toolchain_dir/bin/pnpm" /usr/local/bin/pnpm
+if $build_tools_only; then
+  printf 'Installed build tools: Node.js %s, pnpm %s\n' "$NODE_VERSION" "$PNPM_VERSION"
+  exit 0
+fi
 if [[ -e /usr/local/bin/codex && ! -L /usr/local/bin/codex ]]; then
   printf 'Preserving existing unmanaged /usr/local/bin/codex; the service will use %s directly.\n' "$toolchain_dir/bin/codex"
 else

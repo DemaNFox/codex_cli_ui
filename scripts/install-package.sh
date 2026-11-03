@@ -66,8 +66,8 @@ Usage: sudo scripts/install-package.sh [options]
   --upgrade                Explicitly replace an existing release, preserving config
   --no-start               Install only; use this while provisioning hard storage quotas
 
-The command bootstraps the pinned Node.js/pnpm/Codex toolchain, verifies the
-checksummed inventory and Codex version/login, creates an isolated API identity,
+The command bootstraps Node.js/pnpm and the latest stable Codex for a fresh install,
+verifies package inventory and Codex protocol, creates an isolated API identity,
 prompts locally for the administrator credentials, and starts the service.
 Plain HTTP and automatically generated public certificates are unsupported.
 EOF
@@ -105,6 +105,12 @@ else
 fi
 bootstrap_args=()
 $external_proxy || bootstrap_args+=(--install-nginx)
+fresh_install=false
+if [[ $mode == install && ! -e /etc/codex-web-ui/codex-web-ui.env ]]; then
+  fresh_install=true
+  [[ -z $codex_bin ]] || die '--codex-bin is not supported for a fresh installation'
+  bootstrap_args+=(--build-tools-only)
+fi
 "$SCRIPT_DIR/bootstrap-ubuntu.sh" "${bootstrap_args[@]}"
 export PATH="/usr/local/bin:$PATH"
 for command in getent install realpath sha256sum systemctl runuser python3 node stat groupadd useradd cut date readlink find chown chmod sed rm curl mktemp sleep awk; do require_command "$command"; done
@@ -121,6 +127,17 @@ if m.get('schemaVersion') != 1 or m.get('target') != {'platform':'linux','archit
     raise SystemExit('package manifest does not match this Linux architecture')
 PY
 version_pin=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["codex"]["versionPin"])' "$package/release.json")
+fresh_runtime_stage=
+fresh_runtime_json=
+if $fresh_install; then
+  fresh_runtime_stage=$(mktemp -d /opt/codex-web-ui/runtime/.fresh-codex.XXXXXX)
+  trap 'if [[ -n ${fresh_runtime_stage:-} && -d $fresh_runtime_stage ]]; then rm -rf --one-file-system -- "$fresh_runtime_stage"; fi' EXIT
+  fresh_runtime_json=$(python3 "$package/scripts/codex-runtime-update-stage.py" \
+    --package-root "$package" --output "$fresh_runtime_stage" --latest) || die 'latest stable Codex staging failed'
+  fresh_version=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])' <<<"$fresh_runtime_json")
+  version_pin="codex-cli $fresh_version"
+  codex_bin="$fresh_runtime_stage/lib/node_modules/@openai/codex/bin/codex.js"
+fi
 
 config=/etc/codex-web-ui/codex-web-ui.env
 runner_config=/etc/codex-web-ui/codex-runner.env
@@ -339,6 +356,31 @@ then
   die 'candidate Codex protocol does not match the reviewed package snapshot'
 fi
 rm -rf --one-file-system -- "$protocol_stage"
+if $fresh_install; then
+  FRESH_RUNTIME_JSON=$fresh_runtime_json FRESH_RUNTIME_STAGE=$fresh_runtime_stage python3 - <<'PY'
+import json
+import os
+from pathlib import Path
+
+result = json.loads(os.environ["FRESH_RUNTIME_JSON"])
+manifest = {
+    "schemaVersion": 1,
+    "package": "@openai/codex",
+    "version": result["version"],
+    "architecture": result["architecture"],
+    "mainSha512": result["mainSha512"],
+    "platformSha512": result["platformSha512"],
+    "protocolVerified": True,
+}
+path = Path(os.environ["FRESH_RUNTIME_STAGE"]) / "install-manifest.json"
+path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+path.chmod(0o644)
+PY
+  if [[ ! -e /usr/local/bin/codex && ! -L /usr/local/bin/codex ]]; then
+    ln -s -- "$fresh_runtime_stage/bin/codex" /usr/local/bin/codex
+  fi
+  fresh_runtime_stage=
+fi
 if ! runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_home" "$codex_bin" login status >/dev/null 2>&1; then
   exec {tty_fd}<>/dev/tty || die "Codex login is required; rerun interactively or run: sudo -u $runner_user -H $codex_bin login --device-auth"
   printf 'Codex is not authenticated for %s; starting device login. Never share the displayed device code.\n' "$runner_user" >&${tty_fd}

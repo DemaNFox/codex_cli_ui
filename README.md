@@ -176,7 +176,9 @@ A new host needs only:
 4. an interactive terminal for the first Codex device login and Web UI administrator bootstrap.
 
 Codex authentication, website passwords, `.env` values, databases, transcripts and project worktrees are
-host state and are never committed. The installer must validate the pinned CLI protocol before activation.
+host state and are never committed. A fresh installer resolves the latest stable Codex CLI, verifies the
+published archive checksums and requires its generated protocol to match the reviewed adapter before
+activation. Existing installations retain an explicit, separately checked update path.
 Voice transcription is optional and independent from Codex device authentication. Each verified release
 ships a pinned, manifest-checked quantized Whisper model; production inference stays on-host and requires no
 transcription API key or runtime model download. The browser stops long recordings, while the API enforces

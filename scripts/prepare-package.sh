@@ -70,6 +70,7 @@ required = (
     "scripts/migrate-runner-host-admin.sh",
     "scripts/rebase-codex-home.py",
     "scripts/bootstrap-ubuntu.sh",
+    "scripts/codex-runtime-update-stage.py",
     "apps/server/dist/index.js",
     "apps/web/dist/index.html",
     "models/codex-web-ui-transcription-manifest.json",

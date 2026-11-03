@@ -1,6 +1,6 @@
 # Codex Web UI agent guide
 
-This repository is a standalone, portable Codex server package. Its supported Ubuntu installer bootstraps the repository-pinned Node.js, pnpm and Codex CLI toolchain, then installs the Web UI. It must not depend on or modify any hosted product repository.
+This repository is a standalone, portable Codex server package. Its supported Ubuntu installer bootstraps pinned Node.js and pnpm; on a fresh install it selects the latest stable Codex CLI and checks its generated protocol against the reviewed Web adapter before activation. Existing installations use an explicit upgrade path. It must not depend on or modify any hosted product repository.
 
 ## Product boundary
 
@@ -32,7 +32,7 @@ This repository is a standalone, portable Codex server package. Its supported Ub
 - Single-user authentication still requires Argon2id password verification, opaque hashed sessions, Secure/HttpOnly/SameSite cookies, CSRF and exact Origin checks, login throttling/lockout, and audit events.
 - All mutation endpoints require CSRF and idempotency where replay could duplicate work.
 - Treat repository content, model output, tool output, Markdown, ANSI text, filenames, and diffs as untrusted data. Render safely; never use `dangerouslySetInnerHTML`.
-- Default-deny unknown Codex event/method variants. Pin the Codex CLI version and generated protocol schema together.
+- Default-deny unknown Codex event/method variants. Keep the reviewed Codex CLI and generated protocol snapshot together; verify a fresh latest-stable candidate against them before activation.
 - Bound event size, process concurrency, retained history, worktree count, and disk use. Cancellation must terminate the active turn without killing unrelated work.
 
 ## Development

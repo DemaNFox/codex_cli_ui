@@ -3,9 +3,11 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
+import io
 import json
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -22,6 +24,62 @@ SPEC.loader.exec_module(MODULE)
 
 
 class CodexRuntimeUpdateTest(unittest.TestCase):
+    def test_fresh_install_resolves_stable_latest_and_rejects_prerelease(self) -> None:
+        with mock.patch.object(MODULE, "_fetch", return_value=b'{"name":"@openai/codex","version":"0.166.0"}'):
+            self.assertEqual(MODULE._latest_version(), "0.166.0")
+        for value in ("0.166.0-alpha.1", "0.166.0+local", "latest"):
+            response = json.dumps({"name": "@openai/codex", "version": value}).encode()
+            with mock.patch.object(MODULE, "_fetch", return_value=response):
+                with self.assertRaisesRegex(MODULE.StageError, "stable"):
+                    MODULE._latest_version()
+
+    def test_fresh_install_accepts_only_published_integrity(self) -> None:
+        payload = b"fresh Codex archive"
+        integrity = "sha512-" + base64.b64encode(hashlib.sha512(payload).digest()).decode()
+        MODULE._verify_archive(payload, integrity, None)
+        with self.assertRaises(MODULE.StageError):
+            MODULE._verify_archive(payload + b"modified", integrity, None)
+
+    def test_fresh_installer_stages_published_architecture_artifacts(self) -> None:
+        def archive(relative: str, content: bytes) -> bytes:
+            buffer = io.BytesIO()
+            with tarfile.open(fileobj=buffer, mode="w:gz") as package:
+                entry = tarfile.TarInfo(f"package/{relative}")
+                entry.size = len(content)
+                entry.mode = 0o755
+                package.addfile(entry, io.BytesIO(content))
+            return buffer.getvalue()
+
+        main = archive("bin/codex.js", b"#!/usr/bin/env node\n")
+        native = archive("vendor/x86_64-unknown-linux-gnu/codex", b"binary")
+        archives = {
+            "": main,
+            "-linux-x64": native,
+        }
+
+        def metadata(_version: str, suffix: str = "") -> tuple[str, str]:
+            payload = archives[suffix]
+            digest = base64.b64encode(hashlib.sha512(payload).digest()).decode()
+            return "https://registry.npmjs.org/fixture" + suffix, "sha512-" + digest
+
+        def fetch(url: str, _limit: int) -> bytes:
+            return native if url.endswith("-linux-x64") else main
+
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "runtime"
+            output.mkdir()
+            with mock.patch.object(MODULE, "_latest_version", return_value="0.166.0"), mock.patch.object(
+                MODULE, "_metadata", side_effect=metadata
+            ), mock.patch.object(MODULE, "_fetch", side_effect=fetch), mock.patch.object(
+                MODULE, "_require_root_owned"
+            ):
+                result = MODULE.stage(ROOT, output, machine="x86_64", latest=True)
+            self.assertEqual(result["version"], "0.166.0")
+            self.assertEqual(result["architecture"], "linux-x64")
+            self.assertEqual(result["mainSha512"], hashlib.sha512(main).hexdigest())
+            self.assertEqual(result["platformSha512"], hashlib.sha512(native).hexdigest())
+            self.assertTrue((output / "lib/node_modules/@openai/codex/bin/codex.js").exists())
+
     def test_integrity_requires_published_and_reviewed_sha512(self) -> None:
         payload = b"fixed codex archive"
         digest = hashlib.sha512(payload).digest()

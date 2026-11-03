@@ -6,7 +6,7 @@ The staged replacement is specified in [Web UI v2 rebuild contract](v2-rebuild.m
 
 ## Reference and compatibility rule
 
-The execution and conversation reference is the official Codex app-server protocol, pinned with the CLI in `infra/toolchain.env` and `protocol/manifest.json`. The browser must continue to use only the authenticated Web API; app-server is private. OpenAI's App Server documentation calls the interface experimental, so a new Codex version is a review candidate, not an unattended production update.
+The execution and conversation reference is the official Codex app-server protocol, reviewed in `infra/toolchain.env` and `protocol/manifest.json`. A fresh install resolves the latest stable CLI and requires its generated protocol to match this reviewed snapshot before activation. Existing installations use an explicit update path. The browser continues to use only the authenticated Web API; app-server is private. See [fresh install contract](0003-fresh-install-and-auth.md).
 
 At runtime, the server checks the official npm registry for a newer Codex CLI every six hours. This is **version discovery only**. At every repository verification, `app-server-protocol.test.ts` checks the reviewed schema digest, version pin and server RPC allowlist. Candidate packages and generated schemas still pass the release/update broker's exact compatibility and rollback gates. Neither check can prove visual parity or automatically implement a new UI feature.
 

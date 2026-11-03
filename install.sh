@@ -59,7 +59,7 @@ fi
 for command in git sudo; do command -v "$command" >/dev/null || { printf 'Missing command: %s\n' "$command" >&2; exit 1; }; done
 bootstrap_args=()
 $preflight_external || bootstrap_args+=(--install-nginx)
-sudo "$ROOT/scripts/bootstrap-ubuntu.sh" "${bootstrap_args[@]}"
+sudo "$ROOT/scripts/bootstrap-ubuntu.sh" --build-tools-only "${bootstrap_args[@]}"
 export PATH="/usr/local/bin:$PATH"
 for command in pnpm node python3; do command -v "$command" >/dev/null || { printf 'Bootstrap did not provide command: %s\n' "$command" >&2; exit 1; }; done
 pnpm install --frozen-lockfile
