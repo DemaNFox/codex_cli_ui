@@ -311,7 +311,10 @@ class FakeAppServer implements AppServerClient {
 
   async request(method: string, params: unknown): Promise<unknown> {
     this.requests.push({ method, params });
-    if (this.failNextRequestWith && (!this.failNextRequestMethod || this.failNextRequestMethod === method)) {
+    if (
+      this.failNextRequestWith &&
+      (!this.failNextRequestMethod || this.failNextRequestMethod === method)
+    ) {
       const error = this.failNextRequestWith;
       this.failNextRequestWith = null;
       this.failNextRequestMethod = null;
