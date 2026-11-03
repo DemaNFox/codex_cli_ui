@@ -35,6 +35,7 @@ def main() -> int:
     push_subscribed = False
     push_endpoint = "https://push.example/smoke-device"
     account_login_pending = False
+    api_key_connected = False
     codex_update_state = "ready"
     queued_turn_visible = True
     ambiguous_turn_visible = True
@@ -95,7 +96,7 @@ def main() -> int:
         nonlocal signed_in, archived, thread_name, resolved_user_input, resolved_permission
         nonlocal active_turn_attachment_uploaded, active_turn_steer
         nonlocal push_subscribed
-        nonlocal account_login_pending
+        nonlocal account_login_pending, api_key_connected
         nonlocal codex_update_state
         nonlocal resource_snapshot
         nonlocal queued_turn_visible
@@ -353,6 +354,12 @@ def main() -> int:
                     }
                 },
             )
+        elif path == "/api/system/codex-account/api-key" and request.method == "POST":
+            submitted = request.post_data_json
+            if submitted != {"apiKey": "sk-browser-smoke-key"}:
+                raise AssertionError("API-key login sent an unexpected payload")
+            api_key_connected = True
+            payload(route, 200, {"data": {"type": "apiKey", "connected": True}})
         elif path == "/api/system/codex-update" and request.method == "GET":
             if codex_update_state == "applying":
                 codex_update_state = "current"
@@ -2081,6 +2088,13 @@ def main() -> int:
         page.keyboard.press("Escape")
         account_dialog.wait_for(state="detached")
         page.get_by_text("Смена аккаунта отменена. Текущий аккаунт сохранён.").wait_for()
+        settings.get_by_label("Или подключить OpenAI API-ключ").fill("sk-browser-smoke-key")
+        settings.get_by_role("button", name="Подключить API-ключ").click()
+        settings.get_by_text("Codex переключён на API-ключ.").wait_for()
+        if not api_key_connected:
+            raise AssertionError("API-key login did not reach the protected server command")
+        if page.evaluate("JSON.stringify(localStorage)").find("sk-browser-smoke-key") != -1:
+            raise AssertionError("API key leaked into browser localStorage")
         page.keyboard.press("Escape")
         settings.wait_for(state="detached")
         page.wait_for_function(

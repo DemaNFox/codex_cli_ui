@@ -94,7 +94,7 @@ Browser -> HTTPS edge -> Web API/SSE -> private Unix socket -> Codex app-server
 
 See [architecture](docs/architecture.md), the [desktop parity baseline](docs/desktop-parity.md), and the [threat model](docs/Codex_Web_UI-threat-model.md).
 
-The [fresh-install and browser-authentication target](docs/0003-fresh-install-and-auth.md) is approved but not yet implemented. The installation instructions below describe the current package.
+The [fresh-install and browser-authentication target](docs/0003-fresh-install-and-auth.md) is being implemented in six verified local slices. The installation instructions below describe the supported package; clean-host acceptance is still pending.
 
 ## Portability contract
 
@@ -111,9 +111,9 @@ Replace `--external-proxy` with `--tls-cert /path/fullchain.pem --tls-key
 /path/privkey.pem` to install the bundled Nginx edge. The installer installs any
 missing base Ubuntu commands plus repository-pinned Node.js 22, pnpm and Codex
 CLI artifacts, verifies their cryptographic checksums and the release inventory,
-then checks `codex login status`. When the runner has no Codex session, it starts
-`codex login --device-auth` directly on the local terminal as that non-root user.
-It never accepts or stores an OpenAI token itself. Finally it prompts locally for
+then starts with Codex disconnected when the runner has no session. The administrator
+connects a ChatGPT subscription by device code or supplies an OpenAI API key in the
+protected browser settings. It never prints or stores the key in Web data. Finally it prompts locally for
 the Web UI administrator and generates host-local VAPID credentials for browser notifications without
 printing the private key. An existing
 installation requires the explicit `--upgrade` flag.
