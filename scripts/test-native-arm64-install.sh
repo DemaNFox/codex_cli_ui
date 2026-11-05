@@ -52,12 +52,12 @@ sudo systemctl enable --now \
   codex-web-ui-storage-guard@api.timer \
   codex-web-ui@api.service
 sudo /usr/local/libexec/codex-web-ui-resource-broker --initialize
-"$package_root/release/scripts/health-check.sh" --service-user api --timeout 45
+sudo "$package_root/release/scripts/health-check.sh" --service-user api --timeout 45
 
 sudo bash "$package_root/release/scripts/install-package.sh" \
   --package "$package_root/release" --upgrade --runner-user codex \
   --public-origin https://codex.test --external-proxy
-"$package_root/release/scripts/health-check.sh" --service-user api --timeout 45
+sudo "$package_root/release/scripts/health-check.sh" --service-user api --timeout 45
 before=$(readlink -f /opt/codex-web-ui/current)
 
 cp -a "$package_root/release" "$package_root/broken"
@@ -85,5 +85,5 @@ if sudo bash "$package_root/broken/scripts/install-package.sh" \
 fi
 after=$(readlink -f /opt/codex-web-ui/current)
 [[ $before == "$after" ]] || { echo 'Rollback did not restore the previous release' >&2; exit 1; }
-"$package_root/release/scripts/health-check.sh" --service-user api --timeout 45
+sudo "$package_root/release/scripts/health-check.sh" --service-user api --timeout 45
 echo "Native arm64 install, upgrade, and rollback passed for $(git rev-parse HEAD)"
