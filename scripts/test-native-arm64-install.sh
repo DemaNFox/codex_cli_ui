@@ -17,6 +17,7 @@ done
 
 sudo bash scripts/bootstrap-ubuntu.sh --build-tools-only
 package_root=$(mktemp -d /tmp/codex-web-ui-arm64-package.XXXXXX)
+chmod 0755 "$package_root"
 scripts/prepare-package.sh --output "$package_root/release" --arch linux-arm64
 sudo bash "$package_root/release/scripts/bootstrap-ubuntu.sh"
 sudo apt-get update -qq
