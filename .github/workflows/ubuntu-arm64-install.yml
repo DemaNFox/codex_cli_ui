@@ -1,0 +1,16 @@
+name: Ubuntu arm64 install acceptance
+
+on:
+  push:
+    branches:
+      - codex/desktop-parity-history
+  workflow_dispatch:
+
+jobs:
+  install-upgrade-rollback:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clean install, upgrade, and rollback
+        run: bash scripts/test-native-arm64-install.sh
