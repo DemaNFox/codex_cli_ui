@@ -2,6 +2,18 @@
 set -euo pipefail
 
 [[ $(uname -m) == aarch64 ]] || { echo 'Native arm64 host required' >&2; exit 1; }
+[[ ${GITHUB_ACTIONS:-} == true ]] || { echo 'Disposable GitHub runner required' >&2; exit 1; }
+
+# The hosted runner has a regular, unmanaged Node binary in /usr/local/bin.
+# Move only those preinstalled binaries in this disposable VM so the installer
+# sees the same clean toolchain paths as a fresh Ubuntu Server.
+runner_toolchain_backup=$(mktemp -d /tmp/codex-web-ui-runner-toolchain.XXXXXX)
+for name in node npm npx pnpm; do
+  path=/usr/local/bin/$name
+  if [[ -e $path && ! -L $path ]]; then
+    sudo mv -- "$path" "$runner_toolchain_backup/$name"
+  fi
+done
 
 sudo bash scripts/bootstrap-ubuntu.sh --build-tools-only
 package_root=$(mktemp -d /tmp/codex-web-ui-arm64-package.XXXXXX)
