@@ -128,6 +128,32 @@ def main() -> int:
         elif path == "/api/auth/login":
             signed_in = True
             payload(route, 200, {"username": "owner", "csrfToken": "csrf-smoke"})
+        elif path == "/api/navigation":
+            payload(route, 200, {"data": {
+                "projects": [] if project_archived else [{
+                    "id": "p1", "name": "Demo", "path": "/srv/projects/demo",
+                    "archived": False, "defaultModel": "gpt-6-astra",
+                    "defaultReasoningEffort": "high",
+                    "defaultPermissionPreset": "workspace-write",
+                    "createdAt": "2026-09-27T12:00:00.000Z",
+                    "updatedAt": "2026-09-27T12:00:00.000Z",
+                }],
+                "threads": [] if project_archived else ([{
+                    "id": "t1", "projectId": "p1", "name": thread_name,
+                    "preview": "Проверка архива", "archived": archived,
+                    "status": "idle", "activeTurnId": None, "model": "gpt-6-astra",
+                    "instructionSources": ["/srv/projects/demo/AGENTS.md"],
+                    "createdAt": "2026-09-27T12:00:00.000Z",
+                    "updatedAt": "2026-09-27T12:00:00.000Z",
+                }] if not archived else []) + [{
+                    "id": "t2", "projectId": "p1", "name": "Фоновая задача",
+                    "preview": "Проверка индикатора", "archived": False,
+                    "status": "active", "activeTurnId": "turn-background",
+                    "model": "gpt-6-astra", "instructionSources": [],
+                    "createdAt": "2026-09-27T12:01:00.000Z",
+                    "updatedAt": "2026-09-27T12:01:00.000Z",
+                }],
+            }})
         elif path == "/api/projects" and request.method == "GET":
             wants_archived_project = query.get("archived", ["false"])[0] == "true"
             payload(
@@ -607,6 +633,14 @@ def main() -> int:
                     }
                 },
             )
+        elif path == "/api/threads/t1/snapshot" and request.method == "GET":
+            payload(route, 200, {"data": {
+                "id": "t1", "projectId": "p1", "name": thread_name,
+                "preview": "Проверка архива", "archived": archived,
+                "status": "idle", "activeTurnId": None, "model": "gpt-6-astra",
+                "instructionSources": [], "createdAt": "2026-09-27T12:00:00.000Z",
+                "updatedAt": "2026-09-27T12:00:00.000Z",
+            }, "events": [], "historyState": "degraded", "historyWarning": "REFRESH_PENDING"})
         elif path == "/api/threads/t1" and request.method == "GET":
             thread_detail_reads += 1
             if (
@@ -891,6 +925,15 @@ def main() -> int:
                 raise AssertionError("queued turn cancellation did not carry CSRF protection")
             queued_turn_visible = False
             route.fulfill(status=204, body="")
+        elif path == "/api/threads/t2/snapshot" and request.method == "GET":
+            payload(route, 200, {"data": {
+                "id": "t2", "projectId": "p1", "name": "Фоновая задача",
+                "preview": "Проверка индикатора", "archived": False,
+                "status": "active", "activeTurnId": "turn-background",
+                "model": "gpt-6-astra", "instructionSources": [],
+                "createdAt": "2026-09-27T12:01:00.000Z",
+                "updatedAt": "2026-09-27T12:01:00.000Z",
+            }, "events": [], "historyState": "degraded", "historyWarning": "REFRESH_PENDING"})
         elif path == "/api/threads/t2" and request.method == "GET":
             payload(
                 route,

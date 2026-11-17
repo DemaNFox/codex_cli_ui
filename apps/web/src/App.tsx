@@ -27,6 +27,11 @@ import { AgentMessageContent } from './AgentMessageContent.js';
 import { ImagePreviewDialog } from './ImagePreviewDialog.js';
 import { normalizeProjectFilePath, ProjectFileDownload } from './ProjectFileDownload.js';
 import {
+  clearNavigationCache,
+  readNavigationCache,
+  writeNavigationCache,
+} from './navigationCache.js';
+import {
   clearThreadHistoryCache,
   disableThreadHistoryCacheWrites,
   enableThreadHistoryCacheWrites,
@@ -3820,6 +3825,8 @@ function Workspace({
     null,
   );
   const [projectId, setProjectId] = useState<string | null>(null);
+  const selectedProjectIdRef = useRef(projectId);
+  selectedProjectIdRef.current = projectId;
   const [threadId, setThreadId] = useState<string | null>(null);
   const [archiveView, setArchiveView] = useState(false);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
@@ -3868,6 +3875,8 @@ function Workspace({
     'idle',
   );
   const [threadLoadError, setThreadLoadError] = useState<string | null>(null);
+  const [verifiedThreadId, setVerifiedThreadId] = useState<string | null>(null);
+  const verifiedThreadRef = useRef<Thread | null>(null);
   const [threadHistoryWarning, setThreadHistoryWarning] = useState<string | null>(null);
   const [threadHistoryWarningCode, setThreadHistoryWarningCode] = useState<string | null>(null);
   const [threadHistoryTruncated, setThreadHistoryTruncated] = useState(false);
@@ -3964,6 +3973,7 @@ function Workspace({
   const lastRuntimeEventRef = useRef<SafeEvent | undefined>(lastRuntimeEvent);
   lastRuntimeEventRef.current = lastRuntimeEvent;
   const active = selectedThread?.status === 'active';
+  const statusUnverified = threadId !== null && verifiedThreadId !== threadId;
   const activeTurnId = active ? selectedThread.activeTurnId : null;
   const activeSubagentCount = subagents.filter(
     (subagent) => subagent.status === 'pendingInit' || subagent.status === 'running',
@@ -3971,6 +3981,16 @@ function Workspace({
   const activeRootTurn = active && activeTurnId !== null;
   const subagentsOnlyActive = active && !activeTurnId && activeSubagentCount > 0;
   const activeTurnDuration = useActiveTurnDuration(events, activeTurnId, active);
+
+  function preserveVerifiedStatus(items: Thread[]): Thread[] {
+    const verified = verifiedThreadRef.current;
+    if (!verified) return items;
+    return items.map((item) =>
+      item.id === verified.id
+        ? { ...item, status: verified.status, activeTurnId: verified.activeTurnId }
+        : item,
+    );
+  }
 
   function invalidateNavigationRequests(): number {
     navigationEpochRef.current += 1;
@@ -4348,6 +4368,13 @@ function Workspace({
     if (lastRuntimeEvent.id <= runtimeSnapshotCursorRef.current) return;
     const runtime = threadRuntimeFrom(lastRuntimeEvent);
     if (!runtime) return;
+    if (verifiedThreadRef.current?.id === lastRuntimeEvent.threadId) {
+      verifiedThreadRef.current = {
+        ...verifiedThreadRef.current,
+        status: runtime.status,
+        activeTurnId: runtime.activeTurnId,
+      };
+    }
     const update = (item: Thread) =>
       item.id === lastRuntimeEvent.threadId
         ? {
@@ -4819,18 +4846,41 @@ function Workspace({
     const navigationEpoch = navigationEpochRef.current;
     let cancelled = false;
     const preferencesRequest = api.runtimePreferences();
-    void Promise.all([api.projects(), preferencesRequest])
-      .then(([projectList, preferences]) => {
+    const showNavigation = (navigation: { projects: Project[]; threads: Thread[] }) => {
+      const activeThreads = navigation.threads.filter((item) => !item.archived);
+      const preferredProjectId = selectedProjectIdRef.current;
+      const nextProjectId =
+        preferredProjectId && navigation.projects.some((item) => item.id === preferredProjectId)
+          ? preferredProjectId
+          : (navigation.projects[0]?.id ?? null);
+      setProjects(navigation.projects);
+      setProjectId(nextProjectId);
+      if (!archiveView) {
+        const selectedThreads = activeThreads.filter((item) => item.projectId === nextProjectId);
+        setThreads(preserveVerifiedStatus(selectedThreads));
+        setThreadId((current) =>
+          selectedThreads.some((item) => item.id === current)
+            ? current
+            : (selectedThreads[0]?.id ?? null),
+        );
+      }
+      setRecentThreads(
+        [...activeThreads]
+          .sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt))
+          .slice(0, 20),
+      );
+    };
+    const cachedNavigation = readNavigationCache(session.username);
+    if (cachedNavigation) showNavigation(cachedNavigation);
+    void Promise.all([api.navigation(), preferencesRequest])
+      .then(([navigation, preferences]) => {
         if (cancelled || navigationEpoch !== navigationEpochRef.current) return;
-        setProjects(projectList);
-        setProjectId((current) => current ?? projectList[0]?.id ?? null);
+        showNavigation(navigation);
+        writeNavigationCache(session.username, navigation);
         setModel(preferences.model ?? '');
         setEffort(preferences.reasoningEffort ?? '');
         setPermission(preferences.permissionPreset);
         setApprovalPolicy(preferences.approvalPolicy);
-        void refreshRecentThreads(projectList, navigationEpoch).catch((cause: unknown) =>
-          setError(errorMessage(cause)),
-        );
       })
       .catch((cause: unknown) => {
         if (!cancelled && navigationEpoch === navigationEpochRef.current)
@@ -4887,11 +4937,19 @@ function Workspace({
     const navigationEpoch = navigationEpochRef.current;
     let cancelled = false;
     setError(null);
-    void api
-      .threads(projectId, archiveView)
+    void (
+      archiveView
+        ? api.threads(projectId, true)
+        : api.navigation().then((navigation) => {
+            writeNavigationCache(session.username, navigation);
+            return navigation.threads.filter(
+              (item) => item.projectId === projectId && !item.archived,
+            );
+          })
+    )
       .then((items) => {
         if (cancelled || navigationEpoch !== navigationEpochRef.current) return;
-        setThreads(items);
+        setThreads(preserveVerifiedStatus(items));
         setThreadId((current) =>
           items.some((item) => item.id === current) ? current : (items[0]?.id ?? null),
         );
@@ -4900,6 +4958,20 @@ function Workspace({
         if (!cancelled && navigationEpoch === navigationEpochRef.current)
           setError(errorMessage(cause));
       });
+    if (!archiveView) {
+      void api
+        .threads(projectId, false)
+        .then((items) => {
+          if (cancelled || navigationEpoch !== navigationEpochRef.current) return;
+          setThreads(preserveVerifiedStatus(items));
+          setThreadId((current) =>
+            items.some((item) => item.id === current) ? current : (items[0]?.id ?? null),
+          );
+        })
+        .catch(() => {
+          // Saved navigation is still usable while native discovery is unavailable.
+        });
+    }
     return () => {
       cancelled = true;
     };
@@ -4936,14 +5008,14 @@ function Workspace({
           const nextThreads = activeThreads[0] ?? [];
           setProjectId(projectList[0]?.id ?? null);
           setArchiveView(false);
-          setThreads(nextThreads);
+          setThreads(preserveVerifiedStatus(nextThreads));
           setThreadId(nextThreads[0]?.id ?? null);
           setComposer('');
         } else {
           const nextThreads = archiveView
             ? (archivedThreads ?? [])
             : (activeThreads[selectedIndex] ?? []);
-          setThreads(nextThreads);
+          setThreads(preserveVerifiedStatus(nextThreads));
           setThreadId((current) =>
             nextThreads.some((item) => item.id === current)
               ? current
@@ -5013,6 +5085,8 @@ function Workspace({
     runtimeSnapshotCursorRef.current = 0;
     setEventStreamStart(null);
     setThreadLoadError(null);
+    setVerifiedThreadId(null);
+    verifiedThreadRef.current = null;
     setThreadHistoryWarning(null);
     setThreadHistoryWarningCode(null);
     setThreadHistoryTruncated(false);
@@ -5034,11 +5108,16 @@ function Workspace({
     const requestedThreadId = threadId;
     let cancelled = false;
     void (async () => {
+      const snapshotRequest = api.threadSnapshot(requestedThreadId).then(
+        (value) => ({ value, error: null as unknown }),
+        (cause: unknown) => ({ value: null, error: cause }),
+      );
       const historyRequest = api.thread(requestedThreadId).then(
         (value) => ({ value, error: null as unknown }),
         (cause: unknown) => ({ value: null, error: cause }),
       );
       const cached = await readThreadHistoryCache(session.username, requestedThreadId);
+      let hasUsableSnapshot = Boolean(cached?.events.length);
       if (cancelled) return;
       historyCacheReadyThreadRef.current = requestedThreadId;
       if (cached?.events.length) {
@@ -5047,115 +5126,132 @@ function Workspace({
         setThreadHistoryTruncated(cached.hasMore);
         setThreadLoadState('ready');
       }
-      try {
-        const result = await historyRequest;
-        if (result.error)
-          throw result.error instanceof Error
-            ? result.error
-            : new Error(errorMessage(result.error));
-        const history = result.value;
-        if (!history) throw new Error('История чата недоступна');
-        if (cancelled) return;
-        const historyCursor = history.eventCursor ?? history.events.at(-1)?.id ?? 0;
-        runtimeSnapshotCursorRef.current = historyCursor;
-        setThreads((current) =>
-          current.map((item) => (item.id === requestedThreadId ? history.data : item)),
-        );
-        setRecentThreads((current) =>
-          current.map((item) => (item.id === requestedThreadId ? history.data : item)),
-        );
-        const firstPersistedEventId = history.events.find((event) => event.id > 0)?.id ?? null;
-        const serverOldestEventId = history.oldestEventId ?? firstPersistedEventId;
-        const cachedEarlierEvents =
-          cached?.events.filter(
-            (event) =>
-              event.id > 0 && (serverOldestEventId === null || event.id < serverOldestEventId),
-          ) ?? [];
-        replaceSnapshot(
-          [...cachedEarlierEvents, ...history.events, ...(history.pendingInteractionEvents ?? [])],
-          requestedThreadId,
-        );
-        prependHistory(history.conversationEvents ?? [], requestedThreadId);
-        const retainedOldestEventId =
-          cached?.oldestEventId &&
-          (!serverOldestEventId || cached.oldestEventId < serverOldestEventId)
-            ? cached.oldestEventId
-            : serverOldestEventId;
-        setOldestEventId(retainedOldestEventId);
-        setEventStreamStart({ threadId: requestedThreadId, cursor: historyCursor });
-        setServerTurnNavigation(history.turnNavigation ?? null);
-        setQueuedTurns(
-          (history.queuedTurns ?? []).filter(
-            (queuedTurn) =>
-              !cancelledQueuedTurnKeysRef.current.has(
-                queuedTurnKey(requestedThreadId, queuedTurn.id),
-              ),
-          ),
-        );
-        const historySubagents = history.subagents;
-        if (historySubagents) setSubagents((current) => mergeSubagents(current, historySubagents));
-        const deferredHistory =
-          history.historyState === 'degraded' &&
-          history.historyWarning === 'HISTORY_LOADING_DEFERRED';
-        setThreadHistoryWarning(
-          history.historyState === 'degraded'
-            ? deferredHistory
-              ? 'Показаны последние сохранённые сообщения. Полная история загружается в фоне.'
-              : 'Показана сохранённая история. Свежая сверка с Codex временно недоступна.'
-            : null,
-        );
-        setThreadHistoryWarningCode(
-          history.historyState === 'degraded' ? (history.historyWarning ?? 'DEGRADED') : null,
-        );
-        setThreadHistoryTruncated(
-          retainedOldestEventId === cached?.oldestEventId
-            ? cached.hasMore
-            : history.historyTruncated === true,
-        );
-        setPendingInteractionsTruncated(history.pendingInteractionsTruncated === true);
-        if (deferredHistory && deferredHistoryRetryAttemptedRef.current !== requestedThreadId) {
-          deferredHistoryRetryAttemptedRef.current = requestedThreadId;
-          window.clearTimeout(deferredHistoryRetryTimerRef.current);
-          deferredHistoryRetryTimerRef.current = window.setTimeout(() => {
-            if (attachmentThreadRef.current === requestedThreadId) {
-              deferredHistoryRetryCompletedRef.current = requestedThreadId;
-              setThreadReloadToken((current) => current + 1);
-            }
-          }, 1_500);
-        }
-        automaticThreadRetryRef.current = null;
-        setThreadLoadState('ready');
-        setThreadLoadError(null);
-      } catch (cause: unknown) {
-        if (!cancelled) {
-          const authoritativeCacheRejection =
-            cause instanceof ApiError && [401, 403, 404].includes(cause.status);
-          if (authoritativeCacheRejection) {
-            replaceSnapshot([], requestedThreadId);
-            setOldestEventId(null);
-            setThreadHistoryTruncated(false);
-            setEventStreamStart(null);
-            if (cause.status === 401) {
-              disableThreadHistoryCacheWrites();
-              onSignedOut();
-              await clearThreadHistoryCache();
-              return;
-            }
-            await clearThreadHistoryCache();
-            if (cancelled || attachmentThreadRef.current !== requestedThreadId) return;
-            setThreadLoadState('error');
-            setThreadLoadError(errorMessage(cause));
-          } else if (!cached?.events.length) {
-            setThreadLoadState('error');
-            setThreadLoadError(errorMessage(cause));
-          } else {
-            setThreadHistoryWarning(
-              'Показана сохранённая история. Свежая сверка с сервером временно недоступна.',
-            );
-            setThreadHistoryWarningCode('CACHE_REVALIDATION_FAILED');
+      for (const pendingRequest of [snapshotRequest, historyRequest]) {
+        try {
+          const result = await pendingRequest;
+          if (result.error)
+            throw result.error instanceof Error
+              ? result.error
+              : new Error(errorMessage(result.error));
+          const history = result.value;
+          if (!history) throw new Error('История чата недоступна');
+          if (cancelled) return;
+          const historyCursor = history.eventCursor ?? history.events.at(-1)?.id ?? 0;
+          runtimeSnapshotCursorRef.current = historyCursor;
+          setThreads((current) =>
+            current.map((item) => (item.id === requestedThreadId ? history.data : item)),
+          );
+          setRecentThreads((current) =>
+            current.map((item) => (item.id === requestedThreadId ? history.data : item)),
+          );
+          const firstPersistedEventId = history.events.find((event) => event.id > 0)?.id ?? null;
+          const serverOldestEventId = history.oldestEventId ?? firstPersistedEventId;
+          const cachedEarlierEvents =
+            cached?.events.filter(
+              (event) =>
+                event.id > 0 && (serverOldestEventId === null || event.id < serverOldestEventId),
+            ) ?? [];
+          replaceSnapshot(
+            [
+              ...cachedEarlierEvents,
+              ...history.events,
+              ...(history.pendingInteractionEvents ?? []),
+            ],
+            requestedThreadId,
+          );
+          prependHistory(history.conversationEvents ?? [], requestedThreadId);
+          const retainedOldestEventId =
+            cached?.oldestEventId &&
+            (!serverOldestEventId || cached.oldestEventId < serverOldestEventId)
+              ? cached.oldestEventId
+              : serverOldestEventId;
+          setOldestEventId(retainedOldestEventId);
+          setEventStreamStart({ threadId: requestedThreadId, cursor: historyCursor });
+          setServerTurnNavigation(history.turnNavigation ?? null);
+          setQueuedTurns(
+            (history.queuedTurns ?? []).filter(
+              (queuedTurn) =>
+                !cancelledQueuedTurnKeysRef.current.has(
+                  queuedTurnKey(requestedThreadId, queuedTurn.id),
+                ),
+            ),
+          );
+          const historySubagents = history.subagents;
+          if (historySubagents)
+            setSubagents((current) => mergeSubagents(current, historySubagents));
+          const deferredHistory =
+            history.historyState === 'degraded' &&
+            history.historyWarning === 'HISTORY_LOADING_DEFERRED';
+          setThreadHistoryWarning(
+            history.historyState === 'degraded'
+              ? deferredHistory
+                ? 'Показаны последние сохранённые сообщения. Полная история загружается в фоне.'
+                : history.historyWarning === 'REFRESH_PENDING'
+                  ? 'Показаны сохранённые сообщения. Проверяем текущее состояние чата.'
+                  : 'Показана сохранённая история. Свежая сверка с Codex временно недоступна.'
+              : null,
+          );
+          setThreadHistoryWarningCode(
+            history.historyState === 'degraded' ? (history.historyWarning ?? 'DEGRADED') : null,
+          );
+          setThreadHistoryTruncated(
+            retainedOldestEventId === cached?.oldestEventId
+              ? cached.hasMore
+              : history.historyTruncated === true,
+          );
+          setPendingInteractionsTruncated(history.pendingInteractionsTruncated === true);
+          if (deferredHistory && deferredHistoryRetryAttemptedRef.current !== requestedThreadId) {
+            deferredHistoryRetryAttemptedRef.current = requestedThreadId;
+            window.clearTimeout(deferredHistoryRetryTimerRef.current);
+            deferredHistoryRetryTimerRef.current = window.setTimeout(() => {
+              if (attachmentThreadRef.current === requestedThreadId) {
+                deferredHistoryRetryCompletedRef.current = requestedThreadId;
+                setThreadReloadToken((current) => current + 1);
+              }
+            }, 1_500);
           }
-          if (!authoritativeCacheRejection)
-            setEventStreamStart({ threadId: requestedThreadId, cursor: 0 });
+          automaticThreadRetryRef.current = null;
+          setThreadLoadState('ready');
+          setThreadLoadError(null);
+          if (pendingRequest === historyRequest && history.historyState !== 'degraded') {
+            verifiedThreadRef.current = history.data;
+            setVerifiedThreadId(requestedThreadId);
+          }
+          hasUsableSnapshot ||= Boolean(
+            history.events.length || history.conversationEvents?.length,
+          );
+        } catch (cause: unknown) {
+          if (!cancelled) {
+            const authoritativeCacheRejection =
+              cause instanceof ApiError && [401, 403, 404].includes(cause.status);
+            if (authoritativeCacheRejection) {
+              replaceSnapshot([], requestedThreadId);
+              setOldestEventId(null);
+              setThreadHistoryTruncated(false);
+              setEventStreamStart(null);
+              if (cause.status === 401) {
+                disableThreadHistoryCacheWrites();
+                clearNavigationCache();
+                onSignedOut();
+                await clearThreadHistoryCache();
+                return;
+              }
+              await clearThreadHistoryCache();
+              if (cancelled || attachmentThreadRef.current !== requestedThreadId) return;
+              setThreadLoadState('error');
+              setThreadLoadError(errorMessage(cause));
+            } else if (!hasUsableSnapshot) {
+              setThreadLoadState('error');
+              setThreadLoadError(errorMessage(cause));
+            } else {
+              setThreadHistoryWarning(
+                'Показана сохранённая история. Свежая сверка с сервером временно недоступна.',
+              );
+              setThreadHistoryWarningCode('CACHE_REVALIDATION_FAILED');
+            }
+            if (!authoritativeCacheRejection)
+              setEventStreamStart({ threadId: requestedThreadId, cursor: 0 });
+          }
         }
       }
     })();
@@ -5245,7 +5341,7 @@ function Workspace({
     const requestedArchiveView = archiveView;
     const items = await api.threads(requestedProjectId, requestedArchiveView);
     if (navigationEpoch !== navigationEpochRef.current) return;
-    setThreads(items);
+    setThreads(preserveVerifiedStatus(items));
     setThreadId((current) => {
       if (selectId === null) return null;
       const preferred = selectId ?? current;
@@ -6249,6 +6345,7 @@ function Workspace({
         onLogout={() =>
           void api.logout(session.csrfToken).finally(() => {
             disableThreadHistoryCacheWrites();
+            clearNavigationCache();
             onSignedOut();
             void clearThreadHistoryCache();
           })
@@ -6279,19 +6376,24 @@ function Workspace({
           </button>
           <div className="chat-heading">
             <h1>{selectedThread?.name || selectedThread?.preview || 'Новый чат'}</h1>
-            <span className={`live-status ${active ? 'running' : ''}`}>
+            <span className={`live-status ${active && !statusUnverified ? 'running' : ''}`}>
               <i />
-              {active
-                ? subagentsOnlyActive
-                  ? `Основной ответ готов · продолжают работать субагенты: ${activeSubagentCount}`
-                  : `Codex работает${activeTurnDuration ? ` уже ${activeTurnDuration}` : ''}`
-                : capability?.authenticated === false
-                  ? 'Codex не подключён'
-                  : streamState === 'offline'
-                    ? 'Нет подключения'
-                    : streamState === 'connecting'
-                      ? 'Подключаемся…'
-                      : 'Готов'}
+              {statusUnverified
+                ? threadLoadState === 'error' ||
+                  (threadHistoryWarningCode && threadHistoryWarningCode !== 'REFRESH_PENDING')
+                  ? 'Состояние не подтверждено'
+                  : 'Проверяем состояние…'
+                : active
+                  ? subagentsOnlyActive
+                    ? `Основной ответ готов · продолжают работать субагенты: ${activeSubagentCount}`
+                    : `Codex работает${activeTurnDuration ? ` уже ${activeTurnDuration}` : ''}`
+                  : capability?.authenticated === false
+                    ? 'Codex не подключён'
+                    : streamState === 'offline'
+                      ? 'Нет подключения'
+                      : streamState === 'connecting'
+                        ? 'Подключаемся…'
+                        : 'Готов'}
             </span>
           </div>
           <div className="toolbar-actions">
@@ -7006,6 +7108,7 @@ export function App() {
         setState('ready');
       })
       .catch(() => {
+        clearNavigationCache();
         void clearThreadHistoryCache().finally(() => setState('signed-out'));
       });
   }, []);

@@ -43,6 +43,15 @@ Browser
   only otherwise-free cache capacity, and logout disables writes before clearing storage so an older timer or
   in-flight write cannot repopulate private history afterward. Active-turn
   steering is also written as a canonical user event so it remains visible after reconnect and on every device.
+- After authentication, the browser first paints a bounded, account-scoped local navigation copy when present.
+  `GET /api/navigation` then returns all saved active project/chat titles directly from SQLite without a native
+  `thread/list` round trip. The authenticated server response replaces the local copy; native discovery continues
+  independently and the periodic navigation refresh reconciles newly imported chats. Sign-out and rejected
+  session startup clear the local navigation copy. A selected chat first reads a small persisted snapshot
+  (recent safe events and conversation boundaries, pending interactions and queue state), visibly labels its
+  runtime status as awaiting verification, then applies the authoritative detail refresh. Historical subagents
+  remain on their separate request path; the full chat detail includes only active subagents needed for work
+  state reconciliation. Older transcript pages retain the existing exclusive backward cursor.
 - The thread projection stores the current active turn ID instead of asking the browser to infer it from a
   bounded event journal. A process restart clears that runtime-only projection before Codex is queried, so an
   old `inProgress` history row cannot create a phantom running task. Interrupt acceptance is journaled and

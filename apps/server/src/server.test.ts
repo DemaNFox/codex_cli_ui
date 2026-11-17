@@ -5781,6 +5781,76 @@ describe('Codex routes', () => {
     });
   });
 
+  it('opens saved navigation and a recent chat snapshot without waiting for native discovery', async () => {
+    const { app, appServer, projectPath, repository } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const threadId = await createThread(app, project.id, session.headers);
+    const listGate = appServer.blockThreadLists();
+    const nativeList = app.inject({
+      method: 'GET',
+      url: `/api/threads?projectId=${project.id}&archived=false`,
+      headers: { cookie: session.cookie },
+    });
+    await listGate.entered;
+
+    const navigation = await app.inject({
+      method: 'GET',
+      url: '/api/navigation',
+      headers: { cookie: session.cookie },
+    });
+    const snapshot = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}/snapshot`,
+      headers: { cookie: session.cookie },
+    });
+    expect(navigation.statusCode).toBe(200);
+    expect(navigation.json()).toMatchObject({
+      data: {
+        projects: [expect.objectContaining({ id: project.id })],
+        threads: [expect.objectContaining({ id: threadId })],
+      },
+    });
+    expect(snapshot.statusCode).toBe(200);
+    expect(snapshot.json()).toMatchObject({
+      data: { id: threadId },
+      historyState: 'degraded',
+      historyWarning: 'REFRESH_PENDING',
+    });
+    expect(snapshot.json()).not.toHaveProperty('subagents');
+    listGate.release();
+    await nativeList;
+
+    for (const [id, status] of [
+      ['finished-child', 'completed'],
+      ['running-child', 'running'],
+    ] as const) {
+      repository.upsertSubagent({
+        id,
+        rootThreadId: threadId,
+        parentThreadId: threadId,
+        agentPath: `/root/${id}`,
+        nickname: null,
+        role: null,
+        model: 'gpt-test',
+        reasoningEffort: 'medium',
+        status,
+        message: null,
+        startedAt: new Date().toISOString(),
+        lastActivityAt: new Date().toISOString(),
+        completedAt: status === 'completed' ? new Date().toISOString() : null,
+      });
+    }
+    const detail = await app.inject({
+      method: 'GET',
+      url: `/api/threads/${threadId}`,
+      headers: { cookie: session.cookie },
+    });
+    expect(detail.json<{ subagents: Array<{ id: string }> }>().subagents).toEqual([
+      expect.objectContaining({ id: 'running-child' }),
+    ]);
+  });
+
   it('returns safe journal history instead of raw app-server turns', async () => {
     const { app, appServer, projectPath } = await fixture();
     const session = await login(app);

@@ -59,6 +59,10 @@ including their safe attachment metadata, are persisted and streamed to both dev
 from the row menu. After the first successful task, a new chat adopts Codex's native topic name when it is
 semantic; if Codex supplied only the beginning of the request, the server replaces it asynchronously with a
 short contextual title through the same authenticated app-server account.
+The browser may paint a bounded local copy of chat titles after authentication, then replace it from a fast
+server-side SQLite navigation snapshot. Selecting a chat first shows recent saved messages and pending state;
+the slower native Codex reconciliation follows in the background with an explicit checking label. Older messages
+continue loading upward in pages.
 The last model, reasoning, access and approval selections are account settings stored on the server. Messages
 and execution stages show their date and time, while steer and stop actions show an explicit accepted or failed
 state instead of relying on a disappearing input value. A model change applies to the next new root task and

@@ -3736,6 +3736,18 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return { data: repository.listProjects(query.archived) };
   });
 
+  // The persisted navigation is available even while native Codex history is slow to scan.
+  app.get('/api/navigation', (request) => {
+    auth.authenticate(request);
+    const projects = repository.listProjects(false);
+    return {
+      data: {
+        projects,
+        threads: projects.flatMap((project) => repository.listThreads(project.id, false)),
+      },
+    };
+  });
+
   app.post('/api/projects', async (request, reply) => {
     csrfGuard(auth, request);
     const input = createProjectRequestSchema.parse(request.body);
@@ -3963,6 +3975,28 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     }
   });
 
+  app.get('/api/threads/:id/snapshot', (request) => {
+    auth.authenticate(request);
+    const id = parseId(request);
+    const thread = repository.getThread(id);
+    if (!thread) throw new HttpError(404, 'THREAD_NOT_FOUND');
+    const recent = repository.listRecentEvents(id, 60);
+    const pendingInteractions = pendingInteractionSnapshot(id);
+    return {
+      data: thread,
+      events: recent.events,
+      conversationEvents: repository.listRecentConversationEvents(id, 20),
+      eventCursor: recent.highWater,
+      historyTruncated: recent.historyTruncated,
+      oldestEventId: recent.oldestEventId,
+      pendingInteractionEvents: pendingInteractions.events,
+      pendingInteractionsTruncated: pendingInteractions.truncated,
+      queuedTurns: repository.listVisibleQueuedTurns(id).map(publicQueuedTurn),
+      historyState: 'degraded',
+      historyWarning: 'REFRESH_PENDING',
+    };
+  });
+
   app.get('/api/threads/:id', async (request) => {
     auth.authenticate(request);
     const id = parseId(request);
@@ -4015,7 +4049,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
       pendingInteractionEvents: pendingInteractions.events,
       pendingInteractionsTruncated: pendingInteractions.truncated,
       turnNavigation: repository.listTurnNavigation(id),
-      subagents: repository.listSubagents(id),
+      subagents: repository
+        .listSubagents(id)
+        .filter((agent) => agent.status === 'pendingInit' || agent.status === 'running'),
       queuedTurns: repository.listVisibleQueuedTurns(id).map(publicQueuedTurn),
       historyState,
       ...(historyWarning ? { historyWarning } : {}),

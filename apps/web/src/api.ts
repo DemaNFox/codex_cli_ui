@@ -118,6 +118,11 @@ export interface ThreadHistory {
   turnNavigation?: TurnNavigationEntry[];
 }
 
+export interface SavedNavigation {
+  projects: Project[];
+  threads: Thread[];
+}
+
 export interface ThreadHistoryPage {
   events: SafeEvent[];
   oldestEventId: number | null;
@@ -388,6 +393,8 @@ export const api = {
       ),
     ),
   models: async () => asList(await request<ModelOption[] | { data: ModelOption[] }>('/api/models')),
+  navigation: async () =>
+    unwrapData(await request<SavedNavigation | { data: SavedNavigation }>('/api/navigation')),
   threads: async (projectId: string, archived = false) =>
     asList(
       await request<Thread[] | { data: Thread[] }>(
@@ -396,6 +403,8 @@ export const api = {
     ),
   thread: (threadId: string) =>
     request<ThreadHistory>(`/api/threads/${encodeURIComponent(threadId)}`),
+  threadSnapshot: (threadId: string) =>
+    request<ThreadHistory>(`/api/threads/${encodeURIComponent(threadId)}/snapshot`),
   threadHistory: (threadId: string, before: number, limit = 120) =>
     request<ThreadHistoryPage>(
       `/api/threads/${encodeURIComponent(threadId)}/history?before=${encodeURIComponent(String(before))}&limit=${encodeURIComponent(String(limit))}`,

@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App.js';
 import type { ResourceLimitSnapshot } from './api.js';
 import * as threadHistoryCache from './threadHistoryCache.js';
+import { clearNavigationCache, writeNavigationCache } from './navigationCache.js';
 
 const session = {
   authenticated: true,
@@ -300,6 +301,21 @@ function installAuthenticatedApi(
     if (url === '/api/auth/session') return Promise.resolve(jsonResponse(session));
     if (url === '/api/projects?archived=false') return Promise.resolve(jsonResponse([project]));
     if (url === '/api/projects?archived=true') return Promise.resolve(jsonResponse([]));
+    if (url === '/api/navigation')
+      return Promise.resolve(overrides?.('/api/projects?archived=false') ?? jsonResponse([project]))
+        .then((response) => response.json())
+        .then(async (projects: (typeof project)[]) => {
+          const pages = await Promise.all(
+            projects.map(async (item) => {
+              const response = await Promise.resolve(
+                overrides?.(`/api/threads?projectId=${item.id}&archived=false`) ??
+                  jsonResponse([thread]),
+              );
+              return response.json() as Promise<(typeof thread)[]>;
+            }),
+          );
+          return jsonResponse({ data: { projects, threads: pages.flat() } });
+        });
     if (url === '/api/preferences/runtime')
       return Promise.resolve(
         jsonResponse({
@@ -330,6 +346,9 @@ function installAuthenticatedApi(
     if (url === '/api/threads/thread-1') {
       return Promise.resolve(jsonResponse({ data: thread, events: [] }));
     }
+    if (url === '/api/threads/thread-1/snapshot') {
+      return Promise.resolve(jsonResponse({ data: thread, events: [] }));
+    }
     if (url === '/api/threads/thread-1/turns' && init?.method === 'POST') {
       return Promise.resolve(jsonResponse({ data: { status: 'started', turnId: 'turn-started' } }));
     }
@@ -349,6 +368,7 @@ async function openSettings(
 }
 
 beforeEach(() => {
+  clearNavigationCache();
   FakeEventSource.instances = [];
   FakeXMLHttpRequest.instances = [];
   FakeXMLHttpRequest.autoRespond = true;
@@ -1166,6 +1186,79 @@ describe('App', () => {
     cacheRead.mockRestore();
   });
 
+  it('shows saved chat navigation and recent messages while native requests are pending', async () => {
+    const recentMessage = {
+      id: 42,
+      threadId: thread.id,
+      turnId: 'turn-recent',
+      kind: 'agent-message' as const,
+      phase: 'completed' as const,
+      payload: { text: 'Последний сохранённый ответ', messagePhase: 'final_answer' },
+      createdAt: '2026-10-12T08:00:00.000Z',
+    };
+    let releaseList!: (response: Response) => void;
+    let releaseHistory!: (response: Response) => void;
+    const delayedList = new Promise<Response>((resolve) => {
+      releaseList = resolve;
+    });
+    const delayedHistory = new Promise<Response>((resolve) => {
+      releaseHistory = resolve;
+    });
+    installAuthenticatedApi((url) => {
+      if (url === '/api/navigation')
+        return jsonResponse({ data: { projects: [project], threads: [thread] } });
+      if (url.includes('/api/threads?')) return delayedList;
+      if (url === '/api/threads/thread-1') return delayedHistory;
+      if (url === '/api/threads/thread-1/snapshot')
+        return jsonResponse({
+          data: thread,
+          events: [recentMessage],
+          eventCursor: 42,
+          historyState: 'degraded',
+          historyWarning: 'REFRESH_PENDING',
+        });
+      return undefined;
+    });
+    render(<App />);
+
+    expect(
+      await screen.findByRole('button', { name: 'Открыть чат проекта Frontend task' }),
+    ).not.toBeNull();
+    expect(await screen.findByText('Последний сохранённый ответ')).not.toBeNull();
+    expect(
+      screen.getByText('Показаны сохранённые сообщения. Проверяем текущее состояние чата.'),
+    ).not.toBeNull();
+
+    releaseList(jsonResponse([thread]));
+    releaseHistory(jsonResponse({ data: thread, events: [recentMessage], eventCursor: 42 }));
+    await waitFor(() =>
+      expect(
+        screen.queryByText('Показаны сохранённые сообщения. Проверяем текущее состояние чата.'),
+      ).toBeNull(),
+    );
+  });
+
+  it('paints authenticated local chat titles before server navigation responds', async () => {
+    writeNavigationCache('nick', {
+      projects: [{ ...project, defaultPermissionPreset: 'workspace-write' as const }],
+      threads: [{ ...thread, status: 'idle' as const }],
+    });
+    let releaseNavigation!: (response: Response) => void;
+    const delayedNavigation = new Promise<Response>((resolve) => {
+      releaseNavigation = resolve;
+    });
+    installAuthenticatedApi((url) => {
+      if (url === '/api/navigation') return delayedNavigation;
+      return undefined;
+    });
+    render(<App />);
+
+    expect(
+      await screen.findByRole('button', { name: 'Открыть чат проекта Frontend task' }),
+    ).not.toBeNull();
+    releaseNavigation(jsonResponse({ data: { projects: [project], threads: [thread] } }));
+  });
+
   it('restores recent conversation messages outside a noisy event tail after reload', async () => {
     const prompt = {
       id: 10,
@@ -1704,6 +1797,8 @@ describe('App', () => {
       if (url === '/api/auth/session')
         return Promise.resolve(jsonResponse({ message: 'unauthorized' }, 401));
       if (url === '/api/auth/login') return Promise.resolve(jsonResponse(session));
+      if (url === '/api/navigation')
+        return Promise.resolve(jsonResponse({ data: { projects: [project], threads: [thread] } }));
       if (url === '/api/projects?archived=false') return Promise.resolve(jsonResponse([project]));
       if (url === '/api/models') return Promise.resolve(jsonResponse(models));
       if (url === '/api/system/capabilities') return Promise.resolve(jsonResponse(capabilities));
@@ -5130,6 +5225,8 @@ describe('App', () => {
     });
     installAuthenticatedApi((url) => {
       if (url.includes('/api/threads?')) return jsonResponse([thread, importedThread]);
+      if (url === '/api/threads/thread-imported/snapshot')
+        return jsonResponse({ data: importedThread, events: [historyEvent], eventCursor: 42 });
       if (url === '/api/threads/thread-imported') {
         return importedHistory;
       }
@@ -5141,8 +5238,11 @@ describe('App', () => {
     await user.click(
       await screen.findByRole('button', { name: 'Открыть чат проекта Импортированный чат' }),
     );
-    expect(FakeEventSource.instances.some((source) => source.url.includes('thread-imported'))).toBe(
-      false,
+    expect(await screen.findByText('История с сервера')).not.toBeNull();
+    await waitFor(() =>
+      expect(FakeEventSource.instances.at(-1)?.url).toBe(
+        '/api/threads/thread-imported/events?after=42',
+      ),
     );
 
     resolveImportedHistory(
@@ -5296,6 +5396,13 @@ describe('App', () => {
     const delayedResolvers: Array<(response: Response) => void> = [];
     let archived = false;
     installAuthenticatedApi((url, init) => {
+      if (url === '/api/navigation')
+        return jsonResponse({
+          data: {
+            projects: archived ? [secondProject] : [project, secondProject],
+            threads: archived ? [secondThread] : [thread, secondThread],
+          },
+        });
       if (url === '/api/projects?archived=false') {
         return jsonResponse(archived ? [secondProject] : [project, secondProject]);
       }
