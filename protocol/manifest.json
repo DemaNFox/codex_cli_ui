@@ -1,8 +1,8 @@
 {
-  "codexCliVersion": "0.166.0",
-  "generatedAt": "2026-11-03",
+  "codexCliVersion": "0.167.2",
+  "generatedAt": "2026-11-20",
   "files": {
-    "0.166.0/codex_app_server_protocol.schemas.json": "9b6d53647b00d68a04181b826599025a810cfa78acb3ec4d518c68b4120499c0",
-    "0.166.0/codex_app_server_protocol.v2.schemas.json": "e025e54fb11354eb82767ea040b40efa17b34dfc706c9433a6115b5f4771c465"
+    "0.167.2/codex_app_server_protocol.schemas.json": "021462a9bacd117f4cd40c256a4888619d059cec6a65b795198d521ba660e554",
+    "0.167.2/codex_app_server_protocol.v2.schemas.json": "f2576ca5d46be4cfb159906264fbc173efcfcc917ea8fdc38323770e7b657b5a"
   }
 }
