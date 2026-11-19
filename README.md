@@ -175,7 +175,7 @@ response, an account change, or a still-blocked post-check stays visible and doe
 A new host needs only:
 
 1. Ubuntu with systemd and APT on x64/arm64, Git, internet access and a normal sudo-capable user;
-2. an HTTPS domain/proxy or an existing certificate and private key;
+2. an HTTPS proxy or an existing certificate and private key valid for the configured DNS name or IP address;
 3. write access for the selected Codex user to the intended project roots, unless explicit `host-admin` is used;
 4. an interactive terminal for the Web UI administrator bootstrap. Codex sign-in can follow in the browser.
 

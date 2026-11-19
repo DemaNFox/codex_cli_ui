@@ -337,10 +337,10 @@ class InfraStaticTest(unittest.TestCase):
             wrapper,
         )
 
-    def test_installer_preserves_only_the_exact_legacy_bare_ip_before_migration(self) -> None:
+    def test_installer_accepts_https_ip_origin_and_preserves_origin_on_upgrade(self) -> None:
         installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
         validation_start = installer.index(
-            "PUBLIC_ORIGIN=$public_origin ALLOW_EXISTING_BARE_IP=$allow_existing_bare_ip python3"
+            "PUBLIC_ORIGIN=$public_origin python3"
         )
         validation_body_start = installer.index("\n", validation_start) + 1
         validation_end = installer.index("\nPY\n", validation_body_start)
@@ -348,15 +348,11 @@ class InfraStaticTest(unittest.TestCase):
         migration = installer.index('bash "$SCRIPT_DIR/migrate-runner-host-admin.sh"')
 
         self.assertIn('[[ $public_origin == "$installed_origin" ]]', installer)
-        self.assertIn("if [[ $mode == upgrade ]]; then allow_existing_bare_ip=true; fi", installer)
         self.assertLess(validation_start, migration)
 
-        def validate(origin: str, allow_existing_bare_ip: bool) -> subprocess.CompletedProcess[str]:
+        def validate(origin: str) -> subprocess.CompletedProcess[str]:
             environment = os.environ.copy()
             environment["PUBLIC_ORIGIN"] = origin
-            environment["ALLOW_EXISTING_BARE_IP"] = (
-                "true" if allow_existing_bare_ip else "false"
-            )
             return subprocess.run(
                 [sys.executable, "-c", validation],
                 env=environment,
@@ -365,11 +361,16 @@ class InfraStaticTest(unittest.TestCase):
                 check=False,
             )
 
-        self.assertEqual(validate("https://codex.example.test", False).returncode, 0)
-        fresh_ip = validate("https://192.0.2.10", False)
-        self.assertNotEqual(fresh_ip.returncode, 0)
-        self.assertIn("must use a DNS name", fresh_ip.stderr)
-        self.assertEqual(validate("https://192.0.2.10", True).returncode, 0)
+        self.assertEqual(validate("https://codex.example.test").returncode, 0)
+        self.assertEqual(validate("https://192.0.2.10:8443").returncode, 0)
+        self.assertEqual(validate("https://[2001:db8::10]:8443").returncode, 0)
+        for origin in (
+            "http://192.0.2.10",
+            "https://192.0.2.10/path",
+            "https://192.0.2.10:bad",
+            "https://192.0.2.999",
+        ):
+            self.assertNotEqual(validate(origin).returncode, 0)
 
     def test_legacy_single_service_adoption_rewrites_only_runtime_boundary(self) -> None:
         installer = (ROOT / "scripts/install-package.sh").read_text(encoding="utf-8")
@@ -573,7 +574,9 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("--https-port", installer)
         self.assertIn('HTTP and HTTPS edge ports must differ', installer)
         self.assertIn('TLS private key must be owned by root', installer)
-        self.assertIn('openssl x509 -in "$tls_cert" -noout -checkhost "$domain"', installer)
+        self.assertIn('cert_host_check=(-checkip "$domain")', installer)
+        self.assertIn('cert_host_check=(-checkhost "$domain")', installer)
+        self.assertIn('openssl x509 -in "$tls_cert" -noout "${cert_host_check[@]}"', installer)
         self.assertIn('previous configuration restored', installer)
         self.assertIn('trap rollback ERR', installer)
 

@@ -282,7 +282,7 @@ flowchart LR
   choice, not as protection against a malicious authenticated task.
 - Password-only exposure remains an accepted residual risk; second factor is recommended.
 - Portable targets are Ubuntu with systemd and APT on x64/arm64; installation checks required packages and pinned toolchain artifacts instead of an Ubuntu release number. Public plaintext HTTP and automatically
-  generated bare-IP certificates are excluded; operators supply a domain-backed HTTPS proxy or valid keypair.
+  generated certificates are excluded; operators supply an HTTPS proxy or a valid DNS/IP certificate and keypair.
 - The reference deployment uses a dedicated 80 GiB ext4 volume with a fixed inode ceiling for state,
   projects and releases, plus bounded `/tmp` and `/var/tmp` tmpfs mounts. Portable installation defaults
   target a dedicated personal server and retain soft fail-closed guards. On a shared host, use `--no-start`

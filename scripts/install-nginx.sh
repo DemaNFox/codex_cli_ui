@@ -34,10 +34,22 @@ done
 require_root
 for command in nginx openssl python3 install stat; do require_command "$command"; done
 [[ -n ${domain:-} && ${#domain} -le 253 ]] || die 'invalid domain'
-IFS='.' read -r -a domain_labels <<<"$domain"
-for label in "${domain_labels[@]}"; do
-  [[ ${#label} -le 63 && $label =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || die 'invalid domain label'
-done
+if [[ $domain =~ ^[0-9.]+$ ]]; then
+  python3 - "$domain" <<'PY'
+import ipaddress, sys
+try:
+    ipaddress.IPv4Address(sys.argv[1])
+except ValueError:
+    raise SystemExit('invalid IPv4 address')
+PY
+  cert_host_check=(-checkip "$domain")
+else
+  IFS='.' read -r -a domain_labels <<<"$domain"
+  for label in "${domain_labels[@]}"; do
+    [[ ${#label} -le 63 && $label =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] || die 'invalid domain label'
+  done
+  cert_host_check=(-checkhost "$domain")
+fi
 [[ $port =~ ^[0-9]{2,5}$ ]] && (( port >= 1024 && port <= 65535 )) || die 'invalid backend port'
 [[ $http_port =~ ^[0-9]{2,5}$ ]] && (( http_port >= 1024 && http_port <= 65535 || http_port == 80 )) || die 'invalid HTTP edge port'
 [[ $https_port =~ ^[0-9]{2,5}$ ]] && (( https_port >= 1024 && https_port <= 65535 || https_port == 443 )) || die 'invalid HTTPS edge port'
@@ -50,7 +62,7 @@ tls_key=$(canonical_existing_file "$tls_key")
 key_mode=$(stat -c '%a' "$tls_key")
 (( (8#$key_mode & 8#077) == 0 )) || die 'TLS private key must not be accessible by group or other users'
 openssl x509 -in "$tls_cert" -noout -checkend 86400 >/dev/null || die 'TLS certificate is invalid or expires within 24 hours'
-openssl x509 -in "$tls_cert" -noout -checkhost "$domain" >/dev/null || die 'TLS certificate does not cover the configured domain'
+openssl x509 -in "$tls_cert" -noout "${cert_host_check[@]}" >/dev/null || die 'TLS certificate does not cover the configured host'
 
 target=/etc/nginx/sites-available/codex-web-ui.conf
 enabled=/etc/nginx/sites-enabled/codex-web-ui.conf

@@ -161,15 +161,13 @@ if [[ -e $config && $mode == install ]]; then
 fi
 if [[ ! -e $config && $mode == upgrade ]]; then die '--upgrade requires an existing installation'; fi
 [[ ! -L $runner_config ]] || die 'installed runner configuration is a symlink'
-allow_existing_bare_ip=false
 if [[ $mode == upgrade || $resuming_bootstrap == true ]]; then
   installed_origin=$(sed -n 's/^CODEX_WEB_PUBLIC_ORIGIN=//p' "$config")
   [[ $public_origin == "$installed_origin" ]] || die 'changing the public origin requires an explicit reconfiguration workflow'
   public_origin=$installed_origin
-  if [[ $mode == upgrade ]]; then allow_existing_bare_ip=true; fi
 fi
 
-PUBLIC_ORIGIN=$public_origin ALLOW_EXISTING_BARE_IP=$allow_existing_bare_ip python3 - <<'PY'
+PUBLIC_ORIGIN=$public_origin python3 - <<'PY'
 import ipaddress, os, re
 from urllib.parse import urlsplit
 u = urlsplit(os.environ.get('PUBLIC_ORIGIN', ''))
@@ -181,12 +179,11 @@ if u.scheme != 'https' or u.username or u.password or u.path or u.query or u.fra
 try:
     ipaddress.ip_address(host)
 except ValueError:
+    if re.fullmatch(r'[0-9.]+', host):
+        raise SystemExit('--public-origin has an invalid IP address')
     labels = host.split('.')
     if len(labels) < 2 or any(not re.fullmatch(r'[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?', x) for x in labels):
         raise SystemExit('--public-origin must use a valid DNS hostname')
-else:
-    if os.environ.get('ALLOW_EXISTING_BARE_IP') != 'true':
-        raise SystemExit('--public-origin must use a DNS name, not a bare IP address')
 PY
 if [[ $mode == upgrade && ! -e $runner_config ]]; then
   [[ -f $config && ! -L $config ]] || die 'legacy installed configuration is missing or unsafe'
