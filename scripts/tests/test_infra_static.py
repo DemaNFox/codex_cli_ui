@@ -615,6 +615,7 @@ class InfraStaticTest(unittest.TestCase):
         self.assertIn("prepare-package.sh", wrapper)
         self.assertIn("bootstrap-ubuntu.sh", wrapper)
         self.assertIn("pnpm install --frozen-lockfile", wrapper)
+        self.assertIn("export ONNXRUNTIME_NODE_INSTALL_CUDA=skip", wrapper)
         self.assertIn("preflight_origin", wrapper)
         for expected in (
             'prepare-package.sh" --verify',

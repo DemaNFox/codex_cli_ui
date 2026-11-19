@@ -62,6 +62,9 @@ $preflight_external || bootstrap_args+=(--install-nginx)
 sudo "$ROOT/scripts/bootstrap-ubuntu.sh" --build-tools-only "${bootstrap_args[@]}"
 export PATH="/usr/local/bin:$PATH"
 for command in pnpm node python3; do command -v "$command" >/dev/null || { printf 'Bootstrap did not provide command: %s\n' "$command" >&2; exit 1; }; done
+# The portable server uses the CPU speech backend. Avoid an optional CUDA
+# postinstall download, which is unavailable on hosts without a GPU.
+export ONNXRUNTIME_NODE_INSTALL_CUDA=skip
 pnpm install --frozen-lockfile
 case "$(uname -m)" in
   x86_64) target=linux-x64 ;;

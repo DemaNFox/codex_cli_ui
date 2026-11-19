@@ -12,8 +12,8 @@ architecture-specific checksummed package without root, then invokes the root
 installer only for system integration. It first installs the repository-pinned
 Node.js, pnpm and Codex CLI toolchain beneath `/opt/codex-web-ui/runtime` and
 exposes stable launchers in `/usr/local/bin`. The runner mode defaults to `restricted` and its user defaults
-to the `sudo` caller. Its existing Codex login is reused without copying credentials; otherwise the installer
-starts Codex device login for that user on the controlling terminal:
+to the `sudo` caller. Its existing Codex login is reused without copying credentials; otherwise the Web
+administrator can start device login after installation:
 
 ```sh
 ./install.sh \
@@ -22,11 +22,14 @@ starts Codex device login for that user on the controlling terminal:
   --project-root /srv/codex-projects
 ```
 
+The source installer skips the optional ONNX Runtime CUDA binary download; speech transcription uses the
+CPU backend on a portable server.
+
 For a dedicated Nginx edge, replace `--external-proxy` with existing
 `--tls-cert` and `--tls-key` paths. The private key must be root-owned `0600`
-and the certificate must cover the origin hostname. Installations fail closed
+and the certificate must cover the origin DNS name or IP address. Installations fail closed
 on an unsupported OS/architecture, artifact or package checksum mismatch,
-failed Codex login, unsafe Codex ownership, or public plaintext configuration.
+unsafe Codex ownership, or public plaintext configuration.
 Downloaded artifacts use exact versions and committed SHA-256/SHA-512 digests;
 there is no `curl | sh` or floating `latest` tag. Use `--upgrade` explicitly to preserve the existing admin config
 while switching to a new immutable release.
