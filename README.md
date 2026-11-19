@@ -179,6 +179,9 @@ A new host needs only:
 3. write access for the selected Codex user to the intended project roots, unless explicit `host-admin` is used;
 4. an interactive terminal for the Web UI administrator bootstrap. Codex sign-in can follow in the browser.
 
+Installation configures an allowed filesystem root for future workspaces, but does not register a project
+or create a chat in Web UI. The empty-project status must work; users add projects explicitly afterward.
+
 Codex authentication, website passwords, `.env` values, databases, transcripts and project worktrees are
 host state and are never committed. A fresh installer resolves the latest stable Codex CLI, verifies the
 published archive checksums and requires its generated protocol to match the reviewed adapter before
