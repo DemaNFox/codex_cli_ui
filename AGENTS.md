@@ -12,9 +12,9 @@ This repository is a standalone, portable Codex server package. Its supported Ub
   administer the whole machine. The browser-facing API always remains the separate non-root
   `codex-web-ui-api` identity and never receives sudo, the Docker socket or a general root helper. The installed
   update control may call only the fixed root broker for either an operator-staged compatible full release or
-  the single repository-reviewed Codex runtime target; it must never accept a browser-supplied package, path,
-  URL, version, command or unit. Runtime-only activation must match committed archive digests and the reviewed
-  app-server protocol byte-for-byte before any installed configuration changes.
+  latest stable official Codex runtime; it must never accept a browser-supplied package, path,
+  URL, version, command or unit. Runtime-only activation must match official npm archive integrity and the reviewed
+  app-server method compatibility baseline before any installed configuration changes.
 - Projects are existing directories beneath configured real-path allowlisted roots. Reject traversal, symlink escape, and unregistered working directories.
 - OpenAI credentials remain in the server-side `CODEX_HOME`; never return, log, persist, or accept them through the browser API.
 - Start fresh installs without requiring Codex login. The selected runner identity owns `CODEX_HOME`; an
@@ -33,7 +33,7 @@ This repository is a standalone, portable Codex server package. Its supported Ub
 - Single-user authentication still requires Argon2id password verification, opaque hashed sessions, Secure/HttpOnly/SameSite cookies, CSRF and exact Origin checks, login throttling/lockout, and audit events.
 - All mutation endpoints require CSRF and idempotency where replay could duplicate work.
 - Treat repository content, model output, tool output, Markdown, ANSI text, filenames, and diffs as untrusted data. Render safely; never use `dangerouslySetInnerHTML`.
-- Default-deny unknown Codex event/method variants. Keep the reviewed Codex CLI and generated protocol snapshot together; verify a fresh latest-stable candidate against them before activation.
+- Default-deny unknown Codex event/method variants. Keep a reviewed protocol compatibility baseline and verify each latest-stable candidate against the methods used by Web UI before activation.
 - Bound event size, process concurrency, retained history, worktree count, and disk use. Cancellation must terminate the active turn without killing unrelated work.
 
 ## Development

@@ -13,6 +13,9 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
+import time
+import urllib.request
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
@@ -38,9 +41,44 @@ RUNNER_CONFIG = Path("/etc/codex-web-ui/codex-runner.env")
 SYSTEMCTL = "/usr/bin/systemctl"
 UPDATE_SERVICE = "codex-web-ui-codex-update.service"
 CANDIDATE_LOCK_PATH = Path("/run/codex-web-ui/codex-update-candidate.lock")
+LATEST_CACHE = Path("/run/codex-web-ui/codex-latest-cache.json")
+LATEST_URL = "https://registry.npmjs.org/@openai%2Fcodex/latest"
 SAFE_RELEASE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 
 CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
+
+
+def latest_stable_version() -> str:
+    try:
+        info = LATEST_CACHE.lstat()
+        if (not LATEST_CACHE.is_symlink() and LATEST_CACHE.is_file()
+                and (os.name != "posix" or info.st_uid == 0 and info.st_mode & 0o077 == 0)
+                and time.time() - info.st_mtime < 300):
+            cached = json.loads(LATEST_CACHE.read_text(encoding="utf-8"))["version"]
+            if isinstance(cached, str) and re.fullmatch(r"\d+\.\d+\.\d+", cached):
+                return cached
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    try:
+        with urllib.request.urlopen(LATEST_URL, timeout=5) as response:
+            data = response.read(2 * 1024 * 1024 + 1)
+        if len(data) > 2 * 1024 * 1024:
+            raise ValueError("npm metadata is too large")
+        metadata = json.loads(data)
+        version = metadata.get("version")
+        if metadata.get("name") != "@openai/codex" or not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+", version):
+            raise ValueError("npm latest is not a stable Codex release")
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise BrokerError("UPDATE_UNAVAILABLE", "latest Codex metadata is unavailable") from error
+    fd, temporary = tempfile.mkstemp(prefix=".codex-latest-", dir=LATEST_CACHE.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump({"version": version}, stream)
+        os.replace(temporary, LATEST_CACHE)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    return version
 
 
 def _version_tuple(value: str) -> tuple[int, int, int]:
@@ -121,6 +159,7 @@ class CodexUpdateBroker:
         command_runner: CommandRunner = run_command,
         machine: str | None = None,
         runner_config: Path = RUNNER_CONFIG,
+        latest_version: Callable[[], str] = latest_stable_version,
     ) -> None:
         self.opt_root = opt_root
         self.releases_root = opt_root / "releases"
@@ -130,6 +169,7 @@ class CodexUpdateBroker:
         self.command_runner = command_runner
         self.machine = machine or platform.machine()
         self.runner_config = runner_config
+        self.latest_version = latest_version
 
     @property
     def expected_arch(self) -> str:
@@ -267,7 +307,8 @@ class CodexUpdateBroker:
                     raise BrokerError("RUNTIME_UPDATE_INVALID", "reviewed protocol snapshot checksum mismatch")
         except OSError as error:
             raise BrokerError("UPDATE_UNAVAILABLE", "reviewed runtime update is unavailable") from error
-        return RuntimeCandidate(package_root, f"runtime-{version}", f"codex-cli {version}")
+        latest = self.latest_version()
+        return RuntimeCandidate(package_root, f"runtime-{latest}", f"codex-cli {latest}")
 
     def available_candidate(self) -> Candidate | RuntimeCandidate:
         try:

@@ -109,7 +109,7 @@ rollback_runtime() {
 }
 
 apply_runtime() {
-  local arch pnpm bin stage_error units_output unit _rest
+  local arch pnpm bin stage_error stage_output baseline_version units_output unit _rest
   local -a units=()
   case "$(uname -m)" in x86_64) arch=x64 ;; aarch64) arch=arm64 ;; *) return 1 ;; esac
   pnpm=$(sed -n 's/^PNPM_VERSION=//p' "$package_root/infra/toolchain.env")
@@ -120,26 +120,28 @@ apply_runtime() {
   runtime_stage=$(mktemp -d "$runtime_root/.codex-runtime-stage.XXXXXX")
   runtime_schemas=$(mktemp -d /var/lib/codex-web-ui/.codex-runtime-schema.XXXXXX)
   runtime_backups=$(mktemp -d /run/codex-web-ui/.codex-runtime-backup.XXXXXX)
-  if ! python3 "$package_root/scripts/codex-runtime-update-stage.py" --package-root "$package_root" --output "$runtime_stage" 2>"$runtime_schemas/stage-error"; then
+  if ! stage_output=$(python3 "$package_root/scripts/codex-runtime-update-stage.py" --package-root "$package_root" --output "$runtime_stage" --latest 2>"$runtime_schemas/stage-error"); then
     stage_error=$(<"$runtime_schemas/stage-error"); printf '%s\n' "$stage_error" >&2
     if [[ $stage_error == *'full app package is required'* ]]; then message='Latest Codex is not the reviewed compatible target; a full app package is required.'; fi
     return 1
   fi
+  [[ $(STAGE_OUTPUT=$stage_output python3 -c 'import json,os; print(json.loads(os.environ["STAGE_OUTPUT"])["version"])') == "$target_version" ]] || {
+    message='Codex latest changed while the update was starting; retry the update.'
+    return 1
+  }
   bin="$runtime_stage/lib/node_modules/@openai/codex/bin/codex.js"
   [[ -f $bin && ! -L $bin && $(stat -c '%u' "$bin") == 0 ]] || return 1
   chown "$api_user:$api_user" "$runtime_schemas"; chmod 0700 "$runtime_schemas"
   install -d -m 0700 -o "$api_user" -g "$api_user" "$runtime_schemas/home" "$runtime_schemas/codex-home" "$runtime_schemas/out"
   [[ $(runuser -u "$api_user" -- env HOME="$runtime_schemas/home" CODEX_HOME="$runtime_schemas/codex-home" "$bin" --version) == "codex-cli $target_version" ]] || return 1
   runuser -u "$api_user" -- env HOME="$runtime_schemas/home" CODEX_HOME="$runtime_schemas/codex-home" "$bin" app-server generate-json-schema --out "$runtime_schemas/out" >/dev/null
-  if ! TARGET="$package_root/infra/codex-update-target.json" GENERATED="$runtime_schemas/out" python3 - <<'PY'
-import hashlib,json,os
-from pathlib import Path
-t=json.loads(Path(os.environ['TARGET']).read_text(encoding='utf-8'))['protocolFiles']; g=Path(os.environ['GENERATED'])
-outputs=list(g.iterdir())
-if any(not p.is_file() or p.is_symlink() for p in outputs) or set(t) != {p.name for p in outputs}: raise SystemExit(1)
-if any(hashlib.sha256((g/n).read_bytes()).hexdigest()!=d for n,d in t.items()): raise SystemExit(1)
-PY
-  then message='Latest Codex requires a full app package because its protocol differs from the supported snapshot.'; printf '%s\n' "$message" >&2; return 1; fi
+  baseline_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["codexCliVersion"])' "$package_root/protocol/manifest.json")
+  if ! python3 "$package_root/scripts/verify-codex-protocol.py" \
+    --baseline "$package_root/protocol/$baseline_version" --generated "$runtime_schemas/out"; then
+    message='Latest Codex is incompatible with the Web UI adapter; the previous runtime remains active.'
+    printf '%s\n' "$message" >&2
+    return 1
+  fi
   runtime_created=true
   mv -- "$runtime_stage" "$runtime_dir"; runtime_stage=; bin="$runtime_dir/lib/node_modules/@openai/codex/bin/codex.js"
   install -m 0600 -o root -g root "$runner_config" "$runtime_backups/runner"; install -m 0600 -o root -g root "$config" "$runtime_backups/api"

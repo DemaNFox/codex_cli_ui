@@ -105,11 +105,15 @@ else
 fi
 bootstrap_args=()
 $external_proxy || bootstrap_args+=(--install-nginx)
+# Existing split installations keep their active Codex runtime. Only the
+# one-time legacy adoption still needs the packaged fallback binary.
+if [[ $mode != upgrade || -e /etc/codex-web-ui/codex-runner.env ]]; then
+  bootstrap_args+=(--build-tools-only)
+fi
 fresh_install=false
 if [[ $mode == install && ! -e /etc/codex-web-ui/codex-web-ui.env ]]; then
   fresh_install=true
   [[ -z $codex_bin ]] || die '--codex-bin is not supported for a fresh installation'
-  bootstrap_args+=(--build-tools-only)
 fi
 "$SCRIPT_DIR/bootstrap-ubuntu.sh" "${bootstrap_args[@]}"
 export PATH="/usr/local/bin:$PATH"
@@ -284,12 +288,11 @@ if [[ $mode == upgrade && $legacy_single_service == false ]]; then
   if [[ -n $codex_bin ]]; then
     [[ $(realpath -e -- "$codex_bin") == "$persisted_bin" ]] || die 'changing CODEX_BIN requires an explicit migration workflow'
   else
-    case "$persisted_bin" in
-      /opt/codex-web-ui/runtime/toolchain-pnpm-*-codex-*-${target#linux-}/bin/codex) codex_bin=$managed_codex_bin ;;
-      /opt/codex-web-ui/runtime/toolchain-pnpm-*-codex-*-${target#linux-}/lib/node_modules/@openai/codex/bin/codex.js) codex_bin=$managed_codex_bin ;;
-      *) codex_bin=$persisted_bin ;;
-    esac
+    codex_bin=$persisted_bin
   fi
+  persisted_pin=$(sed -n 's/^CODEX_WEB_CODEX_VERSION_PIN="\(codex-cli [0-9][0-9.]*\)"$/\1/p' "$runner_config")
+  [[ $persisted_pin =~ ^codex-cli\ [0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'installed Codex version pin is invalid'
+  version_pin=$persisted_pin
   runner_user=$persisted_user
   runner_mode=$persisted_runner_mode
   codex_home=$persisted_home
@@ -327,30 +330,11 @@ if ! runuser -u "$runner_user" -- env HOME="$runner_home" CODEX_HOME="$codex_hom
   rm -rf --one-file-system -- "$protocol_stage"
   die 'candidate Codex protocol generation failed'
 fi
-if ! PROTOCOL_STAGE=$protocol_stage PACKAGE_ROOT=$package python3 - <<'PY'
-import hashlib
-import json
-import os
-from pathlib import Path
-
-package = Path(os.environ["PACKAGE_ROOT"])
-generated = Path(os.environ["PROTOCOL_STAGE"])
-manifest = json.loads((package / "protocol/manifest.json").read_text(encoding="utf-8"))
-files = manifest.get("files")
-if not isinstance(files, dict):
-    raise SystemExit("candidate protocol manifest is invalid")
-expected_names = {Path(relative).name for relative in files}
-actual_names = {path.name for path in generated.iterdir() if path.is_file()}
-if not expected_names.issubset(actual_names):
-    raise SystemExit("candidate Codex protocol output is incomplete")
-for relative, expected in files.items():
-    output = generated / Path(relative).name
-    if hashlib.sha256(output.read_bytes()).hexdigest() != expected:
-        raise SystemExit(f"candidate Codex protocol differs from reviewed snapshot: {output.name}")
-PY
-then
+baseline_version=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["codexCliVersion"])' "$package/protocol/manifest.json")
+if ! python3 "$package/scripts/verify-codex-protocol.py" \
+  --baseline "$package/protocol/$baseline_version" --generated "$protocol_stage"; then
   rm -rf --one-file-system -- "$protocol_stage"
-  die 'candidate Codex protocol does not match the reviewed package snapshot'
+  die 'candidate Codex protocol is incompatible with the Web UI adapter'
 fi
 rm -rf --one-file-system -- "$protocol_stage"
 if $fresh_install; then

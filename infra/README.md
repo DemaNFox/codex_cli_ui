@@ -30,7 +30,8 @@ For a dedicated Nginx edge, replace `--external-proxy` with existing
 and the certificate must cover the origin DNS name or IP address. Installations fail closed
 on an unsupported OS/architecture, artifact or package checksum mismatch,
 unsafe Codex ownership, or public plaintext configuration.
-Downloaded artifacts use exact versions and committed SHA-256/SHA-512 digests;
+The latest stable Codex archive uses official npm SHA-512 integrity metadata; Node.js and pnpm retain committed
+SHA-256/SHA-512 digests;
 there is no `curl | sh` or floating `latest` tag. Use `--upgrade` explicitly to preserve the existing admin config
 while switching to a new immutable release.
 If `/usr/local/bin/codex` is already a regular host-managed executable, bootstrap
@@ -191,13 +192,15 @@ UI so updates are serialized against active work and audited.
 The API performs a read-only check of the fixed official npm metadata endpoint at startup and every six hours.
 Opening Status reads the cached result; “Проверить обновления” forces the same bounded check. Discovery never
 selects executable content. The root broker separately exposes either a staged full application package or the
-single reviewed runtime target shipped in `infra/codex-update-target.json`.
+latest stable Codex runtime from the fixed official npm metadata endpoint. The checked-in target is a reviewed
+compatibility baseline, not a cap on the installable version.
 
-When that reviewed target is newer than the installed runtime, Status shows “Скачать и установить”. Its empty
+When that stable release is newer than the installed runtime, Status shows “Скачать и установить”. Its empty
 request carries no URL, path, version, package or command. The fixed worker independently requires the official
-registry latest version to equal the reviewed target, verifies npm and committed SHA-512 digests, performs
-bounded safe extraction, regenerates app-server schemas as an unprivileged identity and requires exact reviewed
-protocol hashes. A mismatch fails closed and requires a compatible full application package. Activation drains
+registry latest version to equal the version shown by Status, verifies official npm SHA-512 integrity, performs
+bounded safe extraction, regenerates app-server schemas as an unprivileged identity and verifies the methods
+used by Web UI against the reviewed baseline. An incompatible change fails closed and requires a compatible
+full application package. Activation drains
 work, switches protected runtime/version pins, health-checks the service and restores the previous configuration
 on failure.
 
@@ -217,7 +220,7 @@ an existing managed package. It never downloads packages. The browser can then i
 operation; it cannot provide a URL, path, version, command, unit or package name. The root broker authenticates
 the API peer, repeats inventory/ownership/architecture/API checks and starts the fixed
 `codex-web-ui-codex-update.service` oneshot. Candidate Codex schemas are generated as the non-root runner and
-must match the reviewed protocol snapshot before any drain begins.
+must pass the reviewed method compatibility check before any drain begins.
 
 Activation waits for all Codex work and other exclusive operations to become idle, then uses the supported
 full installer. It atomically updates both protected version-pin files, restarts the compatible application,

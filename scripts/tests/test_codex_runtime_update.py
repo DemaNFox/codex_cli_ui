@@ -114,7 +114,8 @@ class CodexRuntimeUpdateTest(unittest.TestCase):
         self.assertIn('update_kind == full-package', worker)
         self.assertIn('runuser -u "$api_user"', worker)
         self.assertIn("app-server generate-json-schema", worker)
-        self.assertIn("protocol differs from the supported snapshot", worker)
+        self.assertIn("verify-codex-protocol.py", worker)
+        self.assertIn("--latest", worker)
         self.assertIn("--resolve-update-json", worker)
         self.assertIn("if $runtime_created", worker)
         self.assertIn("rm -rf --one-file-system -- \"$runtime_dir\"", worker)
@@ -145,7 +146,7 @@ class CodexRuntimeUpdateTest(unittest.TestCase):
         self.assertGreater(
             worker.index("write_result succeeded", committed_finish), committed_finish
         )
-        self.assertIn("or set(t) !=", worker)
+        self.assertIn("Codex latest changed while the update was starting", worker)
         self.assertNotIn("trap rollback RETURN", worker)
         for forbidden in ("$URL", "$COMMAND", "browser_version", "request_path"):
             self.assertNotIn(forbidden, worker)

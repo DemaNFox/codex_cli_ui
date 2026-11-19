@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -29,6 +30,17 @@ def completed(
 
 
 class CodexUpdateBrokerTest(unittest.TestCase):
+    def test_latest_metadata_uses_fixed_registry_and_short_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cache = Path(directory) / "latest.json"
+            payload = b'{"name":"@openai/codex","version":"0.170.0"}'
+            with mock.patch.object(MODULE, "LATEST_CACHE", cache), mock.patch.object(
+                MODULE.urllib.request, "urlopen", return_value=io.BytesIO(payload)
+            ) as fetch:
+                self.assertEqual(MODULE.latest_stable_version(), "0.170.0")
+                self.assertEqual(MODULE.latest_stable_version(), "0.170.0")
+                fetch.assert_called_once_with(MODULE.LATEST_URL, timeout=5)
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -55,11 +67,13 @@ class CodexUpdateBrokerTest(unittest.TestCase):
             return completed(arguments)
 
         self.result_path = Path(self.temp.name) / "result.json"
+        self.latest_version = "0.160.0"
         self.broker = MODULE.CodexUpdateBroker(
             opt_root=self.root,
             result_path=self.result_path,
             command_runner=runner,
             machine="x86_64",
+            latest_version=lambda: self.latest_version,
         )
 
     def _release(self, release_id: str, version: str, *, compatibility: int) -> Path:
@@ -89,6 +103,7 @@ class CodexUpdateBrokerTest(unittest.TestCase):
         return {"version": 1, "requestId": str(uuid.uuid4()), "action": action}
 
     def add_runtime_target(self, version: str = "0.160.0") -> None:
+        self.latest_version = version
         protocol = {
             "codex_app_server_protocol.schemas.json": b'{"v":1}\n',
             "codex_app_server_protocol.v2.schemas.json": b'{"v":2}\n',
@@ -242,6 +257,13 @@ class CodexUpdateBrokerTest(unittest.TestCase):
         self.assertEqual(result["snapshot"]["state"], "ready")
         self.assertEqual(result["snapshot"]["availableVersion"], "codex-cli 0.160.0")
         self.assertEqual(result["snapshot"]["candidateReleaseId"], "runtime-0.160.0")
+
+    def test_runtime_candidate_uses_latest_even_when_baseline_is_older(self) -> None:
+        (self.root / "codex-update-candidate").unlink()
+        self.add_runtime_target("0.160.0")
+        self.latest_version = "0.170.0"
+        result = self.broker.handle(self.request("status"))
+        self.assertEqual(result["snapshot"]["availableVersion"], "codex-cli 0.170.0")
 
     def test_runtime_target_equal_or_older_than_installed_is_current(self) -> None:
         (self.root / "codex-update-candidate").unlink()
