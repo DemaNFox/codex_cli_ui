@@ -4966,6 +4966,7 @@ describe('Codex routes', () => {
     });
     expect(capabilities.statusCode).toBe(200);
     expect(capabilities.json()).toMatchObject({ authenticated: false, account: null });
+    expect(appServer.requests.some((request) => request.method === 'skills/list')).toBe(false);
 
     const project = await createProject(app, projectPath, session.headers);
     const blockedThread = await app.inject({

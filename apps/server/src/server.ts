@@ -5870,7 +5870,10 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     );
     const [accountRaw, skillsRaw] = await Promise.all([
       appServer.request('account/read', { refreshToken: false }),
-      appServer.request('skills/list', { cwds: projectPaths, forceReload: false }),
+      // Empty `cwds` means Codex's process cwd, not an empty skill scan.
+      projectPaths.length === 0
+        ? Promise.resolve({ data: [] })
+        : appServer.request('skills/list', { cwds: projectPaths, forceReload: false }),
     ]);
     const account = accountResponseSchema.parse(accountRaw);
     const skills = skillsResponseSchema.parse(skillsRaw);
@@ -5972,13 +5975,14 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (skills.data.some((entry) => entry.errors.length > 0))
       warnings.push('One or more project skill scans reported errors.');
     const names = new Set(skills.data.flatMap((entry) => entry.skills.map((skill) => skill.name)));
-    for (const required of [
-      'multi-agent-orchestrator',
-      'project-change-workflow',
-      'systematic-debugging',
-    ]) {
-      if (!names.has(required)) warnings.push(`Required project skill is missing: ${required}`);
-    }
+    if (projectPaths.length > 0)
+      for (const required of [
+        'multi-agent-orchestrator',
+        'project-change-workflow',
+        'systematic-debugging',
+      ]) {
+        if (!names.has(required)) warnings.push(`Required project skill is missing: ${required}`);
+      }
     return capabilitySchema.parse({
       codexVersion: config.codexVersionPin,
       authenticated: account.account != null,
