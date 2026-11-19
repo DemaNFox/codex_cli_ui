@@ -13,6 +13,12 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class InfraStaticTest(unittest.TestCase):
+    def test_ubuntu_installers_do_not_gate_on_release_number(self) -> None:
+        for script in ("scripts/bootstrap-ubuntu.sh", "scripts/install-package.sh"):
+            source = (ROOT / script).read_text(encoding="utf-8")
+            self.assertIn("[[ ${ID:-} == ubuntu ]] || die 'Ubuntu is required'", source)
+            self.assertNotIn("VERSION_ID", source)
+
     def test_fresh_install_selects_latest_and_checks_protocol_before_activation(self) -> None:
         source_installer = (ROOT / "install.sh").read_text(encoding="utf-8")
         bootstrap = (ROOT / "scripts/bootstrap-ubuntu.sh").read_text(encoding="utf-8")

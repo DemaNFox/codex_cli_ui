@@ -40,7 +40,7 @@ usage() {
 Usage: sudo scripts/bootstrap-ubuntu.sh [--install-nginx] [--build-tools-only]
 
 Installs the pinned system toolchain required by Codex Web UI on Ubuntu
-22.04/24.04: base utilities, Node.js 22, pnpm, and optionally @openai/codex. Node archives
+with systemd and APT: base utilities, Node.js 22, pnpm, and optionally @openai/codex. Node archives
 are downloaded from nodejs.org and checked against repository-pinned SHA-256
 digests before extraction. This command never authenticates Codex or reads its
 credential store.
@@ -68,7 +68,7 @@ done
 [[ -f /etc/os-release ]] || die '/etc/os-release is missing'
 # shellcheck disable=SC1091
 source /etc/os-release
-[[ ${ID:-} == ubuntu && ${VERSION_ID:-} =~ ^(22\.04|24\.04)$ ]] || die 'supported OS is Ubuntu 22.04 or 24.04'
+[[ ${ID:-} == ubuntu ]] || die 'Ubuntu is required'
 
 packages=(ca-certificates curl git python3 xz-utils)
 $install_nginx && packages+=(nginx)

@@ -114,7 +114,7 @@ activation.
 
 ## Assumptions
 
-- Ubuntu 22.04/24.04 with systemd, internet access and a sudo-capable non-root
+- Ubuntu with systemd and APT on x64/arm64, internet access and a sudo-capable non-root
   operator. The bootstrap installs missing `ca-certificates`, `curl`, `git`,
   `python3`, `xz-utils` and (for the bundled edge) Nginx through APT. It installs
   exact toolchain versions from `infra/toolchain.env`; startup fails unless

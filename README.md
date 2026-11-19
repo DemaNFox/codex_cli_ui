@@ -102,7 +102,7 @@ The [fresh-install and browser-authentication target](docs/0003-fresh-install-an
 
 ## Portability contract
 
-The repository is the complete distributable source. On Ubuntu 22.04/24.04
+The repository is the complete distributable source. On Ubuntu with systemd and APT
 (x64 or arm64), clone it and run the default restricted installation:
 
 ```bash
@@ -174,7 +174,7 @@ response, an account change, or a still-blocked post-check stays visible and doe
 
 A new host needs only:
 
-1. Ubuntu 22.04 or 24.04 on x64/arm64, Git, internet access and a normal sudo-capable user;
+1. Ubuntu with systemd and APT on x64/arm64, Git, internet access and a normal sudo-capable user;
 2. an HTTPS domain/proxy or an existing certificate and private key;
 3. write access for the selected Codex user to the intended project roots, unless explicit `host-admin` is used;
 4. an interactive terminal for the Web UI administrator bootstrap. Codex sign-in can follow in the browser.

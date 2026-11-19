@@ -281,7 +281,7 @@ flowchart LR
   to it without losing Web chats or Codex rollout history. Root mode is treated as a dedicated-host trust
   choice, not as protection against a malicious authenticated task.
 - Password-only exposure remains an accepted residual risk; second factor is recommended.
-- Supported portable targets are Ubuntu 22.04/24.04 on x64/arm64. Public plaintext HTTP and automatically
+- Portable targets are Ubuntu with systemd and APT on x64/arm64; installation checks required packages and pinned toolchain artifacts instead of an Ubuntu release number. Public plaintext HTTP and automatically
   generated bare-IP certificates are excluded; operators supply a domain-backed HTTPS proxy or valid keypair.
 - The reference deployment uses a dedicated 80 GiB ext4 volume with a fixed inode ceiling for state,
   projects and releases, plus bounded `/tmp` and `/var/tmp` tmpfs mounts. Portable installation defaults

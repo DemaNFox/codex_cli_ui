@@ -96,7 +96,7 @@ done
 
 require_root
 [[ -f /etc/os-release ]] && . /etc/os-release
-[[ ${ID:-} == ubuntu && ${VERSION_ID:-} =~ ^(22\.04|24\.04)$ ]] || die 'supported OS is Ubuntu 22.04 or 24.04'
+[[ ${ID:-} == ubuntu ]] || die 'Ubuntu is required'
 [[ -n $public_origin ]] || die '--public-origin is required'
 if $external_proxy; then
   [[ -z $tls_cert && -z $tls_key ]] || die 'choose either --external-proxy or --tls-cert/--tls-key'
