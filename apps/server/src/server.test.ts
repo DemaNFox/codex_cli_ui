@@ -4997,6 +4997,46 @@ describe('Codex routes', () => {
     expect(appServer.requests.filter((entry) => entry.method === 'turn/start')).toHaveLength(0);
   });
 
+  it('issues a scoped external client key once and revokes it without disclosing it in listings', async () => {
+    const { app } = await fixture();
+    const session = await login(app);
+    const expiresAt = new Date(Date.now() + 86_400_000).toISOString();
+    const created = await app.inject({
+      method: 'POST',
+      url: '/api/client-tokens',
+      headers: session.headers,
+      payload: { name: 'Laptop', expiresAt, scopes: ['submit', 'read'] },
+    });
+    expect(created.statusCode).toBe(201);
+    const issued = created.json<{ data: { id: string; token: string } }>().data;
+    expect(issued.token).toMatch(/^cwx_[0-9a-f-]{36}\.[A-Za-z0-9_-]{43}$/);
+    expect(created.headers['cache-control']).toBe('no-store');
+
+    const listed = await app.inject({
+      method: 'GET',
+      url: '/api/client-tokens',
+      headers: { cookie: session.cookie },
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.body).not.toContain(issued.token);
+    expect(listed.json()).toMatchObject({ data: [{ id: issued.id, name: 'Laptop' }] });
+
+    const revoked = await app.inject({
+      method: 'DELETE',
+      url: `/api/client-tokens/${issued.id}`,
+      headers: session.headers,
+    });
+    expect(revoked.statusCode).toBe(204);
+    const after = await app.inject({
+      method: 'GET',
+      url: '/api/client-tokens',
+      headers: { cookie: session.cookie },
+    });
+    expect(
+      after.json<{ data: { revokedAt: string | null }[] }>().data[0]?.revokedAt,
+    ).not.toBeNull();
+  });
+
   it('connects an API key only from an authenticated CSRF-protected request without echoing it', async () => {
     const { app, appServer } = await fixture();
     const key = 'sk-test-secret-key-0123456789';

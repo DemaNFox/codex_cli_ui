@@ -9,6 +9,7 @@ import {
   codexAccountSchema,
   codexUpdateSnapshotSchema,
   codexVersionDiscoverySchema,
+  createClientTokenRequestSchema,
   createProjectRequestSchema,
   loginRequestSchema,
   modelOptionSchema,
@@ -3406,6 +3407,56 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     auth.clearSessionCookie(reply);
     repository.audit('auth.logout', 'succeeded');
     return { loggedOut: true };
+  });
+
+  const publicClientToken = (record: {
+    id: string;
+    name: string;
+    scopes: readonly string[];
+    expiresAt: string;
+    revokedAt: string | null;
+    createdAt: string;
+  }) => ({
+    id: record.id,
+    name: record.name,
+    scopes: record.scopes,
+    expiresAt: record.expiresAt,
+    revokedAt: record.revokedAt,
+    createdAt: record.createdAt,
+  });
+
+  app.get('/api/client-tokens', (request, reply) => {
+    auth.authenticate(request);
+    reply.header('Cache-Control', 'no-store');
+    return { data: repository.listClientTokens().map(publicClientToken) };
+  });
+
+  app.post('/api/client-tokens', (request, reply) => {
+    csrfGuard(auth, request);
+    const input = createClientTokenRequestSchema.parse(request.body);
+    const expires = Date.parse(input.expiresAt);
+    if (expires <= Date.now() + 60_000 || expires > Date.now() + 365 * 24 * 60 * 60 * 1_000)
+      throw new HttpError(400, 'CLIENT_TOKEN_EXPIRY_INVALID');
+    if (repository.listClientTokens().filter((record) => record.revokedAt === null).length >= 64)
+      throw new HttpError(409, 'CLIENT_TOKEN_LIMIT');
+    const issued = auth.issueClientToken(input.name, input.scopes, input.expiresAt);
+    repository.audit('client-token.create', 'succeeded', {
+      id: issued.record.id,
+      scopes: input.scopes,
+    });
+    reply.header('Cache-Control', 'no-store');
+    return reply
+      .code(201)
+      .send({ data: { ...publicClientToken(issued.record), token: issued.token } });
+  });
+
+  app.delete('/api/client-tokens/:id', (request, reply) => {
+    csrfGuard(auth, request);
+    const id = z.uuid().parse((request.params as { id: unknown }).id);
+    if (!repository.revokeClientToken(id)) throw new HttpError(404, 'CLIENT_TOKEN_NOT_FOUND');
+    repository.audit('client-token.revoke', 'succeeded', { id });
+    reply.header('Cache-Control', 'no-store');
+    return reply.code(204).send();
   });
 
   app.post(

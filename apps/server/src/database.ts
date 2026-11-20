@@ -26,6 +26,26 @@ interface SessionRow {
   revoked_at: string | null;
 }
 
+export interface ClientTokenRecord {
+  id: string;
+  name: string;
+  tokenHash: string;
+  scopes: string[];
+  expiresAt: string;
+  revokedAt: string | null;
+  createdAt: string;
+}
+
+interface ClientTokenRow {
+  id: string;
+  name: string;
+  token_hash: string;
+  scopes_json: string;
+  expires_at: string;
+  revoked_at: string | null;
+  created_at: string;
+}
+
 interface ProjectRow {
   id: string;
   name: string;
@@ -403,6 +423,17 @@ export class SqliteRepository {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at, revoked_at);
+
+      CREATE TABLE IF NOT EXISTS client_tokens (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        token_hash TEXT NOT NULL UNIQUE,
+        scopes_json TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        revoked_at TEXT,
+        created_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS client_tokens_expiry_idx ON client_tokens(expires_at, revoked_at);
 
       CREATE TABLE IF NOT EXISTS login_attempts (
         attempt_key TEXT PRIMARY KEY,
@@ -1245,6 +1276,67 @@ export class SqliteRepository {
       )
       .run(id, tokenHash, csrfHash, expiresAt, now, now);
     return id;
+  }
+
+  createClientToken(input: {
+    id: string;
+    name: string;
+    tokenHash: string;
+    scopes: readonly string[];
+    expiresAt: string;
+  }): ClientTokenRecord {
+    const createdAt = new Date().toISOString();
+    this.database
+      .prepare(
+        'INSERT INTO client_tokens(id,name,token_hash,scopes_json,expires_at,created_at) VALUES(?,?,?,?,?,?)',
+      )
+      .run(
+        input.id,
+        input.name,
+        input.tokenHash,
+        JSON.stringify(input.scopes),
+        input.expiresAt,
+        createdAt,
+      );
+    return { ...input, scopes: [...input.scopes], revokedAt: null, createdAt };
+  }
+
+  getClientToken(id: string): ClientTokenRecord | undefined {
+    const row = this.database.prepare('SELECT * FROM client_tokens WHERE id=?').get(id) as
+      ClientTokenRow | undefined;
+    return (
+      row && {
+        id: row.id,
+        name: row.name,
+        tokenHash: row.token_hash,
+        scopes: JSON.parse(row.scopes_json) as string[],
+        expiresAt: row.expires_at,
+        revokedAt: row.revoked_at,
+        createdAt: row.created_at,
+      }
+    );
+  }
+
+  listClientTokens(): ClientTokenRecord[] {
+    const rows = this.database
+      .prepare('SELECT * FROM client_tokens ORDER BY created_at DESC, id DESC')
+      .all() as unknown as ClientTokenRow[];
+    return rows.map((row) => ({
+      id: row.id,
+      name: row.name,
+      tokenHash: row.token_hash,
+      scopes: JSON.parse(row.scopes_json) as string[],
+      expiresAt: row.expires_at,
+      revokedAt: row.revoked_at,
+      createdAt: row.created_at,
+    }));
+  }
+
+  revokeClientToken(id: string): boolean {
+    const result = this.database
+      .prepare('UPDATE client_tokens SET revoked_at=? WHERE id=? AND revoked_at IS NULL')
+      .run(new Date().toISOString(), id);
+    return result.changes === 1;
   }
 
   findSession(tokenHash: string, now = new Date()): SessionRow | undefined {

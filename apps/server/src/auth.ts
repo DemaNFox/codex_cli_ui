@@ -1,6 +1,6 @@
 import type { FastifyReply, FastifyRequest } from 'fastify';
 import { verify } from 'argon2';
-import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 
 import type { ServerConfig } from './config.js';
 import type { SqliteRepository } from './database.js';
@@ -21,6 +21,13 @@ export interface AuthContext {
   readonly expiresAt: string;
 }
 
+export type ClientTokenScope = 'submit' | 'read' | 'cancel';
+
+export interface ClientTokenContext {
+  readonly id: string;
+  readonly scopes: readonly ClientTokenScope[];
+}
+
 function opaqueToken(): string {
   return randomBytes(32).toString('base64url');
 }
@@ -37,6 +44,37 @@ export class AuthService {
 
   hash(value: string): string {
     return createHmac('sha256', this.config.sessionSecret).update(value).digest('hex');
+  }
+
+  issueClientToken(name: string, scopes: readonly ClientTokenScope[], expiresAt: string) {
+    const id = randomUUID();
+    const secret = opaqueToken();
+    const token = `cwx_${id}.${secret}`;
+    const record = this.repository.createClientToken({
+      id,
+      name,
+      tokenHash: this.hash(token),
+      scopes,
+      expiresAt,
+    });
+    return { token, record };
+  }
+
+  authenticateClient(request: FastifyRequest, scope: ClientTokenScope): ClientTokenContext {
+    const header = request.headers.authorization;
+    const match =
+      typeof header === 'string' &&
+      /^Bearer (cwx_([0-9a-f-]{36})\.[A-Za-z0-9_-]{43})$/.exec(header);
+    if (!match) throw new HttpError(401, 'CLIENT_TOKEN_REQUIRED');
+    const record = this.repository.getClientToken(match[2]!);
+    if (!record || record.revokedAt || record.expiresAt <= new Date().toISOString())
+      throw new HttpError(401, 'CLIENT_TOKEN_INVALID');
+    const actual = Buffer.from(this.hash(match[1]!), 'hex');
+    const expected = Buffer.from(record.tokenHash, 'hex');
+    if (actual.length !== expected.length || !timingSafeEqual(actual, expected))
+      throw new HttpError(401, 'CLIENT_TOKEN_INVALID');
+    if (!record.scopes.includes(scope)) throw new HttpError(403, 'CLIENT_SCOPE_DENIED');
+    return { id: record.id, scopes: record.scopes as ClientTokenScope[] };
   }
 
   assertOrigin(request: FastifyRequest): void {

@@ -194,6 +194,17 @@ export const createProjectRequestSchema = z.object({
   defaultPermissionPreset: permissionPresetSchema.default('workspace-write'),
 });
 
+export const clientTokenScopeSchema = z.enum(['submit', 'read', 'cancel']);
+export const createClientTokenRequestSchema = z.object({
+  name: z.string().trim().min(1).max(120),
+  expiresAt: z.string().datetime(),
+  scopes: z
+    .array(clientTokenScopeSchema)
+    .min(1)
+    .max(3)
+    .refine((scopes) => new Set(scopes).size === scopes.length),
+});
+
 export const modelOptionSchema = z.object({
   id: z.string(),
   displayName: z.string(),
