@@ -60,6 +60,20 @@ class RemoteCliTests(unittest.TestCase):
             remote.submit(args)
         self.assertEqual(send.call_count, 1)
 
+    def test_rejects_unsafe_multipart_filename_before_request(self):
+        args = types.SimpleNamespace(file=["unsafe"], request_id="fixed-request-id",
+            project_id="project", text="do work", model=None, reasoning=None,
+            permission=None, approval=None)
+        with patch.object(remote, "credentials", return_value=("https://example.test", "secret")), \
+             patch.object(remote, "Path") as path, patch.object(remote, "request") as send:
+            file = path.return_value.expanduser.return_value.resolve.return_value
+            file.name = 'bad"name.txt'
+            file.is_file.return_value = True
+            file.stat.return_value.st_size = 4
+            with self.assertRaises(RuntimeError):
+                remote.submit(args)
+            send.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -64,7 +64,8 @@ def submit(args):
     files = [Path(item).expanduser().resolve(strict=True) for item in args.file]
     manifests = []
     for file in files:
-        if not file.is_file() or file.stat().st_size > 20 * 1024 * 1024:
+        if (not file.is_file() or not 0 < file.stat().st_size <= 20 * 1024 * 1024 or
+                len(file.name) > 180 or any(character in file.name for character in '"\r\n\\')):
             raise RuntimeError(f"Неподдерживаемый файл: {file}")
         manifests.append({"name": file.name, "size": file.stat().st_size,
                           "sha256": hashlib.sha256(file.read_bytes()).hexdigest()})
