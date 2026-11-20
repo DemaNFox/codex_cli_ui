@@ -5090,6 +5090,19 @@ describe('Codex routes', () => {
     expect(duplicate.statusCode).toBe(200);
     expect(duplicate.json()).toMatchObject({ data: { id: task.id, threadId: task.threadId } });
     expect(appServer.requests.filter((entry) => entry.method === 'thread/start')).toHaveLength(1);
+    await vi.waitFor(() =>
+      expect(appServer.requests.filter((entry) => entry.method === 'turn/start')).toHaveLength(1),
+    );
+    const otherDevice = await login(app);
+    const navigation = await app.inject({
+      method: 'GET',
+      url: '/api/navigation',
+      headers: { cookie: otherDevice.cookie },
+    });
+    expect(
+      navigation.json<{ data: { threads: Array<{ id: string }> } }>().data.threads,
+    ).toContainEqual(expect.objectContaining({ id: task.threadId }));
+    expect(appServer.requests.filter((entry) => entry.method === 'turn/start')).toHaveLength(1);
     const read = await app.inject({
       method: 'GET',
       url: `/api/remote-tasks/${task.id}`,
