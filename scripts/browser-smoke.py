@@ -36,6 +36,8 @@ def main() -> int:
     push_endpoint = "https://push.example/smoke-device"
     account_login_pending = False
     api_key_connected = False
+    client_tokens: list[dict[str, object]] = []
+    issued_client_secret = "cwx_smoke-one-time-secret"
     codex_update_state = "ready"
     queued_turn_visible = True
     ambiguous_turn_visible = True
@@ -107,6 +109,7 @@ def main() -> int:
         nonlocal auto_rate_limit_reset
         nonlocal continuation_created
         nonlocal continuation_attachment_failures
+        nonlocal client_tokens
         request = route.request
         parsed = urlparse(request.url)
         path = parsed.path
@@ -128,6 +131,22 @@ def main() -> int:
         elif path == "/api/auth/login":
             signed_in = True
             payload(route, 200, {"username": "owner", "csrfToken": "csrf-smoke"})
+        elif path == "/api/client-tokens" and request.method == "GET":
+            payload(route, 200, {"data": client_tokens})
+        elif path == "/api/client-tokens" and request.method == "POST":
+            body = request.post_data_json
+            if request.headers.get("x-csrf-token") != "csrf-smoke":
+                raise AssertionError("client key creation omitted CSRF")
+            token = {"id": "client-1", "name": body["name"], "scopes": body["scopes"],
+                     "createdAt": "2026-10-01T00:00:00.000Z", "expiresAt": body["expiresAt"],
+                     "revokedAt": None}
+            client_tokens = [token]
+            payload(route, 201, {"data": {**token, "token": issued_client_secret}})
+        elif path == "/api/client-tokens/client-1" and request.method == "DELETE":
+            if request.headers.get("x-csrf-token") != "csrf-smoke":
+                raise AssertionError("client key revocation omitted CSRF")
+            client_tokens = [{**client_tokens[0], "revokedAt": "2026-10-02T00:00:00.000Z"}]
+            route.fulfill(status=204)
         elif path == "/api/navigation":
             payload(route, 200, {"data": {
                 "projects": [] if project_archived else [{
@@ -1438,6 +1457,10 @@ def main() -> int:
         page.get_by_label("Пароль").fill("correct-horse-battery-staple")
         page.get_by_role("button", name="Войти").click()
         page.get_by_role("heading", name="Переносимый чат").wait_for()
+        page.goto(f"{BASE_URL}/?threadId=t2", wait_until="domcontentloaded")
+        page.get_by_role("heading", name="Фоновая задача").wait_for()
+        page.goto(f"{BASE_URL}/?threadId=t1", wait_until="domcontentloaded")
+        page.get_by_role("heading", name="Переносимый чат").wait_for()
         if os.environ.get("CODEX_WEB_CONVERSATION_SPINE_ONLY") == "1":
             for _ in range(2):
                 page.get_by_text("Старая задача после обновления страницы", exact=True).wait_for()
@@ -2138,6 +2161,15 @@ def main() -> int:
             raise AssertionError("API-key login did not reach the protected server command")
         if page.evaluate("JSON.stringify(localStorage)").find("sk-browser-smoke-key") != -1:
             raise AssertionError("API key leaked into browser localStorage")
+        settings.get_by_role("tab", name="Внешние клиенты").click()
+        settings.get_by_label("Имя устройства").fill("Laptop")
+        settings.get_by_role("button", name="Выпустить ключ").click()
+        settings.get_by_text(issued_client_secret).wait_for()
+        if issued_client_secret in page.evaluate("JSON.stringify(localStorage)"):
+            raise AssertionError("external client key leaked into browser localStorage")
+        settings.get_by_role("button", name="Отозвать").click()
+        settings.get_by_text("отозван", exact=False).wait_for()
+        settings.get_by_role("tab", name="Аккаунт").click()
         page.keyboard.press("Escape")
         settings.wait_for(state="detached")
         page.wait_for_function(
@@ -2370,6 +2402,10 @@ def main() -> int:
             field_box = mobile_settings.get_by_label(label).bounding_box()
             if not field_box or field_box["x"] < 0 or field_box["x"] + field_box["width"] > 390:
                 raise AssertionError(f"mobile resource control is outside the viewport: {label}")
+        mobile_settings.get_by_role("tab", name="Внешние клиенты").click()
+        mobile_settings.get_by_text("Laptop", exact=True).wait_for()
+        if page.evaluate("document.documentElement.scrollWidth > document.documentElement.clientWidth"):
+            raise AssertionError("external client settings create horizontal mobile overflow")
         mobile_settings.get_by_role("tab", name="Аккаунт").click()
         mobile_settings.get_by_role("button", name="Сменить аккаунт").click()
         mobile_account_dialog = page.get_by_role("dialog", name="Смена аккаунта Codex")

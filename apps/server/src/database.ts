@@ -36,6 +36,43 @@ export interface ClientTokenRecord {
   createdAt: string;
 }
 
+export interface RemoteTaskRecord {
+  id: string;
+  requestId: string;
+  clientTokenId: string;
+  requestHash: string;
+  requestJson: string;
+  projectId: string;
+  threadId: string | null;
+  queuedTurnId: number | null;
+  turnId: string | null;
+  terminalPhase: 'completed' | 'failed' | null;
+  finalAnswer: string | null;
+  status:
+    'accepted' | 'creating' | 'needsReview' | 'queued' | 'cancelRequested' | 'cancelled' | 'failed';
+  errorCode: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+interface RemoteTaskRow {
+  id: string;
+  request_id: string;
+  client_token_id: string;
+  request_hash: string;
+  request_json: string;
+  project_id: string;
+  thread_id: string | null;
+  queued_turn_id: number | null;
+  turn_id: string | null;
+  terminal_phase: 'completed' | 'failed' | null;
+  final_answer: string | null;
+  status: RemoteTaskRecord['status'];
+  error_code: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 interface ClientTokenRow {
   id: string;
   name: string;
@@ -435,6 +472,33 @@ export class SqliteRepository {
       );
       CREATE INDEX IF NOT EXISTS client_tokens_expiry_idx ON client_tokens(expires_at, revoked_at);
 
+      CREATE TABLE IF NOT EXISTS remote_tasks (
+        id TEXT PRIMARY KEY,
+        request_id TEXT NOT NULL UNIQUE,
+        client_token_id TEXT NOT NULL REFERENCES client_tokens(id) ON DELETE RESTRICT,
+        request_hash TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+        thread_id TEXT REFERENCES threads(id) ON DELETE RESTRICT,
+        queued_turn_id INTEGER,
+        turn_id TEXT,
+        terminal_phase TEXT CHECK(terminal_phase IN ('completed','failed')),
+        final_answer TEXT,
+        status TEXT NOT NULL CHECK(status IN ('accepted','creating','needsReview','queued','cancelRequested','cancelled','failed')),
+        error_code TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS remote_tasks_thread_idx ON remote_tasks(thread_id);
+
+      CREATE TABLE IF NOT EXISTS remote_task_attachments (
+        task_id TEXT NOT NULL REFERENCES remote_tasks(id) ON DELETE RESTRICT,
+        slot INTEGER NOT NULL CHECK(slot >= 0 AND slot < 8),
+        attachment_id TEXT NOT NULL UNIQUE REFERENCES attachments(id) ON DELETE CASCADE,
+        sha256 TEXT NOT NULL,
+        PRIMARY KEY(task_id, slot)
+      );
+
       CREATE TABLE IF NOT EXISTS login_attempts (
         attempt_key TEXT PRIMARY KEY,
         failures INTEGER NOT NULL,
@@ -718,6 +782,7 @@ export class SqliteRepository {
       "CREATE UNIQUE INDEX IF NOT EXISTS queued_turn_recovery_origin_idx ON queued_turns(thread_id,origin_turn_id) WHERE source='rate-limit-continuation' AND origin_turn_id IS NOT NULL",
     );
     this.recoverInterruptedQueuedTurns();
+    this.fenceInterruptedRemoteTasks();
     this.enforcePushStorageBounds();
   }
 
@@ -1337,6 +1402,213 @@ export class SqliteRepository {
       .prepare('UPDATE client_tokens SET revoked_at=? WHERE id=? AND revoked_at IS NULL')
       .run(new Date().toISOString(), id);
     return result.changes === 1;
+  }
+
+  private remoteTask(row: RemoteTaskRow): RemoteTaskRecord {
+    return {
+      id: row.id,
+      requestId: row.request_id,
+      clientTokenId: row.client_token_id,
+      requestHash: row.request_hash,
+      requestJson: row.request_json,
+      projectId: row.project_id,
+      threadId: row.thread_id,
+      queuedTurnId: row.queued_turn_id,
+      turnId: row.turn_id,
+      terminalPhase: row.terminal_phase,
+      finalAnswer: row.final_answer,
+      status: row.status,
+      errorCode: row.error_code,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
+  getRemoteTask(id: string): RemoteTaskRecord | undefined {
+    const row = this.database.prepare('SELECT * FROM remote_tasks WHERE id=?').get(id) as
+      RemoteTaskRow | undefined;
+    return row && this.remoteTask(row);
+  }
+
+  getRemoteTaskByRequestId(requestId: string): RemoteTaskRecord | undefined {
+    const row = this.database
+      .prepare('SELECT * FROM remote_tasks WHERE request_id=?')
+      .get(requestId) as RemoteTaskRow | undefined;
+    return row && this.remoteTask(row);
+  }
+
+  listRemoteTasksNeedingReview(limit = 16): RemoteTaskRecord[] {
+    const rows = this.database
+      .prepare(
+        "SELECT * FROM remote_tasks WHERE status='needsReview' AND thread_id IS NULL ORDER BY created_at LIMIT ?",
+      )
+      .all(limit) as unknown as RemoteTaskRow[];
+    return rows.map((row) => this.remoteTask(row));
+  }
+
+  reserveRemoteTask(input: {
+    id: string;
+    requestId: string;
+    clientTokenId: string;
+    requestHash: string;
+    requestJson: string;
+    projectId: string;
+  }): { record: RemoteTaskRecord; created: boolean } {
+    const now = new Date().toISOString();
+    const result = this.database
+      .prepare(
+        `INSERT OR IGNORE INTO remote_tasks(id,request_id,client_token_id,request_hash,request_json,project_id,status,created_at,updated_at)
+         VALUES(?,?,?,?,?,?,'accepted',?,?)`,
+      )
+      .run(
+        input.id,
+        input.requestId,
+        input.clientTokenId,
+        input.requestHash,
+        input.requestJson,
+        input.projectId,
+        now,
+        now,
+      );
+    return {
+      record: this.getRemoteTaskByRequestId(input.requestId)!,
+      created: result.changes === 1,
+    };
+  }
+
+  updateRemoteTask(
+    id: string,
+    status: RemoteTaskRecord['status'],
+    changes: { threadId?: string; queuedTurnId?: number; errorCode?: string } = {},
+  ): RemoteTaskRecord {
+    this.database
+      .prepare(
+        `UPDATE remote_tasks SET status=?,thread_id=COALESCE(?,thread_id),
+         queued_turn_id=COALESCE(?,queued_turn_id),error_code=?,updated_at=? WHERE id=?`,
+      )
+      .run(
+        status,
+        changes.threadId ?? null,
+        changes.queuedTurnId ?? null,
+        changes.errorCode ?? null,
+        new Date().toISOString(),
+        id,
+      );
+    return this.getRemoteTask(id)!;
+  }
+
+  recordRemoteTaskEvent(event: SafeEvent): void {
+    if (!event.turnId) return;
+    if (
+      event.kind === 'agent-message' &&
+      event.phase === 'completed' &&
+      event.payload.messagePhase === 'final_answer' &&
+      typeof event.payload.text === 'string'
+    ) {
+      this.database
+        .prepare(
+          'UPDATE remote_tasks SET final_answer=?,updated_at=? WHERE thread_id=? AND turn_id=?',
+        )
+        .run(event.payload.text, new Date().toISOString(), event.threadId, event.turnId);
+    }
+    if (event.kind === 'turn' && (event.phase === 'completed' || event.phase === 'failed')) {
+      this.database
+        .prepare(
+          'UPDATE remote_tasks SET terminal_phase=?,updated_at=? WHERE thread_id=? AND turn_id=?',
+        )
+        .run(event.phase, new Date().toISOString(), event.threadId, event.turnId);
+    }
+  }
+
+  fenceInterruptedRemoteTasks(): number {
+    return Number(
+      this.database
+        .prepare(
+          "UPDATE remote_tasks SET status='needsReview',error_code='REMOTE_TASK_START_OUTCOME_UNKNOWN',updated_at=? WHERE status='creating'",
+        )
+        .run(new Date().toISOString()).changes,
+    );
+  }
+
+  getRemoteTaskAttachment(taskId: string, slot: number): string | undefined {
+    const row = this.database
+      .prepare('SELECT attachment_id FROM remote_task_attachments WHERE task_id=? AND slot=?')
+      .get(taskId, slot) as { attachment_id: string } | undefined;
+    return row?.attachment_id;
+  }
+
+  listRemoteTaskAttachments(taskId: string): Array<{ slot: number; attachmentId: string }> {
+    return this.database
+      .prepare(
+        'SELECT slot,attachment_id AS attachmentId FROM remote_task_attachments WHERE task_id=? ORDER BY slot',
+      )
+      .all(taskId) as Array<{ slot: number; attachmentId: string }>;
+  }
+
+  addRemoteTaskAttachment(
+    taskId: string,
+    slot: number,
+    attachment: Omit<AttachmentRecord, 'turnId' | 'createdAt'>,
+    sha256: string,
+  ): AttachmentRecord {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const created = this.createAttachment(attachment);
+      this.database
+        .prepare(
+          'INSERT INTO remote_task_attachments(task_id,slot,attachment_id,sha256) VALUES(?,?,?,?)',
+        )
+        .run(taskId, slot, created.id, sha256);
+      this.database.exec('COMMIT');
+      return created;
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  cancelStagedRemoteTask(id: string): RemoteTaskRecord | undefined {
+    this.database.exec('BEGIN IMMEDIATE');
+    try {
+      const task = this.getRemoteTask(id);
+      if (!task || task.status !== 'accepted' || !task.threadId) {
+        this.database.exec('COMMIT');
+        return undefined;
+      }
+      const attachments = this.listRemoteTaskAttachments(id).map((item) =>
+        this.getAttachment(item.attachmentId),
+      );
+      const now = new Date().toISOString();
+      const insertDeletion = this.database.prepare(
+        `INSERT INTO attachment_file_deletions(
+          id,project_id,thread_id,storage_name,attempts,next_attempt_at,created_at,updated_at
+        ) VALUES(?,?,?,?,0,?,?,?)`,
+      );
+      for (const attachment of attachments) {
+        if (!attachment || attachment.turnId !== null)
+          throw new Error('REMOTE_ATTACHMENT_NOT_STAGED');
+        insertDeletion.run(
+          attachment.id,
+          task.projectId,
+          task.threadId,
+          attachment.storageName,
+          Date.now(),
+          now,
+          now,
+        );
+      }
+      this.database.prepare('DELETE FROM remote_task_attachments WHERE task_id=?').run(id);
+      for (const attachment of attachments)
+        this.database.prepare('DELETE FROM attachments WHERE id=?').run(attachment!.id);
+      this.database
+        .prepare("UPDATE remote_tasks SET status='cancelled',updated_at=? WHERE id=?")
+        .run(now, id);
+      this.database.exec('COMMIT');
+      return this.getRemoteTask(id)!;
+    } catch (error) {
+      this.database.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   findSession(tokenHash: string, now = new Date()): SessionRow | undefined {
@@ -2887,6 +3159,18 @@ export class SqliteRepository {
       const removed = this.database
         .prepare("DELETE FROM queued_turns WHERE id=? AND status IN ('dispatching','unknown')")
         .run(id).changes;
+      this.database
+        .prepare(
+          `UPDATE remote_tasks SET turn_id=?,updated_at=?,
+          terminal_phase=(SELECT phase FROM events WHERE thread_id=? AND turn_id=?
+            AND kind='turn' AND phase IN ('completed','failed') ORDER BY id DESC LIMIT 1),
+          final_answer=(SELECT json_extract(payload_json,'$.text') FROM events
+            WHERE thread_id=? AND turn_id=? AND kind='agent-message' AND phase='completed'
+              AND json_extract(payload_json,'$.messagePhase')='final_answer'
+            ORDER BY id DESC LIMIT 1)
+         WHERE queued_turn_id=?`,
+        )
+        .run(turnId, now, record.threadId, turnId, record.threadId, turnId, id);
       if (idempotency !== 1 || removed !== 1) throw new Error('QUEUED_TURN_COMPLETION_FAILED');
       this.database.exec('COMMIT');
       return true;

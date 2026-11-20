@@ -289,6 +289,30 @@ export const startTurnRequestSchema = z
   });
 export type StartTurnRequest = z.infer<typeof startTurnRequestSchema>;
 
+export const submitRemoteTaskRequestSchema = z.object({
+  requestId: z.string().uuid(),
+  projectId: z.string().uuid(),
+  text: z.string().trim().min(1).max(100_000),
+  model: z.string().min(1).max(120).optional(),
+  reasoningEffort: z.string().min(1).max(40).optional(),
+  permissionPreset: permissionPresetSchema.optional(),
+  approvalPolicy: approvalPolicySchema.optional(),
+  attachments: z
+    .array(
+      z.object({
+        name: z.string().min(1).max(255),
+        size: z
+          .number()
+          .int()
+          .positive()
+          .max(20 * 1024 * 1024),
+        sha256: z.string().regex(/^[0-9a-f]{64}$/),
+      }),
+    )
+    .max(8)
+    .default([]),
+});
+
 const queuedTurnBaseSchema = z.object({
   id: z.number().int().positive(),
   threadId: z.string().min(1).max(200),

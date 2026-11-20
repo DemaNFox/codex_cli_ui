@@ -25,6 +25,7 @@ import {
   startThreadRequestSchema,
   startTurnRequestSchema,
   startTurnResultSchema,
+  submitRemoteTaskRequestSchema,
   steerTurnRequestSchema,
   threadUsageSchema,
   threadContinuationDraftSchema,
@@ -89,6 +90,7 @@ import {
   type ApprovalRecord,
   type AttachmentRecord,
   type QueuedTurnRecord,
+  type RemoteTaskRecord,
   type StoredAutoRateLimitReset,
   type SqliteRepository,
 } from './database.js';
@@ -3188,7 +3190,9 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
             },
           }
         : normalized;
-    publish(repository.appendEvent(persistedNotification));
+    const persistedEvent = repository.appendEvent(persistedNotification);
+    repository.recordRemoteTaskEvent(persistedEvent);
+    publish(persistedEvent);
   };
   const onAppServerLifecycle = (event: AppServerLifecycleEvent): void => {
     if (
@@ -5007,6 +5011,463 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     });
   };
 
+  const publicRemoteTask = (record: RemoteTaskRecord) => {
+    const thread = record.threadId ? repository.getThread(record.threadId) : undefined;
+    const queued = record.queuedTurnId ? repository.getQueuedTurn(record.queuedTurnId) : undefined;
+    const started = record.threadId
+      ? z
+          .object({ data: startTurnResultSchema })
+          .safeParse(
+            repository.getIdempotent(`turn:${record.threadId}`, record.requestId)?.response,
+          )
+      : null;
+    const turnId =
+      record.turnId ??
+      (started?.success && started.data.data.status === 'started'
+        ? started.data.data.turnId
+        : null);
+    const events = record.threadId ? repository.listRecentEvents(record.threadId, 200).events : [];
+    const pendingInteraction = record.threadId
+      ? repository
+          .listUnfinishedApprovals()
+          .find((item) => item.threadId === record.threadId && item.turnId === turnId)
+      : undefined;
+    let status: string = record.status;
+    if (record.status === 'creating') status = 'checking';
+    if (record.status === 'cancelled') status = 'cancelled';
+    else if (record.status === 'cancelRequested')
+      status =
+        (turnId !== null && thread?.activeTurnId === turnId) ||
+        (thread && repository.countActiveSubagentsForRoot(thread.id))
+          ? 'running'
+          : record.terminalPhase
+            ? 'cancelled'
+            : 'needsReview';
+    else if (queued?.status === 'unknown' || record.status === 'needsReview')
+      status = 'needsReview';
+    else if (queued?.status === 'failed' || record.status === 'failed') status = 'failed';
+    else if (queued) status = 'queued';
+    else if (pendingInteraction)
+      status = pendingInteraction.method.includes('userInput')
+        ? 'awaitingInput'
+        : 'awaitingApproval';
+    else if (turnId && thread) {
+      const terminal = events.find(
+        (event) =>
+          event.turnId === turnId &&
+          event.kind === 'turn' &&
+          (event.phase === 'completed' || event.phase === 'failed'),
+      );
+      status =
+        thread.activeTurnId === turnId || repository.countActiveSubagentsForRoot(thread.id)
+          ? 'running'
+          : (record.terminalPhase ?? terminal?.phase) === 'completed'
+            ? 'completed'
+            : (record.terminalPhase ?? terminal?.phase) === 'failed'
+              ? 'failed'
+              : 'needsReview';
+    }
+    const finalAnswer =
+      status === 'completed'
+        ? (record.finalAnswer ??
+          [...events]
+            .reverse()
+            .find(
+              (event) =>
+                event.turnId === turnId &&
+                event.kind === 'agent-message' &&
+                event.phase === 'completed' &&
+                event.payload.messagePhase === 'final_answer',
+            )?.payload.text)
+        : null;
+    return {
+      id: record.id,
+      requestId: record.requestId,
+      projectId: record.projectId,
+      threadId: record.threadId,
+      turnId,
+      status,
+      errorCode: record.errorCode ?? queued?.errorCode ?? null,
+      finalAnswer: typeof finalAnswer === 'string' ? finalAnswer : null,
+      chatUrl: record.threadId
+        ? `${config.webOrigin}/?threadId=${encodeURIComponent(record.threadId)}`
+        : null,
+      eventCursor: record.threadId ? repository.eventHighWater(record.threadId) : null,
+      createdAt: record.createdAt,
+      updatedAt: record.updatedAt,
+    };
+  };
+
+  const queueRemoteTask = (record: RemoteTaskRecord): RemoteTaskRecord => {
+    if (!record.threadId) throw new HttpError(409, 'REMOTE_THREAD_NOT_READY');
+    const input = submitRemoteTaskRequestSchema.parse(JSON.parse(record.requestJson));
+    const uploaded = repository.listRemoteTaskAttachments(record.id);
+    if (
+      uploaded.length !== input.attachments.length ||
+      uploaded.some((attachment, index) => attachment.slot !== index)
+    )
+      throw new HttpError(409, 'REMOTE_ATTACHMENTS_INCOMPLETE');
+    const turnInput = startTurnRequestSchema.parse({
+      text: input.text,
+      attachmentIds: uploaded.map((attachment) => attachment.attachmentId),
+      model: input.model,
+      reasoningEffort: input.reasoningEffort,
+      permissionPreset: input.permissionPreset,
+      approvalPolicy: input.approvalPolicy,
+      idempotencyKey: input.requestId,
+    });
+    const turnHash = requestHash(turnInput);
+    const operation = `turn:${record.threadId}`;
+    const previous = repository.getQueuedTurnByIdempotency(record.threadId, record.requestId);
+    if (previous)
+      return repository.updateRemoteTask(record.id, 'queued', { queuedTurnId: previous.id });
+    const priorReservation = repository.getIdempotent(operation, record.requestId);
+    if (priorReservation?.state === 'completed')
+      return repository.updateRemoteTask(record.id, 'queued');
+    if (priorReservation?.state === 'pending')
+      repository.releasePendingIdempotent(operation, record.requestId, turnHash);
+    const reservation = repository.reserveIdempotent(operation, record.requestId, turnHash);
+    if (!reservation.reserved) throw new HttpError(409, 'REMOTE_TURN_RESERVATION_CONFLICT');
+    const queued = repository.enqueueTurn({
+      threadId: record.threadId,
+      idempotencyKey: record.requestId,
+      requestHash: turnHash,
+      request: turnInput,
+      claimToken: `queued:${record.threadId}:${record.requestId}`,
+    });
+    const updated = repository.updateRemoteTask(record.id, 'queued', {
+      queuedTurnId: queued.record.id,
+    });
+    requestQueuedTurnDispatch();
+    return updated;
+  };
+
+  const remoteReconciliations = new Map<string, Promise<RemoteTaskRecord>>();
+  const reconcileRemoteThread = (record: RemoteTaskRecord): Promise<RemoteTaskRecord> => {
+    const inFlight = remoteReconciliations.get(record.id);
+    if (inFlight) return inFlight;
+    const work = (async () => {
+      const current = repository.getRemoteTask(record.id)!;
+      if (current.threadId || current.status !== 'needsReview') return current;
+      const project = repository.getProject(current.projectId);
+      if (!project) return current;
+      const cwd = await canonicalProjectPath(pathPolicy, project);
+      const matches: z.infer<typeof rpcThreadSchema>[] = [];
+      let cursor: string | null = null;
+      const seen = new Set<string>();
+      for (let page = 0; page < 100; page += 1) {
+        const response = z
+          .object({
+            data: z.array(rpcThreadSchema),
+            nextCursor: z.string().nullable().optional(),
+          })
+          .parse(
+            await appServer.request('thread/list', {
+              cwd,
+              archived: false,
+              cursor,
+              limit: 100,
+            }),
+          );
+        for (const thread of response.data) {
+          if (thread.threadSource === `remote-task:${current.id}` && thread.cwd === cwd)
+            matches.push(thread);
+        }
+        cursor = response.nextCursor ?? null;
+        if (cursor === null) break;
+        if (seen.has(cursor)) return current;
+        seen.add(cursor);
+        if (page === 99) return current;
+      }
+      if (matches.length !== 1) return current;
+      const thread = repository.upsertThread(mapThread(matches[0]!, project.id, false));
+      repository.markThreadHistoryHydrated(thread.id);
+      const attached = repository.updateRemoteTask(current.id, 'accepted', { threadId: thread.id });
+      const input = submitRemoteTaskRequestSchema.parse(JSON.parse(attached.requestJson));
+      return input.attachments.length === 0 ? queueRemoteTask(attached) : attached;
+    })().finally(() => remoteReconciliations.delete(record.id));
+    remoteReconciliations.set(record.id, work);
+    return work;
+  };
+
+  const remoteReviewTimer = setInterval(() => {
+    for (const record of repository.listRemoteTasksNeedingReview())
+      void reconcileRemoteThread(record).catch(() => undefined);
+  }, 30_000);
+  remoteReviewTimer.unref();
+  app.addHook('onClose', () => clearInterval(remoteReviewTimer));
+
+  app.post('/api/remote-tasks', async (request, reply) => {
+    const client = auth.authenticateClient(request, 'submit');
+    const input = submitRemoteTaskRequestSchema.parse(request.body);
+    const hash = requestHash(input);
+    const existing = repository.getRemoteTaskByRequestId(input.requestId);
+    if (existing) {
+      if (existing.clientTokenId !== client.id || existing.requestHash !== hash)
+        throw new HttpError(409, 'REMOTE_REQUEST_ID_CONFLICT');
+      reply.header('Cache-Control', 'no-store');
+      const reviewed =
+        existing.status === 'needsReview' && !existing.threadId
+          ? await reconcileRemoteThread(existing)
+          : existing;
+      const current =
+        reviewed.status === 'accepted' && reviewed.threadId && input.attachments.length === 0
+          ? queueRemoteTask(reviewed)
+          : reviewed;
+      return reply.code(200).send({ data: publicRemoteTask(current) });
+    }
+    if (repository.listProjects().length === 0) throw new HttpError(409, 'NO_PROJECTS_AVAILABLE');
+    const project = repository.getProject(input.projectId);
+    if (!project) throw new HttpError(404, 'PROJECT_NOT_FOUND');
+    requireProjectWorkAllowed(project);
+    if (codexUpdateInterlocked || upgradeDrainRequested())
+      throw new HttpError(503, 'SERVICE_DRAINING');
+    if (accountLoginInterlocked) throw new HttpError(409, 'CODEX_ACCOUNT_LOGIN_PENDING');
+    await requireCodexConnected();
+    const reserved = repository.reserveRemoteTask({
+      id: randomUUID(),
+      requestId: input.requestId,
+      clientTokenId: client.id,
+      requestHash: hash,
+      requestJson: JSON.stringify(input),
+      projectId: project.id,
+    });
+    if (!reserved.created) {
+      if (reserved.record.clientTokenId !== client.id || reserved.record.requestHash !== hash)
+        throw new HttpError(409, 'REMOTE_REQUEST_ID_CONFLICT');
+      return reply.code(200).send({ data: publicRemoteTask(reserved.record) });
+    }
+    const record = repository.updateRemoteTask(reserved.record.id, 'creating');
+    beginPendingThreadStart(project.id);
+    let result: z.infer<typeof threadResponseSchema>;
+    let nativeStartIssued = false;
+    try {
+      const cwd = await canonicalProjectPath(pathPolicy, project);
+      const preset = input.permissionPreset ?? project.defaultPermissionPreset;
+      const reasoningEffort = input.reasoningEffort ?? project.defaultReasoningEffort;
+      const storedAgentLimit = repository.getResourceLimits().desired.maxParallelAgents;
+      const configuredAgentLimit =
+        storedAgentLimit ??
+        (dependencies.resourceBroker ? autoParallelAgents(await brokerSnapshot()) : null);
+      nativeStartIssued = true;
+      result = threadResponseSchema.parse(
+        await appServer.request('thread/start', {
+          cwd,
+          model: input.model ?? project.defaultModel,
+          approvalPolicy: input.approvalPolicy ?? 'on-request',
+          approvalsReviewer: 'user',
+          sandbox: sandboxMode(preset),
+          config:
+            reasoningEffort === null && configuredAgentLimit === null
+              ? null
+              : {
+                  ...(reasoningEffort === null ? {} : { model_reasoning_effort: reasoningEffort }),
+                  ...(configuredAgentLimit === null
+                    ? {}
+                    : { agents: { max_threads: configuredAgentLimit } }),
+                },
+          ephemeral: false,
+          serviceName: 'codex-web-ui',
+          threadSource: `remote-task:${record.id}`,
+        }),
+      );
+      if (result.thread.cwd !== cwd) throw new HttpError(502, 'APP_SERVER_CWD_MISMATCH');
+    } catch (error) {
+      const definitelyNotStarted = !nativeStartIssued || turnStartWasDefinitelyNotAccepted(error);
+      repository.updateRemoteTask(record.id, definitelyNotStarted ? 'failed' : 'needsReview', {
+        errorCode: definitelyNotStarted
+          ? 'REMOTE_THREAD_START_FAILED'
+          : 'REMOTE_THREAD_START_OUTCOME_UNKNOWN',
+      });
+      throw error;
+    } finally {
+      endPendingThreadStart(project.id);
+    }
+    const thread = repository.upsertThread(
+      mapThread(result.thread, project.id, false, result.instructionSources, result.model),
+    );
+    repository.markThreadHistoryHydrated(thread.id);
+    turnNavigationGenerations.set(thread.id, appServer.generation);
+    loadedThreadGenerations.set(thread.id, appServer.generation);
+    repository.updateRemoteTask(record.id, 'accepted', { threadId: thread.id });
+    const queuedRecord =
+      input.attachments.length === 0
+        ? queueRemoteTask(repository.getRemoteTask(record.id)!)
+        : repository.getRemoteTask(record.id)!;
+    repository.audit('remote-task.submit', 'succeeded', { id: record.id, threadId: thread.id });
+    reply.header('Cache-Control', 'no-store');
+    return reply.code(202).send({ data: publicRemoteTask(queuedRecord) });
+  });
+
+  app.get('/api/remote-projects', (request, reply) => {
+    auth.authenticateClient(request, 'read');
+    reply.header('Cache-Control', 'no-store');
+    return {
+      data: repository
+        .listProjects()
+        .filter((project) => !project.archived)
+        .map((project) => ({ id: project.id, name: project.name })),
+    };
+  });
+
+  app.get('/api/remote-tasks/:id', async (request, reply) => {
+    auth.authenticateClient(request, 'read');
+    const id = z.uuid().parse((request.params as { id: unknown }).id);
+    const record = repository.getRemoteTask(id);
+    if (!record) throw new HttpError(404, 'REMOTE_TASK_NOT_FOUND');
+    const current =
+      record.status === 'needsReview' && !record.threadId
+        ? await reconcileRemoteThread(record).catch(() => record)
+        : record;
+    reply.header('Cache-Control', 'no-store');
+    return { data: publicRemoteTask(current) };
+  });
+
+  app.post(
+    '/api/remote-tasks/:id/attachments/:slot',
+    { bodyLimit: MAX_ATTACHMENT_BYTES + 16_384 },
+    async (request, reply) => {
+      const client = auth.authenticateClient(request, 'submit');
+      const params = z
+        .object({ id: z.uuid(), slot: z.coerce.number().int().min(0).max(7) })
+        .parse(request.params);
+      const record = repository.getRemoteTask(params.id);
+      if (!record) throw new HttpError(404, 'REMOTE_TASK_NOT_FOUND');
+      if (record.clientTokenId !== client.id) throw new HttpError(403, 'CLIENT_SCOPE_DENIED');
+      if (!record.threadId || record.status !== 'accepted')
+        throw new HttpError(409, 'REMOTE_TASK_NOT_STAGING');
+      const input = submitRemoteTaskRequestSchema.parse(JSON.parse(record.requestJson));
+      const expected = input.attachments[params.slot];
+      if (!expected) throw new HttpError(400, 'REMOTE_ATTACHMENT_SLOT_INVALID');
+      if (!Buffer.isBuffer(request.body)) throw new HttpError(400, 'MULTIPART_FILE_REQUIRED');
+      const contentType = request.headers['content-type'];
+      if (typeof contentType !== 'string') throw new HttpError(415, 'ATTACHMENT_TYPE_REQUIRED');
+      const upload = parseSingleFileMultipart(contentType, request.body);
+      if (
+        upload.name !== expected.name ||
+        upload.bytes.length !== expected.size ||
+        createHash('sha256').update(upload.bytes).digest('hex') !== expected.sha256
+      )
+        throw new HttpError(409, 'REMOTE_ATTACHMENT_MISMATCH');
+      const project = repository.getProject(record.projectId);
+      if (!project) throw new HttpError(409, 'THREAD_PROJECT_MISSING');
+      requireProjectWorkAllowed(project);
+      const attachment = await attachmentStore.withThreadLock(record.threadId, async () => {
+        if (repository.getRemoteTask(record.id)?.status !== 'accepted')
+          throw new HttpError(409, 'REMOTE_TASK_NOT_STAGING');
+        const existingId = repository.getRemoteTaskAttachment(record.id, params.slot);
+        if (existingId) {
+          const existing = repository.getAttachment(existingId);
+          if (!existing) throw new HttpError(409, 'REMOTE_ATTACHMENT_MISSING');
+          return existing;
+        }
+        if (
+          repository.attachmentBytesForThread(record.threadId!) + upload.bytes.length >
+          MAX_THREAD_ATTACHMENT_BYTES
+        )
+          throw new HttpError(413, 'THREAD_ATTACHMENT_STORAGE_EXHAUSTED');
+        const stored = await attachmentStore.write(
+          project.id,
+          record.threadId!,
+          upload.name,
+          upload.bytes,
+        );
+        try {
+          return repository.addRemoteTaskAttachment(
+            record.id,
+            params.slot,
+            {
+              ...stored,
+              threadId: record.threadId!,
+              name: upload.name,
+              mimeType: upload.mimeType,
+              kind: upload.kind,
+              size: upload.bytes.length,
+            },
+            expected.sha256,
+          );
+        } catch (error) {
+          await attachmentStore.remove(project.id, record.threadId!, stored.storageName);
+          throw error;
+        }
+      });
+      reply.header('Cache-Control', 'no-store');
+      return reply.code(201).send({ data: publicAttachment(attachment) });
+    },
+  );
+
+  app.post('/api/remote-tasks/:id/start', (request, reply) => {
+    const client = auth.authenticateClient(request, 'submit');
+    const id = z.uuid().parse((request.params as { id: unknown }).id);
+    const record = repository.getRemoteTask(id);
+    if (!record) throw new HttpError(404, 'REMOTE_TASK_NOT_FOUND');
+    if (record.clientTokenId !== client.id) throw new HttpError(403, 'CLIENT_SCOPE_DENIED');
+    if (record.status !== 'accepted' && record.status !== 'queued')
+      throw new HttpError(409, 'REMOTE_TASK_NOT_STARTABLE');
+    const updated = record.status === 'accepted' ? queueRemoteTask(record) : record;
+    reply.header('Cache-Control', 'no-store');
+    return reply.code(202).send({ data: publicRemoteTask(updated) });
+  });
+
+  app.post('/api/remote-tasks/:id/cancel', async (request, reply) => {
+    auth.authenticateClient(request, 'cancel');
+    const id = z.uuid().parse((request.params as { id: unknown }).id);
+    const record = repository.getRemoteTask(id);
+    if (!record) throw new HttpError(404, 'REMOTE_TASK_NOT_FOUND');
+    if (record.status === 'cancelled' || record.status === 'cancelRequested')
+      return { data: publicRemoteTask(record) };
+    if (
+      record.terminalPhase &&
+      (!record.threadId || repository.countActiveSubagentsForRoot(record.threadId) === 0)
+    )
+      throw new HttpError(409, 'REMOTE_TASK_ALREADY_TERMINAL');
+    if (!record.threadId || record.status === 'needsReview')
+      throw new HttpError(409, 'REMOTE_TASK_REQUIRES_REVIEW');
+    if (record.status === 'accepted') {
+      const cancelled = await attachmentStore.withThreadLock(record.threadId, () =>
+        Promise.resolve(repository.cancelStagedRemoteTask(id)),
+      );
+      if (!cancelled) throw new HttpError(409, 'REMOTE_TASK_NOT_STAGING');
+      await requestAttachmentFileDeletionDrain();
+      repository.audit('remote-task.cancel', 'succeeded', { id, phase: 'staging' });
+      return { data: publicRemoteTask(cancelled) };
+    }
+    const queued = record.queuedTurnId ? repository.getQueuedTurn(record.queuedTurnId) : undefined;
+    if (queued?.status === 'queued') {
+      const result = await attachmentStore.withThreadLock(record.threadId, () =>
+        Promise.resolve(repository.cancelQueuedTurn(record.threadId!, queued.id)),
+      );
+      if (result.status === 'cancelled') {
+        await requestAttachmentFileDeletionDrain();
+        const cancelled = repository.updateRemoteTask(id, 'cancelled');
+        publishQueueChanged(record.threadId);
+        repository.audit('remote-task.cancel', 'succeeded', { id, phase: 'queued' });
+        reply.header('Cache-Control', 'no-store');
+        return { data: publicRemoteTask(cancelled) };
+      }
+    }
+    const started = z
+      .object({ data: startTurnResultSchema })
+      .safeParse(repository.getIdempotent(`turn:${record.threadId}`, record.requestId)?.response);
+    if (!started.success || started.data.data.status !== 'started')
+      throw new HttpError(409, 'REMOTE_TASK_REQUIRES_REVIEW');
+    const turnId = started.data.data.turnId;
+    await appServer.request('turn/interrupt', { threadId: record.threadId, turnId });
+    const cancelling = repository.updateRemoteTask(id, 'cancelRequested');
+    publish(
+      repository.appendEvent({
+        threadId: record.threadId,
+        turnId,
+        kind: 'turn',
+        phase: 'state',
+        payload: { status: 'interruptRequested', runtime: true },
+      }),
+    );
+    repository.audit('remote-task.cancel', 'succeeded', { id, phase: 'running' });
+    reply.header('Cache-Control', 'no-store');
+    return { data: publicRemoteTask(cancelling) };
+  });
+
   app.get('/api/threads/:id/queued-turns', (request) => {
     auth.authenticate(request);
     const id = parseId(request);
@@ -5644,9 +6105,7 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     return { data: { id, status } };
   });
 
-  app.get('/api/threads/:id/events', async (request, reply) => {
-    auth.authenticate(request);
-    const id = parseId(request);
+  const streamThreadEvents = async (request: FastifyRequest, reply: FastifyReply, id: string) => {
     const existing = repository.getThread(id);
     if (!existing) throw new HttpError(404, 'THREAD_NOT_FOUND');
     const query = z.object({ after: eventCursorSchema.optional() }).parse(request.query);
@@ -5691,6 +6150,20 @@ export async function buildServer(dependencies: ServerDependencies): Promise<Fas
     if (delivery.closed) return;
     if (!repository.isThreadHistoryHydrated(id)) startThreadHistoryHydration(existing);
     connectionTimers.keepalive = setInterval(() => delivery.deliverComment('keepalive'), 15_000);
+  };
+
+  app.get('/api/threads/:id/events', async (request, reply) => {
+    auth.authenticate(request);
+    return streamThreadEvents(request, reply, parseId(request));
+  });
+
+  app.get('/api/remote-tasks/:id/events', async (request, reply) => {
+    auth.authenticateClient(request, 'read');
+    const id = z.uuid().parse((request.params as { id: unknown }).id);
+    const task = repository.getRemoteTask(id);
+    if (!task) throw new HttpError(404, 'REMOTE_TASK_NOT_FOUND');
+    if (!task.threadId) throw new HttpError(409, 'REMOTE_THREAD_NOT_READY');
+    return streamThreadEvents(request, reply, task.threadId);
   });
 
   app.get('/api/system/codex-account/login', (request) => {

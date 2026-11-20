@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-web-remote"
+version = "0.1.0"
+description = "Submit tasks to a Codex Web UI server"
+requires-python = ">=3.10"
+dependencies = ["keyring>=25,<27"]
+
+[project.scripts]
+codex-web-remote = "codex_web_remote:main"
+
+[tool.setuptools]
+py-modules = ["codex_web_remote"]

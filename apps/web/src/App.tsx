@@ -23,6 +23,7 @@ import type {
 } from '@codex-web/contracts';
 
 import { ApiError, api } from './api.js';
+import { ClientTokenSettings } from './ClientTokenSettings.js';
 import { AgentMessageContent } from './AgentMessageContent.js';
 import { ImagePreviewDialog } from './ImagePreviewDialog.js';
 import { normalizeProjectFilePath, ProjectFileDownload } from './ProjectFileDownload.js';
@@ -67,7 +68,7 @@ const NextWorkspace = lazy(() =>
 );
 
 type LoadState = 'loading' | 'ready' | 'signed-out';
-type SettingsTab = 'account' | 'updates' | 'resources' | 'skills';
+type SettingsTab = 'account' | 'updates' | 'resources' | 'skills' | 'clients';
 type PushNotificationState =
   | 'unavailable'
   | 'insecure'
@@ -3091,6 +3092,7 @@ function CodexUpdateSettings({
 
 function SettingsDialog({
   activeTab,
+  csrfToken,
   capability,
   codexUpdate,
   codexUpdateBusy,
@@ -3118,6 +3120,7 @@ function SettingsDialog({
   onUseSkill,
 }: {
   activeTab: SettingsTab;
+  csrfToken: string;
   capability: Capability | null;
   codexUpdate: CodexUpdateSnapshot | null;
   codexUpdateBusy: boolean;
@@ -3182,6 +3185,7 @@ function SettingsDialog({
     { id: 'updates', label: 'Обновления' },
     { id: 'resources', label: 'Ресурсы' },
     { id: 'skills', label: 'Skills и инструкции' },
+    { id: 'clients', label: 'Внешние клиенты' },
   ];
   return createPortal(
     <div className="dialog-backdrop settings-backdrop">
@@ -3406,6 +3410,7 @@ function SettingsDialog({
               </section>
             </>
           )}
+          {activeTab === 'clients' && <ClientTokenSettings csrfToken={csrfToken} />}
         </div>
       </section>
     </div>,
@@ -4848,20 +4853,26 @@ function Workspace({
     const preferencesRequest = api.runtimePreferences();
     const showNavigation = (navigation: { projects: Project[]; threads: Thread[] }) => {
       const activeThreads = navigation.threads.filter((item) => !item.archived);
+      const linkedThreadId = new URLSearchParams(window.location.search).get('threadId');
+      const linkedThread = activeThreads.find((item) => item.id === linkedThreadId);
       const preferredProjectId = selectedProjectIdRef.current;
       const nextProjectId =
-        preferredProjectId && navigation.projects.some((item) => item.id === preferredProjectId)
-          ? preferredProjectId
-          : (navigation.projects[0]?.id ?? null);
+        linkedThread && navigation.projects.some((item) => item.id === linkedThread.projectId)
+          ? linkedThread.projectId
+          : preferredProjectId && navigation.projects.some((item) => item.id === preferredProjectId)
+            ? preferredProjectId
+            : (navigation.projects[0]?.id ?? null);
       setProjects(navigation.projects);
       setProjectId(nextProjectId);
       if (!archiveView) {
         const selectedThreads = activeThreads.filter((item) => item.projectId === nextProjectId);
         setThreads(preserveVerifiedStatus(selectedThreads));
         setThreadId((current) =>
-          selectedThreads.some((item) => item.id === current)
-            ? current
-            : (selectedThreads[0]?.id ?? null),
+          linkedThread && selectedThreads.some((item) => item.id === linkedThread.id)
+            ? linkedThread.id
+            : selectedThreads.some((item) => item.id === current)
+              ? current
+              : (selectedThreads[0]?.id ?? null),
         );
       }
       setRecentThreads(
@@ -7023,6 +7034,7 @@ function Workspace({
       {settingsOpen && !accountLoginOpen && (
         <SettingsDialog
           activeTab={settingsTab}
+          csrfToken={session.csrfToken}
           capability={capability}
           codexUpdate={codexUpdate}
           codexUpdateBusy={codexUpdateBusy}

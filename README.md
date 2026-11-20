@@ -63,6 +63,33 @@ The browser may paint a bounded local copy of chat titles after authentication, 
 server-side SQLite navigation snapshot. Selecting a chat first shows recent saved messages and pending state;
 the slower native Codex reconciliation follows in the background with an explicit checking label. Older messages
 continue loading upward in pages.
+
+### Tasks from another computer
+
+The authenticated Web administrator can issue a named, expiring external client key in **Settings → External
+clients**. The key is shown once and may be revoked immediately. It grants only the selected `submit`, `read`
+and optional `cancel` scopes; it is separate from the OpenAI credential and browser session. The server stores
+only its hash. Install the optional Python CLI with `python -m pip install ./clients/remote-cli`, then run:
+
+```text
+codex-web-remote configure https://your-server.example
+codex-web-remote projects
+codex-web-remote submit --project-id <existing-project-uuid> --text "Task" --file ./note.txt
+codex-web-remote status <task-uuid>
+codex-web-remote watch <task-uuid>
+codex-web-remote open <task-uuid>
+```
+
+The CLI stores the external key in the operating system keyring, never in its configuration file. Headless
+Linux clients need an available system keyring backend. `submit` prints its `requestId` before contacting the
+server; rerun with `--request-id <same-uuid>` and the same payload after a timeout. The `projectId` must refer
+to an existing registered project. No project is chosen or created automatically. The Web UI and CLI share
+one persistent server chat, normal queue, safe event journal and approval flow; the client computer does not
+run Codex. The returned `chatUrl` opens that chat in Web UI after browser login. Attached files are sent to
+the server by slot after task reservation, then the task is queued; reuploading the same slot is idempotent.
+An uncertain native thread start remains in `needsReview` until source-based reconciliation finds the exact
+thread, and an uncertain turn start follows the existing queued-turn reconciliation. API status and SSE are
+available through `GET /api/remote-tasks/:id` and `GET /api/remote-tasks/:id/events` with `Last-Event-ID`.
 The last model, reasoning, access and approval selections are account settings stored on the server. Messages
 and execution stages show their date and time, while steer and stop actions show an explicit accepted or failed
 state instead of relying on a disappearing input value. A model change applies to the next new root task and

@@ -143,6 +143,15 @@ export interface PushSubscriptionStatus {
   subscribed: boolean;
 }
 
+export interface ClientToken {
+  id: string;
+  name: string;
+  scopes: Array<'submit' | 'read' | 'cancel'>;
+  createdAt: string;
+  expiresAt: string;
+  revokedAt: string | null;
+}
+
 export function projectFileDownloadUrl(threadId: string, path: string): string {
   return `/api/threads/${encodeURIComponent(threadId)}/project-files/download?path=${encodeURIComponent(path)}`;
 }
@@ -299,6 +308,20 @@ export const api = {
   login: (username: string, password: string) =>
     request<Session>('/api/auth/login', { method: 'POST', body: { username, password } }),
   logout: (csrfToken: string) => request<void>('/api/auth/logout', { method: 'POST', csrfToken }),
+  clientTokens: async () =>
+    asList(await request<ClientToken[] | { data: ClientToken[] }>('/api/client-tokens')),
+  createClientToken: async (
+    csrfToken: string,
+    input: { name: string; scopes: ClientToken['scopes']; expiresAt: string },
+  ) =>
+    unwrapData(
+      await request<(ClientToken & { token: string }) | { data: ClientToken & { token: string } }>(
+        '/api/client-tokens',
+        { method: 'POST', csrfToken, body: input },
+      ),
+    ),
+  revokeClientToken: (csrfToken: string, id: string) =>
+    request<void>(`/api/client-tokens/${encodeURIComponent(id)}`, { method: 'DELETE', csrfToken }),
   runtimePreferences: async () =>
     unwrapData(
       await request<RuntimePreferences | { data: RuntimePreferences }>('/api/preferences/runtime'),

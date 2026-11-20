@@ -9,7 +9,7 @@ import {
 import { hash } from 'argon2';
 import { EventEmitter } from 'node:events';
 import { createHash } from 'node:crypto';
-import { mkdtemp, mkdir, rename, symlink, unlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { createServer as createNetServer } from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -242,7 +242,7 @@ class FakeAppServer implements AppServerClient {
     for (const listener of this.lifecycleListeners) listener(event);
   }
 
-  addExternalThread(cwd: string): string {
+  addExternalThread(cwd: string, threadSource: string | null = null): string {
     const id = `external-${++this.threadCounter}`;
     const now = Math.floor(Date.now() / 1_000);
     this.threads.set(id, {
@@ -254,6 +254,7 @@ class FakeAppServer implements AppServerClient {
       createdAt: now,
       updatedAt: now,
       cwd,
+      threadSource,
       turns: [],
     });
     return id;
@@ -337,6 +338,7 @@ class FakeAppServer implements AppServerClient {
         createdAt: now,
         updatedAt: now,
         cwd: values.cwd,
+        threadSource: values.threadSource ?? null,
         turns: [],
       };
       this.threads.set(id, thread);
@@ -5035,6 +5037,380 @@ describe('Codex routes', () => {
     expect(
       after.json<{ data: { revokedAt: string | null }[] }>().data[0]?.revokedAt,
     ).not.toBeNull();
+  });
+
+  it('submits a remote task into one ordinary thread and deduplicates the request ID', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const tokenResponse = await app.inject({
+      method: 'POST',
+      url: '/api/client-tokens',
+      headers: session.headers,
+      payload: {
+        name: 'Laptop',
+        expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+        scopes: ['submit', 'read'],
+      },
+    });
+    const token = tokenResponse.json<{ data: { token: string } }>().data.token;
+    const requestId = '624a2856-5a36-44c6-9de1-a0595df1411d';
+    const empty = await app.inject({
+      method: 'POST',
+      url: '/api/remote-tasks',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { requestId, projectId: '624a2856-5a36-44c6-9de1-a0595df1411e', text: 'Check' },
+    });
+    expect(empty.statusCode).toBe(409);
+    expect(empty.json()).toMatchObject({ error: { code: 'NO_PROJECTS_AVAILABLE' } });
+
+    const project = await createProject(app, projectPath, session.headers);
+    const available = await app.inject({
+      method: 'GET',
+      url: '/api/remote-projects',
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(available.json()).toMatchObject({ data: [{ id: project.id }] });
+    expect(available.body).not.toContain(projectPath);
+    const payload = { requestId, projectId: project.id, text: 'Check project', model: 'gpt-test' };
+    const first = await app.inject({
+      method: 'POST',
+      url: '/api/remote-tasks',
+      headers: { authorization: `Bearer ${token}` },
+      payload,
+    });
+    expect(first.statusCode).toBe(202);
+    const task = first.json<{ data: { id: string; threadId: string; chatUrl: string } }>().data;
+    expect(task.chatUrl).toContain(encodeURIComponent(task.threadId));
+    const duplicate = await app.inject({
+      method: 'POST',
+      url: '/api/remote-tasks',
+      headers: { authorization: `Bearer ${token}` },
+      payload,
+    });
+    expect(duplicate.statusCode).toBe(200);
+    expect(duplicate.json()).toMatchObject({ data: { id: task.id, threadId: task.threadId } });
+    expect(appServer.requests.filter((entry) => entry.method === 'thread/start')).toHaveLength(1);
+    const read = await app.inject({
+      method: 'GET',
+      url: `/api/remote-tasks/${task.id}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(read.statusCode).toBe(200);
+    expect(read.json()).toMatchObject({ data: { id: task.id, threadId: task.threadId } });
+  });
+
+  it('stages a remote attachment once before enqueueing the task', async () => {
+    const { app, appServer, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const tokenResponse = await app.inject({
+      method: 'POST',
+      url: '/api/client-tokens',
+      headers: session.headers,
+      payload: {
+        name: 'Laptop',
+        expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+        scopes: ['submit', 'read'],
+      },
+    });
+    const token = tokenResponse.json<{ data: { token: string } }>().data.token;
+    const bytes = Buffer.from('remote attachment');
+    const taskResponse = await app.inject({
+      method: 'POST',
+      url: '/api/remote-tasks',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        requestId: 'adbf1edf-2ed7-4351-9422-feb50ed0a200',
+        projectId: project.id,
+        text: 'Read this file',
+        attachments: [
+          {
+            name: 'note.txt',
+            size: bytes.length,
+            sha256: createHash('sha256').update(bytes).digest('hex'),
+          },
+        ],
+      },
+    });
+    expect(taskResponse.statusCode).toBe(202);
+    const task = taskResponse.json<{ data: { id: string; threadId: string; status: string } }>()
+      .data;
+    expect(task.status).toBe('accepted');
+    expect(appServer.requests.filter((entry) => entry.method === 'turn/start')).toHaveLength(0);
+    const file = multipartFile('note.txt', 'text/plain', bytes);
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const upload = await app.inject({
+        method: 'POST',
+        url: `/api/remote-tasks/${task.id}/attachments/0`,
+        headers: { authorization: `Bearer ${token}`, 'content-type': file.contentType },
+        payload: file.body,
+      });
+      expect(upload.statusCode).toBe(201);
+    }
+    const started = await app.inject({
+      method: 'POST',
+      url: `/api/remote-tasks/${task.id}/start`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(started.statusCode).toBe(202);
+    expect(started.json()).toMatchObject({ data: { id: task.id, threadId: task.threadId } });
+  });
+
+  it('recovers an uncertain remote thread by its unique native source without creating another', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const tokenResponse = await app.inject({
+      method: 'POST',
+      url: '/api/client-tokens',
+      headers: session.headers,
+      payload: {
+        name: 'Laptop',
+        expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+        scopes: ['submit', 'read'],
+      },
+    });
+    const tokenData = tokenResponse.json<{ data: { id: string; token: string } }>().data;
+    const requestId = 'ebf6845b-fcdb-4eae-8be2-95b4fc630e69';
+    const input = { requestId, projectId: project.id, text: 'Recover me', attachments: [] };
+    const id = 'f591359c-1eaa-42c7-80ce-d2b7ee4aff62';
+    repository.reserveRemoteTask({
+      id,
+      requestId,
+      clientTokenId: tokenData.id,
+      requestHash: createHash('sha256').update(JSON.stringify(input)).digest('hex'),
+      requestJson: JSON.stringify(input),
+      projectId: project.id,
+    });
+    repository.updateRemoteTask(id, 'needsReview');
+    const nativeThreadId = appServer.addExternalThread(projectPath, `remote-task:${id}`);
+    const result = await app.inject({
+      method: 'GET',
+      url: `/api/remote-tasks/${id}`,
+      headers: { authorization: `Bearer ${tokenData.token}` },
+    });
+    expect(result.statusCode).toBe(200);
+    expect(result.json()).toMatchObject({ data: { id, threadId: nativeThreadId } });
+    expect(appServer.requests.filter((entry) => entry.method === 'thread/start')).toHaveLength(0);
+  });
+
+  it('enforces external key scopes and revocation on remote task reads and cancellation', async () => {
+    const { app, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const issue = async (scopes: string[]) => {
+      const response = await app.inject({
+        method: 'POST',
+        url: '/api/client-tokens',
+        headers: session.headers,
+        payload: {
+          name: scopes.join('-'),
+          expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+          scopes,
+        },
+      });
+      expect(response.statusCode).toBe(201);
+      return response.json<{ data: { id: string; token: string } }>().data;
+    };
+    const submitKey = await issue(['submit']);
+    const readKey = await issue(['read']);
+    const cancelKey = await issue(['cancel']);
+    const submitted = await app.inject({
+      method: 'POST',
+      url: '/api/remote-tasks',
+      headers: { authorization: `Bearer ${submitKey.token}` },
+      payload: {
+        requestId: '3ae53462-54bf-4492-a29b-853c2e61c4ab',
+        projectId: project.id,
+        text: 'Do work',
+        attachments: [
+          { name: 'note.txt', size: 4, sha256: createHash('sha256').update('note').digest('hex') },
+        ],
+      },
+    });
+    expect(submitted.statusCode).toBe(202);
+    const taskId = submitted.json<{ data: { id: string } }>().data.id;
+    const file = multipartFile('note.txt', 'text/plain', Buffer.from('note'));
+    const upload = await app.inject({
+      method: 'POST',
+      url: `/api/remote-tasks/${taskId}/attachments/0`,
+      headers: { authorization: `Bearer ${submitKey.token}`, 'content-type': file.contentType },
+      payload: file.body,
+    });
+    expect(upload.statusCode).toBe(201);
+    const attachmentId = upload.json<{ data: { id: string } }>().data.id;
+    const deniedRead = await app.inject({
+      method: 'GET',
+      url: `/api/remote-tasks/${taskId}`,
+      headers: { authorization: `Bearer ${submitKey.token}` },
+    });
+    expect(deniedRead.statusCode).toBe(403);
+    const allowedRead = await app.inject({
+      method: 'GET',
+      url: `/api/remote-tasks/${taskId}`,
+      headers: { authorization: `Bearer ${readKey.token}` },
+    });
+    expect(allowedRead.statusCode).toBe(200);
+    expect(allowedRead.body).not.toContain(submitKey.token);
+    const deniedCancel = await app.inject({
+      method: 'POST',
+      url: `/api/remote-tasks/${taskId}/cancel`,
+      headers: { authorization: `Bearer ${readKey.token}` },
+    });
+    expect(deniedCancel.statusCode).toBe(403);
+    const cancelled = await app.inject({
+      method: 'POST',
+      url: `/api/remote-tasks/${taskId}/cancel`,
+      headers: { authorization: `Bearer ${cancelKey.token}` },
+    });
+    expect(cancelled.statusCode).toBe(200);
+    expect(cancelled.json()).toMatchObject({ data: { status: 'cancelled' } });
+    expect(repository.getAttachment(attachmentId)).toBeUndefined();
+    await app.inject({
+      method: 'DELETE',
+      url: `/api/client-tokens/${readKey.id}`,
+      headers: session.headers,
+    });
+    const revoked = await app.inject({
+      method: 'GET',
+      url: `/api/remote-tasks/${taskId}`,
+      headers: { authorization: `Bearer ${readKey.token}` },
+    });
+    expect(revoked.statusCode).toBe(401);
+  });
+
+  it('fences a remote native start after restart and adopts its exact existing thread', async () => {
+    const temp = await mkdtemp(path.join(os.tmpdir(), 'codex-remote-restart-'));
+    const native = new FakeAppServer();
+    const persistent = { temp, appServer: native };
+    const first = await fixture(
+      2,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      persistent,
+    );
+    const session = await login(first.app);
+    const project = await createProject(first.app, first.projectPath, session.headers);
+    const tokenResponse = await first.app.inject({
+      method: 'POST',
+      url: '/api/client-tokens',
+      headers: session.headers,
+      payload: {
+        name: 'Laptop',
+        expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+        scopes: ['submit', 'read'],
+      },
+    });
+    const tokenData = tokenResponse.json<{ data: { id: string; token: string } }>().data;
+    const requestId = 'c0ad44db-2cb0-47fd-a349-a9c9def88054';
+    const taskId = '152e32f7-b5b1-47e8-8cd0-b83450e01841';
+    const input = { requestId, projectId: project.id, text: 'After restart', attachments: [] };
+    first.repository.reserveRemoteTask({
+      id: taskId,
+      requestId,
+      clientTokenId: tokenData.id,
+      requestHash: createHash('sha256').update(JSON.stringify(input)).digest('hex'),
+      requestJson: JSON.stringify(input),
+      projectId: project.id,
+    });
+    first.repository.updateRemoteTask(taskId, 'creating');
+    const nativeThreadId = native.addExternalThread(first.projectPath, `remote-task:${taskId}`);
+    await first.app.close();
+    const second = await fixture(
+      2,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      {},
+      persistent,
+    );
+    expect(second.repository.getRemoteTask(taskId)?.status).toBe('needsReview');
+    const recovered = await second.app.inject({
+      method: 'GET',
+      url: `/api/remote-tasks/${taskId}`,
+      headers: { authorization: `Bearer ${tokenData.token}` },
+    });
+    expect(recovered.statusCode).toBe(200);
+    expect(recovered.json()).toMatchObject({ data: { id: taskId, threadId: nativeThreadId } });
+    expect(native.requests.filter((entry) => entry.method === 'thread/start')).toHaveLength(0);
+    await second.app.close();
+    expect(path.dirname(temp)).toBe(os.tmpdir());
+    expect(path.basename(temp)).toMatch(/^codex-remote-restart-/);
+    await rm(temp, { recursive: true });
+  });
+
+  it('keeps a remote final answer behind terminal work and persists its task status', async () => {
+    const { app, appServer, repository, projectPath } = await fixture();
+    const session = await login(app);
+    const project = await createProject(app, projectPath, session.headers);
+    const keyResponse = await app.inject({
+      method: 'POST',
+      url: '/api/client-tokens',
+      headers: session.headers,
+      payload: {
+        name: 'Laptop',
+        expiresAt: new Date(Date.now() + 86_400_000).toISOString(),
+        scopes: ['submit', 'read'],
+      },
+    });
+    const token = keyResponse.json<{ data: { token: string } }>().data.token;
+    const submitted = await app.inject({
+      method: 'POST',
+      url: '/api/remote-tasks',
+      headers: { authorization: `Bearer ${token}` },
+      payload: {
+        requestId: '6f08c444-c0c1-48e3-b141-c63d3bc1be6f',
+        projectId: project.id,
+        text: 'Complete this',
+      },
+    });
+    const task = submitted.json<{ data: { id: string; threadId: string } }>().data;
+    await vi.waitFor(() => expect(repository.getRemoteTask(task.id)?.turnId).toBeTruthy());
+    const turnId = repository.getRemoteTask(task.id)!.turnId!;
+    appServer.emit({
+      method: 'item/completed',
+      params: {
+        threadId: task.threadId,
+        turnId,
+        item: { type: 'agentMessage', phase: 'final_answer', text: 'Result from server' },
+      },
+    });
+    const before = await app.inject({
+      method: 'GET',
+      url: `/api/remote-tasks/${task.id}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(before.json()).toMatchObject({ data: { finalAnswer: null } });
+    appServer.emit({
+      method: 'turn/completed',
+      params: { threadId: task.threadId, turn: { id: turnId, status: 'completed', items: [] } },
+    });
+    const after = await app.inject({
+      method: 'GET',
+      url: `/api/remote-tasks/${task.id}`,
+      headers: { authorization: `Bearer ${token}` },
+    });
+    expect(after.json()).toMatchObject({
+      data: { status: 'completed', finalAnswer: 'Result from server', turnId },
+    });
+    expect(repository.getRemoteTask(task.id)).toMatchObject({
+      terminalPhase: 'completed',
+      finalAnswer: 'Result from server',
+    });
   });
 
   it('connects an API key only from an authenticated CSRF-protected request without echoing it', async () => {

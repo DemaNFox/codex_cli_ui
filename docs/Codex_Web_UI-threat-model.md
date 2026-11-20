@@ -18,6 +18,15 @@ sessions, TLS, audit and an explicit fail-closed mode choice are mandatory; seco
   Docker access, browser-controlled runner-mode changes and automatic deployment. Host-root Codex execution is
   in scope only when the operator explicitly installs or migrates to `host-admin`.
 - One trusted human operator uses multiple personal devices.
+- External CLI clients may use named, expiring, scoped bearer keys. A stolen `submit` key can create executable
+  Codex work under the selected runner's authority, and a stolen `read` key can disclose saved task events.
+  Issuance and revocation remain browser-session and CSRF protected; the one-time secret is kept only in the
+  client's OS keyring and a hash in SQLite. The API checks expiry/revocation on every request. The key must
+  never appear in audit records, event payloads, URLs or responses after issuance. TLS and host keyring
+  integrity remain trust assumptions. The optional `cancel` scope can interrupt a turn but cannot grant
+  broader browser administration. A random request ID is scoped to one token and persisted before native
+  thread creation; collisions with a different token or payload fail closed. An ambiguous native start
+  remains reviewable and is reconciled by the unique native thread source instead of starting a duplicate.
 - The service initially shares the existing Ubuntu host with other workloads.
 - Public access is protected by HTTPS and application login. Password compromise remains a material residual risk.
 - The owner explicitly wants a dedicated-host option in which authenticated Codex tasks may administer the
